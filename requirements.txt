@@ -1,0 +1,65 @@
+# 🏛️ Sovereign Hall - Requirements
+# 全自动化多智能体投资研究系统
+
+# Core Dependencies
+python >= 3.10
+asyncio >= 3.4.3
+
+# LLM Clients
+openai >= 1.12.0
+anthropic >= 0.18.0  # 可选，如果使用Anthropic API
+
+# HTTP Client
+httpx >= 0.26.0
+requests >= 2.31.0
+
+# Web Scraping
+beautifulsoup4 >= 4.12.0
+readability-lxml >= 0.8.1
+lxml >= 5.0.0
+
+# Data Processing
+numpy >= 1.26.0
+pandas >= 2.2.0
+
+# Vector Database (optional, for production)
+faiss-cpu >= 1.7.4
+# faiss-gpu >= 1.7.4  # 如果有GPU
+
+# Configuration
+pyyaml >= 6.0
+python-dotenv >= 1.0.0
+
+# Logging
+python-json-logger >= 2.0.0
+structlog >= 24.1.0
+colorama >= 0.4.6
+
+# Utilities
+tqdm >= 4.66.0
+rich >= 13.7.0
+
+# Testing
+pytest >= 8.0.0
+pytest-asyncio >= 0.23.0
+pytest-cov >= 4.1.0
+
+# Code Quality
+black >= 24.1.0
+isort >= 5.13.0
+flake8 >= 7.0.0
+
+# Type Checking
+mypy >= 1.8.0
+
+# Optional: Monitoring
+prometheus-client >= 0.19.0
+
+# Optional: Database
+aiosqlite >= 0.19.0  # 异步SQLite（推荐）
+# psycopg2-binary >= 2.9.0  # 如果使用PostgreSQL
+# redis >= 5.0.0  # 如果使用Redis缓存
+
+# Optional: Browser Automation (for JS-rendered pages)
+# selenium >= 4.16.0
+# playwright >= 1.41.0

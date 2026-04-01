@@ -1,0 +1,135 @@
+# 🏛️ Sovereign Hall - 系统配置文件
+# 2026-03-02 更新
+
+# LLM配置 (使用本地API)
+llm:
+  provider: "openai"  # openai/anthropic/local
+  base_url: "http://172.18.1.128:30977/v1"
+  model: "MiniMax/MiniMax-M2.5"
+  api_key: "empty"
+  model_uuid: "142ebd20-ee7f-4607-b0a3-4375fb99b714"  # 用于Host header
+  max_concurrent: 16
+  temperature: 0.7
+  max_tokens: 15000
+  timeout: 180
+
+  # Embedding 配置
+  embedding_model: "bge-large-zh-v1.5"
+  embedding_uuid: "ec85af59-12aa-4cba-9090-74cc48c39eda"
+  embedding_dim: 1024
+
+
+# 爬虫配置
+spider:
+  max_concurrent: 10  # 降低并发，防止被封
+  timeout: 30
+  user_agent: "SovereignHall/1.0 (Research Bot)"
+  retry_times: 3
+  retry_delay: 2
+  respect_robots_txt: true
+  rate_limit:
+    requests_per_minute: 30  # 降低请求频率
+    burst: 10
+  search_interval: 0.5  # 每次搜索间隔0.5秒
+
+# 模拟投资配置
+simulation:
+  enabled: true
+  initial_capital: 10000  # 初始资金 10000 元
+  min_unit: 100  # 最小买卖单位：一手=100股
+  trading_fee: 0.0003  # 佣金万三
+  stamp_duty: 0.001  # 印花税千一（卖出时）
+
+# 向量数据库
+vector_db:
+  provider: "simple"  # simple/faiss/pinecone
+  dimension: 1024  # 与 embedding_dim 一致
+
+# 数据库配置
+database:
+  provider: "sqlite"
+  path: "./sovereign_hall/data/sovereign_hall.db"
+
+# 系统运行配置
+system:
+  mode: "research"  # research/production
+
+  # 迭代控制
+  iteration_interval: 3600  # 每轮间隔（秒）
+  max_iterations: null
+
+  # 日志
+  log_level: "INFO"
+
+  # 并发控制
+  enable_rate_limiting: true
+  enable_circuit_breaker: true
+  circuit_breaker:
+    failure_threshold: 5
+    timeout: 60
+
+# 研究讨论配置
+research:
+  max_tokens: 15000
+  reflection_limit: 5
+  rounds: 6
+  conclusion_max_length: 20000
+
+# 投委会配置
+investment_committee:
+  max_rounds: 3
+  quorum: 5
+  approval_threshold: 0.6
+  strong_buy_threshold: 0.8
+  defer_threshold: 0.5
+  voting_weights:
+    cio: 2.0
+    risk_officer: 1.5
+    quant_researcher: 1.0
+    macro_strategist: 1.0
+    analyst: 1.0
+
+# 分析师配置
+analysts:
+  enabled_roles:
+    - tmt_analyst
+    - consumer_analyst
+    - cycle_analyst
+    - macro_strategist
+    - risk_officer
+    - quant_researcher
+
+  sector_specialist:
+    "TMT": "tmt_analyst"
+    "科技": "tmt_analyst"
+    "AI": "tmt_analyst"
+    "消费": "consumer_analyst"
+    "医药": "consumer_analyst"
+    "白酒": "consumer_analyst"
+    "周期": "cycle_analyst"
+    "制造": "cycle_analyst"
+    "金融": "macro_strategist"
+    "地产": "macro_strategist"
+
+# 机构记忆配置
+institutional_memory:
+  playbook_path: "./sovereign_hall/data/playbooks"
+  version_control: true
+  min_outcome_samples: 3
+  confidence_adjustment_factor: 0.1
+  blacklist_threshold: 3
+  blacklist_duration: 2592000
+  retrieval_top_k: 5
+  similarity_threshold: 0.7
+
+# 输出配置
+output:
+  reports_dir: "./sovereign_hall/data/reports"
+  minutes_dir: "./sovereign_hall/data/minutes"
+  archive:
+    enabled: true
+    retention_days: 180
+
+# 版本信息
+version: "1.1.0"
+last_updated: "2026-03-02"
