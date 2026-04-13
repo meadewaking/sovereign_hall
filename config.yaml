@@ -21,16 +21,16 @@ llm:
 
 # 爬虫配置
 spider:
-  max_concurrent: 10  # 降低并发，防止被封
+  max_concurrent: 2  # 进一步降低并发，防止被封
   timeout: 30
   user_agent: "SovereignHall/1.0 (Research Bot)"
   retry_times: 3
   retry_delay: 2
   respect_robots_txt: true
   rate_limit:
-    requests_per_minute: 30  # 降低请求频率
-    burst: 10
-  search_interval: 0.5  # 每次搜索间隔0.5秒
+    requests_per_minute: 6  # 进一步降低请求频率
+    burst: 2
+  search_interval: 5  # 增加搜索间隔，减少被封风险
 
 # 模拟投资配置
 simulation:

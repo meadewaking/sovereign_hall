@@ -241,10 +241,10 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
     # 合并额外查询词并去重
     all_queries = list(set(queries + extra_queries))[:query_count]
 
-    # 高并发搜索 - 30个并发，10个结果/查询
+    # 降低搜索量以减少被封风险 - 减少查询数和结果数
     raw_docs = await spiders.aggressive_search(
         all_queries,
-        max_results_per_query=10,
+        max_results_per_query=5,  # 从10降到5
     )
 
     print(f"\n抓取 {len(raw_docs)} 篇文档")
@@ -778,8 +778,30 @@ async def main():
             print(f"{'='*60}")
 
             try:
-                # 阶段1：海量搜索
-                docs = await stage1_mass_search(llm, spiders, topic, query_count=30)
+                # 阶段1：按需搜索（先检查本地数据是否足够）
+                # 检查 VectorDB 中是否有相关数据
+                existing_docs = []
+                try:
+                    # 简单搜索已有数据
+                    existing_docs = vector_db.search(topic, limit=20)
+                except:
+                    pass
+
+                # 如果有足够数据，跳过搜索
+                if existing_docs and len(existing_docs) >= 10:
+                    print(f"\n📚 阶段1：使用本地数据 ({len(existing_docs)} 条相关文档)")
+                    docs = []
+                    for d in existing_docs:
+                        docs.append({
+                            'title': d.get('title', '') or '无标题',
+                            'content': d.get('content', '') or d.get('text', ''),
+                            'url': d.get('url', ''),
+                            'source': 'vector_db'
+                        })
+                else:
+                    # 数据不足，执行搜索（减少搜索量以降低被封风险）
+                    print(f"\n📚 阶段1：本地数据不足，进行搜索补充...")
+                    docs = await stage1_mass_search(llm, spiders, topic, query_count=6)
 
                 # 保存文档
                 if docs:

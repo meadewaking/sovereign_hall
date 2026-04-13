@@ -15,7 +15,8 @@ import shutil
 from collections import OrderedDict
 
 from ..core.config import get_config
-from ..core import Document as Doc, DATA_DIR
+from readability import Document as Doc
+from ..core import DATA_DIR
 from ..utils import ensure_dir, save_json, load_json, generate_id
 from .llm_client import LLMClient
 

@@ -454,18 +454,17 @@ class LLMClient:
         embedding_uuid = embedding_config.get('embedding_uuid', '')
 
         # 如果有API密钥，调用真实API
-        if self.api_key and self.base_url:
+        if embedding_uuid and self.base_url:
             try:
                 import httpx
-                url = f"{self.base_url}/embeddings"
-                payload = {
-                    "model": model,
-                    "input": text[:8000],  # 限制长度
+                # 使用正确的 encode 端点（去掉 /v1 前缀）
+                base = self.base_url.rstrip('/v1').rstrip('/')
+                url = f"{base}/encode"
+                payload = {"sentence": [text[:8000]]}  # 限制长度
+                headers = {
+                    "Host": embedding_uuid,
+                    "Content-Type": "application/json"
                 }
-                headers = {"Authorization": f"Bearer {self.api_key}"}
-                # 添加 uuid 用于 embedding 服务
-                if embedding_uuid:
-                    headers["uuid"] = embedding_uuid
                 # 复用HTTP客户端
                 resp = await self._http_client.post(
                     url,
@@ -476,9 +475,9 @@ class LLMClient:
                 data = resp.json()
                 # 检查返回格式
                 if 'embedding' in data and data['embedding']:
-                    return data['embedding']
-                elif 'data' in data and data['data']:
-                    return data['data'][0]["embedding"]
+                    embeddings = data['embedding']
+                    if embeddings and len(embeddings) > 0:
+                        return embeddings[0]
             except Exception as e:
                 logger.warning(f"Embedding API failed: {e}, using mock")
 

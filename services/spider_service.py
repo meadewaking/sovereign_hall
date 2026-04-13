@@ -16,10 +16,9 @@ import threading
 
 import httpx
 from bs4 import BeautifulSoup
-from readability import Document
+from readability import Document as Doc
 
 from ..core.config import get_config
-from ..core import Document as Doc
 from ..utils import (
     safe_parse_json,
     ThreadSafeCounter,
@@ -163,8 +162,10 @@ class SpiderSwarm:
         if wait_time > 0:
             await asyncio.sleep(wait_time)
 
-        # 搜索间隔
-        await asyncio.sleep(self.search_interval)
+        # 搜索间隔 + 随机抖动（0.5-1.5倍）
+        import random
+        jitter = self.search_interval * (0.5 + random.random())
+        await asyncio.sleep(jitter)
 
         async with self.semaphore:
             logger.debug(f"Searching: {query}")
