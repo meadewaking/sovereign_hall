@@ -4,10 +4,10 @@
 # LLM配置 (使用本地API)
 llm:
   provider: "openai"  # openai/anthropic/local
-  base_url: "http://172.18.1.128:30977/v1"
+  base_url: "http://172.18.1.128:30618/v1"
   model: "MiniMax/MiniMax-M2.5"
-  api_key: "empty"
-  model_uuid: "142ebd20-ee7f-4607-b0a3-4375fb99b714"  # 用于Host header
+  api_key: "not_need"
+  model_uuid: ""  # 用于Host header
   max_concurrent: 16
   temperature: 0.7
   max_tokens: 15000
@@ -17,6 +17,7 @@ llm:
   embedding_model: "bge-large-zh-v1.5"
   embedding_uuid: "ec85af59-12aa-4cba-9090-74cc48c39eda"
   embedding_dim: 1024
+  embedding_base_url: "http://172.18.1.128:30977"
 
 
 # 爬虫配置

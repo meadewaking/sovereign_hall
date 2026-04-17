@@ -16,7 +16,7 @@ import threading
 
 import httpx
 from bs4 import BeautifulSoup
-from readability import Document as Doc
+from ..core import Document as Doc
 
 from ..core.config import get_config
 from ..utils import (
@@ -42,6 +42,60 @@ class SpiderSwarm:
     _alarm_mode = False
     _alarm_start_time = 0  # 进入告警模式的时间
     _alarm_timeout = 30  # 告警模式30秒后自动恢复（缩短）
+
+    # 内容质量过滤配置
+    MIN_CONTENT_LENGTH = 30  # 最小内容长度
+    MIN_UNIQUE_CHARS = 8  # 最少不同字符数
+    MIN_TITLE_LENGTH = 4  # 最小标题长度
+
+    @staticmethod
+    def _is_valid_content(doc) -> bool:
+        """检查文档内容是否有效（过滤垃圾信息）"""
+        content = doc.content or ""
+        title = doc.title or ""
+
+        # 1. 内容长度检查
+        if len(content) < SpiderSwarm.MIN_CONTENT_LENGTH:
+            return False
+
+        # 2. 检查是否是模板化内容（纯标题重复）
+        if content == f"关于{title.replace('的搜索结果', '')}的搜索结果":
+            return False
+
+        # 3. 检查是否是占位符内容
+        placeholder_patterns = [
+            "关于{query}的搜索结果",
+            "关于{query}的深度分析报告",
+            "暂无内容",
+            "内容获取失败",
+        ]
+        for p in placeholder_patterns:
+            if p.format(query=title) in content or content == p:
+                return False
+
+        # 4. 检查内容是否有实际信息量（不同字符数）
+        unique_chars = len(set(content))
+        if unique_chars < SpiderSwarm.MIN_UNIQUE_CHARS:
+            return False
+
+        # 5. 检查标题是否过短
+        if len(title) < SpiderSwarm.MIN_TITLE_LENGTH:
+            return False
+
+        return True
+
+    @staticmethod
+    def _filter_documents(docs: list) -> list:
+        """过滤无效文档"""
+        valid_docs = []
+        for doc in docs:
+            if SpiderSwarm._is_valid_content(doc):
+                valid_docs.append(doc)
+
+        if len(docs) > 0:
+            logger.info(f"Document filter: {len(valid_docs)}/{len(docs)} valid")
+
+        return valid_docs
 
     def __init__(
         self,
@@ -88,11 +142,12 @@ class SpiderSwarm:
         logger.info(f"Spider Swarm initialized: max_concurrent={max_concurrent}, timeout={timeout}")
 
     def _init_client(self):
-        """初始化HTTP客户端"""
+        """初始化HTTP客户端（走代理）"""
         self.client = httpx.AsyncClient(
             timeout=self.timeout,
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=100),
             follow_redirects=True,
+            proxy="http://127.0.0.1:7890"
         )
 
     async def close(self):
@@ -148,7 +203,10 @@ class SpiderSwarm:
 
         logger.info(f"Aggressive search complete: {len(all_docs)} unique docs from {len(seen_urls)} URLs")
 
-        return all_docs
+        # 过滤无效文档
+        filtered_docs = self._filter_documents(all_docs)
+
+        return filtered_docs
 
     async def _search_single_query(
         self,
@@ -219,12 +277,12 @@ class SpiderSwarm:
         sources: List[str] = None,
     ) -> List[Doc]:
         """
-        执行搜索 - 优先级：百度 → 搜狗
+        执行搜索 - 优先级：DDG → 百度 → 搜狗
         搜索失败时进入告警模式，不再生成假数据
         """
         import time
         docs = []
-        sources = sources or ['baidu', 'sogou']
+        sources = sources or ['ddg']  # 百度被封禁频繁，默认只用DDG
 
         # 检查是否处于告警模式，如果是，检查是否超时需要恢复
         if SpiderSwarm._alarm_mode:
@@ -238,7 +296,17 @@ class SpiderSwarm:
                 logger.warning(f"Spider in alarm mode - search skipped for '{query}'")
                 return []
 
-        # 1. 尝试百度搜索
+        # 1. 尝试 DuckDuckGO 搜索（带代理）
+        if 'ddg' in sources:
+            try:
+                ddg_results = await self._ddg_search(query, max_results)
+                if ddg_results:
+                    docs.extend(ddg_results)
+                    logger.info(f"DDG search for '{query}': found {len(ddg_results)} results")
+            except Exception as e:
+                logger.warning(f"DDG search failed: {e}")
+
+        # 2. 尝试百度搜索
         if 'baidu' in sources:
             try:
                 baidu_results = await self._baidu_search(query, max_results)
@@ -550,51 +618,27 @@ class SpiderSwarm:
             return []
 
     async def _ddg_search(self, query: str, max_results: int) -> List[Doc]:
-        """DuckDuckGO 搜索（最不容易被封）"""
+        """DuckDuckGO 搜索（使用 ddgs 库 + 代理）"""
         try:
-            import httpx
+            from ddgs import DDGS
 
-            # DuckDuckGO HTML 搜索
-            url = f"https://html.duckduckgo.com/html/?q={query}"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-            }
+            # 使用代理
+            ddgs = DDGS(proxy="http://127.0.0.1:7890", timeout=15)
+            results = ddgs.text(query, max_results=max_results)
 
-            resp = await self.client.get(url, headers=headers, follow_redirects=True)
-            resp.encoding = 'utf-8'
-            resp.raise_for_status()
-
-            soup = BeautifulSoup(resp.text, 'html.parser')
-
-            # DuckDuckGO 结果结构
             docs = []
-            results = soup.find_all('a', class_='result__a')
-
-            for result in results[:max_results]:
+            for r in results:
                 try:
-                    title = result.get_text(strip=True)
-                    link_url = result.get('href', '')
+                    title = r.get('title', '')
+                    url = r.get('href', '')
+                    body = r.get('body', '')
 
-                    # DuckDuckGO 的链接需要再次解析
-                    if not link_url or link_url == '#':
-                        continue
-
-                    # 尝试从上下文获取摘要
-                    parent = result.find_parent('div', class_='result')
-                    snippet = ""
-                    if parent:
-                        snippet_elem = parent.find('a', class_='result__snippet')
-                        if snippet_elem:
-                            snippet = snippet_elem.get_text(strip=True)
-
-                    if title and link_url.startswith('http'):
+                    if title and url and url.startswith('http'):
                         doc = Doc(
                             id=generate_id('doc'),
                             title=title,
-                            content=snippet or f"关于{query}的搜索结果",
-                            url=link_url,
+                            content=body or f"关于{query}的搜索结果",
+                            url=url,
                             source='duckduckgo',
                             publish_time=datetime.now(),
                             sector=self._infer_sector(query),
@@ -602,7 +646,7 @@ class SpiderSwarm:
                         )
                         docs.append(doc)
                 except Exception as e:
-                    logger.debug(f"Failed to parse DuckDuckGO result: {e}")
+                    logger.debug(f"Failed to parse DDG result: {e}")
                     continue
 
             return docs[:max_results]
@@ -820,8 +864,16 @@ class SearchQueryGenerator:
         self,
         count: int = 50,
         seeds: Dict[str, List[str]] = None,
+        _retry_count: int = 0,
     ) -> List[str]:
-        """生成搜索查询词"""
+        """生成搜索查询词
+
+        Args:
+            count: 要生成的查询词数量
+            seeds: 种子词字典
+            _retry_count: 内部重试计数器，防止无限递归
+        """
+        MAX_RETRIES = 3  # 最大重试次数
         seeds = seeds or self.DEFAULT_SEEDS
 
         prompt = f"""
@@ -859,6 +911,19 @@ class SearchQueryGenerator:
 
             # 清理响应
             response = response.strip()
+            # 检查截断响应
+            if "输出被截断" in response or "缩短输入" in response:
+                logger.warning(f"LLM response truncated, reducing count")
+                # 减少数量重试，但不超过最大重试次数
+                if _retry_count < MAX_RETRIES:
+                    return await self.generate_queries(
+                        count=max(5, count // 2),
+                        seeds=seeds,
+                        _retry_count=_retry_count + 1
+                    )
+                else:
+                    logger.warning(f"Max retries reached for query generation, using fallback")
+
             if not response or response == "null" or response == "None" or response == "[]":
                 raise ValueError(f"Empty response after strip: '{response[:100]}'")
 

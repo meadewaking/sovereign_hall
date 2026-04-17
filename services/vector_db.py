@@ -15,8 +15,7 @@ import shutil
 from collections import OrderedDict
 
 from ..core.config import get_config
-from readability import Document as Doc
-from ..core import DATA_DIR
+from ..core import Document as Doc, DATA_DIR
 from ..utils import ensure_dir, save_json, load_json, generate_id
 from .llm_client import LLMClient
 
@@ -133,78 +132,54 @@ class VectorDatabase:
 
             logger.info(f"LRU evicted document: {oldest_doc_id}, current count: {len(self.documents)}")
 
-    async def add_document(self, doc: Doc, embedding: List[float] = None):
+    async def add_document(self, doc: Doc, embedding: List[float] = None, llm_client: LLMClient = None):
         """
-        添加文档到向量库
+        添加文档到向量库（生成 embedding 用于语义搜索）
 
         Args:
             doc: 文档对象
-            embedding: 预计算的向量（可选）
+            embedding: 忽略（保留参数兼容）
+            llm_client: LLM 客户端，用于生成 embedding
         """
         # 检查内存上限，必要时淘汰
         if len(self.documents) >= self.max_documents:
             self._evict_oldest()
 
-        # 生成向量
-        if embedding is None and doc.embedding is None:
-            logger.warning(f"No embedding for doc {doc.id}, skipping vector index")
-            self.documents[doc.id] = doc
-            self.documents.move_to_end(doc.id)  # 更新 LRU 顺序
-            await self._save_doc(doc)
-            return
-
-        if embedding is not None:
-            doc.embedding = embedding
-
-        vector = np.array(doc.embedding, dtype=np.float32)
-
-        # 存储（移动到末尾表示最近使用）
+        # 存储文档
         self.documents[doc.id] = doc
-        self.documents.move_to_end(doc.id)
-        self.embeddings[doc.id] = vector
-        self.embeddings.move_to_end(doc.id)
+        self.documents.move_to_end(doc.id)  # 更新 LRU 顺序
 
-        # 保存到磁盘
+        # 生成并存储 embedding（如果提供 llm_client）
+        if llm_client:
+            try:
+                # 使用标题+内容生成 embedding
+                text = f"{doc.title} {doc.content}"[:8000]
+                emb = await llm_client.get_embedding(text)
+                self.embeddings[doc.id] = np.array(emb, dtype=np.float32)
+                self.embeddings.move_to_end(doc.id)  # 更新 LRU 顺序
+                await self._save_embedding(doc.id, self.embeddings[doc.id])
+            except Exception as e:
+                logger.warning(f"Failed to generate embedding for {doc.id}: {e}")
+
+        # 保存文档到磁盘
         await self._save_doc(doc)
-        await self._save_embedding(doc.id, vector)
-
-        # 更新索引
-        if self._index_ready:
-            await self._update_single_index(doc.id, vector)
 
     async def add_documents_batch(self, docs: List[Doc], llm_client: LLMClient = None):
         """
-        批量添加文档
+        批量添加文档（生成 embedding 用于语义搜索）
 
         Args:
             docs: 文档列表
-            llm_client: 用于生成向量
+            llm_client: LLM 客户端，用于生成 embedding
         """
         if not docs:
             return
 
-        logger.info(f"Adding {len(docs)} documents in batch")
+        logger.info(f"Adding {len(docs)} documents in batch (semantic search mode)")
 
-        # 批量生成向量（如果需要）
-        if llm_client and any(doc.embedding is None for doc in docs):
-            texts = [f"{doc.title}\n{doc.content[:500]}" for doc in docs]
-            # 注意：这里应该是批量embedding调用，当前简化处理
-            for doc in docs:
-                if doc.embedding is None:
-                    try:
-                        doc.embedding = await llm_client.get_embedding(
-                            f"{doc.title}\n{doc.content[:500]}"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to embed doc {doc.id}: {e}")
-
-        # 添加所有文档
+        # 添加文档（会生成 embedding）
         for doc in docs:
-            await self.add_document(doc)
-
-        # 重建索引
-        if len(docs) > 10:
-            await self._build_index()
+            await self.add_document(doc, llm_client=llm_client)
 
         logger.info(f"Batch add complete: {len(self.documents)} total docs")
 
@@ -216,54 +191,42 @@ class VectorDatabase:
         min_similarity: float = 0.0,
         llm_client: LLMClient = None,
     ) -> List[Doc]:
-        """
-        语义搜索
-
-        Args:
-            query: 查询文本
-            top_k: 返回结果数
-            filter_sector: 行业过滤
-            min_similarity: 最小相似度
-            llm_client: 用于生成查询向量
-
-        Returns:
-            相关文档列表
-        """
+        """搜索 - 使用 embedding 语义搜索"""
         if not self.documents:
             return []
 
-        # 生成查询向量
-        try:
-            if llm_client:
-                query_embedding = await llm_client.get_embedding(query)
-            else:
-                # 如果没有LLM客户端，使用TF-IDF相似度作为后备
-                return await self._keyword_search(query, top_k, filter_sector)
+        # 如果有 embedding 客户端，使用语义搜索
+        if llm_client and self.embeddings:
+            try:
+                # 获取查询向量
+                query_vec = await llm_client.get_embedding(query)
+                query_vec = np.array(query_vec, dtype=np.float32)
 
-            query_vec = np.array(query_embedding, dtype=np.float32)
+                # 计算相似度
+                results = []
+                for doc_id, doc_vec in self.embeddings.items():
+                    doc = self.documents[doc_id]
 
-        except Exception as e:
-            logger.error(f"Failed to generate query embedding: {e}")
-            return await self._keyword_search(query, top_k, filter_sector)
+                    # 行业过滤
+                    if filter_sector and doc.sector != filter_sector:
+                        continue
 
-        # 计算相似度
-        results = []
-        for doc_id, doc_vec in self.embeddings.items():
-            doc = self.documents[doc_id]
+                    # 计算相似度
+                    similarity = self._compute_similarity(query_vec, doc_vec)
 
-            # 行业过滤
-            if filter_sector and doc.sector != filter_sector:
-                continue
+                    if similarity >= min_similarity:
+                        results.append((similarity, doc))
 
-            # 计算相似度
-            similarity = self._compute_similarity(query_vec, doc_vec)
+                # 排序并返回top_k
+                results.sort(key=lambda x: x[0], reverse=True)
+                logger.debug(f"Semantic search: query='{query}', results={len(results)}")
+                return [doc for _, doc in results[:top_k]]
+            except Exception as e:
+                logger.warning(f"Semantic search failed: {e}, falling back to keyword")
 
-            if similarity >= min_similarity:
-                results.append((similarity, doc))
-
-        # 排序并返回top_k
-        results.sort(key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in results[:top_k]]
+        # 后备：关键词搜索
+        logger.debug(f"Using keyword search for: {query}")
+        return await self._keyword_search(query, top_k, filter_sector)
 
     async def _keyword_search(
         self,

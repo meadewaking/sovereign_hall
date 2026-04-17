@@ -135,10 +135,18 @@ class LLMClient:
             timeout=self.timeout,
             default_headers=default_headers,
         )
-        # 创建复用的异步HTTP客户端
+        # 创建复用的异步HTTP客户端（内网，不走代理）
         self._http_client = httpx.AsyncClient(
             timeout=self.timeout,
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+            proxy=None  # 内网直连，不走代理
+        )
+        # 用于 embedding 的内网客户端（使用 AsyncHTTPTransport，不走代理）
+        transport = httpx.AsyncHTTPTransport(retries=3)
+        self._embedding_client = httpx.AsyncClient(
+            timeout=self.timeout,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
+            transport=transport  # 不走代理
         )
 
     def _init_anthropic_client(self):
@@ -346,8 +354,27 @@ class LLMClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            content = data["choices"][0]["message"].get("content")
+            message = data["choices"][0]["message"]
+
+            # 优先使用 content，如果为空则尝试使用 reasoning_content（MiniMax 等模型）
+            content = message.get("content")
             if not content:
+                # MiniMax 等模型可能将内容放在 reasoning 字段
+                reasoning = message.get("reasoning") or message.get("reasoning_content")
+                if reasoning:
+                    logger.info("Using reasoning content as fallback")
+                    content = reasoning
+                else:
+                    content = None
+
+            if not content:
+                # 记录详细错误信息
+                logger.warning(f"LLM returned empty content. Response data: {data}")
+                # 尝试返回 reason 如果有的话
+                if "choices" in data and len(data["choices"]) > 0:
+                    finish_reason = data["choices"][0].get("finish_reason", "")
+                    if finish_reason == "length":
+                        return "输出被截断，请缩短输入。", {}
                 raise ValueError("LLM returned empty content")
 
             # 提取 usage 信息
@@ -449,24 +476,25 @@ class LLMClient:
         config = get_config()
         embedding_config = config.get_llm_config()
 
-        model = embedding_config.get('embedding_model', 'text-embedding-3-small')
+        model_name = embedding_config.get('embedding_model', 'text-embedding-3-small')
         dimension = embedding_config.get('embedding_dim', 1024)
         embedding_uuid = embedding_config.get('embedding_uuid', '')
+        embedding_base_url = embedding_config.get('embedding_base_url', 'http://172.18.1.128:30977')
 
         # 如果有API密钥，调用真实API
-        if embedding_uuid and self.base_url:
+        if embedding_uuid and embedding_base_url:
             try:
                 import httpx
-                # 使用正确的 encode 端点（去掉 /v1 前缀）
-                base = self.base_url.rstrip('/v1').rstrip('/')
-                url = f"{base}/encode"
-                payload = {"sentence": [text[:8000]]}  # 限制长度
+                # 使用 /encode 端点
+                url = f"{embedding_base_url}/encode"
+                # 添加 model 到 payload（按 test_embedding.py 的格式）
+                payload = {"sentence": [text[:8000]], "model": model_name}
                 headers = {
                     "Host": embedding_uuid,
                     "Content-Type": "application/json"
                 }
-                # 复用HTTP客户端
-                resp = await self._http_client.post(
+                # 使用内网客户端（不走代理）
+                resp = await self._embedding_client.post(
                     url,
                     json=payload,
                     headers=headers
@@ -477,6 +505,7 @@ class LLMClient:
                 if 'embedding' in data and data['embedding']:
                     embeddings = data['embedding']
                     if embeddings and len(embeddings) > 0:
+                        logger.info(f"Embedding API success: dim={len(embeddings[0])}")
                         return embeddings[0]
             except Exception as e:
                 logger.warning(f"Embedding API failed: {e}, using mock")
@@ -533,21 +562,15 @@ class LLMClient:
 
     def get_stats(self) -> Dict:
         """获取统计信息"""
-        with self._stats_lock:
-            return {
-                'total_requests': self.token_stats.total_requests,
-                'successful_requests': self.token_stats.successful_requests,
-                'failed_requests': self.token_stats.failed_requests,
-                'success_rate': f"{self.token_stats.success_rate:.2%}",
-                'total_tokens': self.token_stats.total_tokens,
-                'prompt_tokens': self.token_stats.prompt_tokens,
-                'completion_tokens': self.token_stats.completion_tokens,
-                'total_cost_usd': f"¥{self.token_stats.total_cost_usd:.4f}",
-                'avg_tokens_per_request': f"{self.token_stats.avg_tokens_per_request:.0f}",
-                'peak_token_rate': f"{self.token_stats.peak_token_rate:.1f}/s",
-                'avg_token_rate': f"{self.token_stats.avg_token_rate:.1f}/s",
-                'cache_size': len(self.cache),
-            }
+        stats = self.token_stats.get_stats()
+        return {
+            'total_requests': stats['request_count'],
+            'total_tokens': stats['total_tokens'],
+            'prompt_tokens': stats['prompt_tokens'],
+            'completion_tokens': stats['completion_tokens'],
+            'total_cost': f"¥{stats['total_cost']:.4f}",
+            'cache_size': len(self.cache),
+        }
 
     def reset_stats(self):
         """重置统计"""

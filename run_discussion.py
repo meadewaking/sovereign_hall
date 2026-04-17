@@ -547,13 +547,21 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str):
                 f"从量化角度，对{ticker}投票：\n{full_context[:800]}\n\n【投票】",
             ]
 
-            round3_results = await asyncio.wait_for(
-                asyncio.gather(*[
-                    agent.think(task=prompt, temperature=0.6, max_tokens=3000)
-                    for agent, prompt in zip([a for a, _ in vote_tasks], vote_prompts)
-                ]),
-                timeout=300
-            )
+            # 第三轮投票 - 增加错误处理和日志
+            print("      🔄 等待投票结果...")
+            try:
+                round3_results = await asyncio.wait_for(
+                    asyncio.gather(*[
+                        agent.think(task=prompt, temperature=0.6, max_tokens=3000)
+                        for agent, prompt in zip([a for a, _ in vote_tasks], vote_prompts)
+                    ]),
+                    timeout=300
+                )
+            except Exception as e:
+                logger.error(f"第三轮投票失败: {e}")
+                print(f"      ⚠️ 投票出错: {e}")
+                # 返回空结果继续
+                round3_results = [f"投票失败: {str(e)[:100]}" for _ in vote_tasks]
 
             vote_names = [name for _, name in vote_tasks]
             all_discussions.append(f"\n{'='*50}\n【{ticker}】第三轮投票\n{'='*50}")
@@ -929,7 +937,13 @@ async def main():
                     await simulation.save_snapshot(reflection)
 
                 # 阶段3：投委会讨论
-                discussions, decisions = await stage3_ic_discussion(llm, spiders, proposals, topic)
+                logger.info(f"开始阶段3投委会审议，提案数: {len(proposals)}")
+                try:
+                    discussions, decisions = await stage3_ic_discussion(llm, spiders, proposals, topic)
+                    logger.info(f"阶段3完成，讨论长度: {len(discussions)}, 决策数: {len(decisions)}")
+                except Exception as e:
+                    logger.error(f"阶段3失败: {e}", exc_info=True)
+                    raise
 
                 # 阶段4：综合结论
                 conclusion_data = await stage4_final_conclusion(llm, discussions, decisions, topic)
