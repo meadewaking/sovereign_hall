@@ -144,6 +144,22 @@ class InvestmentSimulation:
                     ('last_trade_date', self.last_trade_date.isoformat(), datetime.now().isoformat())
                 )
 
+            # 保存持仓
+            for ticker, pos in self.positions.items():
+                await conn.execute("""
+                    INSERT OR REPLACE INTO simulation_positions (ticker, shares, avg_cost, updated_at)
+                    VALUES (?, ?, ?, ?)
+                """, (ticker, pos['shares'], pos['avg_cost'], datetime.now().isoformat()))
+
+            # 删除不在当前持仓中的股票
+            if self.positions:
+                placeholders = ','.join(['?' for _ in self.positions])
+                await conn.execute(f"""
+                    DELETE FROM simulation_positions WHERE ticker NOT IN ({placeholders})
+                """, list(self.positions.keys()))
+            else:
+                await conn.execute("DELETE FROM simulation_positions")
+
             await conn.commit()
         except Exception as e:
             logger.warning(f"Failed to save simulation state: {e}")

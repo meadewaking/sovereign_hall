@@ -9,6 +9,9 @@ from typing import Dict, Any, List, Optional
 from enum import Enum
 import threading
 from datetime import datetime
+import logging
+
+logger = logging.getLogger("sovereign_hall")
 
 # 项目路径常量
 PROJECT_ROOT = Path(__file__).parent.parent  # sovereign_hall 根目录
@@ -250,18 +253,93 @@ class TokenStats:
     request_count: int = 0
     total_requests: int = 0  # request_count 的别名
     successful_requests: int = 0
-    _lock: threading.Lock = field(default_factory=threading.Lock)
-    
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    # 非dataclass字段
+    _persistence_loaded: bool = field(default=False, repr=False)
+    _first_request_time: float = field(default=None, repr=False)
+    _last_request_time: float = field(default=None, repr=False)
+    _peak_token_rate: float = field(default=0.0, repr=False)
+    _request_timestamps: list = field(default_factory=list, repr=False)
+
+    def __post_init__(self):
+        # 尝试从持久化加载
+        self._persistence_loaded = False
+        self._try_load_from_disk()
+
+    def _try_load_from_disk(self):
+        """尝试从磁盘加载之前的统计"""
+        try:
+            from ..services.persistence import get_persistence
+            persistence = get_persistence()
+            prev_stats = persistence.load_previous_stats()
+            if prev_stats and prev_stats.get('total_tokens', 0) > 0:
+                self.total_tokens = prev_stats.get('total_tokens', 0)
+                self.prompt_tokens = prev_stats.get('prompt_tokens', 0)
+                self.completion_tokens = prev_stats.get('completion_tokens', 0)
+                self.total_cost = prev_stats.get('total_cost_usd', 0.0)
+                self.request_count = prev_stats.get('total_requests', 0)
+                self.total_requests = self.request_count
+                self._persistence_loaded = True
+                logger.info(f"已加载历史Token统计: {self.total_tokens:,} tokens, ${self.total_cost:.2f}")
+        except Exception as e:
+            logger.debug(f"加载历史统计失败: {e}")
+
     def add_usage(self, prompt_tokens: int, completion_tokens: int, cost: float = 0.0, success: bool = True):
+        import time
+        current_time = time.time()
+        tokens_this_request = prompt_tokens + completion_tokens
+
         with self._lock:
             self.prompt_tokens += prompt_tokens
             self.completion_tokens += completion_tokens
-            self.total_tokens += prompt_tokens + completion_tokens
+            self.total_tokens += tokens_this_request
             self.total_cost += cost
             self.request_count += 1
             self.total_requests = self.request_count
             if success:
                 self.successful_requests += 1
+
+            # 追踪时间戳用于计算速率
+            if self._first_request_time is None:
+                self._first_request_time = current_time
+            self._last_request_time = current_time
+            self._request_timestamps.append((current_time, tokens_this_request))
+
+            # 只保留最近60秒的时间戳
+            cutoff = current_time - 60
+            self._request_timestamps = [(t, tok) for t, tok in self._request_timestamps if t > cutoff]
+
+            # 计算当前速率 (tokens/秒)
+            if len(self._request_timestamps) >= 2:
+                time_span = self._request_timestamps[-1][0] - self._request_timestamps[0][0]
+                if time_span > 0:
+                    current_rate = sum(tok for _, tok in self._request_timestamps) / time_span
+                    if current_rate > self._peak_token_rate:
+                        self._peak_token_rate = current_rate
+
+        # 持久化（每次更新都保存）
+        self._save_to_disk()
+
+    def _save_to_disk(self):
+        """保存到磁盘"""
+        try:
+            from ..services.persistence import get_persistence
+            persistence = get_persistence()
+            persistence.accumulate_token_usage(
+                prompt_tokens=0,  # 这里传0，因为是累加
+                completion_tokens=0,
+                cost=0
+            )
+            # 直接更新持久化文件
+            persistence._stats.token_stats.total_tokens = self.total_tokens
+            persistence._stats.token_stats.prompt_tokens = self.prompt_tokens
+            persistence._stats.token_stats.completion_tokens = self.completion_tokens
+            persistence._stats.token_stats.total_cost_usd = self.total_cost
+            persistence._stats.token_stats.total_requests = self.request_count
+            persistence._save_stats()
+        except Exception as e:
+            logger.debug(f"保存Token统计失败: {e}")
 
     def add_request(self, prompt_len: int, completion_len: int, success: bool = True, cost_usd: float = 0.0):
         """兼容旧代码的 add_request 方法（参数是字符数）"""
@@ -271,7 +349,16 @@ class TokenStats:
         self.add_usage(prompt_tokens, completion_tokens, cost_usd, success)
 
     def get_stats(self) -> Dict[str, Any]:
+        import time
         with self._lock:
+            # 计算平均 token 速率
+            avg_token_rate = "0/s"
+            if self._first_request_time and self._last_request_time:
+                elapsed = self._last_request_time - self._first_request_time
+                if elapsed > 0:
+                    avg_rate = self.total_tokens / elapsed
+                    avg_token_rate = f"{avg_rate:.1f}/s"
+
             return {
                 "total_tokens": self.total_tokens,
                 "prompt_tokens": self.prompt_tokens,
@@ -280,6 +367,8 @@ class TokenStats:
                 "request_count": self.request_count,
                 "total_requests": self.total_requests,
                 "successful_requests": self.successful_requests,
+                "peak_token_rate": f"{self._peak_token_rate:.1f}/s",
+                "avg_token_rate": avg_token_rate,
             }
 
 

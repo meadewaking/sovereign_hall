@@ -10,7 +10,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urljoin
 import threading
 
@@ -103,6 +103,7 @@ class SpiderSwarm:
         timeout: int = 30,
         user_agent: str = None,
         retry_times: int = 3,
+        cache_ttl: int = 3600,  # 缓存有效期（秒），默认1小时
     ):
         """
         初始化爬虫集群
@@ -112,6 +113,7 @@ class SpiderSwarm:
             timeout: 请求超时时间（秒）
             user_agent: User-Agent
             retry_times: 重试次数
+            cache_ttl: 搜索结果缓存有效期（秒）
         """
         config = get_config()
         spider_config = config.get_spider_config()
@@ -121,6 +123,10 @@ class SpiderSwarm:
         self.user_agent = user_agent or spider_config.get('user_agent', 'SovereignHall/1.0 (Research Bot)')
         self.retry_times = retry_times or spider_config.get('retry_times', 3)
         self.search_interval = spider_config.get('search_interval', 0.5)  # 搜索间隔
+
+        # 搜索结果缓存（类级别共享，同一轮次内有效）
+        self._search_cache: Dict[str, Tuple[List[Doc], float]] = {}  # query -> (docs, timestamp)
+        self._cache_ttl = cache_ttl
 
         # 并发控制
         self.semaphore = asyncio.Semaphore(max_concurrent)
@@ -139,7 +145,7 @@ class SpiderSwarm:
         # HTTP客户端
         self._init_client()
 
-        logger.info(f"Spider Swarm initialized: max_concurrent={max_concurrent}, timeout={timeout}")
+        logger.info(f"Spider Swarm initialized: max_concurrent={max_concurrent}, timeout={timeout}, cache_ttl={cache_ttl}s")
 
     def _init_client(self):
         """初始化HTTP客户端（走代理）"""
@@ -154,6 +160,11 @@ class SpiderSwarm:
         """关闭客户端"""
         await self.client.aclose()
 
+    def clear_cache(self):
+        """清空搜索缓存"""
+        self._search_cache.clear()
+        logger.info("Search cache cleared")
+
     async def aggressive_search(
         self,
         queries: List[str],
@@ -161,7 +172,7 @@ class SpiderSwarm:
         sources: List[str] = None,
     ) -> List[Doc]:
         """
-        激进式搜索 - 并发抓取
+        激进式搜索 - 并发抓取（带缓存）
 
         Args:
             queries: 搜索词列表
@@ -171,14 +182,38 @@ class SpiderSwarm:
         Returns:
             文档列表
         """
+        import time
         if not queries:
             return []
 
-        logger.info(f"Starting aggressive search: {len(queries)} queries")
+        current_time = time.time()
+        queries_to_search = []
+        cached_results: Dict[str, List[Doc]] = {}
 
-        # 创建搜索任务
-        tasks = []
+        # 检查缓存，分类需要搜索和已缓存的查询
+        cache_hits = 0
         for query in queries:
+            if query in self._search_cache:
+                cached_docs, cached_time = self._search_cache[query]
+                # 检查缓存是否过期
+                if current_time - cached_time < self._cache_ttl:
+                    cached_results[query] = cached_docs
+                    cache_hits += 1
+                    logger.info(f"🔍 Cache HIT: {query} ({len(cached_docs)} docs)")
+                else:
+                    # 缓存过期，需要重新搜索
+                    queries_to_search.append(query)
+            else:
+                queries_to_search.append(query)
+
+        if queries_to_search:
+            logger.info(f"Starting aggressive search: {len(queries_to_search)} queries ({len(cached_results)} from cache)")
+        else:
+            logger.info(f"Aggressive search: all {len(queries)} queries from cache")
+
+        # 创建搜索任务（只对需要搜索的查询）
+        tasks = []
+        for query in queries_to_search:
             task = self._search_single_query(query, max_results_per_query, sources)
             tasks.append(task)
 
@@ -188,20 +223,37 @@ class SpiderSwarm:
         # 展平并去重
         all_docs = []
         seen_urls: Set[str] = set()
+        newly_cached = 0
 
-        for result in results:
+        for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Search task failed: {result}")
                 self.fail_count.increment()
                 continue
 
+            query = queries_to_search[i]
+            query_docs = []
+
             for doc in result:
                 if doc.url not in seen_urls:
                     seen_urls.add(doc.url)
                     all_docs.append(doc)
+                    query_docs.append(doc)
                     self.success_count.increment()
 
-        logger.info(f"Aggressive search complete: {len(all_docs)} unique docs from {len(seen_urls)} URLs")
+            # 缓存搜索结果
+            if query_docs:
+                self._search_cache[query] = (query_docs, current_time)
+                newly_cached += 1
+
+        # 添加缓存结果到最终结果（去重）
+        for query, docs in cached_results.items():
+            for doc in docs:
+                if doc.url not in seen_urls:
+                    seen_urls.add(doc.url)
+                    all_docs.append(doc)
+
+        logger.info(f"Aggressive search complete: {len(all_docs)} unique docs from {len(seen_urls)} URLs (cached: {len(cached_results)}, newly: {newly_cached})")
 
         # 过滤无效文档
         filtered_docs = self._filter_documents(all_docs)

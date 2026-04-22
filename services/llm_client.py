@@ -568,8 +568,11 @@ class LLMClient:
             'total_tokens': stats['total_tokens'],
             'prompt_tokens': stats['prompt_tokens'],
             'completion_tokens': stats['completion_tokens'],
-            'total_cost': f"¥{stats['total_cost']:.4f}",
+            'total_cost_usd': f"${stats['total_cost']:.2f}",
+            'total_cost': stats['total_cost'],  # 数值
             'cache_size': len(self.cache),
+            'peak_token_rate': stats.get('peak_token_rate', '0/s'),
+            'avg_token_rate': stats.get('avg_token_rate', '0/s'),
         }
 
     def reset_stats(self):

@@ -42,10 +42,11 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("sovereign_hall")
-
 from sovereign_hall.services.database import DatabaseService
 from sovereign_hall.services.llm_client import LLMClient
 from sovereign_hall.services.spider_service import SpiderSwarm, SearchQueryGenerator
+from sovereign_hall.services.decision_tracker import DecisionRecorder
+from sovereign_hall.services.learning_engine import LearningEngine
 from sovereign_hall.core import AgentRole
 from sovereign_hall.core.config import get_config
 from sovereign_hall.utils import safe_parse_json, estimate_tokens
@@ -575,7 +576,25 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str):
                 'confidence': proposal.get('confidence', 0),
                 'thesis': thesis,
                 'cio_vote': round3_results[0][:200],
+                'target_price': proposal.get('take_profit', 15.0),
+                'stop_loss': proposal.get('stop_loss', 5.0),
             })
+
+            # 记录到决策追踪器
+            try:
+                recorder = DecisionRecorder()
+                await recorder.record_decision(
+                    ticker=ticker,
+                    decision=proposal.get('direction', 'buy'),
+                    confidence=proposal.get('confidence', 0.5),
+                    target_price=float(proposal.get('take_profit', 15.0)),
+                    stop_loss=float(proposal.get('stop_loss', 5.0)),
+                    discussion_context=thesis[:500],
+                    expected_days=30,
+                )
+                print(f"      📊 决策已记录")
+            except Exception as e:
+                logger.warning(f"记录决策失败: {e}")
 
             print(f"      ✅ 投票完成")
 
@@ -697,6 +716,19 @@ async def main():
     print("  - 0.1秒间隔，持续燃烧Token")
     print("="*60 + "\n")
 
+    # ========== 加载历史统计 ==========
+    from sovereign_hall.services.persistence import get_persistence
+    persistence = get_persistence()
+    prev_stats = persistence.load_previous_stats()
+    if prev_stats and prev_stats.get('total_tokens', 0) > 0:
+        print(f"📊 历史累计统计:")
+        print(f"   - 累计Token: {prev_stats.get('total_tokens', 0):,}")
+        print(f"   - 累计成本: ${prev_stats.get('total_cost_usd', 0):.2f}")
+        print(f"   - 请求次数: {prev_stats.get('total_requests', 0):,}")
+        print(f"   - 已讨论话题: {len(prev_stats.get('topics_discussed', []))}个")
+        print(f"   - 已完成轮次: {prev_stats.get('total_rounds', 0)}轮")
+        print()
+
     # ========== 启动自检 ==========
     print("🔍 系统自检...")
 
@@ -759,7 +791,9 @@ async def main():
     # 加载已完成议题
     completed_topics = load_completed_topics()
 
-    iteration = 0
+    # 从持久化加载历史轮次
+    prev_stats = persistence.load_previous_stats()
+    iteration = prev_stats.get('total_rounds', 0) if prev_stats else 0
     start_time = datetime.now()
 
     try:
@@ -767,6 +801,15 @@ async def main():
         empty_rounds = 0
         docs = []
         proposals = []
+
+        # 初始化验证（处理之前的待验证决策）
+        try:
+            recorder = DecisionRecorder()
+            validation_result = await recorder.validate_pending(max_count=20)
+            if validation_result.get('validated', 0) > 0:
+                logger.info(f"启动时验证了 {validation_result['validated']} 条历史决策")
+        except Exception as e:
+            logger.debug(f"初始验证失败: {e}")
 
         while True:
             iteration += 1
@@ -784,6 +827,29 @@ async def main():
             print(f"\n{'='*60}")
             print(f"🔥 第 {iteration} 轮 | 议题: {topic}")
             print(f"{'='*60}")
+
+            # 加载历史教训并显示
+            try:
+                learning_engine = LearningEngine()
+                lessons_prompt = await learning_engine.generate_lessons_prompt()
+                stats = await learning_engine.get_accuracy_stats()
+                if stats['total'] > 0:
+                    print(f"\n📈 历史预测胜率: {stats['accuracy']:.1%} ({stats['correct']}/{stats['total']})")
+                if lessons_prompt:
+                    print(f"📜 加载了 {lessons_prompt.count('教训') - 1} 条历史教训")
+
+                # 验证待验证决策（每轮最多验证10条）
+                recorder = DecisionRecorder()
+                validation_result = await recorder.validate_pending(max_count=10)
+                if validation_result.get('validated', 0) > 0:
+                    print(f"🔄 本轮验证了 {validation_result['validated']} 条决策")
+
+                # 更新playbook
+                await learning_engine.update_playbook()
+
+            except Exception as e:
+                logger.debug(f"加载历史教训/验证失败: {e}")
+                lessons_prompt = ""
 
             try:
                 # 阶段1：按需搜索（先检查本地数据是否足够）
@@ -990,6 +1056,12 @@ async def main():
             else:
                 empty_rounds += 1
                 logger.warning(f"第{iteration}轮无有效结果 (连续{empty_rounds}轮)")
+
+            # 更新持久化统计
+            persistence.increment_rounds()
+            persistence.add_topic(topic)
+            persistence.add_time(round_time)
+            persistence.increment_proposals(len(proposals))
 
             stats_msg = f"⏱️  本轮用时: {round_time:.1f}秒 | 累计Token: {llm_stats.get('total_tokens', 0):,} | 成本: {llm_stats.get('total_cost_usd', '$0')}"
             logger.info(stats_msg)
