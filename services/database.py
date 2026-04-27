@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 class DatabaseService:
     """SQLite数据库服务（异步版本）"""
 
+    _instance = None
+
+    @classmethod
+    async def get_instance(cls, db_path: str = None) -> "DatabaseService":
+        """获取单例实例"""
+        if cls._instance is None:
+            cls._instance = cls(db_path)
+        return cls._instance
+
     def __init__(self, db_path: str = None):
         if db_path is None:
             db_path = str(DATA_DIR / "sovereign_hall.db")
@@ -82,7 +91,7 @@ class DatabaseService:
         if 'proposals' not in existing_tables:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS proposals (
-                    id TEXT PRIMARY KEY,
+                    proposal_id TEXT PRIMARY KEY,
                     ticker TEXT,
                     direction TEXT,
                     target_position REAL,
@@ -202,21 +211,34 @@ class DatabaseService:
 
     async def add_document(self, doc: Any):
         """添加文档"""
+        if isinstance(doc, dict):
+            from ..core import Document
+            doc = Document.from_dict(doc)
+
+        def _attr(name: str, default=None):
+            if isinstance(doc, dict):
+                return doc.get(name, default)
+            return getattr(doc, name, default)
+
+        publish_time = _attr('publish_time')
+        if isinstance(publish_time, datetime):
+            publish_time = publish_time.isoformat()
+
         conn = await self._get_connection()
         await conn.execute("""
             INSERT OR REPLACE INTO documents
             (id, title, content, url, source, sector, keywords, publish_time, embedding, crawled_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
-            doc.id,
-            doc.title,
-            doc.content,
-            doc.url,
-            doc.source,
-            doc.sector,
-            json.dumps(doc.keywords, ensure_ascii=False) if doc.keywords else None,
-            doc.publish_time.isoformat() if doc.publish_time else None,
-            json.dumps(doc.embedding) if doc.embedding else None
+            _attr('id') or _attr('doc_id'),
+            _attr('title', ''),
+            _attr('content', ''),
+            _attr('url', ''),
+            _attr('source', ''),
+            _attr('sector', ''),
+            json.dumps(_attr('keywords', []), ensure_ascii=False) if _attr('keywords', []) else None,
+            publish_time,
+            json.dumps(_attr('embedding')) if _attr('embedding') else None
         ))
         await conn.commit()
 
@@ -264,26 +286,44 @@ class DatabaseService:
 
     async def add_proposal(self, proposal: Any):
         """添加提案"""
+        if isinstance(proposal, dict):
+            class _Proposal:
+                pass
+            obj = _Proposal()
+            for key, value in proposal.items():
+                setattr(obj, key, value)
+            if not getattr(obj, "proposal_id", None):
+                from ..utils import generate_id
+                obj.proposal_id = generate_id("proposal")
+            proposal = obj
+
+        analyst_role = getattr(proposal, 'analyst_role', None)
+        if hasattr(analyst_role, "value"):
+            analyst_role = analyst_role.value
+
+        def pget(name: str, default=None):
+            return getattr(proposal, name, default)
+
         conn = await self._get_connection()
         await conn.execute("""
             INSERT OR REPLACE INTO proposals
-            (id, ticker, direction, target_position, entry_price, stop_loss,
+            (proposal_id, ticker, direction, target_position, entry_price, stop_loss,
              take_profit, holding_period, confidence, thesis, analyst_role, sector, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            proposal.id,
-            proposal.ticker,
-            proposal.direction,
-            proposal.target_position,
-            proposal.entry_price,
-            proposal.stop_loss,
-            proposal.take_profit,
-            proposal.holding_period,
-            proposal.confidence,
-            proposal.thesis[:10000] if proposal.thesis else None,
-            getattr(proposal, 'analyst_role', None),
-            getattr(proposal, 'sector', None),
-            getattr(proposal, 'status', 'pending')
+            pget('proposal_id') or pget('id'),
+            pget('ticker', ''),
+            pget('direction', 'long'),
+            pget('target_position', 0.0),
+            pget('entry_price', 0.0),
+            pget('stop_loss', 0.0),
+            pget('take_profit', pget('target_price', 0.0)),
+            pget('holding_period', 30),
+            pget('confidence', 0.0),
+            pget('thesis', '')[:10000] if pget('thesis') else None,
+            analyst_role,
+            pget('sector', None),
+            pget('status', 'pending')
         ))
         await conn.commit()
 

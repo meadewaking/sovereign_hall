@@ -4,7 +4,7 @@
 """
 
 from pathlib import Path
-from dataclasses import dataclass, field, MISSING
+from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, List, Optional
 from enum import Enum
 import threading
@@ -98,6 +98,16 @@ class Document:
         """设置 embedding（存到 metadata 中）"""
         self.metadata["embedding"] = value
 
+    @property
+    def publish_time(self):
+        """兼容旧代码的 publish_time 属性"""
+        return self.metadata.get("publish_time")
+
+    @property
+    def crawled_at(self):
+        """兼容旧代码的 crawled_at 属性"""
+        return self.metadata.get("crawled_at")
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
@@ -181,47 +191,178 @@ class Document:
         )
 
 
-@dataclass  
+@dataclass
 class InvestmentProposal:
     """投资提案"""
-    ticker: str
-    direction: str  # long / short
-    sector: str
-    thesis: str
+    ticker: str = ""
+    direction: str = "long"  # long / short / hold
+    sector: str = ""
+    thesis: str = ""
     confidence: float = 0.0
+    target_position: float = 0.0
     entry_price: float = 0.0
     target_price: float = 0.0
     stop_loss: float = 0.0
+    take_profit: float = 0.0
+    holding_period: int = 30
     analyst: str = ""
+    analyst_role: Any = None
+    supporting_evidence: List[str] = field(default_factory=list)
+    risks: List[str] = field(default_factory=list)
+    catalysts: List[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=datetime.now)
     proposal_id: str = ""
-    
+
     def __post_init__(self):
         if not self.proposal_id:
             import uuid
             self.proposal_id = str(uuid.uuid4())
+        if not self.take_profit and self.target_price:
+            self.take_profit = self.target_price
+        if not self.target_price and self.take_profit:
+            self.target_price = self.take_profit
+
+    @property
+    def id(self) -> str:
+        """兼容 DatabaseService.add_proposal 的 id 属性"""
+        return self.proposal_id
+
+    @property
+    def risk_reward_ratio(self) -> float:
+        risk = abs((self.entry_price or 0) - (self.stop_loss or 0))
+        reward = abs((self.take_profit or self.target_price or 0) - (self.entry_price or 0))
+        return reward / risk if risk > 0 else 0.0
+
+    @classmethod
+    def create(cls, **kwargs) -> "InvestmentProposal":
+        """兼容旧主控的便捷构造器"""
+        if "id" in kwargs and "proposal_id" not in kwargs:
+            kwargs["proposal_id"] = kwargs.pop("id")
+        if "target_price" not in kwargs and "take_profit" in kwargs:
+            kwargs["target_price"] = kwargs["take_profit"]
+        if "take_profit" not in kwargs and "target_price" in kwargs:
+            kwargs["take_profit"] = kwargs["target_price"]
+        return cls(**kwargs)
+
+
+@dataclass
+class ChallengeQuestion:
+    """投委会质询记录"""
+    questioner: AgentRole
+    question: str
+    severity: str = "medium"
+    referenced_data: List[str] = field(default_factory=list)
+    challenge_id: str = ""
+
+    def __post_init__(self):
+        if not self.challenge_id:
+            import uuid
+            self.challenge_id = str(uuid.uuid4())
+
+    @classmethod
+    def create(cls, **kwargs) -> "ChallengeQuestion":
+        return cls(**kwargs)
+
+
+@dataclass
+class DefenseResponse:
+    """投委会答辩记录"""
+    challenge_id: str
+    defender: AgentRole
+    response: str
+    revised_confidence: float = 0.0
+    defense_id: str = ""
+
+    def __post_init__(self):
+        if not self.defense_id:
+            import uuid
+            self.defense_id = str(uuid.uuid4())
+
+    @classmethod
+    def create(cls, **kwargs) -> "DefenseResponse":
+        return cls(**kwargs)
+
+
+class VerdictDecision(Enum):
+    """投委会裁决枚举"""
+    APPROVE = "approve"
+    REJECT = "reject"
+    DEFER = "defer"
 
 
 @dataclass
 class ICMeetingMinutes:
     """投委会会议记录"""
     meeting_id: str = ""
+    proposal_id: str = ""
     timestamp: datetime = field(default_factory=datetime.now)
     proposals: List[InvestmentProposal] = field(default_factory=list)
+    proposal: Optional[InvestmentProposal] = None
+    participants: List[AgentRole] = field(default_factory=list)
+    rounds: int = 0
+    total_tokens_consumed: int = 0
+    challenges: List[ChallengeQuestion] = field(default_factory=list)
+    defenses: List[DefenseResponse] = field(default_factory=list)
+    final_verdict: Dict[str, Any] = field(default_factory=dict)
+    voting_results: Dict[str, Any] = field(default_factory=dict)
+    meeting_duration: float = 0.0
     votes: Dict[str, Any] = field(default_factory=dict)
     minutes: str = ""
     next_actions: List[str] = field(default_factory=list)
-    
+    created_at: datetime = field(default_factory=datetime.now)
+
     def __post_init__(self):
         if not self.meeting_id:
             import uuid
             self.meeting_id = str(uuid.uuid4())
+        if self.proposal and not self.proposals:
+            self.proposals = [self.proposal]
+        if self.voting_results and not self.votes:
+            self.votes = self.voting_results
+
+    @property
+    def id(self) -> str:
+        return self.meeting_id
+
+    @property
+    def decision(self) -> str:
+        return self.final_verdict.get("decision", "defer") if self.final_verdict else "defer"
+
+    @property
+    def ticker(self) -> str:
+        if self.proposal:
+            return self.proposal.ticker
+        if self.proposals:
+            return self.proposals[0].ticker
+        return ""
+
+    @property
+    def vote_details(self) -> Dict[str, Any]:
+        return self.voting_results or self.votes
+
+    @property
+    def action_items(self) -> List[str]:
+        return self.next_actions
+
+    @property
+    def discussion(self) -> Dict[str, Any]:
+        return {
+            "challenges": [getattr(c, "question", str(c)) for c in self.challenges],
+            "defenses": [getattr(d, "response", str(d)) for d in self.defenses],
+            "final_verdict": self.final_verdict,
+        }
 
 
 @dataclass
 class PlaybookEntry:
     """策略手册条目"""
     entry_id: str = ""
+    ticker: str = ""
+    situation: str = ""
+    lesson: str = ""
+    outcome: str = ""
+    success: Optional[bool] = None
+    confidence_delta: float = 0.0
     pattern: str = ""
     conditions: List[str] = field(default_factory=list)
     action: str = ""
@@ -240,7 +381,27 @@ class SystemStats:
     total_documents: int = 0
     total_proposals: int = 0
     total_meetings: int = 0
+    iteration: int = 0
+    documents_indexed: int = 0
+    approved_proposals: int = 0
+    rejected_proposals: int = 0
+    spider_success: int = 0
+    spider_failed: int = 0
+    playbook_entries: int = 0
+    blacklisted_tickers: int = 0
+    start_time: Optional[datetime] = None
     last_updated: datetime = field(default_factory=datetime.now)
+
+    def __post_init__(self):
+        # TokenStats is defined later in this module; resolve it lazily at runtime.
+        self.token_stats = globals().get("TokenStats", lambda: None)()
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["last_updated"] = self.last_updated.isoformat() if isinstance(self.last_updated, datetime) else self.last_updated
+        data["start_time"] = self.start_time.isoformat() if isinstance(self.start_time, datetime) else self.start_time
+        data["token_stats"] = self.token_stats.get_stats() if self.token_stats else {}
+        return data
 
 
 @dataclass
@@ -378,6 +539,9 @@ __all__ = [
     "AgentRole",
     "Document",
     "InvestmentProposal",
+    "ChallengeQuestion",
+    "DefenseResponse",
+    "VerdictDecision",
     "ICMeetingMinutes",
     "PlaybookEntry",
     "SystemStats",

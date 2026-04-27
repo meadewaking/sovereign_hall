@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import argparse
 import sys
 import sqlite3
 import json
@@ -16,7 +17,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root.parent))
 
 # 配置日志系统
 log_dir = project_root / "data" / "logs"
@@ -47,6 +48,7 @@ from sovereign_hall.services.llm_client import LLMClient
 from sovereign_hall.services.spider_service import SpiderSwarm, SearchQueryGenerator
 from sovereign_hall.services.decision_tracker import DecisionRecorder
 from sovereign_hall.services.learning_engine import LearningEngine
+from sovereign_hall.services.market_data import get_market_data
 from sovereign_hall.core import AgentRole
 from sovereign_hall.core.config import get_config
 from sovereign_hall.utils import safe_parse_json, estimate_tokens
@@ -124,6 +126,13 @@ def generate_default_proposals(topic: str) -> List[Dict]:
     return proposals
 
 logger = logging.getLogger(__name__)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Sovereign Hall continuous discussion runner")
+    parser.add_argument("--once", action="store_true", help="只运行一轮后退出")
+    parser.add_argument("--max-rounds", type=int, default=0, help="最多运行轮数，0 表示无限")
+    return parser.parse_args()
 
 # ============================================================================
 # 预设议题池 - 定期轮换，避免重复
@@ -706,6 +715,8 @@ async def stage4_final_conclusion(llm, discussions: str, decisions: List[Dict], 
 # 主循环
 # ============================================================================
 async def main():
+    args = parse_args()
+
     print("\n" + "="*60)
     print("🔥 Sovereign Hall - 无限 Token 焚化炉")
     print("="*60)
@@ -778,6 +789,7 @@ async def main():
     db_service = DatabaseService()
     await db_service._init_db()
     await db_service.init_report_tables()
+    market_data = get_market_data()
 
     # 初始化投资模拟
     from sovereign_hall.services.investment_simulation import InvestmentSimulation
@@ -812,6 +824,10 @@ async def main():
             logger.debug(f"初始验证失败: {e}")
 
         while True:
+            if args.max_rounds and (iteration - (prev_stats.get('total_rounds', 0) if prev_stats else 0)) >= args.max_rounds:
+                print(f"\n✅ 已达到 --max-rounds={args.max_rounds}，退出")
+                break
+
             iteration += 1
             round_start = datetime.now()
 
@@ -857,21 +873,14 @@ async def main():
                 existing_docs = []
                 try:
                     # 简单搜索已有数据
-                    existing_docs = vector_db.search(topic, limit=20)
-                except:
-                    pass
+                    existing_docs = await vector_db.search(topic, top_k=20, llm_client=llm)
+                except Exception as e:
+                    logger.warning(f"向量检索失败: {e}")
 
                 # 如果有足够数据，跳过搜索
                 if existing_docs and len(existing_docs) >= 10:
                     print(f"\n📚 阶段1：使用本地数据 ({len(existing_docs)} 条相关文档)")
-                    docs = []
-                    for d in existing_docs:
-                        docs.append({
-                            'title': d.get('title', '') or '无标题',
-                            'content': d.get('content', '') or d.get('text', ''),
-                            'url': d.get('url', ''),
-                            'source': 'vector_db'
-                        })
+                    docs = existing_docs
                 else:
                     # 数据不足，执行搜索（减少搜索量以降低被封风险）
                     print(f"\n📚 阶段1：本地数据不足，进行搜索补充...")
@@ -885,7 +894,7 @@ async def main():
                         try:
                             await db_service.add_document(doc)
                         except Exception as e:
-                            pass
+                            logger.warning(f"保存文档失败: {e}")
 
                     # 批量添加到 VectorDB（带 embedding）
                     await vector_db.add_documents_batch(docs, llm_client=llm)
@@ -894,6 +903,11 @@ async def main():
 
                 # 阶段2：深度研报 → 提案
                 proposals = await stage2_deep_research(llm, docs, topic, db_service)
+                for proposal in proposals:
+                    try:
+                        await db_service.add_proposal(proposal)
+                    except Exception as e:
+                        logger.warning(f"保存提案失败: {e}")
 
                 # 💰 每日投资模拟（基于提案+反思执行交易）
                 # 检查是否需要执行每日交易（每天第一次运行或有新提案时）
@@ -931,7 +945,10 @@ async def main():
                             direction = proposal.get('direction', 'long')
                             confidence = proposal.get('confidence', 0.5)
                             target_position = proposal.get('target_position', 0.1)
-                            entry_price = proposal.get('entry_price', 10.0)
+                            current_price = await market_data.get_current_price(ticker)
+                            if current_price is None:
+                                print(f"   ⏭️ {ticker}: 无法获取真实价格，跳过交易")
+                                continue
 
                             # 决策考虑因素
                             has_position = ticker in current_tickers
@@ -960,7 +977,7 @@ async def main():
                                 ticker=ticker,
                                 direction=direction,
                                 target_position=trade_position,
-                                current_price=entry_price,
+                                current_price=current_price,
                                 llm=llm,
                                 reason=trade_reason
                             )
@@ -1072,6 +1089,10 @@ async def main():
             print(f"💰  累计成本: {llm_stats.get('total_cost_usd', '$0')}")
 
             # 根据是否有结果决定休息时间
+            if args.once:
+                print("\n✅ --once 模式：本轮完成后退出")
+                break
+
             if has_valid_result:
                 print(f"\n💤 休息 1 秒后继续...")
                 await asyncio.sleep(1)
@@ -1095,6 +1116,7 @@ async def main():
 
     finally:
         await spiders.close()
+        await market_data.close()
         print("🔒 资源已释放")
 
 

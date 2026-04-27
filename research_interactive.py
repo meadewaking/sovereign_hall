@@ -11,14 +11,12 @@ from pathlib import Path
 from datetime import datetime
 
 project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root.parent))
 
-from sovereign_hall.services.research_discussion import (
-    ResearchDiscussionSystem, DatabaseRetriever
-)
+from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
 
 
-def print_report(context):
+async def print_report(context):
     """打印研究报告"""
     print(f"\n{'#'*70}")
     print(f"# 研究报告")
@@ -28,11 +26,7 @@ def print_report(context):
     print("="*70)
     print("📊 摘要")
     print("="*70)
-    db = DatabaseRetriever()
-    stats = db.get_stats_summary()
-    recent_conclusions = db.get_recent_conclusions(limit=5)
-    print(f"数据库: {stats.get('documents', 0)} 篇文档, {stats.get('proposals', 0)} 个提案")
-    print(f"历史结论: {len(recent_conclusions)} 条")
+    print(f"问题: {context.question}")
     print(f"本次讨论轮次: {len(context.discussion_history)} 轮")
 
     print("\n" + "="*70)
@@ -73,11 +67,11 @@ async def main():
 
         try:
             system = ResearchDiscussionSystem(
-                enable_search=False,
+                enable_search=True,
                 enable_web=False
             )
             context = await system.research(question)
-            print_report(context)
+            await print_report(context)
 
             # 保存到文件
             report_file = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"

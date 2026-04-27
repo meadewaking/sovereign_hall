@@ -1,6 +1,6 @@
 """
 🏛️ Sovereign Hall - Vector Database Service
-向量数据库服务 - 语义检索增强生成
+向量数据库服务 - SQLite + FAISS 高效存储和检索
 """
 
 import asyncio
@@ -10,28 +10,28 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
 import json
-import pickle
 import shutil
-from collections import OrderedDict
+
+import aiosqlite
 
 from ..core.config import get_config
 from ..core import Document as Doc, DATA_DIR
-from ..utils import ensure_dir, save_json, load_json, generate_id
+from ..utils import ensure_dir, generate_id
 from .llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
 
 class VectorDatabase:
-    """向量数据库 - 用于语义检索"""
+    """向量数据库 - SQLite存储 + FAISS索引"""
 
-    # 默认内存上限
     DEFAULT_MAX_DOCUMENTS = 10000
+    DB_NAME = "vector_store.db"
 
     def __init__(
         self,
-        dimension: int = 1536,
-        index_type: str = "IVF",
+        dimension: int = 1024,
+        index_type: str = "Flat",
         nlist: int = 100,
         metric: str = "cosine",
         storage_path: str = None,
@@ -44,11 +44,11 @@ class VectorDatabase:
 
         Args:
             dimension: 向量维度
-            index_type: 索引类型 (IVF/Flat/HNSW)
+            index_type: 索引类型 (Flat/IVF/HNSW)
             nlist: IVF索引的聚类中心数
             metric: 距离度量 (cosine/euclidean/dot_product)
             storage_path: 存储路径
-            max_documents: 最大文档数量（用于内存管理）
+            max_documents: 最大文档数量
         """
         self.dimension = dimension
         self.index_type = index_type
@@ -56,129 +56,212 @@ class VectorDatabase:
         self.metric = metric
         self.storage_path = Path(storage_path)
         self.max_documents = max_documents or self.DEFAULT_MAX_DOCUMENTS
+        self.db_path = self.storage_path / self.DB_NAME
 
-        # 存储（使用 OrderedDict 实现 LRU）
-        self.documents: OrderedDict[str, Doc] = OrderedDict()
-        self.embeddings: OrderedDict[str, np.ndarray] = OrderedDict()
+        # 内存缓存（LRU）
+        self.documents: Dict[str, Doc] = {}
+        self.embeddings: Dict[str, np.ndarray] = {}
+        self._id_list: List[str] = []  # 有序ID列表用于LRU
 
-        # 索引（延迟初始化）
+        # FAISS索引
         self._index = None
         self._index_ready = False
+        self._id_to_idx: Dict[str, int] = {}  # doc_id -> index position
+        self._idx_to_id: Dict[int, str] = {}  # index position -> doc_id
 
-        # 自动持久化任务
+        # 异步连接
+        self._db: Optional[aiosqlite.Connection] = None
+
+        # 自动持久化
         self._persist_task: Optional[asyncio.Task] = None
-        self._persist_interval = 300  # 5分钟
+        self._persist_interval = 300
         self._last_persist_time = datetime.now()
+        self._dirty = False
 
-        # 初始化存储目录
         ensure_dir(self.storage_path)
-        ensure_dir(self.storage_path / "documents")
-        ensure_dir(self.storage_path / "embeddings")
+        logger.info(f"Vector DB initialized: dim={dimension}, type={index_type}, path={storage_path}")
 
-        logger.info(f"Vector DB initialized: dim={dimension}, type={index_type}, path={storage_path}, max_docs={self.max_documents}")
+    async def _get_db(self) -> aiosqlite.Connection:
+        """获取数据库连接"""
+        if self._db is None:
+            self._db = await aiosqlite.connect(str(self.db_path))
+            await self._init_tables()
+        return self._db
+
+    async def _init_tables(self):
+        """初始化表结构"""
+        db = self._db
+        # 文档表
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT,
+                url TEXT,
+                source TEXT,
+                sector TEXT,
+                keywords TEXT,
+                publish_time TEXT,
+                crawled_at TEXT,
+                embedding BLOB,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # 向量索引表（FAISS序列化）
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS faiss_index (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                index_data BLOB,
+                id_to_idx TEXT,
+                idx_to_id TEXT,
+                updated_at TEXT
+            )
+        """)
+        # LRU顺序表
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS lru_order (
+                doc_id TEXT PRIMARY KEY,
+                position INTEGER,
+                updated_at TEXT
+            )
+        """)
+        await db.commit()
 
     async def initialize(self, llm_client: LLMClient = None):
         """初始化索引和加载现有数据"""
-        # 尝试加载现有数据
-        await self._load_from_disk()
+        await self._get_db()
+        await self._load_from_db()
 
-        # 创建索引
-        if self.documents:
+        if self.embeddings:
             await self._build_index()
 
-        # 启动自动持久化任务
         self._start_auto_persist()
+        logger.info(f"VectorDB ready: {len(self.documents)} docs, {len(self.embeddings)} vectors")
 
     def _start_auto_persist(self):
-        """启动自动持久化任务"""
+        """启动自动持久化"""
         if self._persist_task is None or self._persist_task.done():
             self._persist_task = asyncio.create_task(self._auto_persist_loop())
-            logger.info("Auto-persist task started")
 
     async def _auto_persist_loop(self):
         """自动持久化循环"""
         while True:
             try:
                 await asyncio.sleep(self._persist_interval)
-                # 检查是否需要持久化（距离上次持久化超过间隔，且有变更）
-                if self._should_persist():
-                    await self.save()
+                if self._dirty and self._should_persist():
+                    await self._persist_index()
+                    await self._save_lru_order()
                     self._last_persist_time = datetime.now()
+                    self._dirty = False
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Auto-persist error: {e}")
 
     def _should_persist(self) -> bool:
-        """检查是否需要持久化"""
         elapsed = (datetime.now() - self._last_persist_time).total_seconds()
         return elapsed >= self._persist_interval
 
     def _evict_oldest(self):
-        """LRU 淘汰：移除最旧的文档"""
-        if len(self.documents) >= self.max_documents:
-            # 移除最旧的文档（ OrderedDict 的第一个元素）
-            oldest_doc_id = next(iter(self.documents))
-            del self.documents[oldest_doc_id]
-            if oldest_doc_id in self.embeddings:
-                del self.embeddings[oldest_doc_id]
+        """LRU淘汰最旧的文档"""
+        if len(self.documents) >= self.max_documents and self._id_list:
+            oldest_id = self._id_list[0]
+            self._remove_doc(oldest_id)
+            logger.info(f"LRU evicted: {oldest_id}, remaining: {len(self.documents)}")
 
-            # 删除磁盘文件
-            try:
-                (self.storage_path / "documents" / f"{oldest_doc_id}.json").unlink(missing_ok=True)
-                (self.storage_path / "embeddings" / f"{oldest_doc_id}.npy").unlink(missing_ok=True)
-            except Exception as e:
-                logger.warning(f"Failed to delete evicted doc files: {e}")
-
-            logger.info(f"LRU evicted document: {oldest_doc_id}, current count: {len(self.documents)}")
+    def _remove_doc(self, doc_id: str):
+        """移除文档"""
+        if doc_id in self.documents:
+            del self.documents[doc_id]
+        if doc_id in self.embeddings:
+            del self.embeddings[doc_id]
+        if doc_id in self._id_list:
+            self._id_list.remove(doc_id)
+        if doc_id in self._id_to_idx:
+            idx = self._id_to_idx[doc_id]
+            del self._id_to_idx[doc_id]
+            del self._idx_to_id[idx]
 
     async def add_document(self, doc: Doc, embedding: List[float] = None, llm_client: LLMClient = None):
-        """
-        添加文档到向量库（生成 embedding 用于语义搜索）
-
-        Args:
-            doc: 文档对象
-            embedding: 忽略（保留参数兼容）
-            llm_client: LLM 客户端，用于生成 embedding
-        """
-        # 检查内存上限，必要时淘汰
+        """添加文档"""
+        # LRU淘汰
         if len(self.documents) >= self.max_documents:
             self._evict_oldest()
 
-        # 存储文档
-        self.documents[doc.id] = doc
-        self.documents.move_to_end(doc.id)  # 更新 LRU 顺序
-
-        # 生成并存储 embedding（如果提供 llm_client）
-        if llm_client:
+        # 生成embedding
+        if llm_client and embedding is None:
             try:
-                # 使用标题+内容生成 embedding
                 text = f"{doc.title} {doc.content}"[:8000]
                 emb = await llm_client.get_embedding(text)
-                self.embeddings[doc.id] = np.array(emb, dtype=np.float32)
-                self.embeddings.move_to_end(doc.id)  # 更新 LRU 顺序
-                await self._save_embedding(doc.id, self.embeddings[doc.id])
+                embedding = emb
             except Exception as e:
-                logger.warning(f"Failed to generate embedding for {doc.id}: {e}")
+                logger.warning(f"Failed to generate embedding: {e}")
 
-        # 保存文档到磁盘
-        await self._save_doc(doc)
+        # 存储到内存
+        self.documents[doc.id] = doc
+        if doc.id not in self._id_list:
+            self._id_list.append(doc.id)
+
+        if embedding:
+            self.embeddings[doc.id] = np.array(embedding, dtype=np.float32)
+
+        # 保存到数据库
+        await self._save_doc_to_db(doc, embedding)
+        self._dirty = True
+
+        # 更新FAISS索引
+        if embedding:
+            await self._add_to_index(doc.id, self.embeddings[doc.id])
+
+    async def _save_doc_to_db(self, doc: Doc, embedding: List[float] = None):
+        """保存文档到SQLite"""
+        db = await self._get_db()
+        emb_bytes = None
+        if embedding:
+            emb_bytes = np.array(embedding, dtype=np.float32).tobytes()
+
+        # Document使用metadata存储字段
+        publish_time = doc.metadata.get("publish_time", "")
+        crawled_at = doc.metadata.get("crawled_at", "")
+
+        await db.execute("""
+            INSERT OR REPLACE INTO documents
+            (id, title, content, url, source, sector, keywords, publish_time, crawled_at, embedding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            doc.id, doc.title, doc.content, doc.url, doc.source,
+            doc.sector, json.dumps(doc.keywords), publish_time, crawled_at, emb_bytes
+        ))
+        await db.commit()
+
+    async def _add_to_index(self, doc_id: str, vector: np.ndarray):
+        """添加向量到FAISS索引"""
+        if self._index is None:
+            await self._build_index()
+
+        if self._index_ready:
+            try:
+                norm = np.linalg.norm(vector)
+                if norm > 0:
+                    vector = vector / norm
+                # 新向量添加到末尾
+                idx = len(self._idx_to_id)
+                self._index.add(np.array([vector], dtype=np.float32))
+                self._id_to_idx[doc_id] = idx
+                self._idx_to_id[idx] = doc_id
+            except Exception as e:
+                logger.warning(f"Failed to add to index: {e}")
 
     async def add_documents_batch(self, docs: List[Doc], llm_client: LLMClient = None):
-        """
-        批量添加文档（生成 embedding 用于语义搜索）
-
-        Args:
-            docs: 文档列表
-            llm_client: LLM 客户端，用于生成 embedding
-        """
+        """批量添加文档"""
         if not docs:
             return
 
-        logger.info(f"Adding {len(docs)} documents in batch (semantic search mode)")
+        logger.info(f"Adding {len(docs)} documents in batch")
 
-        # 添加文档（会生成 embedding）
         for doc in docs:
+            if isinstance(doc, dict):
+                doc = Doc.from_dict(doc)
             await self.add_document(doc, llm_client=llm_client)
 
         logger.info(f"Batch add complete: {len(self.documents)} total docs")
@@ -191,91 +274,72 @@ class VectorDatabase:
         min_similarity: float = 0.0,
         llm_client: LLMClient = None,
     ) -> List[Doc]:
-        """搜索 - 使用 embedding 语义搜索"""
-        if not self.documents:
+        """语义搜索"""
+        if not self.documents or not llm_client:
             return []
 
-        # 如果有 embedding 客户端，使用语义搜索
-        if llm_client and self.embeddings:
-            try:
-                # 获取查询向量
-                query_vec = await llm_client.get_embedding(query)
-                query_vec = np.array(query_vec, dtype=np.float32)
+        try:
+            # 获取查询向量
+            query_vec = await llm_client.get_embedding(query)
+            query_vec = np.array([query_vec], dtype=np.float32)
+            norm = np.linalg.norm(query_vec)
+            if norm > 0:
+                query_vec = query_vec / norm
 
-                # 计算相似度
+            # 使用FAISS搜索
+            if self._index_ready and self._index is not None:
+                scores, indices = self._index.search(query_vec, min(top_k * 2, len(self.documents)))
+
                 results = []
-                for doc_id, doc_vec in self.embeddings.items():
+                for score, idx in zip(scores[0], indices[0]):
+                    if idx < 0:
+                        continue
+                    doc_id = self._idx_to_id.get(int(idx))
+                    if not doc_id or doc_id not in self.documents:
+                        continue
                     doc = self.documents[doc_id]
-
-                    # 行业过滤
                     if filter_sector and doc.sector != filter_sector:
                         continue
+                    if score >= min_similarity:
+                        results.append((float(score), doc))
 
-                    # 计算相似度
-                    similarity = self._compute_similarity(query_vec, doc_vec)
-
-                    if similarity >= min_similarity:
-                        results.append((similarity, doc))
-
-                # 排序并返回top_k
                 results.sort(key=lambda x: x[0], reverse=True)
-                logger.debug(f"Semantic search: query='{query}', results={len(results)}")
                 return [doc for _, doc in results[:top_k]]
-            except Exception as e:
-                logger.warning(f"Semantic search failed: {e}, falling back to keyword")
+            else:
+                # 后备：暴力搜索
+                return await self._brute_force_search(query_vec[0], top_k, filter_sector, min_similarity)
 
-        # 后备：关键词搜索
-        logger.debug(f"Using keyword search for: {query}")
-        return await self._keyword_search(query, top_k, filter_sector)
+        except Exception as e:
+            logger.warning(f"Search failed: {e}")
+            return []
 
-    async def _keyword_search(
+    async def _brute_force_search(
         self,
-        query: str,
+        query_vec: np.ndarray,
         top_k: int,
         filter_sector: str = None,
+        min_similarity: float = 0.0,
     ) -> List[Doc]:
-        """关键词搜索（后备方案）"""
-        query_words = query.lower().split()
-
-        scored = []
-        for doc in self.documents.values():
-            # 行业过滤
+        """暴力搜索（后备）"""
+        results = []
+        for doc_id, doc_vec in self.embeddings.items():
+            doc = self.documents[doc_id]
             if filter_sector and doc.sector != filter_sector:
                 continue
+            similarity = self._cosine_similarity(query_vec, doc_vec)
+            if similarity >= min_similarity:
+                results.append((similarity, doc))
 
-            # 简单的词匹配评分
-            text = (doc.title + ' ' + doc.content).lower()
-            score = sum(1 for word in query_words if word in text)
+        results.sort(key=lambda x: x[0], reverse=True)
+        return [doc for _, doc in results[:top_k]]
 
-            if score > 0:
-                scored.append((score / len(query_words), doc))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in scored[:top_k]]
-
-    def _compute_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
-        """计算向量相似度"""
-        if self.metric == "cosine":
-            # 余弦相似度
-            norm_a = np.linalg.norm(a)
-            norm_b = np.linalg.norm(b)
-            if norm_a == 0 or norm_b == 0:
-                return 0.0
-            return np.dot(a, b) / (norm_a * norm_b)
-        elif self.metric == "euclidean":
-            # 欧氏距离转相似度
-            dist = np.linalg.norm(a - b)
-            return 1.0 / (1.0 + dist)
-        elif self.metric == "dot_product":
-            # 点积（需要归一化才能比较）
-            return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-        else:
-            # 默认余弦相似度
-            norm_a = np.linalg.norm(a)
-            norm_b = np.linalg.norm(b)
-            if norm_a == 0 or norm_b == 0:
-                return 0.0
-            return np.dot(a, b) / (norm_a * norm_b)
+    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        """余弦相似度"""
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(np.dot(a, b) / (norm_a * norm_b))
 
     async def _build_index(self):
         """构建FAISS索引"""
@@ -289,138 +353,160 @@ class VectorDatabase:
             ids = list(self.embeddings.keys())
             vectors = np.array([self.embeddings[id_] for id_ in ids], dtype=np.float32)
 
+            # 归一化向量（用于余弦相似度）
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            vectors = vectors / norms
+
             # 创建索引
-            if self.index_type == "IVF":
-                quantizer = faiss.IndexFlatIP(self.dimension)
-                self._index = faiss.IndexIVFFlat(
-                    quantizer, self.dimension, self.nlist, faiss.METRIC_INNER_PRODUCT
-                )
-                self._index.train(vectors)
-            elif self.index_type == "Flat":
+            if self.index_type == "Flat":
                 self._index = faiss.IndexFlatIP(self.dimension)
+            elif self.index_type == "IVF":
+                quantizer = faiss.IndexFlatIP(self.dimension)
+                self._index = faiss.IndexIVFFlat(quantizer, self.dimension, self.nlist, faiss.METRIC_INNER_PRODUCT)
+                self._index.train(vectors)
             elif self.index_type == "HNSW":
                 self._index = faiss.IndexHNSWFlat(self.dimension, 32)
             else:
-                logger.warning(f"Unknown index type {self.index_type}, using Flat")
                 self._index = faiss.IndexFlatIP(self.dimension)
 
-            # 添加向量
             self._index.add(vectors)
 
+            # 建立ID映射
+            for idx, doc_id in enumerate(ids):
+                self._id_to_idx[doc_id] = idx
+                self._idx_to_id[idx] = doc_id
+
             self._index_ready = True
-            logger.info(f"Index built: {len(ids)} vectors")
+            logger.info(f"FAISS index built: {len(ids)} vectors")
 
         except ImportError:
-            logger.warning("FAISS not installed, using brute force search")
+            logger.warning("FAISS not installed")
             self._index_ready = False
         except Exception as e:
             logger.error(f"Failed to build index: {e}")
             self._index_ready = False
 
-    async def _update_single_index(self, doc_id: str, vector: np.ndarray):
-        """更新单个向量到索引"""
-        if not self._index_ready or self._index is None:
+    async def _load_from_db(self):
+        """从SQLite加载数据"""
+        db = await self._get_db()
+
+        # 加载文档和向量
+        async with db.execute("""
+            SELECT id, title, content, url, source, sector, keywords, publish_time, crawled_at, embedding
+            FROM documents
+        """) as cursor:
+            rows = await cursor.fetchall()
+
+        for row in rows:
+            doc_id, title, content, url, source, sector, keywords, publish_time, crawled_at, emb_bytes = row
+
+            keywords_list = json.loads(keywords) if keywords else []
+            doc = Doc(
+                content=content or "",
+                title=title or "",
+                url=url,
+                source=source,
+                sector=sector,
+                keywords=keywords_list,
+                metadata={
+                    "publish_time": publish_time,
+                    "crawled_at": crawled_at,
+                }
+            )
+            doc.doc_id = doc_id
+            self.documents[doc_id] = doc
+            self._id_list.append(doc_id)
+
+            if emb_bytes:
+                self.embeddings[doc_id] = np.frombuffer(emb_bytes, dtype=np.float32)
+
+        # 加载LRU顺序
+        async with db.execute("SELECT doc_id FROM lru_order ORDER BY position") as cursor:
+            rows = await cursor.fetchall()
+            if rows:
+                self._id_list = [row[0] for row in rows]
+
+        logger.info(f"Loaded {len(self.documents)} docs from SQLite")
+
+    async def _save_lru_order(self):
+        """保存LRU顺序"""
+        db = await self._get_db()
+        await db.execute("DELETE FROM lru_order")
+        for pos, doc_id in enumerate(self._id_list):
+            await db.execute(
+                "INSERT INTO lru_order (doc_id, position, updated_at) VALUES (?, ?, ?)",
+                (doc_id, pos, datetime.now().isoformat())
+            )
+        await db.commit()
+
+    async def _persist_index(self):
+        """持久化FAISS索引"""
+        if self._index is None:
             return
 
+        db = await self._get_db()
         try:
             import faiss
-            self._index.add(np.array([vector], dtype=np.float32))
+            index_data = faiss.serialize_index(self._index)
+            await db.execute("""
+                INSERT OR REPLACE INTO faiss_index (id, index_data, id_to_idx, idx_to_id, updated_at)
+                VALUES (1, ?, ?, ?, ?)
+            """, (
+                index_data,
+                json.dumps(self._id_to_idx),
+                json.dumps(self._idx_to_id),
+                datetime.now().isoformat()
+            ))
+            await db.commit()
+            logger.info("FAISS index persisted")
         except Exception as e:
-            logger.error(f"Failed to update index: {e}")
-
-    # =========================================================================
-    # 持久化
-    # =========================================================================
-
-    async def _save_doc(self, doc: Doc):
-        """保存文档到磁盘"""
-        filepath = self.storage_path / "documents" / f"{doc.id}.json"
-        save_json(doc.to_dict(), str(filepath))
-
-    async def _save_embedding(self, doc_id: str, embedding: np.ndarray):
-        """保存向量到磁盘"""
-        filepath = self.storage_path / "embeddings" / f"{doc_id}.npy"
-        np.save(str(filepath), embedding)
-
-    async def _load_from_disk(self):
-        """从磁盘加载数据"""
-        # 加载文档
-        doc_dir = self.storage_path / "documents"
-        if doc_dir.exists():
-            for file in doc_dir.glob("*.json"):
-                try:
-                    data = load_json(str(file))
-                    if data:
-                        doc = Doc.from_dict(data)
-                        self.documents[doc.id] = doc
-                except Exception as e:
-                    logger.warning(f"Failed to load doc {file}: {e}")
-
-        # 加载向量
-        emb_dir = self.storage_path / "embeddings"
-        if emb_dir.exists():
-            for file in emb_dir.glob("*.npy"):
-                try:
-                    doc_id = file.stem
-                    embedding = np.load(str(file))
-                    if doc_id in self.documents:
-                        self.embeddings[doc_id] = embedding
-                except Exception as e:
-                    logger.warning(f"Failed to load embedding {file}: {e}")
-
-        logger.info(f"Loaded {len(self.documents)} docs from disk")
+            logger.warning(f"Failed to persist index: {e}")
 
     async def save(self):
         """保存整个数据库"""
-        # 保存索引
-        if self._index is not None:
-            try:
-                import faiss
-                index_path = self.storage_path / "index.faiss"
-                faiss.write_index(self._index, str(index_path))
-            except Exception as e:
-                logger.warning(f"Failed to save index: {e}")
-
+        await self._persist_index()
+        await self._save_lru_order()
+        self._dirty = False
         logger.info(f"DB saved: {len(self.documents)} docs")
 
     async def clear(self):
         """清空数据库"""
-        # 停止自动持久化任务
-        if self._persist_task and not self._persist_task.done():
+        if self._persist_task:
             self._persist_task.cancel()
-            self._persist_task = None
 
         self.documents.clear()
         self.embeddings.clear()
+        self._id_list.clear()
         self._index = None
         self._index_ready = False
+        self._id_to_idx.clear()
+        self._idx_to_id.clear()
 
-        # 清空存储目录
-        for path in (self.storage_path / "documents", self.storage_path / "embeddings"):
-            if path.exists():
-                shutil.rmtree(path)
-            ensure_dir(path)
+        if self._db:
+            await self._db.execute("DELETE FROM documents")
+            await self._db.execute("DELETE FROM faiss_index")
+            await self._db.execute("DELETE FROM lru_order")
+            await self._db.commit()
 
         logger.info("Database cleared")
 
     async def close(self):
-        """关闭数据库，保存并清理资源"""
-        # 停止自动持久化
-        if self._persist_task and not self._persist_task.done():
+        """关闭数据库"""
+        if self._persist_task:
             self._persist_task.cancel()
             try:
                 await self._persist_task
             except asyncio.CancelledError:
                 pass
 
-        # 保存当前状态
         await self.save()
 
-        logger.info("Vector database closed")
+        if self._db:
+            await self._db.close()
+            self._db = None
 
-    # =========================================================================
-    # 统计
-    # =========================================================================
+        logger.info("Vector database closed")
 
     def get_stats(self) -> Dict:
         """获取统计信息"""
@@ -435,7 +521,6 @@ class VectorDatabase:
         }
 
     def _get_sector_distribution(self) -> Dict[str, int]:
-        """获取行业分布"""
         distribution = {}
         for doc in self.documents.values():
             sector = doc.sector or "未知"

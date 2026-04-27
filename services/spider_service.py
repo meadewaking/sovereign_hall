@@ -16,6 +16,7 @@ import threading
 
 import httpx
 from bs4 import BeautifulSoup
+from readability import Document as ReadabilityDocument
 from ..core import Document as Doc
 
 from ..core.config import get_config
@@ -669,8 +670,15 @@ class SpiderSwarm:
             logger.warning(f"Sogou search failed: {e}")
             return []
 
-    async def _ddg_search(self, query: str, max_results: int) -> List[Doc]:
-        """DuckDuckGO 搜索（使用 ddgs 库 + 代理）"""
+    async def _ddg_search(self, query: str, max_results: int, deep_fetch: bool = True) -> List[Doc]:
+        """
+        DuckDuckGO 搜索（使用 ddgs 库 + 代理）
+
+        Args:
+            query: 搜索关键词
+            max_results: 最大结果数
+            deep_fetch: 是否深度抓取URL内容（默认开启）
+        """
         try:
             from ddgs import DDGS
 
@@ -678,30 +686,83 @@ class SpiderSwarm:
             ddgs = DDGS(proxy="http://127.0.0.1:7890", timeout=15)
             results = ddgs.text(query, max_results=max_results)
 
-            docs = []
-            for r in results:
-                try:
-                    title = r.get('title', '')
-                    url = r.get('href', '')
-                    body = r.get('body', '')
+            if not deep_fetch:
+                # 快速模式：只使用搜索结果摘要
+                docs = []
+                for r in results:
+                    try:
+                        title = r.get('title', '')
+                        url = r.get('href', '')
+                        body = r.get('body', '')
 
-                    if title and url and url.startswith('http'):
-                        doc = Doc(
+                        if title and url and url.startswith('http'):
+                            doc = Doc(
+                                id=generate_id('doc'),
+                                title=title,
+                                content=body or f"关于{query}的搜索结果",
+                                url=url,
+                                source='duckduckgo',
+                                publish_time=datetime.now(),
+                                sector=self._infer_sector(query),
+                                keywords=[query],
+                            )
+                            docs.append(doc)
+                    except Exception as e:
+                        logger.debug(f"Failed to parse DDG result: {e}")
+                        continue
+                return docs[:max_results]
+
+            # 深度模式：抓取URL完整内容
+            search_results = [(r.get('title', ''), r.get('href', ''), r.get('body', ''))
+                             for r in results if r.get('title') and r.get('href', '').startswith('http')]
+
+            if not search_results:
+                return []
+
+            # 并发抓取URL内容
+            async def fetch_and_parse(title: str, url: str, fallback_body: str):
+                try:
+                    full_doc = await self.deep_fetch(url, extract_full_text=True)
+                    if full_doc and full_doc.content and len(full_doc.content) > 100:
+                        return Doc(
                             id=generate_id('doc'),
-                            title=title,
-                            content=body or f"关于{query}的搜索结果",
+                            title=title or full_doc.title,
+                            content=full_doc.content[:20000],  # 限制长度
                             url=url,
                             source='duckduckgo',
                             publish_time=datetime.now(),
                             sector=self._infer_sector(query),
                             keywords=[query],
                         )
-                        docs.append(doc)
                 except Exception as e:
-                    logger.debug(f"Failed to parse DDG result: {e}")
-                    continue
+                    logger.debug(f"Deep fetch failed for {url}: {e}")
 
-            return docs[:max_results]
+                # 如果抓取失败，使用摘要
+                return Doc(
+                    id=generate_id('doc'),
+                    title=title,
+                    content=fallback_body or f"关于{query}的搜索结果",
+                    url=url,
+                    source='duckduckgo',
+                    publish_time=datetime.now(),
+                    sector=self._infer_sector(query),
+                    keywords=[query],
+                )
+
+            # 并发执行（限制并发数）
+            semaphore = asyncio.Semaphore(3)
+            async def limited_fetch(title, url, body):
+                async with semaphore:
+                    return await fetch_and_parse(title, url, body)
+
+            tasks = [limited_fetch(t, u, b) for t, u, b in search_results[:max_results]]
+            docs = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 过滤异常结果
+            valid_docs = [d for d in docs if isinstance(d, Doc)]
+            logger.info(f"DDG search for '{query}': {len(valid_docs)}/{len(tasks)} docs with full content")
+
+            return valid_docs[:max_results]
 
         except Exception as e:
             logger.warning(f"DuckDuckGO search failed: {e}")
@@ -763,12 +824,23 @@ class SpiderSwarm:
                 resp = await self.client.get(url, headers=headers, follow_redirects=True)
                 resp.raise_for_status()
 
-                # 检测编码
-                resp.encoding = resp.apparent_encoding or 'utf-8'
+                # 手动检测编码，避免httpx兼容性
+                content_type = resp.headers.get('content-type', '')
+                if 'charset=' in content_type:
+                    charset = content_type.split('charset=')[-1].split(';')[0].strip()
+                    resp.encoding = charset
+                else:
+                    # 尝试检测HTML中的编码声明
+                    import re
+                    match = re.search(r'<meta[^>]+charset=["\']?([^"\'\s]+)', resp.text, re.I)
+                    if match:
+                        resp.encoding = match.group(1)
+                    else:
+                        resp.encoding = 'utf-8'
 
                 if extract_full_text:
                     # 使用readability提取正文
-                    doc = Document(resp.text)
+                    doc = ReadabilityDocument(resp.text)
                     content = BeautifulSoup(doc.summary(), 'html.parser').get_text(separator='\n')
                     content = clean_text(content)
 

@@ -123,9 +123,7 @@ class ResearchDiscussionSystem:
     async def _reflect_on_history(self, question: str) -> str:
         """反思最近的历史结论"""
         db = await self._get_db()
-        # 暂时使用内存存储获取最近结论，后续可以通过 DatabaseService 添加相应方法
-        # 这里简化处理，返回空字符串
-        recent_conclusions = []
+        recent_conclusions = await db.get_recent_conclusions(limit=5)
         if not recent_conclusions:
             return ""
 
@@ -196,13 +194,14 @@ class ResearchDiscussionSystem:
     async def _save_conclusion_to_db(self, question: str, conclusion: str):
         """解析并保存结论到数据库"""
         import re
-        ticker_match = re.search(r'标的[：:]\s*([A-Z]{2,6})', conclusion)
+        ticker_match = re.search(r'(?:标的|代码)[：:]\s*([A-Z0-9]{2,10})', conclusion)
         position_match = re.search(r'仓位[：:]\s*(\d+(?:\.\d+)?%?)', conclusion)
         stop_loss_match = re.search(r'止损[：:]\s*(\d+(?:\.\d+)?%?)', conclusion)
         take_profit_match = re.search(r'止盈[：:]\s*(\d+(?:\.\d+)?%?)', conclusion)
         confidence_match = re.search(r'置信度[：:]\s*(\d+(?:\.\d+)?%?)', conclusion)
 
         ticker = ticker_match.group(1) if ticker_match else ""
+        ticker = ticker.split()[0].strip().upper()
         position = float(re.sub(r'%', '', position_match.group(1))) / 100 if position_match else 0
         stop_loss = float(re.sub(r'%', '', stop_loss_match.group(1))) / 100 if stop_loss_match else 0
         take_profit = float(re.sub(r'%', '', take_profit_match.group(1))) / 100 if take_profit_match else 0
@@ -219,6 +218,24 @@ class ResearchDiscussionSystem:
             confidence=confidence
         )
         print(f"   ✓ 结论已保存 (标的: {ticker or 'N/A'})")
+
+        if ticker and confidence > 0 and take_profit > 0 and stop_loss > 0:
+            try:
+                from .decision_tracker import DecisionRecorder
+                direction = "short" if any(word in conclusion for word in ["卖出", "做空", "看空"]) else "long"
+                recorder = DecisionRecorder()
+                await recorder.record_decision(
+                    ticker=ticker,
+                    decision=direction,
+                    confidence=confidence,
+                    target_price=take_profit,
+                    stop_loss=stop_loss,
+                    discussion_context=conclusion[:1000],
+                    expected_days=90 if "半年" in question else 30,
+                )
+                print("   ✓ 可验证预测已记录")
+            except Exception as e:
+                logger.warning(f"记录可验证预测失败: {e}")
 
     async def _agent_think_with_retrieval(self, agent, question: str,
                                           additional_instruction: str = "",

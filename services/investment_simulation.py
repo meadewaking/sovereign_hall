@@ -164,11 +164,11 @@ class InvestmentSimulation:
         except Exception as e:
             logger.warning(f"Failed to save simulation state: {e}")
 
-    def get_current_price(self, ticker: str) -> Optional[float]:
+    async def get_current_price(self, ticker: str) -> Optional[float]:
         """获取当前价格（这里需要接入真实行情或使用AI预测）"""
-        # TODO: 接入真实行情API
-        # 暂时返回模拟价格
-        return None
+        from .market_data import get_market_data
+
+        return await get_market_data().get_current_price(ticker)
 
     async def execute_trade(
         self,
@@ -202,7 +202,14 @@ class InvestmentSimulation:
                 'reason': f'冷却期内，上次交易{self.last_trade_records.get(ticker, "")[:10]}'
             }
 
-        price = current_price or 10.0
+        price = current_price or await self.get_current_price(ticker)
+        if price is None or price <= 0:
+            return {
+                'success': False,
+                'action': 'hold',
+                'ticker': ticker,
+                'reason': '无法获取真实价格，拒绝模拟交易'
+            }
 
         # 计算当前持仓
         current_shares = self.positions.get(ticker, {}).get('shares', 0)
@@ -366,7 +373,7 @@ class InvestmentSimulation:
         total_value = self.cash
 
         for ticker, pos in self.positions.items():
-            price = (prices or {}).get(ticker) or self.get_current_price(ticker) or pos['avg_cost']
+            price = (prices or {}).get(ticker) or await self.get_current_price(ticker) or pos['avg_cost']
             total_value += pos['shares'] * price
 
         return {
@@ -592,8 +599,10 @@ async def run_daily_simulation(llm: LLMClient, db_service, proposals: List[Dict]
             direction = proposal.get('direction', 'long')
             target_position = proposal.get('target_position', 0.1)
 
-            # 获取当前价格（这里需要真实行情）
-            current_price = 10.0  # 模拟价格
+            current_price = await simulation.get_current_price(ticker)
+            if current_price is None:
+                logger.info(f"Skip simulation trade for {ticker}: no real price")
+                continue
 
             result = await simulation.execute_trade(
                 ticker=ticker,

@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 
 project_root = Path(__file__).parent
-sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root.parent))
 
 
 def format_size(size_bytes: int) -> str:
@@ -145,6 +145,26 @@ def show_stats(db_path):
     print(f"\n   📈 研究讨论统计:")
     print(f"      - 讨论结论: {rc_count} 条")
     print(f"      - 反思总结: {rs_count} 条")
+
+    if "price_predictions" in tables:
+        try:
+            c.execute("""
+                SELECT status, result, COUNT(*)
+                FROM price_predictions
+                GROUP BY status, result
+                ORDER BY status, result
+            """)
+            prediction_rows = c.fetchall()
+            total_predictions = sum(row[2] for row in prediction_rows)
+            print(f"\n   🎯 预测验证统计:")
+            print(f"      - 预测记录: {total_predictions:,} 条")
+            if prediction_rows:
+                for status, result, count in prediction_rows:
+                    print(f"      - {status}/{result}: {count:,} 条")
+            else:
+                print("      - 暂无可信预测记录")
+        except Exception as e:
+            print(f"\n   🎯 预测验证统计: 无法读取 ({e})")
 
     conn.close()
     return tables
@@ -286,6 +306,34 @@ def run_discussion_once(db_path):
         return False
 
 
+def validate_pending_predictions():
+    """验证已到期的待验证预测"""
+    import asyncio
+    from sovereign_hall.services.decision_tracker import DecisionRecorder
+
+    async def _run():
+        recorder = DecisionRecorder()
+        return await recorder.validate_pending(max_count=50)
+
+    try:
+        result = asyncio.run(_run())
+        print("\n" + "="*60)
+        print("🎯 到期预测验证")
+        print("="*60)
+        print(f"   本次处理: {result.get('validated', 0)} 条")
+        print(f"   正确数量: {result.get('correct', 0)} 条")
+        if result.get("results"):
+            for item in result["results"][:10]:
+                if "error" in item:
+                    print(f"   - {item['error']}")
+                else:
+                    print(f"   - {item.get('result')} | accuracy={item.get('accuracy', 0):.2f} | price={item.get('current_price')}")
+        return True
+    except Exception as e:
+        print(f"\n❌ 验证失败: {e}")
+        return False
+
+
 def clean_database(db_path):
     """清洗数据库 - 删除无实际内容的文档和提案"""
     conn = sqlite3.connect(str(db_path))
@@ -407,11 +455,12 @@ def main():
     print("   3. 查看最近讨论结论")
     print("   4. 运行一次讨论（动态生成议题）")
     print("   5. 🧹 清洗数据库（删除无效数据）")
+    print("   6. 🎯 验证到期预测")
     print("   q. 退出")
     print("="*60)
 
     while True:
-        choice = input("\n👉 请选择 (1/2/3/4/5/q): ").strip().lower()
+        choice = input("\n👉 请选择 (1/2/3/4/5/6/q): ").strip().lower()
 
         if choice == '1':
             show_stats(db_path)
@@ -428,6 +477,8 @@ def main():
             run_discussion_once(db_path)
         elif choice == '5':
             clean_database(db_path)
+        elif choice == '6':
+            validate_pending_predictions()
         elif choice == 'q':
             print("👋 再见！")
             break

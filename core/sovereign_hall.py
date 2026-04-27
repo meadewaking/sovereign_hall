@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -125,6 +126,11 @@ class SovereignHall:
         print(f"{'='*80}")
 
         try:
+            await self.db._init_db()
+            await self.db.init_report_tables()
+            if self.vector_db._db is None:
+                await self.vector_db.initialize(self.llm)
+
             # 阶段1：信息收集
             docs = await self.stage1_information_harvest()
 
@@ -262,7 +268,7 @@ class SovereignHall:
 
         # 存入向量库和数据库
         for doc in cleaned_docs:
-            await self.vector_db.add_document(doc)
+            await self.vector_db.add_document(doc, llm_client=self.llm)
             await self.db.add_document(doc)
 
         doc_count = await self.db.count_documents()
@@ -319,6 +325,7 @@ class SovereignHall:
                 query=sector,
                 top_k=30,
                 filter_sector=sector,
+                llm_client=self.llm,
             )
 
             if not sector_docs:
@@ -468,7 +475,7 @@ class SovereignHall:
     async def _get_relevant_lessons(self, proposal: InvestmentProposal) -> List[PlaybookEntry]:
         """检索相关历史教训"""
         query = f"{proposal.ticker} {proposal.direction}"
-        results = await self.vector_db.search(query, top_k=5)
+        results = await self.vector_db.search(query, top_k=5, llm_client=self.llm)
 
         relevant = []
         for entry in self.playbook:
