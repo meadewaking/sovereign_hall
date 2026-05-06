@@ -680,11 +680,32 @@ class SpiderSwarm:
             deep_fetch: 是否深度抓取URL内容（默认开启）
         """
         try:
-            from ddgs import DDGS
+            import logging
 
-            # 使用代理
-            ddgs = DDGS(proxy="http://127.0.0.1:7890", timeout=15)
-            results = ddgs.text(query, max_results=max_results)
+            # 抑制 ddgs 内部日志（ddgs 是元搜索引擎，部分引擎失败是正常的）
+            # 只有当所有引擎都失败、返回空结果时才记录警告
+            ddgs_logger = logging.getLogger('ddgs.ddgs')
+            primp_logger = logging.getLogger('primp')
+            original_ddgs_level = ddgs_logger.level
+            original_primp_level = primp_logger.level
+            ddgs_logger.setLevel(logging.WARNING)
+            primp_logger.setLevel(logging.WARNING)
+
+            try:
+                from ddgs import DDGS
+
+                # 使用代理
+                ddgs = DDGS(proxy="http://127.0.0.1:7890", timeout=15)
+                results = ddgs.text(query, max_results=max_results)
+            finally:
+                # 恢复日志级别
+                ddgs_logger.setLevel(original_ddgs_level)
+                primp_logger.setLevel(original_primp_level)
+
+            # 只有当没有返回结果时才记录警告
+            if not results:
+                logger.warning(f"DuckDuckGO search returned no results for '{query}'")
+                return []
 
             if not deep_fetch:
                 # 快速模式：只使用搜索结果摘要
@@ -719,10 +740,15 @@ class SpiderSwarm:
             if not search_results:
                 return []
 
-            # 并发抓取URL内容
+            # 并发抓取URL内容（带超时，避免长时间等待）
+            DEEP_FETCH_TIMEOUT = 10  # 深度抓取超时10秒
+
             async def fetch_and_parse(title: str, url: str, fallback_body: str):
                 try:
-                    full_doc = await self.deep_fetch(url, extract_full_text=True)
+                    full_doc = await asyncio.wait_for(
+                        self.deep_fetch(url, extract_full_text=True),
+                        timeout=DEEP_FETCH_TIMEOUT
+                    )
                     if full_doc and full_doc.content and len(full_doc.content) > 100:
                         return Doc(
                             id=generate_id('doc'),
@@ -734,6 +760,8 @@ class SpiderSwarm:
                             sector=self._infer_sector(query),
                             keywords=[query],
                         )
+                except asyncio.TimeoutError:
+                    logger.debug(f"Deep fetch timeout for {url}, using fallback")
                 except Exception as e:
                     logger.debug(f"Deep fetch failed for {url}: {e}")
 
