@@ -916,96 +916,104 @@ async def main():
                     (datetime.now() - simulation.last_trade_date).days >= 1
                 )
                 if should_trade:
-                    print(f"\n💰 执行每日投资模拟...")
-
-                    # 获取历史反思（用于决策参考）
-                    history_reflection = await simulation.get_recent_reflection(limit=2)
-
-                    # 获取当前资产
-                    assets = await simulation.calculate_assets()
-                    print(f"   当前资产: {assets['total_assets']:.2f}元 | 现金: {assets['cash']:.2f}元 | 持仓: {assets['positions_value']:.2f}元")
-
-                    # 当前持仓
-                    current_positions = assets.get('positions', {})
-                    current_tickers = set(current_positions.keys())
-
-                    # 如果有新提案，做出交易决策（纳入反思）
-                    if proposals:
-                        # 优先处理排名前3的提案
-                        for proposal in proposals[:3]:
-                            ticker = proposal.get('ticker')
-                            if not ticker:
-                                continue
-
-                            # 检查冷却期
-                            if simulation.is_in_cooldown(ticker):
-                                print(f"   ⏳ {ticker} 在冷却期内，跳过交易")
-                                continue
-
-                            direction = proposal.get('direction', 'long')
-                            confidence = proposal.get('confidence', 0.5)
-                            target_position = proposal.get('target_position', 0.1)
-                            current_price = await market_data.get_current_price(ticker)
-                            if current_price is None:
-                                print(f"   ⏭️ {ticker}: 无法获取真实价格，跳过交易")
-                                continue
-
-                            # 决策考虑因素
-                            has_position = ticker in current_tickers
-                            trade_reason = ""
-
-                            # 结合反思判断
-                            if "卖出" in history_reflection and has_position:
-                                # 反思建议卖出，降低买入意愿
-                                trade_position = target_position * 0.3
-                                trade_reason = f"反思建议谨慎，小幅建仓"
-                            elif has_position:
-                                # 已有持仓，不重复买入
-                                print(f"   ⏭️ {ticker} 已有持仓，跳过买入")
-                                continue
-                            elif confidence < 0.4:
-                                trade_position = target_position * 0.3
-                                trade_reason = f"低置信度{confidence:.0%}，轻仓尝试"
-                            elif confidence < 0.6:
-                                trade_position = target_position * 0.5
-                                trade_reason = f"中等置信度{confidence:.0%}，半仓"
-                            else:
-                                trade_position = target_position
-                                trade_reason = f"高置信度{confidence:.0%}，按提案执行"
-
-                            result = await simulation.execute_trade(
-                                ticker=ticker,
-                                direction=direction,
-                                target_position=trade_position,
-                                current_price=current_price,
-                                llm=llm,
-                                reason=trade_reason
-                            )
-
-                            if result.get('success') == False:
-                                print(f"   ⏭️ {ticker}: {result.get('reason', '交易失败')}")
-                            elif result.get('action') == 'buy':
-                                print(f"   📈 买入 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
-                            elif result.get('action') == 'sell':
-                                print(f"   📉 卖出 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
-                            elif result.get('action') == 'hold':
-                                if result.get('reason'):
-                                    print(f"   ➖ 持有 {ticker}: {result['reason']}")
+                    if not await market_data.is_trading_day():
+                        print("\n💰 当前非交易日，跳过每日投资模拟交易")
+                        reflection = await simulation.daily_reflection(llm)
+                        if reflection:
+                            print(f"\n📝 每日投资反思:")
+                            print(reflection[:500] + "...")
+                        await simulation.save_snapshot(reflection)
                     else:
-                        # 没有新提案，保持不动
-                        if current_positions:
-                            print(f"   💤 无新提案，保持当前持仓不动")
-                            for ticker, pos in current_positions.items():
-                                days_held = 0
-                                if ticker in simulation.last_trade_records:
-                                    try:
-                                        last_date = datetime.fromisoformat(simulation.last_trade_records[ticker])
-                                        days_held = (datetime.now() - last_date).days
-                                    except:
-                                        pass
-                                print(f"      - {ticker}: {pos['shares']}股 @ 成本{pos['avg_cost']:.2f} (持有{days_held}天)")
+                        print(f"\n💰 执行每日投资模拟...")
+
+                        # 获取历史反思（用于决策参考）
+                        history_reflection = await simulation.get_recent_reflection(limit=2)
+
+                        # 获取当前资产
+                        assets = await simulation.calculate_assets()
+                        print(f"   当前资产: {assets['total_assets']:.2f}元 | 现金: {assets['cash']:.2f}元 | 持仓: {assets['positions_value']:.2f}元")
+
+                        # 当前持仓
+                        current_positions = assets.get('positions', {})
+                        current_tickers = set(current_positions.keys())
+
+                        # 如果有新提案，做出交易决策（纳入反思）
+                        if proposals:
+                            # 优先处理排名前3的提案
+                            for proposal in proposals[:3]:
+                                ticker = proposal.get('ticker')
+                                if not ticker:
+                                    continue
+
+                                # 检查冷却期
+                                if simulation.is_in_cooldown(ticker):
+                                    print(f"   ⏳ {ticker} 在冷却期内，跳过交易")
+                                    continue
+
+                                direction = proposal.get('direction', 'long')
+                                confidence = proposal.get('confidence', 0.5)
+                                target_position = proposal.get('target_position', 0.1)
+                                current_price = await market_data.get_current_price(ticker)
+                                if current_price is None:
+                                    print(f"   ⏭️ {ticker}: 无法获取真实价格，跳过交易")
+                                    continue
+
+                                # 决策考虑因素
+                                has_position = ticker in current_tickers
+                                trade_reason = ""
+
+                                # 结合反思判断
+                                if "卖出" in history_reflection and has_position:
+                                    # 反思建议卖出，降低买入意愿
+                                    trade_position = target_position * 0.3
+                                    trade_reason = f"反思建议谨慎，小幅建仓"
+                                elif has_position:
+                                    # 已有持仓，不重复买入
+                                    print(f"   ⏭️ {ticker} 已有持仓，跳过买入")
+                                    continue
+                                elif confidence < 0.4:
+                                    trade_position = target_position * 0.3
+                                    trade_reason = f"低置信度{confidence:.0%}，轻仓尝试"
+                                elif confidence < 0.6:
+                                    trade_position = target_position * 0.5
+                                    trade_reason = f"中等置信度{confidence:.0%}，半仓"
+                                else:
+                                    trade_position = target_position
+                                    trade_reason = f"高置信度{confidence:.0%}，按提案执行"
+
+                                result = await simulation.execute_trade(
+                                    ticker=ticker,
+                                    direction=direction,
+                                    target_position=trade_position,
+                                    current_price=current_price,
+                                    llm=llm,
+                                    reason=trade_reason
+                                )
+
+                                if result.get('success') == False:
+                                    print(f"   ⏭️ {ticker}: {result.get('reason', '交易失败')}")
+                                elif result.get('action') == 'buy':
+                                    print(f"   📈 买入 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
+                                elif result.get('action') == 'sell':
+                                    print(f"   📉 卖出 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
+                                elif result.get('action') == 'hold':
+                                    if result.get('reason'):
+                                        print(f"   ➖ 持有 {ticker}: {result['reason']}")
                         else:
-                            print(f"   💤 无新提案且空仓，保持观望")
+                            # 没有新提案，保持不动
+                            if current_positions:
+                                print(f"   💤 无新提案，保持当前持仓不动")
+                                for ticker, pos in current_positions.items():
+                                    days_held = 0
+                                    if ticker in simulation.last_trade_records:
+                                        try:
+                                            last_date = datetime.fromisoformat(simulation.last_trade_records[ticker])
+                                            days_held = (datetime.now() - last_date).days
+                                        except:
+                                            pass
+                                    print(f"      - {ticker}: {pos['shares']}股 @ 成本{pos['avg_cost']:.2f} (持有{days_held}天)")
+                            else:
+                                print(f"   💤 无新提案且空仓，保持观望")
 
                     # 更新最终资产状态
                     final_assets = await simulation.calculate_assets()

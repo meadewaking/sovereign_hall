@@ -193,6 +193,18 @@ class InvestmentSimulation:
         Returns:
             交易结果
         """
+        from .market_data import get_market_data
+
+        market_data = get_market_data()
+
+        if not await market_data.is_trading_day():
+            return {
+                'success': False,
+                'action': 'hold',
+                'ticker': ticker,
+                'reason': '当前非交易日，暂停模拟交易'
+            }
+
         # 检查冷却期
         if self.is_in_cooldown(ticker):
             return {
@@ -588,6 +600,14 @@ async def run_daily_simulation(llm: LLMClient, db_service, proposals: List[Dict]
     simulation = InvestmentSimulation(db_service)
     await simulation.initialize()
     await simulation.init_tables()
+    from .market_data import get_market_data
+
+    market_data = get_market_data()
+    if not await market_data.is_trading_day():
+        logger.info("Skip daily simulation: today is not a trading day")
+        reflection = await simulation.daily_reflection(llm)
+        await simulation.save_snapshot(reflection)
+        return await simulation.calculate_assets(), reflection
 
     # 计算当前资产
     assets = await simulation.calculate_assets()

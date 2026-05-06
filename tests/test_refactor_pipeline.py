@@ -115,8 +115,10 @@ async def test_validate_pending_waits_for_expected_window(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_simulation_refuses_trade_without_real_price():
+async def test_simulation_refuses_trade_without_real_price(monkeypatch):
     sim = InvestmentSimulation()
+    fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)})()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
     sim.get_current_price = AsyncMock(return_value=None)
 
     result = await sim.execute_trade(
@@ -128,6 +130,24 @@ async def test_simulation_refuses_trade_without_real_price():
 
     assert result["success"] is False
     assert "真实价格" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_simulation_blocks_on_non_trading_day(monkeypatch):
+    sim = InvestmentSimulation()
+    fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=False)})()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+    sim.get_current_price = AsyncMock(return_value=None)
+
+    result = await sim.execute_trade(
+        ticker="600519",
+        direction="long",
+        target_position=0.1,
+        current_price=None,
+    )
+
+    assert result["success"] is False
+    assert "非交易日" in result["reason"]
 
 
 @pytest.mark.asyncio

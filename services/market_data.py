@@ -8,7 +8,7 @@ simulation all share the same price source and never fall back to fake prices.
 import asyncio
 import logging
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import httpx
 
@@ -64,6 +64,46 @@ class MarketDataService:
     def _ensure_client(self):
         if self._client.is_closed:
             self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True)
+
+    async def is_trading_day(self, when: Optional[date | datetime] = None) -> bool:
+        """Return whether the exchange is open on the given date.
+
+        Falls back to weekday logic when the external trading calendar cannot be loaded.
+        """
+        target = when.date() if isinstance(when, datetime) else (when or datetime.now().date())
+        if not isinstance(target, date):
+            target = datetime.now().date()
+
+        if target.weekday() >= 5:
+            return False
+
+        trade_days = await self._load_trade_days()
+        if trade_days is None:
+            return True
+        return target in trade_days
+
+    async def _load_trade_days(self) -> Optional[Set[date]]:
+        global _trade_days_cache
+        if _trade_days_cache is not None:
+            return _trade_days_cache
+
+        try:
+            import akshare as ak
+
+            df = await asyncio.to_thread(ak.tool_trade_date_hist_sina)
+            days = set()
+            for value in df.get("trade_date", []):
+                if hasattr(value, "to_pydatetime"):
+                    value = value.to_pydatetime()
+                if isinstance(value, datetime):
+                    days.add(value.date())
+                else:
+                    days.add(datetime.strptime(str(value)[:10], "%Y-%m-%d").date())
+            _trade_days_cache = days
+            return _trade_days_cache
+        except Exception as exc:
+            logger.warning("Trading calendar unavailable, falling back to weekday check: %s", exc)
+            return None
 
     async def get_current_price(self, ticker: str) -> Optional[float]:
         """Return the latest quote, or None if no reliable quote is available."""
@@ -276,6 +316,7 @@ class MarketDataService:
 
 
 _market_data: Optional[MarketDataService] = None
+_trade_days_cache: Optional[Set[date]] = None
 
 
 def get_market_data() -> MarketDataService:
