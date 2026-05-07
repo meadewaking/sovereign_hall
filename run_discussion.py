@@ -877,13 +877,23 @@ async def main():
                 except Exception as e:
                     logger.warning(f"向量检索失败: {e}")
 
-                # 如果有足够数据，跳过搜索
-                if existing_docs and len(existing_docs) >= 10:
+                # 强制定期搜索新数据（每5轮或议题变化时）
+                # 避免一直用旧缓存导致空转
+                should_force_search = (
+                    not existing_docs or
+                    len(existing_docs) < 10 or
+                    iteration % 5 == 0  # 每5轮强制搜索一次
+                )
+
+                if should_force_search and not existing_docs:
+                    print(f"\n📚 阶段1：本地数据不足，进行搜索补充...")
+                    docs = await stage1_mass_search(llm, spiders, topic, query_count=6)
+                elif existing_docs and len(existing_docs) >= 10 and iteration % 5 != 0:
                     print(f"\n📚 阶段1：使用本地数据 ({len(existing_docs)} 条相关文档)")
                     docs = existing_docs
                 else:
-                    # 数据不足，执行搜索（减少搜索量以降低被封风险）
-                    print(f"\n📚 阶段1：本地数据不足，进行搜索补充...")
+                    # 每5轮强制搜索更新数据
+                    print(f"\n📚 阶段1：定期更新数据 (每5轮强制搜索)")
                     docs = await stage1_mass_search(llm, spiders, topic, query_count=6)
 
                 # 保存文档
