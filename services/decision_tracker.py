@@ -44,9 +44,35 @@ class DecisionRecord:
 class DecisionRecorder:
     """决策记录器 - 记录每次投票决策"""
 
+    MIN_EXPECTED_DAYS = 3
+    MAX_EXPECTED_DAYS = 180
+
     def __init__(self, db_path: str = None):
         from ..core import DATA_DIR
         self.db_path = db_path or str(DATA_DIR / "sovereign_hall.db")
+
+    @classmethod
+    def normalize_expected_days(cls, expected_days: int = None, context: str = "") -> int:
+        """归一化预测验证窗口，允许模型动态决定但限制在可验证范围内。"""
+        if expected_days is None:
+            text = context or ""
+            if any(word in text for word in ("半年", "6个月", "六个月", "中长期", "长线")):
+                expected_days = 120
+            elif any(word in text for word in ("季度", "三个月", "3个月", "中线")):
+                expected_days = 90
+            elif any(word in text for word in ("月内", "一个月", "1个月", "波段")):
+                expected_days = 30
+            elif any(word in text for word in ("短线", "催化", "事件驱动", "财报", "政策落地")):
+                expected_days = 14
+            else:
+                expected_days = 30
+
+        try:
+            expected_days = int(float(expected_days))
+        except (TypeError, ValueError):
+            expected_days = 30
+
+        return max(cls.MIN_EXPECTED_DAYS, min(cls.MAX_EXPECTED_DAYS, expected_days))
 
     async def _ensure_tables(self):
         """确保表结构存在"""
@@ -107,6 +133,7 @@ class DecisionRecorder:
             target_price=float(target_price or 0),
             stop_loss=float(stop_loss or 0),
         )
+        expected_days = self.normalize_expected_days(expected_days, discussion_context)
 
         record = DecisionRecord(
             ticker=ticker,
@@ -466,31 +493,20 @@ class DecisionRecorder:
     async def validate_pending(self, max_count: int = 50) -> Dict:
         """批量验证待验证的决策"""
         # 只验证已到预期窗口的 pending 记录，避免新预测被当天价格污染。
-        now = datetime.now()
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("""
                 SELECT id, predicted_at, expected_days FROM price_predictions
                 WHERE status = 'pending'
+                AND datetime(predicted_at, '+' || COALESCE(expected_days, 30) || ' days') <= datetime('now', 'localtime')
                 ORDER BY predicted_at ASC
                 LIMIT ?
-            """, (max_count * 5,)) as cursor:
+            """, (max_count,)) as cursor:
                 candidates = await cursor.fetchall()
 
-        all_ids = []
-        for row in candidates:
-            try:
-                predicted_at = datetime.fromisoformat(row['predicted_at'])
-                expected_days = int(row['expected_days'] or 30)
-                if predicted_at + timedelta(days=expected_days) <= now:
-                    all_ids.append(row['id'])
-                if len(all_ids) >= max_count:
-                    break
-            except Exception:
-                continue
-
         results = []
-        for record_id in all_ids:
+        for row in candidates:
+            record_id = row['id']
             result = await self.validate_single(record_id)
             results.append(result)
 

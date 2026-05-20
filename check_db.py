@@ -161,6 +161,21 @@ def show_stats(db_path):
             if prediction_rows:
                 for status, result, count in prediction_rows:
                     print(f"      - {status}/{result}: {count:,} 条")
+                c.execute("""
+                    SELECT COUNT(*)
+                    FROM price_predictions
+                    WHERE status = 'pending'
+                    AND datetime(predicted_at, '+' || COALESCE(expected_days, 30) || ' days') <= datetime('now', 'localtime')
+                """)
+                due_count = c.fetchone()[0]
+                c.execute("""
+                    SELECT MIN(datetime(predicted_at, '+' || COALESCE(expected_days, 30) || ' days'))
+                    FROM price_predictions
+                    WHERE status = 'pending'
+                """)
+                next_due = c.fetchone()[0]
+                print(f"      - 当前到期可验证: {due_count:,} 条")
+                print(f"      - 下一批到期时间: {next_due or 'N/A'}")
             else:
                 print("      - 暂无可信预测记录")
         except Exception as e:

@@ -170,3 +170,34 @@ async def test_prediction_tracker_waits_for_window(tmp_path):
 
 def test_backtest_singleton_returns_instance():
     assert get_backtest_engine() is not None
+
+
+def test_expected_days_are_normalized():
+    assert DecisionRecorder.normalize_expected_days(1) == 3
+    assert DecisionRecorder.normalize_expected_days(365) == 180
+    assert DecisionRecorder.normalize_expected_days(None, "短线事件驱动") == 14
+    assert DecisionRecorder.normalize_expected_days(None, "半年产业趋势") == 120
+
+
+@pytest.mark.asyncio
+async def test_decision_records_dynamic_expected_days(tmp_path):
+    db_path = tmp_path / "test.db"
+    recorder = DecisionRecorder(str(db_path))
+    decision_id = await recorder.record_decision(
+        ticker="600519",
+        decision="long",
+        confidence=0.7,
+        target_price=0.1,
+        stop_loss=0.05,
+        entry_price=10.0,
+        expected_days=7,
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT expected_days FROM price_predictions WHERE id = ?",
+        (decision_id,),
+    ).fetchone()
+    conn.close()
+
+    assert row == (7,)

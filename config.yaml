@@ -59,6 +59,7 @@ system:
   # Token预算护栏（每天1亿；设为 null 或 0 可关闭）
   daily_token_budget: 100000000
   daily_budget_pause_seconds: 3600
+  validation_batch_size: 100
 
   # 迭代控制
   iteration_interval: 3600  # 每轮间隔（秒）

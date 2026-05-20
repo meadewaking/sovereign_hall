@@ -127,6 +127,10 @@ class LearningEngine:
             return 0
 
         count = 0
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("PRAGMA table_info(playbook)") as cursor:
+                playbook_columns = {row[1] async for row in cursor}
+
         for row in rows:
             record = dict(row)
             ticker = record['ticker']
@@ -137,13 +141,45 @@ class LearningEngine:
 
             async with aiosqlite.connect(self.db_path) as db:
                 async with db.execute("SELECT id FROM playbook WHERE ticker = ?", (ticker,)) as cursor:
-                    existing = await cursor.fetchone()
+                    existing = await cursor.fetchone() if "id" in playbook_columns else None
+                if not existing and "entry_id" in playbook_columns:
+                    async with db.execute("SELECT entry_id FROM playbook WHERE ticker = ?", (ticker,)) as cursor:
+                        existing = await cursor.fetchone()
 
                 if not existing:
-                    await db.execute("""
-                        INSERT INTO playbook (ticker, situation, lesson, outcome, success, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (ticker, context[:100], lesson, result, 0 if result == 'wrong' else 0.5, datetime.now().isoformat()))
+                    if {"id", "ticker", "situation", "lesson", "outcome", "success", "created_at"}.issubset(playbook_columns):
+                        await db.execute("""
+                            INSERT INTO playbook (id, ticker, situation, lesson, outcome, success, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            f"lesson_{ticker}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                            ticker,
+                            context[:100],
+                            lesson,
+                            result,
+                            0 if result == 'wrong' else 0.5,
+                            datetime.now().isoformat(),
+                        ))
+                    elif {"entry_id", "category", "situation", "action_taken", "outcome", "lesson", "confidence_delta", "ticker", "refs", "created_at"}.issubset(playbook_columns):
+                        await db.execute("""
+                            INSERT INTO playbook
+                            (entry_id, category, situation, action_taken, outcome, lesson, confidence_delta, ticker, refs, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            f"lesson_{ticker}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                            "prediction_validation",
+                            context[:100],
+                            record.get("direction", ""),
+                            result,
+                            lesson,
+                            -0.1 if result == 'wrong' else -0.05,
+                            ticker,
+                            record.get("id", ""),
+                            datetime.now().isoformat(),
+                        ))
+                    else:
+                        logger.warning("playbook表结构不兼容，跳过教训写入")
+                        continue
                     await db.commit()
                     count += 1
 

@@ -223,6 +223,10 @@ class ResearchDiscussionSystem:
                 from .decision_tracker import DecisionRecorder
                 direction = "short" if any(word in conclusion for word in ["卖出", "做空", "看空"]) else "long"
                 recorder = DecisionRecorder()
+                expected_days = DecisionRecorder.normalize_expected_days(
+                    90 if "半年" in question else None,
+                    f"{question}\n{conclusion[:1000]}",
+                )
                 await recorder.record_decision(
                     ticker=ticker,
                     decision=direction,
@@ -230,7 +234,7 @@ class ResearchDiscussionSystem:
                     target_price=take_profit,
                     stop_loss=stop_loss,
                     discussion_context=conclusion[:1000],
-                    expected_days=90 if "半年" in question else 30,
+                    expected_days=expected_days,
                 )
                 print("   ✓ 可验证预测已记录")
             except Exception as e:

@@ -104,7 +104,8 @@ def generate_default_proposals(topic: str) -> List[Dict]:
                     'target_position': 0.1,
                     'stop_loss': 5.0,
                     'take_profit': 15.0,
-                    'holding_period': 30,
+                    'holding_period': infer_default_holding_period(topic),
+                    'holding_period_reason': '根据议题性质自动推断验证窗口',
                     'confidence': 0.5,
                     'thesis': p.get('thesis', topic),
                     'sector': p.get('sector', '未知'),
@@ -118,13 +119,30 @@ def generate_default_proposals(topic: str) -> List[Dict]:
             'target_position': 0.1,
             'stop_loss': 5.0,
             'take_profit': 15.0,
-            'holding_period': 30,
+            'holding_period': infer_default_holding_period(topic),
+            'holding_period_reason': '根据议题性质自动推断验证窗口',
             'confidence': 0.5,
             'thesis': topic,
             'sector': '综合',
         })
 
     return proposals
+
+
+def infer_default_holding_period(topic: str) -> int:
+    """根据议题给默认验证窗口，作为模型缺省值的后备。"""
+    return DecisionRecorder.normalize_expected_days(None, topic)
+
+
+def normalize_proposal_holding_period(proposal: Dict, topic: str) -> int:
+    context = " ".join(
+        str(proposal.get(key, ""))
+        for key in ("thesis", "sector", "holding_period_reason")
+    )
+    return DecisionRecorder.normalize_expected_days(
+        proposal.get("holding_period"),
+        f"{topic} {context}",
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +342,7 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
 # ============================================================================
 # 阶段2：深度研报生成
 # ============================================================================
-async def stage2_deep_research(llm, docs: list, topic: str, db_service=None) -> list:
+async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, lessons_prompt: str = "") -> list:
     """阶段2：从文档中提取投资提案"""
     if not docs:
         print("\n⚠️ 没有文档，跳过深度研究")
@@ -388,6 +406,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None) -> 
 
 研究议题：{topic}
 {blacklist_prompt}
+{lessons_prompt}
 
 资料：
 {content_text[:8000]}
@@ -400,6 +419,8 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None) -> 
         "target_position": 0.1,
         "stop_loss": 5.0,
         "take_profit": 15.0,
+        "holding_period": 30,
+        "holding_period_reason": "验证窗口选择理由，例如短线催化14天、财报/政策落地30天、产业趋势90-180天",
         "confidence": 0.7,
         "thesis": "一句话核心逻辑",
         "sector": "行业分类"
@@ -409,6 +430,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None) -> 
 如果无法确定具体标的，使用：159995(科技)、159928(消费)、159915(医药)、159990(周期)、512880(半导体)
 
 重要：必须排除黑名单中的标的！
+重要：holding_period 必须根据投资逻辑动态决定，范围3-180天，不要一律填30。
 """
 
     try:
@@ -439,21 +461,23 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None) -> 
                 if blacklist and ticker in blacklist:
                     logger.warning(f"Filtered blacklisted ticker: {ticker}")
                     continue
-                cleaned.append({
+                cleaned_proposal = {
                     'ticker': ticker,
                     'direction': p.get('direction', 'long'),
                     'target_position': float(p.get('target_position', 0.1)),
                     'stop_loss': float(p.get('stop_loss', 5.0)),
                     'take_profit': float(p.get('take_profit', 15.0)),
-                    'holding_period': int(p.get('holding_period', 30)),
                     'confidence': float(p.get('confidence', 0.6)),
                     'thesis': p.get('thesis', '')[:100],
                     'sector': p.get('sector', '未知'),
-                })
+                    'holding_period_reason': p.get('holding_period_reason', '')[:200],
+                }
+                cleaned_proposal['holding_period'] = normalize_proposal_holding_period(cleaned_proposal | {'holding_period': p.get('holding_period')}, topic)
+                cleaned.append(cleaned_proposal)
 
         print(f"\n   ✅ 生成 {len(cleaned)} 个提案（过滤黑名单后）")
         for p in cleaned:
-            print(f"      {p['ticker']} | {p['direction']} | 置信度: {p['confidence']:.0%} | {p['thesis'][:30]}")
+            print(f"      {p['ticker']} | {p['direction']} | {p['holding_period']}天 | 置信度: {p['confidence']:.0%} | {p['thesis'][:30]}")
 
         # 如果没有生成有效提案，使用基于议题的默认提案
         if not cleaned:
@@ -475,7 +499,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None) -> 
 # ============================================================================
 # 阶段3：投委会审议（多轮辩论）
 # ============================================================================
-async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str):
+async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lessons_prompt: str = ""):
     """阶段3：投委会审议"""
     if not proposals:
         logger.warning("阶段3：无提案，跳过审议")
@@ -505,6 +529,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str):
         ticker = proposal.get('ticker', '')
         thesis = proposal.get('thesis', '')
         sector = proposal.get('sector', '')
+        learned_context = f"\n\n{lessons_prompt}" if lessons_prompt else ""
 
         print(f"\n### 提案 {i+1}: {ticker} ({proposal.get('direction')}) | 置信度: {proposal.get('confidence', 0):.0%}")
 
@@ -514,20 +539,20 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str):
         print("   📝 第一轮：14路并发分析...")
 
         round1_tasks = [
-            (agents[AgentRole.RISK_OFFICER], "风控-财务风险", f"作为风控官，分析{ticker}的财务造假风险。核心观点：{thesis}。请找出潜在风险。", [f"{ticker} 财务", f"{ticker} 风险"]),
-            (agents[AgentRole.RISK_OFFICER], "风控-最坏情况", f"作为风控官，分析{ticker}最坏情况可能跌多少。", [f"{ticker} 历史跌幅"]),
-            (agents[AgentRole.QUANT_RESEARCHER], "量化-技术面", f"作为量化分析师，分析{ticker}的技术走势。", [f"{ticker} K线", f"{ticker} 技术分析"]),
-            (agents[AgentRole.QUANT_RESEARCHER], "量化-估值", f"作为量化分析师，分析{ticker}的估值水平PE/PB。", [f"{ticker} 估值", f"{ticker} PE"]),
-            (agents[AgentRole.MACRO_STRATEGIST], "宏观-政策风险", f"作为宏观策略师，分析{ticker}面临的政策风险。", [f"{ticker} 政策", f"{sector} 政策"]),
-            (agents[AgentRole.MACRO_STRATEGIST], "宏观-时机", f"作为宏观策略师，分析当前是否是买入{ticker}的时机。", ["A股 买入时机", "2025 投资"]),
-            (agents[AgentRole.TMT_ANALYST], "TMT-行业", f"作为TMT分析师，从行业角度点评{ticker}。", [f"{sector} 行业", f"{ticker} 动态"]),
-            (agents[AgentRole.CONSUMER_ANALYST], "消费-行业", f"作为消费分析师，从行业角度点评{ticker}。", [f"{sector} 消费", f"{ticker} 消费"]),
-            (agents[AgentRole.CYCLE_ANALYST], "周期-行业", f"作为周期分析师，从行业周期角度点评{ticker}。", [f"{sector} 周期"]),
-            (agents[AgentRole.CIO], "CIO-综合", f"作为CIO，综合分析{ticker}的投资价值。", [f"{ticker} 机构观点", f"{ticker} 评级"]),
-            (agents[AgentRole.TMT_ANALYST], "TMT-机会", f"作为TMT分析师，分析{ticker}的增长机会。", [f"{ticker} 增长", f"{ticker} 前景"]),
-            (agents[AgentRole.CONSUMER_ANALYST], "消费-机会", f"作为消费分析师，分析{ticker}的增长机会。", [f"{ticker} 业绩", f"{ticker} 增长"]),
-            (agents[AgentRole.CYCLE_ANALYST], "周期-机会", f"作为周期分析师，分析{ticker}的周期位置。", [f"{sector} 供需"]),
-            (agents[AgentRole.QUANT_RESEARCHER], "量化-资金", f"作为量化分析师，分析{ticker}的资金流向。", [f"{ticker} 主力资金"]),
+            (agents[AgentRole.RISK_OFFICER], "风控-财务风险", f"作为风控官，分析{ticker}的财务造假风险。核心观点：{thesis}。请找出潜在风险。{learned_context}", [f"{ticker} 财务", f"{ticker} 风险"]),
+            (agents[AgentRole.RISK_OFFICER], "风控-最坏情况", f"作为风控官，分析{ticker}最坏情况可能跌多少。{learned_context}", [f"{ticker} 历史跌幅"]),
+            (agents[AgentRole.QUANT_RESEARCHER], "量化-技术面", f"作为量化分析师，分析{ticker}的技术走势。{learned_context}", [f"{ticker} K线", f"{ticker} 技术分析"]),
+            (agents[AgentRole.QUANT_RESEARCHER], "量化-估值", f"作为量化分析师，分析{ticker}的估值水平PE/PB。{learned_context}", [f"{ticker} 估值", f"{ticker} PE"]),
+            (agents[AgentRole.MACRO_STRATEGIST], "宏观-政策风险", f"作为宏观策略师，分析{ticker}面临的政策风险。{learned_context}", [f"{ticker} 政策", f"{sector} 政策"]),
+            (agents[AgentRole.MACRO_STRATEGIST], "宏观-时机", f"作为宏观策略师，分析当前是否是买入{ticker}的时机。{learned_context}", ["A股 买入时机", "2025 投资"]),
+            (agents[AgentRole.TMT_ANALYST], "TMT-行业", f"作为TMT分析师，从行业角度点评{ticker}。{learned_context}", [f"{sector} 行业", f"{ticker} 动态"]),
+            (agents[AgentRole.CONSUMER_ANALYST], "消费-行业", f"作为消费分析师，从行业角度点评{ticker}。{learned_context}", [f"{sector} 消费", f"{ticker} 消费"]),
+            (agents[AgentRole.CYCLE_ANALYST], "周期-行业", f"作为周期分析师，从行业周期角度点评{ticker}。{learned_context}", [f"{sector} 周期"]),
+            (agents[AgentRole.CIO], "CIO-综合", f"作为CIO，综合分析{ticker}的投资价值。{learned_context}", [f"{ticker} 机构观点", f"{ticker} 评级"]),
+            (agents[AgentRole.TMT_ANALYST], "TMT-机会", f"作为TMT分析师，分析{ticker}的增长机会。{learned_context}", [f"{ticker} 增长", f"{ticker} 前景"]),
+            (agents[AgentRole.CONSUMER_ANALYST], "消费-机会", f"作为消费分析师，分析{ticker}的增长机会。{learned_context}", [f"{ticker} 业绩", f"{ticker} 增长"]),
+            (agents[AgentRole.CYCLE_ANALYST], "周期-机会", f"作为周期分析师，分析{ticker}的周期位置。{learned_context}", [f"{sector} 供需"]),
+            (agents[AgentRole.QUANT_RESEARCHER], "量化-资金", f"作为量化分析师，分析{ticker}的资金流向。{learned_context}", [f"{ticker} 主力资金"]),
         ]
 
         try:
@@ -608,13 +633,13 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str):
             ]
 
             vote_prompts = [
-                f"基于以下所有讨论，对{ticker}给出最终投票：\n{full_context[:1000]}\n\n输出格式：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX% | 止损: XX%",
-                f"从TMT行业角度，对{ticker}投票：\n{full_context[:800]}\n\n【投票】",
-                f"从消费行业角度，对{ticker}投票：\n{full_context[:800]}\n\n【投票】",
-                f"从周期行业角度，对{ticker}投票：\n{full_context[:800]}\n\n【投票】",
-                f"从宏观角度，对{ticker}投票：\n{full_context[:800]}\n\n【投票】",
-                f"从风控角度，对{ticker}投票：\n{full_context[:800]}\n\n【投票】",
-                f"从量化角度，对{ticker}投票：\n{full_context[:800]}\n\n【投票】",
+                f"基于以下所有讨论，对{ticker}给出最终投票：\n{full_context[:1000]}{learned_context}\n\n输出格式：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX% | 止损: XX%",
+                f"从TMT行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
+                f"从消费行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
+                f"从周期行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
+                f"从宏观角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
+                f"从风控角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
+                f"从量化角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
             ]
 
             # 第三轮投票 - 增加错误处理和日志
@@ -639,6 +664,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str):
                 all_discussions.append(f"\n[{name}]\n{result[:300]}")
 
             # 记录最终决策
+            expected_days = normalize_proposal_holding_period(proposal, topic)
             final_decisions.append({
                 'ticker': ticker,
                 'direction': proposal.get('direction'),
@@ -647,6 +673,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str):
                 'cio_vote': round3_results[0][:200],
                 'target_price': proposal.get('take_profit', 15.0),
                 'stop_loss': proposal.get('stop_loss', 5.0),
+                'expected_days': expected_days,
             })
 
             # 记录到决策追踪器
@@ -658,10 +685,10 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str):
                     confidence=proposal.get('confidence', 0.5),
                     target_price=float(proposal.get('take_profit', 15.0)),
                     stop_loss=float(proposal.get('stop_loss', 5.0)),
-                    discussion_context=thesis[:500],
-                    expected_days=30,
+                    discussion_context=f"{thesis[:500]}\n验证窗口: {expected_days}天。{proposal.get('holding_period_reason', '')[:200]}",
+                    expected_days=expected_days,
                 )
-                print(f"      📊 决策已记录")
+                print(f"      📊 决策已记录，{expected_days}天后验证")
             except Exception as e:
                 logger.warning(f"记录决策失败: {e}")
 
@@ -845,6 +872,7 @@ async def main():
         budget=system_config.get("daily_token_budget"),
     )
     daily_budget_pause = int(system_config.get("daily_budget_pause_seconds", 3600) or 3600)
+    validation_batch_size = int(system_config.get("validation_batch_size", 100) or 100)
 
     llm = LLMClient(
         max_concurrent=16,  # 高并发
@@ -932,9 +960,9 @@ async def main():
                 if lessons_prompt:
                     print(f"📜 加载了 {lessons_prompt.count('教训') - 1} 条历史教训")
 
-                # 验证待验证决策（每轮最多验证10条）
+                # 验证待验证决策
                 recorder = DecisionRecorder()
-                validation_result = await recorder.validate_pending(max_count=10)
+                validation_result = await recorder.validate_pending(max_count=validation_batch_size)
                 if validation_result.get('validated', 0) > 0:
                     print(f"🔄 本轮验证了 {validation_result['validated']} 条决策")
 
@@ -992,7 +1020,7 @@ async def main():
                     print(f"   ✅ 文档已保存 (DB: {saved_docs}, VectorDB自动跳过重复文档)")
 
                 # 阶段2：深度研报 → 提案
-                proposals = await stage2_deep_research(llm, docs, topic, db_service)
+                proposals = await stage2_deep_research(llm, docs, topic, db_service, lessons_prompt=lessons_prompt)
                 for proposal in proposals:
                     try:
                         await db_service.add_proposal(proposal)
@@ -1120,7 +1148,7 @@ async def main():
                 # 阶段3：投委会讨论
                 logger.info(f"开始阶段3投委会审议，提案数: {len(proposals)}")
                 try:
-                    discussions, decisions = await stage3_ic_discussion(llm, spiders, proposals, topic)
+                    discussions, decisions = await stage3_ic_discussion(llm, spiders, proposals, topic, lessons_prompt=lessons_prompt)
                     logger.info(f"阶段3完成，讨论长度: {len(discussions)}, 决策数: {len(decisions)}")
                 except Exception as e:
                     logger.error(f"阶段3失败: {e}", exc_info=True)
