@@ -52,7 +52,7 @@ async def main():
     print("输入 'quit' 退出")
     print("="*60 + "\n")
 
-    default_question = "从现在出发，找出目前a股中一支适合持有三个月到半年的股票，并预估他的止盈止损价格"
+    default_question = "我最近看好存储行业，特别是ai方面的，选几个A股值得投资的股票"
 
     while True:
         question = input("❓ 问题: ").strip()

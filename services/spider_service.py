@@ -150,11 +150,13 @@ class SpiderSwarm:
 
     def _init_client(self):
         """初始化HTTP客户端（走代理）"""
+        spider_config = get_config().get_spider_config()
+        proxy = spider_config.get("proxy")
         self.client = httpx.AsyncClient(
             timeout=self.timeout,
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=100),
             follow_redirects=True,
-            proxy="http://127.0.0.1:7890"
+            proxy=proxy
         )
 
     async def close(self):
@@ -899,10 +901,10 @@ class SpiderSwarm:
                 logger.warning(f"Timeout fetching {url}")
                 return None
             except httpx.HTTPStatusError as e:
-                logger.warning(f"HTTP error {e.response.status_code} for {url}")
+                logger.debug(f"HTTP error {e.response.status_code} for {url}")
                 return None
             except Exception as e:
-                logger.error(f"Failed to fetch {url}: {e}")
+                logger.debug(f"Failed to fetch {url}: {e}")
                 return None
 
     async def parallel_fetch(

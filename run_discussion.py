@@ -41,6 +41,7 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger("sovereign_hall")
 from sovereign_hall.services.database import DatabaseService
@@ -179,6 +180,65 @@ TOPIC_POOL = [
 
 # 已完成议题记录文件
 COMPLETED_TOPICS_FILE = project_root / "data" / "completed_topics.json"
+TOKEN_BUDGET_FILE = project_root / "data" / "token_budget.json"
+
+
+class DailyTokenBudget:
+    """按自然日限制 token 使用，防止异常循环无人值守失控。"""
+
+    def __init__(self, path: Path, budget: int = None):
+        self.path = path
+        self.budget = int(budget or 0)
+        self.today = datetime.now().strftime("%Y-%m-%d")
+        self.baseline_tokens = 0
+        self._load()
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if data.get("date") == self.today:
+                self.baseline_tokens = int(data.get("baseline_tokens", 0))
+        except Exception as exc:
+            logger.debug(f"加载Token预算状态失败: {exc}")
+
+    def sync(self, total_tokens: int):
+        if not self.budget:
+            return
+        current_day = datetime.now().strftime("%Y-%m-%d")
+        if current_day != self.today:
+            self.today = current_day
+            self.baseline_tokens = total_tokens
+            self._save(total_tokens)
+            return
+        if self.baseline_tokens <= 0:
+            self.baseline_tokens = total_tokens
+            self._save(total_tokens)
+
+    def _save(self, total_tokens: int):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "date": self.today,
+                "baseline_tokens": self.baseline_tokens,
+                "last_total_tokens": total_tokens,
+                "updated_at": datetime.now().isoformat(),
+            }
+            self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.debug(f"保存Token预算状态失败: {exc}")
+
+    def used_today(self, total_tokens: int) -> int:
+        if not self.budget:
+            return 0
+        self.sync(total_tokens)
+        used = max(0, total_tokens - self.baseline_tokens)
+        self._save(total_tokens)
+        return used
+
+    def exceeded(self, total_tokens: int) -> bool:
+        return bool(self.budget and self.used_today(total_tokens) >= self.budget)
 
 
 def load_completed_topics() -> set:
@@ -766,7 +826,10 @@ async def main():
     config = get_config()
     vector_config = config.get('vector_db', {})
     vector_dim = vector_config.get('dimension', 1024)
-    vector_db = VectorDatabase(dimension=vector_dim)
+    vector_db = VectorDatabase(
+        dimension=vector_dim,
+        max_documents=vector_config.get("max_documents"),
+    )
     await vector_db.initialize()
     print(f"   ✅ Vector DB 已初始化 (当前: {len(vector_db.documents)} 条)")
 
@@ -776,6 +839,12 @@ async def main():
 
     config = get_config()
     llm_config = config.get_llm_config()
+    system_config = config.get("system", {})
+    daily_budget = DailyTokenBudget(
+        TOKEN_BUDGET_FILE,
+        budget=system_config.get("daily_token_budget"),
+    )
+    daily_budget_pause = int(system_config.get("daily_budget_pause_seconds", 3600) or 3600)
 
     llm = LLMClient(
         max_concurrent=16,  # 高并发
@@ -827,6 +896,15 @@ async def main():
             if args.max_rounds and (iteration - (prev_stats.get('total_rounds', 0) if prev_stats else 0)) >= args.max_rounds:
                 print(f"\n✅ 已达到 --max-rounds={args.max_rounds}，退出")
                 break
+
+            current_tokens = llm.get_stats().get("total_tokens", 0)
+            if daily_budget.exceeded(current_tokens):
+                used = daily_budget.used_today(current_tokens)
+                logger.warning(
+                    f"今日Token预算已用尽: {used:,}/{daily_budget.budget:,}，暂停{daily_budget_pause}秒"
+                )
+                await asyncio.sleep(daily_budget_pause)
+                continue
 
             iteration += 1
             round_start = datetime.now()
@@ -899,17 +977,19 @@ async def main():
                 # 保存文档
                 if docs:
                     print(f"\n💾 保存 {len(docs)} 篇文档...")
+                    saved_docs = 0
                     # 先保存到数据库
                     for doc in docs:
                         try:
                             await db_service.add_document(doc)
+                            saved_docs += 1
                         except Exception as e:
                             logger.warning(f"保存文档失败: {e}")
 
                     # 批量添加到 VectorDB（带 embedding）
                     await vector_db.add_documents_batch(docs, llm_client=llm)
 
-                    print(f"   ✅ 文档已保存 (DB + VectorDB)")
+                    print(f"   ✅ 文档已保存 (DB: {saved_docs}, VectorDB自动跳过重复文档)")
 
                 # 阶段2：深度研报 → 提案
                 proposals = await stage2_deep_research(llm, docs, topic, db_service)
@@ -1105,6 +1185,9 @@ async def main():
             print(f"🚀  峰值Token速率: {llm_stats.get('peak_token_rate', '0/s')}")
             print(f"📊  平均Token速率: {llm_stats.get('avg_token_rate', '0/s')}")
             print(f"💰  累计成本: {llm_stats.get('total_cost_usd', '$0')}")
+            if daily_budget.budget:
+                used_today = daily_budget.used_today(llm_stats.get('total_tokens', 0))
+                print(f"🧯 今日Token预算: {used_today:,}/{daily_budget.budget:,}")
 
             # 根据是否有结果决定休息时间
             if args.once:
@@ -1135,6 +1218,8 @@ async def main():
     finally:
         await spiders.close()
         await market_data.close()
+        await vector_db.close()
+        await db_service.close()
         print("🔒 资源已释放")
 
 

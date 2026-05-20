@@ -53,6 +53,20 @@ class DatabaseService:
                 tables.add(row[0])
         return tables
 
+    async def _get_table_columns(self, conn, table: str) -> set:
+        """获取表字段列表，用于轻量级迁移。"""
+        columns = set()
+        async with conn.execute(f"PRAGMA table_info({table})") as cursor:
+            async for row in cursor:
+                columns.add(row[1])
+        return columns
+
+    async def _add_column_if_missing(self, conn, table: str, column: str, definition: str):
+        columns = await self._get_table_columns(conn, table)
+        if column not in columns:
+            await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            logger.info("Migrated %s: added column %s", table, column)
+
     async def _init_db(self):
         """初始化数据库表"""
         conn = await self._get_connection()
@@ -78,11 +92,7 @@ class DatabaseService:
                 )
             """)
 
-        # 添加缺失字段的迁移
-        try:
-            await conn.execute("ALTER TABLE documents ADD COLUMN crawled_at TEXT")
-        except:
-            pass  # 字段已存在
+        await self._add_column_if_missing(conn, "documents", "crawled_at", "TEXT")
 
         # 创建索引
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_sector ON documents(sector)")
@@ -108,11 +118,9 @@ class DatabaseService:
                 )
             """)
         else:
-            # 添加缺失的字段
-            try:
-                await conn.execute("ALTER TABLE proposals ADD COLUMN status TEXT DEFAULT 'pending'")
-            except:
-                pass
+            await self._add_column_if_missing(conn, "proposals", "analyst_role", "TEXT")
+            await self._add_column_if_missing(conn, "proposals", "sector", "TEXT")
+            await self._add_column_if_missing(conn, "proposals", "status", "TEXT DEFAULT 'pending'")
 
         # meetings 表
         if 'meetings' not in existing_tables:

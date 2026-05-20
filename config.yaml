@@ -25,6 +25,7 @@ spider:
   max_concurrent: 2  # 进一步降低并发，防止被封
   timeout: 30
   user_agent: "SovereignHall/1.0 (Research Bot)"
+  proxy: "http://127.0.0.1:7890"
   retry_times: 3
   retry_delay: 2
   respect_robots_txt: true
@@ -54,6 +55,10 @@ database:
 # 系统运行配置
 system:
   mode: "research"  # research/production
+
+  # Token预算护栏（每天1亿；设为 null 或 0 可关闭）
+  daily_token_budget: 100000000
+  daily_budget_pause_seconds: 3600
 
   # 迭代控制
   iteration_interval: 3600  # 每轮间隔（秒）

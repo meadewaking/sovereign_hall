@@ -200,8 +200,7 @@ class ResearchDiscussionSystem:
         take_profit_match = re.search(r'止盈[：:]\s*(\d+(?:\.\d+)?%?)', conclusion)
         confidence_match = re.search(r'置信度[：:]\s*(\d+(?:\.\d+)?%?)', conclusion)
 
-        ticker = ticker_match.group(1) if ticker_match else ""
-        ticker = ticker.split()[0].strip().upper()
+        ticker = ticker_match.group(1).strip().upper() if ticker_match else ""
         position = float(re.sub(r'%', '', position_match.group(1))) / 100 if position_match else 0
         stop_loss = float(re.sub(r'%', '', stop_loss_match.group(1))) / 100 if stop_loss_match else 0
         take_profit = float(re.sub(r'%', '', take_profit_match.group(1))) / 100 if take_profit_match else 0

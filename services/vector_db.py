@@ -88,6 +88,22 @@ class VectorDatabase:
             await self._init_tables()
         return self._db
 
+    async def has_document(self, doc_id: str = None, url: str = None) -> bool:
+        """检查文档是否已经存在，避免重复生成 embedding。"""
+        if doc_id and doc_id in self.documents:
+            return True
+
+        db = await self._get_db()
+        if doc_id:
+            async with db.execute("SELECT 1 FROM documents WHERE id = ? LIMIT 1", (doc_id,)) as cursor:
+                if await cursor.fetchone():
+                    return True
+        if url:
+            async with db.execute("SELECT 1 FROM documents WHERE url = ? LIMIT 1", (url,)) as cursor:
+                if await cursor.fetchone():
+                    return True
+        return False
+
     async def _init_tables(self):
         """初始化表结构"""
         db = self._db
@@ -162,11 +178,15 @@ class VectorDatabase:
         elapsed = (datetime.now() - self._last_persist_time).total_seconds()
         return elapsed >= self._persist_interval
 
-    def _evict_oldest(self):
+    async def _evict_oldest(self):
         """LRU淘汰最旧的文档"""
         if len(self.documents) >= self.max_documents and self._id_list:
             oldest_id = self._id_list[0]
             self._remove_doc(oldest_id)
+            db = await self._get_db()
+            await db.execute("DELETE FROM documents WHERE id = ?", (oldest_id,))
+            await db.execute("DELETE FROM lru_order WHERE doc_id = ?", (oldest_id,))
+            await db.commit()
             logger.info(f"LRU evicted: {oldest_id}, remaining: {len(self.documents)}")
 
     def _remove_doc(self, doc_id: str):
@@ -186,7 +206,7 @@ class VectorDatabase:
         """添加文档"""
         # LRU淘汰
         if len(self.documents) >= self.max_documents:
-            self._evict_oldest()
+            await self._evict_oldest()
 
         # 生成embedding
         if llm_client and embedding is None:
@@ -258,13 +278,17 @@ class VectorDatabase:
             return
 
         logger.info(f"Adding {len(docs)} documents in batch")
+        skipped = 0
 
         for doc in docs:
             if isinstance(doc, dict):
                 doc = Doc.from_dict(doc)
+            if await self.has_document(doc_id=doc.id, url=doc.url):
+                skipped += 1
+                continue
             await self.add_document(doc, llm_client=llm_client)
 
-        logger.info(f"Batch add complete: {len(self.documents)} total docs")
+        logger.info(f"Batch add complete: {len(self.documents)} total docs, skipped={skipped}")
 
     async def search(
         self,
