@@ -1056,12 +1056,20 @@ async def main():
                         current_tickers = set(current_positions.keys())
 
                         # 如果有新提案，做出交易决策（纳入反思）
+                        # 每日最多交易5次
+                        max_daily_trades = 5
+                        trade_count = 0
                         if proposals:
-                            # 优先处理排名前3的提案
-                            for proposal in proposals[:3]:
+                            # 优先处理排名前5的提案
+                            for proposal in proposals[:5]:
                                 ticker = proposal.get('ticker')
                                 if not ticker:
                                     continue
+
+                                # 检查每日交易次数限制
+                                if trade_count >= max_daily_trades:
+                                    print(f"   ⏹️ 今日已达最大交易次数 ({max_daily_trades}次)，停止交易")
+                                    break
 
                                 # 检查冷却期
                                 if simulation.is_in_cooldown(ticker):
@@ -1112,8 +1120,10 @@ async def main():
                                     print(f"   ⏭️ {ticker}: {result.get('reason', '交易失败')}")
                                 elif result.get('action') == 'buy':
                                     print(f"   📈 买入 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
+                                    trade_count += 1
                                 elif result.get('action') == 'sell':
                                     print(f"   📉 卖出 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
+                                    trade_count += 1
                                 elif result.get('action') == 'hold':
                                     if result.get('reason'):
                                         print(f"   ➖ 持有 {ticker}: {result['reason']}")

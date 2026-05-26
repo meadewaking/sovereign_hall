@@ -22,6 +22,23 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.2f} TB"
 
 
+def get_realtime_prices(tickers: list) -> dict:
+    """获取实时价格"""
+    import asyncio
+    from sovereign_hall.services.market_data import get_market_data
+
+    async def fetch():
+        md = get_market_data()
+        prices = {}
+        for ticker in tickers:
+            price = await md.get_current_price(ticker)
+            if price:
+                prices[ticker] = price
+        return prices
+
+    return asyncio.run(fetch())
+
+
 def show_investment_status(db_path):
     """显示投资模拟状态"""
     conn = sqlite3.connect(str(db_path))
@@ -71,14 +88,23 @@ def show_investment_status(db_path):
 
     conn.close()
 
-    # 计算当前资产（简化版，需要真实价格）
+    # 获取实时价格
+    tickers = [pos[0] for pos in positions]
+    realtime_prices = get_realtime_prices(tickers) if tickers else {}
+
+    # 计算当前资产（使用实时价格）
     total_value = cash
     position_details = []
     for pos in positions:
-        # 简化：使用成本价估算
-        position_value = pos[1] * pos[2]
+        ticker = pos[0]
+        shares = pos[1]
+        cost = pos[2]
+        current_price = realtime_prices.get(ticker, cost)  # 优先用实时价，没有则用成本价
+        position_value = shares * current_price
         total_value += position_value
-        position_details.append(f"  {pos[0]}: {pos[1]}股 @ {pos[2]:.2f}")
+        change = (current_price - cost) / cost * 100 if cost > 0 else 0
+        sign = '+' if change >= 0 else ''
+        position_details.append(f"  {ticker}: {shares}股 @ 现价{current_price:.3f} 成本{cost:.3f} ({sign}{change:.1f}%)")
 
     profit = total_value - initial_capital
     profit_pct = (profit / initial_capital) * 100

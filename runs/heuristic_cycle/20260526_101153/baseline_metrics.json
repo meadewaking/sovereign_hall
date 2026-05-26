@@ -1,0 +1,16 @@
+{
+  "sample_start": "2026-04-28",
+  "sample_end": "2026-05-26",
+  "days": 28,
+  "total_return": 0.04596997974373829,
+  "annualized_return": 0.498556013207452,
+  "max_drawdown": -0.024318961763845848,
+  "sharpe": 4.171636807880121,
+  "sortino": 7.0551260076302045,
+  "win_rate": 0.5490196078431373,
+  "turnover": 15.504888442268735,
+  "trade_count": 51,
+  "cost_paid": 0.019838048989335534,
+  "cost_assumption": "fee=0.0300%, stamp_duty=0.1000%, slippage=0.0500%, applied on turnover",
+  "score": -0.98393036089068
+}

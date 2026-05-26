@@ -1,0 +1,20 @@
+{
+  "strategy_agent_risk_backtest_files": [
+    "agents/agent.py",
+    "services/investment_committee.py",
+    "services/investment_simulation.py",
+    "services/backtest_engine.py",
+    "services/market_data.py",
+    "services/learning_engine.py",
+    "services/prediction_tracker.py"
+  ],
+  "historical_experiment_files_found": [
+    "data/sovereign_hall.db",
+    "data/logs/sovereign_hall.log",
+    "report_20260305_173824.md",
+    "report_20260323_152445.md",
+    "report_20260512_163737.md",
+    "report_20260512_165348.md"
+  ],
+  "note": "Previous best read from /Users/wangziming/PycharmProjects/PythonProject/sovereign_hall/runs/heuristic_cycle/20260526_100908/summary.csv"
+}
