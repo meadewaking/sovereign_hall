@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import os
+import pprint
 import sqlite3
 import sys
 import types
@@ -53,6 +54,8 @@ class PolicyConfig:
     use_anomaly_veto: bool = False
     drawdown_guard: float = 1.0
     drawdown_guard_threshold: float = 0.04
+    loss_streak_threshold: int = 0
+    loss_streak_guard: float = 1.0
     rebalance_threshold: float = 0.0
     min_signal_count: int = 1
     max_stop_gap: float = 0.55
@@ -163,6 +166,7 @@ def pick_targets(
     policy: PolicyConfig,
     current_positions: dict[str, float],
     current_drawdown: float,
+    consecutive_loss_days: int = 0,
 ) -> tuple[dict[str, float], list[str]]:
     if signal_rows.empty:
         return {}, ["no_signal_rows"]
@@ -194,6 +198,9 @@ def pick_targets(
     if current_drawdown <= -policy.drawdown_guard_threshold:
         gross *= policy.drawdown_guard
         reasons.append("drawdown_guard_scaled_gross")
+    if policy.loss_streak_threshold and consecutive_loss_days >= policy.loss_streak_threshold:
+        gross *= policy.loss_streak_guard
+        reasons.append("loss_streak_guard_scaled_gross")
 
     weights: dict[str, float] = {}
     raw_scores = candidates["signal_strength"].clip(lower=0.0)
@@ -318,12 +325,19 @@ def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
     trades: list[dict[str, Any]] = []
     total_turnover = 0.0
     total_cost = 0.0
+    consecutive_loss_days = 0
 
     for idx in range(1, len(dates)):
         signal_date = dates[idx - 1]
         date = dates[idx]
         current_dd = equity / peak - 1.0
-        targets, reasons = pick_targets(by_date[signal_date], policy, positions, current_dd)
+        targets, reasons = pick_targets(
+            by_date[signal_date],
+            policy,
+            positions,
+            current_dd,
+            consecutive_loss_days,
+        )
         turnover, rebalance_cost, _, trade_count = cost_for_rebalance(positions, targets, costs)
 
         prev_prices = prices_by_date[signal_date]
@@ -361,6 +375,7 @@ def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
 
         net_return = gross_return - rebalance_cost
         equity *= 1.0 + net_return
+        consecutive_loss_days = consecutive_loss_days + 1 if net_return < 0 else 0
         peak = max(peak, equity)
         total_turnover += turnover
         total_cost += rebalance_cost
@@ -483,6 +498,7 @@ def analyze_failures(result: dict[str, Any], daily: pd.DataFrame, policy: Policy
     if not losing.empty:
         groups = (losing.index.to_series().diff() != 1).cumsum()
         streak = max((group for _, group in losing.groupby(groups)), key=len)
+        has_loss_cooldown = policy.loss_streak_threshold > 0 and policy.loss_streak_guard < 1.0
         failures.append(
             {
                 "case_type": "consecutive_losses",
@@ -494,8 +510,16 @@ def analyze_failures(result: dict[str, Any], daily: pd.DataFrame, policy: Policy
                 "signals": {"policy": policy.name},
                 "positions": json.loads(streak.iloc[-1]["positions"]),
                 "result": "multiple negative portfolio days without a pause",
-                "suspected_reason": "daily policy has no explicit losing-streak cooldown",
-                "repair_direction": "test a cooldown that halves gross after two negative days",
+                "suspected_reason": (
+                    "losing-streak cooldown softened exposure but did not fully interrupt small sequential losses"
+                    if has_loss_cooldown
+                    else "daily policy has no explicit losing-streak cooldown"
+                ),
+                "repair_direction": (
+                    "test minimum holding periods or a one-day no-new-risk pause after repeated losses"
+                    if has_loss_cooldown
+                    else "test a cooldown that halves gross after two negative days"
+                ),
             }
         )
 
@@ -605,15 +629,17 @@ def split_checks(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
 
 
 def write_policy_snapshot(path: Path, policy: PolicyConfig, costs: CostConfig) -> None:
+    policy_literal = pprint.pformat(asdict(policy), sort_dicts=False, width=88)
+    costs_literal = pprint.pformat(asdict(costs), sort_dicts=False, width=88)
     body = f'''"""Best heuristic policy snapshot from the latest local cycle.
 
 This file is generated for reproducibility. It does not place orders and does
 not call market data services.
 """
 
-POLICY_CONFIG = {json.dumps(asdict(policy), ensure_ascii=False, indent=4)}
+POLICY_CONFIG = {policy_literal}
 
-COST_CONFIG = {json.dumps(asdict(costs), ensure_ascii=False, indent=4)}
+COST_CONFIG = {costs_literal}
 
 
 def score_candidate(row):
@@ -661,8 +687,8 @@ def write_readme(
 - Previous best comparison: {comparison}
 
 ## What Changed
-- Added a local-only delayed-signal heuristic evaluation loop for this cycle.
-- Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, and rebalance friction.
+- Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
+- Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, and rebalance friction.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
 
 ## Best Metrics
@@ -692,7 +718,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Add a losing-streak cooldown and compare it against the drawdown guard.
+- Test minimum holding periods by ticker to reduce churn without suppressing new high-conviction names.
 - Require independent confirmation from simulation trade outcomes once validated prices are available.
 - Build a small local leaderboard that separates ETF and single-stock universes before mixing them in one portfolio.
 """
@@ -791,6 +817,26 @@ def main() -> int:
             anomaly_return_threshold=0.14,
             drawdown_guard=0.50,
             drawdown_guard_threshold=0.025,
+            rebalance_threshold=0.02,
+        ),
+        PolicyConfig(
+            name="loss_streak_cooldown",
+            min_confidence=0.66,
+            max_names=5,
+            max_position=0.10,
+            max_gross=0.55,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            vol_lookback=3,
+            high_vol_threshold=0.05,
+            high_vol_scale=0.55,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.14,
+            drawdown_guard=0.50,
+            drawdown_guard_threshold=0.025,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.55,
             rebalance_threshold=0.02,
         ),
     ]
