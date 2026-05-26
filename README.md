@@ -1,190 +1,287 @@
-# 🏛️ Project Sovereign Hall - 君临殿
+# Sovereign Hall - 君临殿
 
-## 全自动化多智能体投资研究系统
+全自动化多智能体投资研究与策略学习系统。
 
-> 一个模拟完整买方投资机构的AI系统，通过对抗性多智能体辩论机制，生成高质量投资决策。
+Sovereign Hall 模拟一个买方投研机构：自动选择议题、检索资料、组织多角色投委会辩论、生成投资提案，并把提案转成可验证的价格预测和模拟交易。当前版本已经从“生成研究结论”扩展为“生成 -> 执行/记录 -> 验证 -> 回测 -> 学习”的闭环。
 
----
+> 本项目仅供研究学习使用，不构成任何投资建议。
 
-## 🎬 三个一键脚本
+## 当前状态
 
-| 脚本 | 功能 | 使用场景 |
-|-----|------|---------|
-| `check_db.py` | 查看数据库统计和投资状态 | 了解系统有多少数据、当前资产情况 |
-| `run_discussion.py` | 持续自动讨论+模拟投资 | 让AI自动研究，积累结论并执行模拟交易 |
-| `research_interactive.py` | 交互式研究 | 输入你的问题，AI给出投资建议 |
+- 主数据库：`data/sovereign_hall.db`
+- 当前数据库规模：约 1.2 万篇文档、6.3 万条研究结论、15.6 万条价格预测、1.8 万条投资提案
+- 最新启发式学习运行：`runs/heuristic_cycle/20260526_123405`
+- 最新离线最优策略：`loss_streak_cooldown`
+- 最新样本区间：2026-04-28 至 2026-05-26
+- 最新离线结果：总收益 1.35%，最大回撤 -1.34%，Sharpe 2.267，交易 30 笔
+- 注意：3 倍滑点压力测试下仍标记为 `overfit_risk=true`，策略产物应作为研究信号，不应直接当成实盘策略。
 
----
+## 快速开始
 
-## 🚀 快速开始
+建议先创建虚拟环境并安装依赖：
 
 ```bash
-cd sovereign_hall/
+cd /Users/wangziming/PycharmProjects/PythonProject/sovereign_hall
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-# 1. 查看当前数据库和投资状态
+常用入口可以直接在本目录运行：
+
+```bash
+# 查看数据库、预测、持仓和交易状态
+python check_db.py
+
+# 连续自动投研；Ctrl+C 停止
+python run_discussion.py
+
+# 只运行一轮自动投研
+python run_discussion.py --once
+
+# 交互式提问，生成多智能体研究报告
+python research_interactive.py
+
+# 离线启发式学习循环，读取本地 price_predictions 并生成 run artifacts
+python scripts/run_heuristic_cycle.py --db data/sovereign_hall.db
+```
+
+如果使用 `python -m sovereign_hall.xxx` 形式，需要从父目录运行：
+
+```bash
+cd /Users/wangziming/PycharmProjects/PythonProject
 python -m sovereign_hall.check_db
-
-# 2. 让AI自动研究，模拟投资（Ctrl+C停止）
-python -m sovereign_hall.run_discussion
-
-# 3. 输入你的问题，让AI给出投资建议
+python -m sovereign_hall.run_discussion --once
 python -m sovereign_hall.research_interactive
 ```
 
----
+## 核心工作流
 
-## 📁 项目结构
+### 1. 自动研究与投委会
 
+`run_discussion.py` 会从预设议题池中选择议题，生成初始投资提案，拉取研究材料，然后让多智能体团队进行讨论和投票。
+
+默认角色包括：
+
+| 角色 | 关注点 |
+| --- | --- |
+| TMT 分析师 | 科技、AI、半导体、云计算 |
+| 消费分析师 | 消费、医药、白酒、服务 |
+| 周期分析师 | 有色、化工、地产、制造 |
+| 宏观策略 | 利率、汇率、政策、市场风格 |
+| 风控官 | 下行风险、仓位约束、反方论证 |
+| 量化研究 | 数据、胜率、回测和信号质量 |
+| 投资总监 | 综合投票、定案和组合取舍 |
+
+### 2. 决策记录与价格预测
+
+投委会结论会被记录为结构化数据：
+
+- `proposals`：投资提案
+- `report_conclusions`：研究结论
+- `price_predictions`：可验证价格预测，包括入场价、目标价、止损、方向、置信度和验证窗口
+- `reflection_summary` / `playbook`：历史反思和机构经验
+
+当前代码会拒绝没有真实价格的数据进入关键预测和模拟交易环节，避免把不可验证的假价格写进闭环。
+
+### 3. 市场数据与验证
+
+`services/market_data.py` 统一处理 A 股和 ETF 行情：
+
+- 代码标准化和市场推断
+- 腾讯行情与东方财富行情
+- 东方财富日线 OHLC，AkShare 作为兜底
+- 交易日判断
+- 短 TTL 行情缓存
+
+`services/decision_tracker.py` 和 `services/prediction_tracker.py` 会按预测窗口验证结果，并写回命中目标、触发止损、过期、准确率等字段。
+
+### 4. 模拟投资
+
+`services/investment_simulation.py` 维护模拟账户：
+
+- 初始资金：10,000 元
+- 最小交易单位：100 股
+- 佣金：0.03%
+- 印花税：0.10%，卖出时收取
+- 非交易日不交易
+- 无真实价格时拒绝交易
+
+相关表：
+
+- `simulation_positions`
+- `simulation_trades`
+- `simulation_snapshots`
+- `system_stats`
+
+### 5. 离线启发式学习循环
+
+`scripts/run_heuristic_cycle.py` 是当前新增的重要离线评估入口。它只读取本地 SQLite 数据，不调用外部行情服务，也不下单。
+
+它会：
+
+1. 读取 `price_predictions`
+2. 构建按日聚合的信号带
+3. 测试多组可解释策略
+4. 计算收益、回撤、Sharpe、Sortino、胜率、换手和交易成本
+5. 输出失败案例、过拟合检查、最优策略快照和图表
+
+输出目录示例：
+
+```text
+runs/heuristic_cycle/20260526_123405/
+├── README.md
+├── summary.csv
+├── trials.jsonl
+├── baseline_metrics.json
+├── best_metrics.json
+├── overfit_checks.json
+├── failure_cases.jsonl
+├── daily_signal_tape.csv
+├── equity_curve_best.csv
+├── trades_best.csv
+├── policy_snapshot.py
+└── sample_efficiency.png
 ```
+
+`runs/heuristic_cycle/LATEST` 保存最新运行目录。
+
+## 项目结构
+
+```text
 sovereign_hall/
-├── README.md                      # 本文档
-├── check_db.py                    # 查看数据库统计和投资状态
-├── run_discussion.py              # 持续自动讨论+模拟投资
-├── research_interactive.py        # 交互式研究
-├── config.yaml                    # 配置文件
-├── requirements.txt               # 依赖
-│
+├── README.md
+├── config.yaml
+├── requirements.txt
+├── main.py
+├── check_db.py
+├── run_discussion.py
+├── research_interactive.py
+├── scripts/
+│   └── run_heuristic_cycle.py
+├── agents/
+│   └── agent.py
+├── core/
+│   ├── config.py
+│   ├── sovereign_hall.py
+│   ├── deep_debate.py
+│   ├── enhanced_discussion.py
+│   ├── prediction_validator.py
+│   └── price_anchor.py
+├── services/
+│   ├── database.py
+│   ├── llm_client.py
+│   ├── spider_service.py
+│   ├── market_data.py
+│   ├── decision_tracker.py
+│   ├── prediction_tracker.py
+│   ├── prediction_enhancer.py
+│   ├── backtest_engine.py
+│   ├── investment_committee.py
+│   ├── investment_simulation.py
+│   ├── learning_engine.py
+│   ├── vector_db.py
+│   ├── db_viewer.py
+│   └── db_inspector.py
+├── tests/
+│   └── test_refactor_pipeline.py
 ├── data/
-│   ├── sovereign_hall.db          # SQLite数据库（异步）
-│   ├── logs/                      # 日志目录（自动轮转）
-│   ├── vector_db/                 # 向量数据库（LRU缓存）
-│   └── reports/                   # 报告输出
-│
-├── core/                          # 核心模块
-├── agents/                        # 7种智能体人格
-├── services/                      # 核心服务
-│   ├── llm_client.py              # LLM客户端（支持embedding）
-│   ├── spider_service.py          # 爬虫服务（防封策略）
-│   ├── database.py                # 异步数据库服务
-│   ├── vector_db.py               # 向量数据库（LRU+持久化）
-│   ├── investment_simulation.py   # 投资模拟服务
-│   └── ...
-└── utils/                         # 工具函数
+│   ├── sovereign_hall.db
+│   ├── logs/
+│   ├── vector_db/
+│   └── session_history/
+└── runs/
+    └── heuristic_cycle/
 ```
 
----
+## 配置
 
-## 🧠 系统特性
+主要配置在 `config.yaml`。
 
-### 7智能体团队
-
-| 角色 | 名字 | 风格 |
-|-----|------|------|
-| TMT分析师 | 张科技 | 激进乐观 |
-| 消费分析师 | 李稳健 | 保守谨慎 |
-| 周期分析师 | 王周期 | 周期主义 |
-| 宏观策略 | 赵宏观 | 鹰派现实 |
-| 风控官 | 刘挑刺 | 悲观主义 |
-| 量化研究 | 钱量化 | 数据至上 |
-| 投资总监 | 陈总监 | 平衡者 |
-
-### 4阶段讨论流程
-
-1. **阶段1：海量搜索** - 并发爬取相关文档（防封策略+缓存）
-2. **阶段2：深度研报** - 从文档提取投资提案
-3. **阶段3：投委会辩论** - 多智能体轮询分析（共享搜索缓存）
-4. **阶段4：综合结论** - 生成最终投资建议
-
-### 🔄 学习闭环系统
-
-系统具备**决策→验证→学习**的闭环能力：
-
-| 模块 | 功能 |
-|------|------|
-| `decision_tracker.py` | 记录每次投票决策（ticker、方向、置信度、目标/止损） |
-| `learning_engine.py` | 分析错误特征，生成历史教训Prompt |
-| 验证机制 | 定时验证决策是否命中目标/止损（7天/30天） |
-| 胜率追踪 | 实时统计预测准确率并显示 |
-
-**工作流程**：
-- 讨论结束后自动记录决策
-- 定时验证决策结果（使用AKShare获取实时价格）
-- 从错误决策中提取教训，注入下次讨论
-- 自动更新playbook经验库
-
-### 💰 投资模拟
-
-- 初始资金：10,000元
-- 每日基于提案执行买入/卖出/持有
-- 交易记录和资产变化存入数据库
-- 每日生成投资反思
-- 支持置信度分级仓位管理
-
----
-
-## 🔧 技术特性
-
-### 数据库
-- **aiosqlite** 异步SQLite，避免并发锁死
-- 向量数据库支持LRU淘汰和自动持久化
-- 统一DatabaseService访问层
-
-### 爬虫（已优化）
-- 并发控制：10个并发
-- 请求频率：30次/分钟
-- 搜索间隔：0.5秒
-- 告警模式：连续失败5次后进入，30秒自动恢复
-- **搜索缓存**：相同查询词1小时内直接返回缓存，减少重复请求约50%
-
-### 日志
-- 自动轮转，保留最近10份
-- 启动时自动清理旧日志
-
-### 内存管理
-- Agent记忆绑定到议题，不跨话题污染
-- VectorDB最大10000条，LRU淘汰
-
----
-
-## 📊 代码统计
-
-- **总代码量**: ~12,000+ 行 Python
-- **核心模块**:
-  - `services/llm_client.py` - LLM + Embedding
-  - `services/spider_service.py` - 分布式爬虫（带缓存）
-  - `services/database.py` - 异步数据库
-  - `services/vector_db.py` - 向量检索
-  - `services/investment_simulation.py` - 投资模拟
-  - `services/decision_tracker.py` - 决策追踪（学习闭环）
-  - `services/learning_engine.py` - 学习引擎
-  - `run_discussion.py` - 主循环
-
----
-
-## ⚙️ 配置说明
-
-主要配置在 `config.yaml`：
+重点配置项：
 
 ```yaml
-# LLM配置
 llm:
   provider: "openai"
-  base_url: "http://172.18.1.128:30977/v1"
+  base_url: "http://172.18.1.128:30618/v1"
   model: "MiniMax/MiniMax-M2.5"
-  embedding_model: "bge-large-zh-v1.5"
+  max_concurrent: 16
+  max_tokens: 15000
 
-# 爬虫配置
 spider:
-  max_concurrent: 10
-  requests_per_minute: 30
-  search_interval: 0.5
+  max_concurrent: 2
+  proxy: "http://127.0.0.1:7890"
+  rate_limit:
+    requests_per_minute: 6
+    burst: 2
+  search_interval: 5
 
-# 投资模拟
 simulation:
   enabled: true
   initial_capital: 10000
+  min_unit: 100
+  trading_fee: 0.0003
+  stamp_duty: 0.001
+
+system:
+  daily_token_budget: 100000000
+  iteration_interval: 3600
+  validation_batch_size: 100
+
+investment_committee:
+  max_rounds: 3
+  quorum: 5
+  approval_threshold: 0.6
 ```
 
----
+根据本机环境需要调整：
 
-**⚠️ 风险提示**
+- `llm.base_url` / `llm.api_key`
+- `llm.embedding_base_url` / `llm.embedding_uuid`
+- `spider.proxy`
+- `database.path`
+- `output.reports_dir`
 
-本系统仅供研究学习使用，不构成投资建议。
+## 数据表概览
 
----
+当前主数据库包含这些关键表：
 
-<div align="center">
+| 表 | 用途 |
+| --- | --- |
+| `documents` | 爬取和清洗后的研究文档 |
+| `proposals` | 投资提案 |
+| `report_conclusions` | 多智能体讨论结论 |
+| `price_predictions` | 带目标价、止损和验证窗口的预测记录 |
+| `reflection_summary` | 反思摘要 |
+| `simulation_positions` | 当前模拟持仓 |
+| `simulation_trades` | 模拟交易流水 |
+| `simulation_snapshots` | 模拟账户快照 |
+| `system_stats` | 系统状态和模拟现金等键值数据 |
+| `blacklist` | 需要规避的标的或模式 |
+| `playbook` | 机构经验库 |
 
-**🏛️ 君临殿 - Where AI Agents Deliberate**
+## 测试与验证
 
-</div>
+从项目目录运行测试时，需要让 Python 能找到父级包路径：
+
+```bash
+cd /Users/wangziming/PycharmProjects/PythonProject/sovereign_hall
+PYTHONPATH=.. pytest tests/test_refactor_pipeline.py
+```
+
+快速检查离线学习脚本：
+
+```bash
+python scripts/run_heuristic_cycle.py --db data/sovereign_hall.db --timestamp manual_check
+```
+
+如果 `runs/heuristic_cycle/manual_check` 已存在，换一个新的 `--timestamp`。
+
+## 重要注意事项
+
+- 这是研究系统，不是交易系统。
+- LLM 输出会被结构化和验证，但仍可能产生错误推理。
+- 离线回测基于本地预测带，不能代表未来收益。
+- 当前最优启发式策略在成本压力测试下存在过拟合风险。
+- 爬虫配置较保守，默认启用代理并降低频率，避免请求过密。
+- 数据库和 `runs/` 产物可能很大，提交代码前应确认是否需要纳入版本管理。
