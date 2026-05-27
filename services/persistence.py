@@ -3,6 +3,7 @@
 保存统计信息和会话历史，支持重启后继续累加
 """
 import json
+import logging
 import os
 from pathlib import Path
 from datetime import datetime
@@ -10,6 +11,8 @@ from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict, field
 import threading
 
+
+logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 STATS_FILE = DATA_DIR / "session_stats.json"
@@ -24,6 +27,7 @@ class TokenStats:
     total_requests: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    unattributed_tokens: int = 0
 
 
 @dataclass
@@ -70,7 +74,10 @@ class PersistenceManager:
                     data = json.load(f)
                     # 重建 TokenStats
                     if 'token_stats' in data:
-                        data['token_stats'] = TokenStats(**data['token_stats'])
+                        allowed = set(TokenStats.__dataclass_fields__)
+                        data['token_stats'] = TokenStats(
+                            **{k: v for k, v in data['token_stats'].items() if k in allowed}
+                        )
                     return SessionStats(**data)
             except Exception as e:
                 print(f"加载统计失败: {e}")
@@ -85,7 +92,7 @@ class PersistenceManager:
                 data = {
                     'start_time': self._stats.start_time,
                     'total_rounds': self._stats.total_rounds,
-                    'total_time_seconds': self._stats.total_rounds,
+                    'total_time_seconds': self._stats.total_time_seconds,
                     'topics_discussed': self._stats.topics_discussed,
                     'proposals_generated': self._stats.proposals_generated,
                     'winning_proposals': self._stats.winning_proposals,
@@ -95,6 +102,7 @@ class PersistenceManager:
                         'total_requests': self._stats.token_stats.total_requests,
                         'prompt_tokens': self._stats.token_stats.prompt_tokens,
                         'completion_tokens': self._stats.token_stats.completion_tokens,
+                        'unattributed_tokens': self._stats.token_stats.unattributed_tokens,
                     },
                     'last_updated': self._stats.last_updated,
                 }
@@ -110,15 +118,51 @@ class PersistenceManager:
             'total_tokens': stats.total_tokens,
             'total_cost_usd': stats.total_cost_usd,
             'total_requests': stats.total_requests,
+            'prompt_tokens': stats.prompt_tokens,
+            'completion_tokens': stats.completion_tokens,
+            'unattributed_tokens': stats.unattributed_tokens,
             'total_rounds': self._stats.total_rounds,
+            'total_time_seconds': self._stats.total_time_seconds,
             'topics_discussed': self._stats.topics_discussed,
         }
 
     def accumulate_token_usage(self, prompt_tokens: int = 0, completion_tokens: int = 0, cost: float = 0):
         """累加Token使用（用于已有数据加载或更新）"""
         with self._lock:
-            # 这个方法主要用于触发保存，实际数据由外部更新
-            pass
+            prompt_tokens = int(prompt_tokens or 0)
+            completion_tokens = int(completion_tokens or 0)
+            self._stats.token_stats.prompt_tokens += prompt_tokens
+            self._stats.token_stats.completion_tokens += completion_tokens
+            self._stats.token_stats.total_tokens += prompt_tokens + completion_tokens
+            self._stats.token_stats.total_cost_usd += float(cost or 0)
+            self._stats.token_stats.total_requests += 1
+        self._save_stats()
+
+    def set_token_totals(
+        self,
+        *,
+        total_tokens: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_cost_usd: float,
+        total_requests: int,
+        unattributed_tokens: int = None,
+    ):
+        """Overwrite persisted token totals from the live LLM counter."""
+        with self._lock:
+            self._stats.token_stats.total_tokens = int(total_tokens or 0)
+            self._stats.token_stats.prompt_tokens = int(prompt_tokens or 0)
+            self._stats.token_stats.completion_tokens = int(completion_tokens or 0)
+            self._stats.token_stats.total_cost_usd = float(total_cost_usd or 0)
+            self._stats.token_stats.total_requests = int(total_requests or 0)
+            if unattributed_tokens is None:
+                unattributed_tokens = max(
+                    0,
+                    self._stats.token_stats.total_tokens
+                    - self._stats.token_stats.prompt_tokens
+                    - self._stats.token_stats.completion_tokens,
+                )
+            self._stats.token_stats.unattributed_tokens = int(unattributed_tokens or 0)
         self._save_stats()
 
     def increment_rounds(self):
@@ -199,8 +243,8 @@ class PersistenceManager:
                 with open(history_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     return data.get('summary', '')
-            except:
-                pass
+            except Exception as exc:
+                logger.warning("加载话题摘要失败 %s: %s", history_file, exc)
         return ""
 
     def list_topics(self) -> List[str]:
@@ -213,8 +257,8 @@ class PersistenceManager:
                         data = json.load(file)
                         topic = data.get('topic', f.stem)
                         topics.append(topic)
-                except:
-                    pass
+                except Exception as exc:
+                    logger.warning("加载历史话题失败 %s: %s", f, exc)
         return topics
 
 

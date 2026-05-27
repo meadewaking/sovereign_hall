@@ -568,6 +568,7 @@ class LLMClient:
             'total_tokens': stats['total_tokens'],
             'prompt_tokens': stats['prompt_tokens'],
             'completion_tokens': stats['completion_tokens'],
+            'unattributed_tokens': stats.get('unattributed_tokens', 0),
             'total_cost_usd': f"${stats['total_cost']:.2f}",
             'total_cost': stats['total_cost'],  # 数值
             'cache_size': len(self.cache),

@@ -976,7 +976,8 @@ class SpiderSwarm:
         try:
             parsed = urlparse(url)
             return parsed.netloc.replace('www.', '')
-        except:
+        except Exception as exc:
+            logger.debug("提取域名失败 %r: %s", url, exc)
             return "unknown"
 
     def get_stats(self) -> Dict:
@@ -1091,8 +1092,8 @@ class SearchQueryGenerator:
                     queries = ast.literal_eval(response)
                     if not isinstance(queries, list):
                         queries = []
-                except:
-                    pass
+                except Exception as exc:
+                    logger.debug("解析查询词列表失败: %s", exc)
 
             # 如果还是失败，尝试提取所有引号内的内容
             if not queries:
@@ -1123,7 +1124,8 @@ class SearchQueryGenerator:
                 if category:
                     all_seeds.extend(category)
             return all_seeds[:count] if all_seeds else ["投资机会", "A股市场", "股票推荐"]
-        except:
+        except Exception as exc:
+            logger.warning("加载默认搜索种子失败，使用兜底种子: %s", exc)
             return ["投资机会", "A股市场", "股票推荐"]
 
     def get_default_seeds(self) -> Dict[str, List[str]]:

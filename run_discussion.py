@@ -12,7 +12,7 @@ import sqlite3
 import json
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import logging
 from logging.handlers import RotatingFileHandler
@@ -200,6 +200,7 @@ TOPIC_POOL = [
 # 已完成议题记录文件
 COMPLETED_TOPICS_FILE = project_root / "data" / "completed_topics.json"
 TOKEN_BUDGET_FILE = project_root / "data" / "token_budget.json"
+DEFAULT_TOPIC_COOLDOWN_HOURS = 24
 
 
 class DailyTokenBudget:
@@ -226,7 +227,7 @@ class DailyTokenBudget:
         if not self.budget:
             return
         current_day = datetime.now().strftime("%Y-%m-%d")
-        if current_day != self.today:
+        if current_day != self.today or total_tokens < self.baseline_tokens:
             self.today = current_day
             self.baseline_tokens = total_tokens
             self._save(total_tokens)
@@ -266,8 +267,8 @@ def load_completed_topics() -> set:
         if COMPLETED_TOPICS_FILE.exists():
             with open(COMPLETED_TOPICS_FILE, 'r', encoding='utf-8') as f:
                 return set(json.load(f))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("加载已完成议题失败，将从空集合开始: %s", exc)
     return set()
 
 
@@ -281,14 +282,62 @@ def save_completed_topics(topics: set):
         logger.warning(f"保存已完成议题失败: {e}")
 
 
-def select_next_topic(completed_topics: set) -> str:
+def load_recent_topics(db_path: Path, hours: int = DEFAULT_TOPIC_COOLDOWN_HOURS) -> set:
+    """加载近期已讨论议题，用于避免在冷却期内重复消耗 token。"""
+    if hours <= 0 or not db_path.exists():
+        return set()
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT question
+                FROM report_conclusions
+                WHERE created_at >= ?
+                  AND question IS NOT NULL
+                  AND question != ''
+                """,
+                (cutoff,),
+            ).fetchall()
+        return {row[0] for row in rows}
+    except sqlite3.Error as exc:
+        logger.debug(f"加载近期议题失败: {exc}")
+        return set()
+
+
+def select_next_topic(completed_topics: set, recent_topics: set = None) -> Optional[str]:
     """选择下一个议题：优先选未完成的，其次循环"""
+    recent_topics = recent_topics or set()
     # 先尝试从未完成的议题中选择
-    remaining = [t for t in TOPIC_POOL if t not in completed_topics]
+    remaining = [t for t in TOPIC_POOL if t not in completed_topics and t not in recent_topics]
     if remaining:
         return remaining[0]
-    # 如果都完成了，重置并随机选一个
-    return TOPIC_POOL[0]
+
+    if len(completed_topics.intersection(TOPIC_POOL)) >= len(TOPIC_POOL):
+        logger.info("议题池已完成一轮，重置完成记录并进入下一轮")
+        completed_topics.clear()
+        save_completed_topics(completed_topics)
+        remaining = [t for t in TOPIC_POOL if t not in recent_topics]
+        if remaining:
+            return remaining[0]
+
+    logger.warning("所有议题都在近期冷却期内，暂停新研究轮次")
+    return None
+
+
+def dedupe_proposals(proposals: List[Dict]) -> List[Dict]:
+    """同一轮内按标的和方向去重，保留置信度最高的提案。"""
+    by_key = {}
+    for proposal in proposals:
+        ticker = str(proposal.get("ticker", "")).strip().upper()
+        direction = str(proposal.get("direction", "long")).strip().lower()
+        if not ticker:
+            continue
+        key = (ticker, direction)
+        previous = by_key.get(key)
+        if previous is None or float(proposal.get("confidence", 0)) > float(previous.get("confidence", 0)):
+            by_key[key] = proposal | {"ticker": ticker, "direction": direction}
+    return list(by_key.values())
 
 
 # ============================================================================
@@ -965,8 +1014,8 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 try:
                     last_date = datetime.fromisoformat(simulation.last_trade_records[ticker])
                     days_held = (datetime.now() - last_date).days
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("解析持仓日期失败 %s=%r: %s", ticker, simulation.last_trade_records[ticker], exc)
             print(f"      - {ticker}: {pos['shares']}股 @ 成本{pos['avg_cost']:.2f} (持有{days_held}天)")
     else:
         print(f"   💤 投委会无新交易裁决且空仓，保持观望")
@@ -1022,8 +1071,8 @@ async def main():
                 try:
                     f.unlink()
                     print(f"   🗑️  删除旧日志: {f.name}")
-                except:
-                    pass
+                except Exception as exc:
+                    logger.debug("删除旧日志失败 %s: %s", f, exc)
 
     # 2. 重置 Spider 告警状态（避免启动时无法搜索）
     from sovereign_hall.services.spider_service import SpiderSwarm
@@ -1056,6 +1105,7 @@ async def main():
     )
     daily_budget_pause = int(system_config.get("daily_budget_pause_seconds", 3600) or 3600)
     validation_batch_size = int(system_config.get("validation_batch_size", 100) or 100)
+    topic_cooldown_hours = int(system_config.get("topic_cooldown_hours", DEFAULT_TOPIC_COOLDOWN_HOURS) or 0)
 
     llm = LLMClient(
         max_concurrent=16,  # 高并发
@@ -1117,9 +1167,6 @@ async def main():
                 await asyncio.sleep(daily_budget_pause)
                 continue
 
-            iteration += 1
-            round_start = datetime.now()
-
             # 连续无结果时增加延迟，防止空转
             if empty_rounds >= 3:
                 wait_seconds = min(60, 10 * (empty_rounds - 2))  # 最多等60秒
@@ -1127,7 +1174,16 @@ async def main():
                 await asyncio.sleep(wait_seconds)
 
             # 选择议题
-            topic = select_next_topic(completed_topics)
+            recent_topics = load_recent_topics(db_path, topic_cooldown_hours)
+            topic = select_next_topic(completed_topics, recent_topics=recent_topics)
+            if topic is None:
+                wait_seconds = min(3600, max(300, topic_cooldown_hours * 60))
+                print(f"\n💤 所有议题都在 {topic_cooldown_hours} 小时冷却期内，休息 {wait_seconds} 秒")
+                await asyncio.sleep(wait_seconds)
+                continue
+
+            iteration += 1
+            round_start = datetime.now()
             logger.info(f"🔥 第 {iteration} 轮开始 | 议题: {topic}")
             print(f"\n{'='*60}")
             print(f"🔥 第 {iteration} 轮 | 议题: {topic}")
@@ -1204,6 +1260,7 @@ async def main():
 
                 # 阶段2：深度研报 → 提案
                 proposals = await stage2_deep_research(llm, docs, topic, db_service, lessons_prompt=lessons_prompt)
+                proposals = dedupe_proposals(proposals)
                 for proposal in proposals:
                     try:
                         await db_service.add_proposal(proposal)

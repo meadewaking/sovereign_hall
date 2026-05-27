@@ -46,7 +46,8 @@ class InvestmentSimulation:
             from ..core.config import get_config
             config = get_config()
             return config.get('simulation', {})
-        except:
+        except Exception as exc:
+            logger.warning("加载投资模拟配置失败，使用默认参数: %s", exc)
             return {}
 
     async def initialize(self):
@@ -120,7 +121,8 @@ class InvestmentSimulation:
             last_date = datetime.fromisoformat(last_trade)
             days_since = (datetime.now() - last_date).days
             return days_since < self.cooldown_days
-        except:
+        except Exception as exc:
+            logger.warning("解析最近交易日期失败 %s=%r: %s", ticker, last_trade, exc)
             return False
 
     async def save_state(self):

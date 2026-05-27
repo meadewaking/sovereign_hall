@@ -155,8 +155,8 @@ class ResearchDiscussionSystem:
                             for r in results[:2]
                         ])
                         print(f"   🔍 验证搜索完成")
-                except:
-                    pass
+                except Exception as exc:
+                    logger.warning("历史结论验证搜索失败: %s", exc)
 
         prompt = f"""
 基于以下历史结论，请进行反思和验证：
@@ -405,7 +405,8 @@ class ResearchDiscussionSystem:
                 content = doc.content[:1000]
                 parts.append(f"   摘要: {content}...")
             return "\n".join(parts)
-        except:
+        except Exception as exc:
+            logger.warning("网络搜索上下文获取失败: %s", exc)
             return ""
 
     async def _run_extended_discussion(self, context: ResearchContext):

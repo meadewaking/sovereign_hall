@@ -127,7 +127,8 @@ class Document:
         if isinstance(timestamp, str):
             try:
                 timestamp = datetime.fromisoformat(timestamp)
-            except:
+            except ValueError as exc:
+                logger.warning("文档时间戳解析失败 %r: %s", timestamp, exc)
                 timestamp = datetime.now()
         elif timestamp is None:
             timestamp = datetime.now()
@@ -422,6 +423,7 @@ class TokenStats:
     _last_request_time: float = field(default=None, repr=False)
     _peak_token_rate: float = field(default=0.0, repr=False)
     _request_timestamps: list = field(default_factory=list, repr=False)
+    _loaded_total_tokens: int = field(default=0, repr=False)
 
     def __post_init__(self):
         # 尝试从持久化加载
@@ -441,6 +443,7 @@ class TokenStats:
                 self.total_cost = prev_stats.get('total_cost_usd', 0.0)
                 self.request_count = prev_stats.get('total_requests', 0)
                 self.total_requests = self.request_count
+                self._loaded_total_tokens = self.total_tokens
                 self._persistence_loaded = True
                 logger.info(f"已加载历史Token统计: {self.total_tokens:,} tokens, ${self.total_cost:.2f}")
         except Exception as e:
@@ -487,18 +490,14 @@ class TokenStats:
         try:
             from ..services.persistence import get_persistence
             persistence = get_persistence()
-            persistence.accumulate_token_usage(
-                prompt_tokens=0,  # 这里传0，因为是累加
-                completion_tokens=0,
-                cost=0
+            persistence.set_token_totals(
+                total_tokens=self.total_tokens,
+                prompt_tokens=self.prompt_tokens,
+                completion_tokens=self.completion_tokens,
+                total_cost_usd=self.total_cost,
+                total_requests=self.request_count,
+                unattributed_tokens=max(0, self.total_tokens - self.prompt_tokens - self.completion_tokens),
             )
-            # 直接更新持久化文件
-            persistence._stats.token_stats.total_tokens = self.total_tokens
-            persistence._stats.token_stats.prompt_tokens = self.prompt_tokens
-            persistence._stats.token_stats.completion_tokens = self.completion_tokens
-            persistence._stats.token_stats.total_cost_usd = self.total_cost
-            persistence._stats.token_stats.total_requests = self.request_count
-            persistence._save_stats()
         except Exception as e:
             logger.debug(f"保存Token统计失败: {e}")
 
@@ -517,13 +516,15 @@ class TokenStats:
             if self._first_request_time and self._last_request_time:
                 elapsed = self._last_request_time - self._first_request_time
                 if elapsed > 0:
-                    avg_rate = self.total_tokens / elapsed
+                    session_tokens = max(0, self.total_tokens - self._loaded_total_tokens)
+                    avg_rate = session_tokens / elapsed
                     avg_token_rate = f"{avg_rate:.1f}/s"
 
             return {
                 "total_tokens": self.total_tokens,
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
+                "unattributed_tokens": max(0, self.total_tokens - self.prompt_tokens - self.completion_tokens),
                 "total_cost": self.total_cost,
                 "request_count": self.request_count,
                 "total_requests": self.total_requests,

@@ -1,9 +1,10 @@
 import sqlite3
+import json
 from unittest.mock import AsyncMock
 
 import pytest
 
-from sovereign_hall.core import Document
+from sovereign_hall.core import Document, PlaybookEntry
 from sovereign_hall.services.database import DatabaseService
 from sovereign_hall.services.decision_tracker import DecisionRecorder
 from sovereign_hall.services.investment_simulation import InvestmentSimulation
@@ -11,7 +12,9 @@ from sovereign_hall.services.market_data import MarketDataService
 from sovereign_hall.services.prediction_tracker import PredictionTracker
 from sovereign_hall.services.backtest_engine import get_backtest_engine
 from sovereign_hall.services.prediction_store import ensure_prediction_tables
-from sovereign_hall.run_discussion import aggregate_committee_decision
+from sovereign_hall.run_discussion import TOPIC_POOL, aggregate_committee_decision, select_next_topic
+from sovereign_hall.services.persistence import PersistenceManager
+import sovereign_hall.services.persistence as persistence_module
 
 
 def test_entry_imports():
@@ -224,6 +227,37 @@ async def test_decision_records_dynamic_expected_days(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_recent_duplicate_decision_reuses_existing_id(tmp_path):
+    db_path = tmp_path / "test.db"
+    recorder = DecisionRecorder(str(db_path))
+    first = await recorder.record_decision(
+        ticker="600519",
+        decision="long",
+        confidence=0.7,
+        target_price=0.1,
+        stop_loss=0.05,
+        entry_price=10.0,
+        expected_days=7,
+    )
+    second = await recorder.record_decision(
+        ticker="600519",
+        decision="long",
+        confidence=0.72,
+        target_price=0.1,
+        stop_loss=0.05,
+        entry_price=10.0,
+        expected_days=7,
+    )
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM price_predictions").fetchone()[0]
+    conn.close()
+
+    assert second == first
+    assert count == 1
+
+
+@pytest.mark.asyncio
 async def test_prediction_schema_migrates_existing_table(tmp_path):
     db_path = tmp_path / "test.db"
     conn = sqlite3.connect(db_path)
@@ -252,3 +286,171 @@ def test_committee_votes_can_defer_to_hold():
 
     assert decision["direction"] == "hold"
     assert decision["target_position"] == 0.0
+
+
+def test_topic_pool_resets_after_full_cycle_and_skips_recent():
+    completed = set(TOPIC_POOL)
+    topic = select_next_topic(completed, recent_topics={TOPIC_POOL[0]})
+
+    assert completed == set()
+    assert topic == TOPIC_POOL[1]
+
+
+def test_persistence_preserves_token_breakdown(tmp_path, monkeypatch):
+    stats_file = tmp_path / "session_stats.json"
+    history_dir = tmp_path / "history"
+    stats_file.write_text(json.dumps({
+        "start_time": "2026-01-01T00:00:00",
+        "total_rounds": 2,
+        "total_time_seconds": 12.5,
+        "topics_discussed": [],
+        "proposals_generated": 0,
+        "winning_proposals": 0,
+        "token_stats": {
+            "total_tokens": 100,
+            "total_cost_usd": 0.2,
+            "total_requests": 3,
+            "prompt_tokens": 40,
+            "completion_tokens": 50,
+            "unattributed_tokens": 10,
+        },
+        "last_updated": "2026-01-01T00:00:00",
+    }), encoding="utf-8")
+    monkeypatch.setattr(persistence_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(persistence_module, "STATS_FILE", stats_file)
+    monkeypatch.setattr(persistence_module, "HISTORY_DIR", history_dir)
+
+    manager = PersistenceManager()
+    loaded = manager.load_previous_stats()
+    manager.add_time(7.5)
+
+    saved = json.loads(stats_file.read_text(encoding="utf-8"))
+    assert loaded["prompt_tokens"] == 40
+    assert loaded["completion_tokens"] == 50
+    assert loaded["unattributed_tokens"] == 10
+    assert saved["total_time_seconds"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_database_migrates_legacy_blacklist_schema(tmp_path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE blacklist (ticker TEXT PRIMARY KEY, reason TEXT, created_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO blacklist (ticker, reason, created_at) VALUES (?, ?, ?)",
+        ("600519", "legacy", "2026-01-01T00:00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    db = DatabaseService(str(db_path))
+    await db._init_db()
+    await db.add_to_blacklist("600519", "again")
+    await db.close()
+
+    conn = sqlite3.connect(db_path)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(blacklist)")}
+    row = conn.execute(
+        "SELECT failure_count, added_at FROM blacklist WHERE ticker = ?",
+        ("600519",),
+    ).fetchone()
+    conn.close()
+
+    assert {"failure_count", "added_at", "expires_at"}.issubset(columns)
+    assert row[0] == 2
+    assert row[1] is not None
+
+
+@pytest.mark.asyncio
+async def test_playbook_insert_supports_legacy_schema(tmp_path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE playbook (
+            entry_id TEXT PRIMARY KEY,
+            category TEXT,
+            situation TEXT,
+            action_taken TEXT,
+            outcome TEXT,
+            lesson TEXT,
+            confidence_delta REAL,
+            ticker TEXT,
+            refs TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    db = DatabaseService(str(db_path))
+    await db._init_db()
+    await db.add_playbook_entry(PlaybookEntry(
+        ticker="600519",
+        situation="高估值回撤",
+        lesson="等待确认信号",
+        outcome="avoided_loss",
+        confidence_delta=0.2,
+        pattern="risk",
+        action="hold",
+        examples=["case-1"],
+    ))
+    await db.close()
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT category, action_taken, lesson, confidence_delta, ticker, refs FROM playbook"
+    ).fetchone()
+    conn.close()
+
+    assert row[0] == "risk"
+    assert row[1] == "hold"
+    assert row[2] == "等待确认信号"
+    assert row[3] == 0.2
+    assert row[4] == "600519"
+    assert json.loads(row[5]) == ["case-1"]
+
+
+@pytest.mark.asyncio
+async def test_report_conclusion_ids_are_backfilled_and_new_rows_get_id(tmp_path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE report_conclusions (
+            id INT,
+            question TEXT,
+            conclusion TEXT,
+            ticker TEXT,
+            position REAL,
+            stop_loss REAL,
+            take_profit REAL,
+            holding_period TEXT,
+            confidence REAL,
+            key_points TEXT,
+            risks TEXT,
+            created_at TEXT,
+            learned_at TEXT
+        )
+    """)
+    conn.execute("INSERT INTO report_conclusions (question, conclusion) VALUES (?, ?)", ("q1", "c1"))
+    conn.execute("INSERT INTO report_conclusions (id, question, conclusion) VALUES (?, ?, ?)", (10, "q2", "c2"))
+    conn.commit()
+    conn.close()
+
+    db = DatabaseService(str(db_path))
+    await db.init_report_tables()
+    await db.save_report_conclusion("q3", "c3", ticker="600519")
+    await db.close()
+
+    conn = sqlite3.connect(db_path)
+    null_ids, total, max_id = conn.execute(
+        "SELECT SUM(id IS NULL), COUNT(*), MAX(id) FROM report_conclusions"
+    ).fetchone()
+    ids = [row[0] for row in conn.execute("SELECT id FROM report_conclusions ORDER BY id")]
+    conn.close()
+
+    assert null_ids == 0
+    assert total == 3
+    assert max_id == 12
+    assert ids == [10, 11, 12]

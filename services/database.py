@@ -68,6 +68,38 @@ class DatabaseService:
             await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             logger.info("Migrated %s: added column %s", table, column)
 
+    async def _create_index_if_possible(self, conn, sql: str):
+        try:
+            await conn.execute(sql)
+        except Exception as exc:
+            logger.warning("Failed to create index with SQL %r: %s", sql, exc)
+
+    async def _next_integer_id(self, conn, table: str, column: str = "id") -> int:
+        async with conn.execute(
+            f"SELECT COALESCE(MAX({column}), 0) + 1 FROM {table}"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0] if row else 1)
+
+    async def _backfill_report_conclusion_ids(self, conn):
+        """旧库里 report_conclusions.id 可能只是普通 INT，历史写入会留下 NULL。"""
+        columns = await self._get_table_columns(conn, "report_conclusions")
+        if "id" not in columns:
+            await self._add_column_if_missing(conn, "report_conclusions", "id", "INTEGER")
+
+        next_id = await self._next_integer_id(conn, "report_conclusions", "id")
+        async with conn.execute(
+            "SELECT rowid FROM report_conclusions WHERE id IS NULL ORDER BY rowid"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        for row in rows:
+            await conn.execute(
+                "UPDATE report_conclusions SET id = ? WHERE rowid = ?",
+                (next_id, row[0]),
+            )
+            next_id += 1
+
     async def _init_db(self):
         """初始化数据库表"""
         conn = await self._get_connection()
@@ -164,6 +196,17 @@ class DatabaseService:
                     expires_at TEXT
                 )
             """)
+        else:
+            await self._add_column_if_missing(conn, "blacklist", "reason", "TEXT")
+            await self._add_column_if_missing(conn, "blacklist", "failure_count", "INTEGER DEFAULT 1")
+            await self._add_column_if_missing(conn, "blacklist", "added_at", "TEXT")
+            await self._add_column_if_missing(conn, "blacklist", "expires_at", "TEXT")
+            columns = await self._get_table_columns(conn, "blacklist")
+            if "created_at" in columns:
+                await conn.execute(
+                    "UPDATE blacklist SET added_at = COALESCE(added_at, created_at) WHERE added_at IS NULL"
+                )
+            await conn.execute("UPDATE blacklist SET failure_count = 1 WHERE failure_count IS NULL")
 
         # system_stats 表
         if 'system_stats' not in existing_tables:
@@ -189,31 +232,12 @@ class DatabaseService:
 
         await ensure_prediction_schema(conn)
 
-        # 创建索引（忽略已存在索引的错误）
-        try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_sector ON documents(sector)")
-        except:
-            pass
-        try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_url ON documents(url)")
-        except:
-            pass
-        try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_ticker ON proposals(ticker)")
-        except:
-            pass
-        try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
-        except:
-            pass
-        try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_meetings_proposal ON meetings(proposal_id)")
-        except:
-            pass
-        try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_playbook_ticker ON playbook(ticker)")
-        except:
-            pass
+        await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_sector ON documents(sector)")
+        await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_url ON documents(url)")
+        await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_proposals_ticker ON proposals(ticker)")
+        await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
+        await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_meetings_proposal ON meetings(proposal_id)")
+        await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_playbook_ticker ON playbook(ticker)")
 
         await conn.commit()
         logger.info(f"Database initialized: {self.db_path}")
@@ -397,20 +421,48 @@ class DatabaseService:
     async def add_playbook_entry(self, entry: Any):
         """添加经验条目"""
         conn = await self._get_connection()
-        await conn.execute("""
-            INSERT INTO playbook
-            (id, ticker, situation, lesson, outcome, success, confidence_adjustment, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            getattr(entry, 'id', None) or getattr(entry, 'entry_id', None),
-            getattr(entry, 'ticker', None),
-            getattr(entry, 'situation', None),
-            entry.lesson,
-            getattr(entry, 'outcome', None),
-            getattr(entry, 'success', None),
-            getattr(entry, 'confidence_delta', 0.0) or getattr(entry, 'confidence_adjustment', 0.0),
-            datetime.now().isoformat()
-        ))
+        columns = await self._get_table_columns(conn, "playbook")
+        entry_id = getattr(entry, 'id', None) or getattr(entry, 'entry_id', None)
+        confidence_delta = (
+            getattr(entry, 'confidence_delta', 0.0)
+            or getattr(entry, 'confidence_adjustment', 0.0)
+        )
+        now = datetime.now().isoformat()
+
+        if {"id", "ticker", "situation", "lesson", "outcome", "success", "confidence_adjustment", "created_at"}.issubset(columns):
+            await conn.execute("""
+                INSERT OR REPLACE INTO playbook
+                (id, ticker, situation, lesson, outcome, success, confidence_adjustment, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                entry_id,
+                getattr(entry, 'ticker', None),
+                getattr(entry, 'situation', None),
+                entry.lesson,
+                getattr(entry, 'outcome', None),
+                getattr(entry, 'success', None),
+                confidence_delta,
+                now
+            ))
+        elif {"entry_id", "category", "situation", "action_taken", "outcome", "lesson", "confidence_delta", "ticker", "refs", "created_at"}.issubset(columns):
+            await conn.execute("""
+                INSERT OR REPLACE INTO playbook
+                (entry_id, category, situation, action_taken, outcome, lesson, confidence_delta, ticker, refs, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                entry_id,
+                getattr(entry, 'pattern', None) or "manual",
+                getattr(entry, 'situation', None),
+                getattr(entry, 'action', None),
+                getattr(entry, 'outcome', None),
+                entry.lesson,
+                confidence_delta,
+                getattr(entry, 'ticker', None),
+                json.dumps(getattr(entry, 'examples', []), ensure_ascii=False),
+                now,
+            ))
+        else:
+            raise RuntimeError(f"Unsupported playbook schema: {sorted(columns)}")
         await conn.commit()
 
     async def get_playbook_by_ticker(self, ticker: str) -> List[Dict]:
@@ -580,6 +632,10 @@ class DatabaseService:
             created_at TEXT
         )''')
 
+        await self._add_column_if_missing(conn, "report_conclusions", "learned_at", "TEXT")
+        await self._add_column_if_missing(conn, "reflection_summary", "learned_at", "TEXT")
+        await self._backfill_report_conclusion_ids(conn)
+
         await conn.commit()
 
     async def save_report_conclusion(self, question: str, conclusion: str, ticker: str = "",
@@ -589,11 +645,12 @@ class DatabaseService:
                                       risks: str = ""):
         """保存报告结论"""
         conn = await self._get_connection()
+        conclusion_id = await self._next_integer_id(conn, "report_conclusions", "id")
         await conn.execute('''INSERT INTO report_conclusions
-            (question, conclusion, ticker, position, stop_loss, take_profit,
+            (id, question, conclusion, ticker, position, stop_loss, take_profit,
              holding_period, confidence, key_points, risks, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (question, conclusion, ticker, position, stop_loss, take_profit,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (conclusion_id, question, conclusion, ticker, position, stop_loss, take_profit,
              holding_period, confidence, key_points, risks, datetime.now().isoformat()))
         await conn.commit()
 

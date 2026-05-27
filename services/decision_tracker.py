@@ -109,6 +109,19 @@ class DecisionRecorder:
         )
         expected_days = self.normalize_expected_days(expected_days, discussion_context)
 
+        recent_id = await self._find_recent_duplicate(
+            ticker=ticker,
+            decision=decision,
+            confidence=confidence,
+            current_price=float(current_price),
+            target_price=target_price,
+            stop_loss=stop_loss,
+            expected_days=expected_days,
+        )
+        if recent_id:
+            logger.info(f"跳过重复决策: {ticker} {decision}，复用记录 {recent_id}")
+            return recent_id
+
         record = DecisionRecord(
             ticker=ticker,
             decision=decision,
@@ -149,6 +162,53 @@ class DecisionRecorder:
 
         logger.info(f"决策已记录: {ticker} {decision} 置信度{confidence:.0%}")
         return record.id
+
+    async def _find_recent_duplicate(
+        self,
+        ticker: str,
+        decision: str,
+        confidence: float,
+        current_price: float,
+        target_price: float,
+        stop_loss: float,
+        expected_days: int,
+        hours: int = 24,
+    ) -> Optional[str]:
+        """Return a recent near-identical pending prediction id, if one exists."""
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT id
+                FROM price_predictions
+                WHERE ticker = ?
+                  AND direction = ?
+                  AND expected_days = ?
+                  AND status = 'pending'
+                  AND predicted_at >= ?
+                  AND ABS(COALESCE(current_price, 0) - ?) <= MAX(0.01, ? * 0.005)
+                  AND ABS(COALESCE(target_price, 0) - ?) <= MAX(0.01, ? * 0.01)
+                  AND ABS(COALESCE(stop_loss, 0) - ?) <= MAX(0.01, ? * 0.01)
+                  AND ABS(COALESCE(confidence, 0) - ?) <= 0.05
+                ORDER BY predicted_at DESC
+                LIMIT 1
+                """,
+                (
+                    ticker,
+                    decision,
+                    expected_days,
+                    cutoff,
+                    current_price,
+                    current_price,
+                    target_price,
+                    target_price,
+                    stop_loss,
+                    stop_loss,
+                    confidence,
+                ),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else None
 
     def _normalize_price_targets(
         self,
@@ -322,9 +382,10 @@ class DecisionRecorder:
                     if len(parts) > 3 and parts[3]:
                         try:
                             return float(parts[3])
-                        except ValueError:
-                            pass
+                        except ValueError as exc:
+                            logger.debug("腾讯行情价格解析失败 %s: %s", ticker, exc)
             except Exception as e:
+                logger.debug("腾讯行情请求失败 %s/%s: %s", market, ticker, e)
                 continue
 
         # 东方财富备用（不稳定但偶尔可用）
