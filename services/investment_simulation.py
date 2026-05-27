@@ -224,7 +224,25 @@ class InvestmentSimulation:
             }
 
         # 计算当前持仓
+        direction_norm = (direction or "").lower()
         current_shares = self.positions.get(ticker, {}).get('shares', 0)
+        if direction_norm in ("hold", "neutral", "观望"):
+            return {
+                'success': True,
+                'action': 'hold',
+                'ticker': ticker,
+                'reason': '投委会裁决为观望'
+            }
+        if direction_norm in ("short", "sell"):
+            if current_shares <= 0:
+                return {
+                    'success': False,
+                    'action': 'hold',
+                    'ticker': ticker,
+                    'reason': '模拟账户不支持裸做空，空仓不交易'
+                }
+            target_position = 0.0
+
         current_position_value = current_shares * price
         total_assets = self.cash + current_position_value
         current_position_pct = current_position_value / total_assets if total_assets > 0 else 0

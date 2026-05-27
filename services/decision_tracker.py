@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 
 import aiosqlite
 
+from .prediction_store import ensure_prediction_tables
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,35 +78,7 @@ class DecisionRecorder:
 
     async def _ensure_tables(self):
         """确保表结构存在"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS price_predictions (
-                    id TEXT PRIMARY KEY,
-                    conclusion_id TEXT,
-                    ticker TEXT NOT NULL,
-                    current_price REAL,
-                    target_price REAL,
-                    stop_loss REAL,
-                    direction TEXT,
-                    confidence REAL,
-                    predicted_at TEXT,
-                    expected_days INTEGER,
-                    actual_hit_price REAL,
-                    actual_hit_date TEXT,
-                    actual_hit_type TEXT,
-                    max_price_reached REAL,
-                    min_price_reached REAL,
-                    status TEXT DEFAULT 'pending',
-                    result TEXT DEFAULT 'unknown',
-                    accuracy_score REAL,
-                    created_at TEXT,
-                    validated_at TEXT,
-                    entry_date TEXT,
-                    discussion_context TEXT,
-                    FOREIGN KEY (conclusion_id) REFERENCES report_conclusions(id)
-                )
-            """)
-            await db.commit()
+        await ensure_prediction_tables(self.db_path)
 
     async def record_decision(
         self,

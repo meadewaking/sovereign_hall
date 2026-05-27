@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 
 from ..core import DATA_DIR
+from .prediction_store import ensure_prediction_schema
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +186,8 @@ class DatabaseService:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+        await ensure_prediction_schema(conn)
 
         # 创建索引（忽略已存在索引的错误）
         try:

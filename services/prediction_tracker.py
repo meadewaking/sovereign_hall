@@ -15,6 +15,7 @@ import aiosqlite
 
 from ..core import DATA_DIR
 from .market_data import get_market_data
+from .prediction_store import ensure_prediction_tables
 
 logger = logging.getLogger(__name__)
 
@@ -78,68 +79,7 @@ class PredictionTracker:
         
     async def _ensure_tables(self):
         """确保表结构存在"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS price_predictions (
-                    id TEXT PRIMARY KEY,
-                    conclusion_id TEXT,
-                    ticker TEXT NOT NULL,
-                    current_price REAL,
-                    target_price REAL,
-                    stop_loss REAL,
-                    direction TEXT,
-                    confidence REAL,
-                    predicted_at TEXT,
-                    expected_days INTEGER,
-                    actual_hit_price REAL,
-                    actual_hit_date TEXT,
-                    actual_hit_type TEXT,
-                    max_price_reached REAL,
-                    min_price_reached REAL,
-                    status TEXT DEFAULT 'pending',
-                    result TEXT DEFAULT 'unknown',
-                    accuracy_score REAL,
-                    created_at TEXT,
-                    validated_at TEXT,
-                    FOREIGN KEY (conclusion_id) REFERENCES report_conclusions(id)
-                )
-            """)
-            
-            await db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_predictions_ticker 
-                ON price_predictions(ticker)
-            """)
-            
-            await db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_predictions_status 
-                ON price_predictions(status)
-            """)
-            
-            await db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_predictions_predicted_at 
-                ON price_predictions(predicted_at)
-            """)
-            
-            # 预测准确率统计表
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS prediction_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ticker TEXT,
-                    period_days INTEGER,
-                    total_predictions INTEGER DEFAULT 0,
-                    correct_predictions INTEGER DEFAULT 0,
-                    partial_correct INTEGER DEFAULT 0,
-                    wrong_predictions INTEGER DEFAULT 0,
-                    avg_accuracy_score REAL,
-                    avg_return_pct REAL,
-                    win_rate REAL,
-                    sharpe_ratio REAL,
-                    calculated_at TEXT,
-                    UNIQUE(ticker, period_days)
-                )
-            """)
-            
-            await db.commit()
+        await ensure_prediction_tables(self.db_path)
     
     async def create_prediction(
         self,

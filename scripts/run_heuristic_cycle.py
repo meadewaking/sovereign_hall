@@ -56,6 +56,8 @@ class PolicyConfig:
     drawdown_guard_threshold: float = 0.04
     loss_streak_threshold: int = 0
     loss_streak_guard: float = 1.0
+    new_entry_loss_streak_threshold: int = 0
+    min_holding_days: int = 0
     rebalance_threshold: float = 0.0
     min_signal_count: int = 1
     max_stop_gap: float = 0.55
@@ -115,7 +117,51 @@ def load_predictions(db_path: Path) -> pd.DataFrame:
     return df
 
 
-def build_daily_tape(predictions: pd.DataFrame) -> pd.DataFrame:
+def load_daily_prices(db_path: Path, predictions: pd.DataFrame) -> pd.DataFrame:
+    if predictions.empty:
+        return pd.DataFrame()
+
+    tickers = sorted(predictions["ticker"].dropna().unique())
+    if not tickers:
+        return pd.DataFrame()
+
+    start = predictions["predicted_at"].min().strftime("%Y-%m-%d")
+    end = predictions["predicted_at"].max().strftime("%Y-%m-%d")
+    placeholders = ",".join("?" for _ in tickers)
+    query = f"""
+        SELECT ticker, date, close
+        FROM daily_prices
+        WHERE ticker IN ({placeholders})
+          AND date >= ?
+          AND date <= ?
+          AND close IS NOT NULL
+          AND close > 0
+    """
+    try:
+        with sqlite3.connect(db_path) as conn:
+            if not sqlite_table_exists(conn, "daily_prices"):
+                return pd.DataFrame()
+            prices = pd.read_sql_query(query, conn, params=[*tickers, start, end])
+    except Exception:
+        return pd.DataFrame()
+
+    if prices.empty:
+        return prices
+    prices["ticker"] = prices["ticker"].map(normalize_ticker)
+    prices["date"] = pd.to_datetime(prices["date"], errors="coerce").dt.date.astype(str)
+    prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
+    return prices.dropna(subset=["date", "ticker", "close"])
+
+
+def sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def build_daily_tape(predictions: pd.DataFrame, price_history: pd.DataFrame | None = None) -> pd.DataFrame:
     if predictions.empty:
         return predictions
 
@@ -150,6 +196,22 @@ def build_daily_tape(predictions: pd.DataFrame) -> pd.DataFrame:
     daily["risk_reward"] = daily["risk_reward"].fillna(0.0)
     daily["stop_gap"] = daily["stop_gap"].fillna(1.0)
     daily["target_gap"] = daily["target_gap"].fillna(0.0)
+    if price_history is not None and not price_history.empty:
+        independent = price_history.rename(columns={"close": "independent_price"})
+        daily = daily.merge(
+            independent[["date", "ticker", "independent_price"]],
+            on=["date", "ticker"],
+            how="left",
+        )
+        daily["price_source"] = np.where(
+            daily["independent_price"].notna(),
+            "daily_prices",
+            "prediction_current_price",
+        )
+        daily["price"] = daily["independent_price"].fillna(daily["price"])
+        daily = daily.drop(columns=["independent_price"])
+    else:
+        daily["price_source"] = "prediction_current_price"
     daily["return_1d"] = daily.groupby("ticker")["price"].pct_change()
     for lb in (2, 3, 5):
         daily[f"momentum_{lb}d"] = daily.groupby("ticker")["price"].pct_change(lb)
@@ -165,6 +227,7 @@ def pick_targets(
     signal_rows: pd.DataFrame,
     policy: PolicyConfig,
     current_positions: dict[str, float],
+    position_age_days: dict[str, int],
     current_drawdown: float,
     consecutive_loss_days: int = 0,
 ) -> tuple[dict[str, float], list[str]]:
@@ -190,7 +253,16 @@ def pick_targets(
         candidates = candidates[candidates["return_1d"].abs().fillna(0.0) <= policy.anomaly_return_threshold]
         reasons.append(f"anomaly_veto_removed={before - len(candidates)}")
 
+    if policy.new_entry_loss_streak_threshold and consecutive_loss_days >= policy.new_entry_loss_streak_threshold:
+        before = len(candidates)
+        candidates = candidates[candidates["ticker"].isin(current_positions)]
+        reasons.append(f"new_entry_pause_removed={before - len(candidates)}")
+
     if candidates.empty:
+        forced = forced_holding_positions(policy, current_positions, position_age_days)
+        if forced:
+            reasons.append("min_holding_retained_existing")
+            return forced, reasons
         return {}, reasons or ["all_candidates_filtered"]
 
     candidates = candidates.sort_values(["signal_strength", "confidence"], ascending=False).head(policy.max_names)
@@ -202,13 +274,24 @@ def pick_targets(
         gross *= policy.loss_streak_guard
         reasons.append("loss_streak_guard_scaled_gross")
 
-    weights: dict[str, float] = {}
+    weights = forced_holding_positions(policy, current_positions, position_age_days)
+    if weights:
+        reasons.append("min_holding_reserved_gross")
+    reserved_gross = sum(weights.values())
+    if reserved_gross > gross and reserved_gross > 0:
+        scale = gross / reserved_gross
+        weights = {ticker: float(weight * scale) for ticker, weight in weights.items()}
+        reserved_gross = sum(weights.values())
+        reasons.append("min_holding_scaled_to_risk_cap")
+
+    allocatable = max(0.0, gross - reserved_gross)
+    candidates = candidates[~candidates["ticker"].isin(weights)]
     raw_scores = candidates["signal_strength"].clip(lower=0.0)
     if raw_scores.sum() <= 0:
-        return {}, reasons or ["non_positive_scores"]
+        return weights, reasons or ["non_positive_scores"]
 
     for _, row in candidates.iterrows():
-        raw_weight = gross * float(row["signal_strength"] / raw_scores.sum())
+        raw_weight = allocatable * float(row["signal_strength"] / raw_scores.sum())
         vol_scale = 1.0
         if policy.vol_lookback:
             vol = row.get(f"vol_{policy.vol_lookback}d")
@@ -221,6 +304,20 @@ def pick_targets(
                 weight = old
             weights[row["ticker"]] = float(weight)
     return weights, reasons
+
+
+def forced_holding_positions(
+    policy: PolicyConfig,
+    current_positions: dict[str, float],
+    position_age_days: dict[str, int],
+) -> dict[str, float]:
+    if policy.min_holding_days <= 0:
+        return {}
+    return {
+        ticker: float(weight)
+        for ticker, weight in current_positions.items()
+        if weight > 0 and position_age_days.get(ticker, 0) < policy.min_holding_days
+    }
 
 
 def cost_for_rebalance(old: dict[str, float], new: dict[str, float], costs: CostConfig) -> tuple[float, float, float, int]:
@@ -317,6 +414,7 @@ def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
     }
 
     positions: dict[str, float] = {}
+    position_age_days: dict[str, int] = {}
     entry_price: dict[str, float] = {}
     entry_date: dict[str, str] = {}
     equity = 1.0
@@ -335,6 +433,7 @@ def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
             by_date[signal_date],
             policy,
             positions,
+            position_age_days,
             current_dd,
             consecutive_loss_days,
         )
@@ -379,6 +478,11 @@ def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
         peak = max(peak, equity)
         total_turnover += turnover
         total_cost += rebalance_cost
+        previous_age = position_age_days
+        position_age_days = {
+            ticker: previous_age.get(ticker, -1) + 1
+            for ticker in targets
+        }
         positions = targets
         rows.append(
             {
@@ -688,7 +792,8 @@ def write_readme(
 
 ## What Changed
 - Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
-- Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, and rebalance friction.
+- Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, minimum holding periods, no-new-risk pauses, and rebalance friction.
+- Made `python -m sovereign_hall.check_db` exit cleanly in non-interactive automation after printing database and simulated portfolio status.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
 
 ## Best Metrics
@@ -718,9 +823,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Test minimum holding periods by ticker to reduce churn without suppressing new high-conviction names.
-- Require independent confirmation from simulation trade outcomes once validated prices are available.
-- Build a small local leaderboard that separates ETF and single-stock universes before mixing them in one portfolio.
+- Separate ETF and single-stock universes before mixing them in one portfolio.
+- Add validated simulation trade outcomes once local prices are available.
+- Test a stricter cost-stress gate that rejects policies with negative 3x-slippage scores.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -791,7 +896,8 @@ def main() -> int:
     predictions = load_predictions(db_path)
     if predictions.empty:
         raise SystemExit(f"No local predictions found in {db_path}")
-    daily = build_daily_tape(predictions)
+    price_history = load_daily_prices(db_path, predictions)
+    daily = build_daily_tape(predictions, price_history)
     daily.to_csv(run_dir / "daily_signal_tape.csv", index=False)
 
     costs = CostConfig()
@@ -837,6 +943,70 @@ def main() -> int:
             drawdown_guard_threshold=0.025,
             loss_streak_threshold=2,
             loss_streak_guard=0.55,
+            rebalance_threshold=0.02,
+        ),
+        PolicyConfig(
+            name="min_holding_cooldown",
+            min_confidence=0.66,
+            max_names=5,
+            max_position=0.10,
+            max_gross=0.55,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            vol_lookback=3,
+            high_vol_threshold=0.05,
+            high_vol_scale=0.55,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.14,
+            drawdown_guard=0.50,
+            drawdown_guard_threshold=0.025,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.55,
+            min_holding_days=2,
+            rebalance_threshold=0.02,
+        ),
+        PolicyConfig(
+            name="no_new_risk_after_losses",
+            min_confidence=0.66,
+            max_names=5,
+            max_position=0.10,
+            max_gross=0.55,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            vol_lookback=3,
+            high_vol_threshold=0.05,
+            high_vol_scale=0.55,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.14,
+            drawdown_guard=0.50,
+            drawdown_guard_threshold=0.025,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.55,
+            new_entry_loss_streak_threshold=2,
+            rebalance_threshold=0.02,
+        ),
+        PolicyConfig(
+            name="hold_and_pause_guard",
+            min_confidence=0.66,
+            max_names=5,
+            max_position=0.10,
+            max_gross=0.55,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            vol_lookback=3,
+            high_vol_threshold=0.05,
+            high_vol_scale=0.55,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.14,
+            drawdown_guard=0.50,
+            drawdown_guard_threshold=0.025,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.55,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=2,
             rebalance_threshold=0.02,
         ),
     ]
@@ -951,6 +1121,11 @@ def main() -> int:
         "note": "No prior runs/heuristic_cycle outputs were found before this run."
         if previous_score is None
         else f"Previous best read from {previous_path}",
+        "price_source": (
+            "daily_prices table with fallback to prediction current_price"
+            if not price_history.empty
+            else "prediction current_price fallback; daily_prices table unavailable or empty"
+        ),
     }
     write_json(run_dir / "project_context.json", code_context)
     write_readme(

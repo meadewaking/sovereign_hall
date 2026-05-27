@@ -10,6 +10,8 @@ from sovereign_hall.services.investment_simulation import InvestmentSimulation
 from sovereign_hall.services.market_data import MarketDataService
 from sovereign_hall.services.prediction_tracker import PredictionTracker
 from sovereign_hall.services.backtest_engine import get_backtest_engine
+from sovereign_hall.services.prediction_store import ensure_prediction_tables
+from sovereign_hall.run_discussion import aggregate_committee_decision
 
 
 def test_entry_imports():
@@ -151,6 +153,24 @@ async def test_simulation_blocks_on_non_trading_day(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_simulation_does_not_buy_for_short_without_position(monkeypatch):
+    sim = InvestmentSimulation()
+    fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)})()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+
+    result = await sim.execute_trade(
+        ticker="600519",
+        direction="short",
+        target_position=0.1,
+        current_price=10.0,
+    )
+
+    assert result["success"] is False
+    assert result["action"] == "hold"
+    assert sim.positions == {}
+
+
+@pytest.mark.asyncio
 async def test_prediction_tracker_waits_for_window(tmp_path):
     db_path = tmp_path / "test.db"
     tracker = PredictionTracker(str(db_path))
@@ -201,3 +221,34 @@ async def test_decision_records_dynamic_expected_days(tmp_path):
     conn.close()
 
     assert row == (7,)
+
+
+@pytest.mark.asyncio
+async def test_prediction_schema_migrates_existing_table(tmp_path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE price_predictions (id TEXT PRIMARY KEY, ticker TEXT NOT NULL)")
+    conn.commit()
+    conn.close()
+
+    await ensure_prediction_tables(str(db_path))
+
+    conn = sqlite3.connect(db_path)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(price_predictions)")}
+    daily_prices_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_prices'"
+    ).fetchone()
+    conn.close()
+
+    assert {"entry_date", "discussion_context", "expected_days"}.issubset(columns)
+    assert daily_prices_exists is not None
+
+
+def test_committee_votes_can_defer_to_hold():
+    decision = aggregate_committee_decision(
+        {"confidence": 0.8, "target_position": 0.2},
+        ["【投票】观望 | 置信度: 70% | 仓位: 0%"] * 7,
+    )
+
+    assert decision["direction"] == "hold"
+    assert decision["target_position"] == 0.0

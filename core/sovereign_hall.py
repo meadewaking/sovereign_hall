@@ -78,6 +78,8 @@ class SovereignHall:
             max_concurrent=self.config.get('max_concurrent_llm', llm_config.get('max_concurrent', 16)),
             model=self.config.get('model', llm_config.get('model')),
             provider=self.config.get('provider', llm_config.get('provider')),
+            base_url=self.config.get('base_url', llm_config.get('base_url')),
+            api_key=self.config.get('api_key', llm_config.get('api_key')),
         )
 
         # 向量数据库
