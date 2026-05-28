@@ -97,6 +97,8 @@ class Config:
             # 系统运行配置
             'system': {
                 'mode': 'production',
+                'daily_token_budget': 0,
+                'daily_budget_pause_seconds': 3600,
                 'iteration_interval': 1800,
                 'max_iterations': None,
                 'checkpoint_interval': 10,

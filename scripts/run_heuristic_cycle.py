@@ -265,7 +265,7 @@ def pick_targets(
             return forced, reasons
         return {}, reasons or ["all_candidates_filtered"]
 
-    candidates = candidates.sort_values(["signal_strength", "confidence"], ascending=False).head(policy.max_names)
+    candidates = candidates.sort_values(["signal_strength", "confidence"], ascending=False)
     gross = policy.max_gross
     if current_drawdown <= -policy.drawdown_guard_threshold:
         gross *= policy.drawdown_guard
@@ -286,6 +286,10 @@ def pick_targets(
 
     allocatable = max(0.0, gross - reserved_gross)
     candidates = candidates[~candidates["ticker"].isin(weights)]
+    remaining_slots = max(0, policy.max_names - len(weights))
+    if remaining_slots <= 0 or allocatable <= 1e-9:
+        return weights, reasons or ["max_names_filled_by_forced_holds"]
+    candidates = candidates.head(remaining_slots)
     raw_scores = candidates["signal_strength"].clip(lower=0.0)
     if raw_scores.sum() <= 0:
         return weights, reasons or ["non_positive_scores"]
@@ -302,7 +306,8 @@ def pick_targets(
             old = current_positions.get(row["ticker"], 0.0)
             if abs(weight - old) < policy.rebalance_threshold:
                 weight = old
-            weights[row["ticker"]] = float(weight)
+            if weight > 1e-9:
+                weights[row["ticker"]] = float(weight)
     return weights, reasons
 
 
@@ -793,7 +798,9 @@ def write_readme(
 ## What Changed
 - Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
 - Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, minimum holding periods, no-new-risk pauses, and rebalance friction.
-- Made `python -m sovereign_hall.check_db` exit cleanly in non-interactive automation after printing database and simulated portfolio status.
+- Added a cost-robust 4-day minimum holding policy with wider rebalance friction to reduce churn under slippage stress.
+- Enforced `max_names` after reserving minimum-hold positions, and removed zero-weight placeholder holdings from simulated positions.
+- Added a local compatibility shim so `python -m sovereign_hall.check_db` works from the package directory used by this automation.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
 
 ## Best Metrics
@@ -823,9 +830,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
+- Add a ticker-level age/volatility stop for worst-trade reversals without increasing turnover.
 - Separate ETF and single-stock universes before mixing them in one portfolio.
-- Add validated simulation trade outcomes once local prices are available.
-- Test a stricter cost-stress gate that rejects policies with negative 3x-slippage scores.
+- Replace prediction-current-price fallback with validated local daily prices when available.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -1009,6 +1016,44 @@ def main() -> int:
             min_holding_days=2,
             rebalance_threshold=0.02,
         ),
+        PolicyConfig(
+            name="cost_robust_hold4",
+            min_confidence=0.66,
+            max_names=5,
+            max_position=0.10,
+            max_gross=0.55,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.50,
+            drawdown_guard_threshold=0.025,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.55,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            rebalance_threshold=0.05,
+        ),
+        PolicyConfig(
+            name="compact_cost_robust_hold4",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.10,
+            max_gross=0.55,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.50,
+            drawdown_guard_threshold=0.025,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.55,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            rebalance_threshold=0.05,
+        ),
     ]
 
     trial_rows: list[dict[str, Any]] = []
@@ -1049,33 +1094,36 @@ def main() -> int:
         high_vol_scale=1.0,
         anomaly_return_threshold=0.18,
     )
-    simplified_result = run_backtest(daily, simplified, costs)
-    simplified_metrics = simplified_result["metrics"]
-    simplify_row = {
-        "trial_index": len(trial_rows),
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "trial_name": simplified.name,
-        "changed_files": ["scripts/run_heuristic_cycle.py"],
-        "config": asdict(simplified),
-        "eval_period": f"{simplified_metrics['sample_start']}..{simplified_metrics['sample_end']}",
-        "total_return": simplified_metrics["total_return"],
-        "annualized_return": simplified_metrics["annualized_return"],
-        "max_drawdown": simplified_metrics["max_drawdown"],
-        "sharpe": simplified_metrics["sharpe"],
-        "turnover": simplified_metrics["turnover"],
-        "trade_count": simplified_metrics["trade_count"],
-        "cost_assumption": simplified_metrics["cost_assumption"],
-        "score": simplified_metrics["score"],
-        "notes": "simplification stage: removed volatility scaling and excess anomaly tuning",
-    }
-    trial_rows.append(simplify_row)
-    append_jsonl(trials_path, [simplify_row])
-    if simplified_metrics["score"] >= best_trial["score"] - 1e-9:
-        best_trial = simplify_row
-        best_policy = simplified
-        results[simplified.name] = simplified_result
-    else:
-        results[simplified.name] = simplified_result
+    best_without_name = {k: v for k, v in asdict(best_policy).items() if k != "name"}
+    simplified_without_name = {k: v for k, v in asdict(simplified).items() if k != "name"}
+    if simplified_without_name != best_without_name:
+        simplified_result = run_backtest(daily, simplified, costs)
+        simplified_metrics = simplified_result["metrics"]
+        simplify_row = {
+            "trial_index": len(trial_rows),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "trial_name": simplified.name,
+            "changed_files": ["scripts/run_heuristic_cycle.py"],
+            "config": asdict(simplified),
+            "eval_period": f"{simplified_metrics['sample_start']}..{simplified_metrics['sample_end']}",
+            "total_return": simplified_metrics["total_return"],
+            "annualized_return": simplified_metrics["annualized_return"],
+            "max_drawdown": simplified_metrics["max_drawdown"],
+            "sharpe": simplified_metrics["sharpe"],
+            "turnover": simplified_metrics["turnover"],
+            "trade_count": simplified_metrics["trade_count"],
+            "cost_assumption": simplified_metrics["cost_assumption"],
+            "score": simplified_metrics["score"],
+            "notes": "simplification stage: removed volatility scaling and excess anomaly tuning",
+        }
+        trial_rows.append(simplify_row)
+        append_jsonl(trials_path, [simplify_row])
+        if simplified_metrics["score"] >= best_trial["score"] - 1e-9:
+            best_trial = simplify_row
+            best_policy = simplified
+            results[simplified.name] = simplified_result
+        else:
+            results[simplified.name] = simplified_result
 
     best_result = results[best_trial["trial_name"]]
     best_metrics = best_result["metrics"]

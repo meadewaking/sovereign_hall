@@ -70,10 +70,10 @@ class LearningEngine:
             return ""
 
         prompt = "\n【历史投资教训】\n"
-        prompt += "以下是从过去决策中总结的教训，请务必注意：\n"
+        prompt += "以下教训只用于否决或修正当前判断，不要复述；若与当前标的无关请忽略：\n"
 
         for i, lesson in enumerate(lessons[:5], 1):
-            prompt += f"{i}. {lesson['description']}\n"
+            prompt += f"{i}. {lesson['description'][:160]}\n"
 
         stats = await self.get_accuracy_stats()
         if stats['total'] > 0:

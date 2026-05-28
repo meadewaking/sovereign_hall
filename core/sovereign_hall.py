@@ -371,7 +371,7 @@ class SovereignHall:
 
 {report[:3000]}...
 
-请提取以下信息（如果没有明确的标的，返回None）：
+请提取以下信息（如果报告没有明确证据支持的标的，返回None）：
 1. 推荐的股票/ETF代码
 2. 投资方向（long/short）
 3. 建议仓位（0-1之间）
@@ -392,7 +392,10 @@ class SovereignHall:
     "holding_period": 90,
     "confidence": 0.7
 }}
-如果无法提取，返回{{"ticker": null}}
+规则：
+1. 只输出JSON，不要解释
+2. 不要根据行业泛泛联想补标的
+3. 证据不足、价格缺失或止损止盈无法判断时，返回{{"ticker": null}}
 """
 
         try:

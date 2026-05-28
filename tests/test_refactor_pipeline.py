@@ -1,10 +1,12 @@
 import sqlite3
 import json
+import inspect
 from unittest.mock import AsyncMock
 
 import pytest
 
-from sovereign_hall.core import Document, PlaybookEntry
+from sovereign_hall.core import AgentRole, Document, PlaybookEntry
+from sovereign_hall.agents import get_persona
 from sovereign_hall.services.database import DatabaseService
 from sovereign_hall.services.decision_tracker import DecisionRecorder
 from sovereign_hall.services.investment_simulation import InvestmentSimulation
@@ -12,7 +14,13 @@ from sovereign_hall.services.market_data import MarketDataService
 from sovereign_hall.services.prediction_tracker import PredictionTracker
 from sovereign_hall.services.backtest_engine import get_backtest_engine
 from sovereign_hall.services.prediction_store import ensure_prediction_tables
-from sovereign_hall.run_discussion import TOPIC_POOL, aggregate_committee_decision, select_next_topic
+from sovereign_hall.run_discussion import (
+    TOPIC_POOL,
+    aggregate_committee_decision,
+    select_next_topic,
+    stage2_deep_research,
+    stage3_ic_discussion,
+)
 from sovereign_hall.services.persistence import PersistenceManager
 import sovereign_hall.services.persistence as persistence_module
 
@@ -288,12 +296,27 @@ def test_committee_votes_can_defer_to_hold():
     assert decision["target_position"] == 0.0
 
 
-def test_topic_pool_resets_after_full_cycle_and_skips_recent():
+def test_topic_pool_resets_after_full_cycle_and_skips_recent(monkeypatch):
+    monkeypatch.setattr("sovereign_hall.run_discussion.save_completed_topics", lambda topics: None)
     completed = set(TOPIC_POOL)
     topic = select_next_topic(completed, recent_topics={TOPIC_POOL[0]})
 
     assert completed == set()
     assert topic == TOPIC_POOL[1]
+
+
+def test_topic_selection_falls_back_to_oldest_recent_when_pool_saturated(monkeypatch):
+    monkeypatch.setattr("sovereign_hall.run_discussion.save_completed_topics", lambda topics: None)
+    recent_topics = {
+        topic: f"2026-05-27T{hour:02d}:00:00"
+        for hour, topic in enumerate(TOPIC_POOL)
+    }
+    completed = set(TOPIC_POOL[1:])
+
+    topic = select_next_topic(completed, recent_topics=recent_topics)
+
+    assert topic == TOPIC_POOL[0]
+    assert completed == set()
 
 
 def test_persistence_preserves_token_breakdown(tmp_path, monkeypatch):
@@ -329,6 +352,26 @@ def test_persistence_preserves_token_breakdown(tmp_path, monkeypatch):
     assert loaded["completion_tokens"] == 50
     assert loaded["unattributed_tokens"] == 10
     assert saved["total_time_seconds"] == 20.0
+
+
+def test_agent_system_prompt_discourages_repetition_and_requires_evidence():
+    prompt = get_persona(AgentRole.CIO).get_system_prompt()
+
+    assert "不复述题目" in prompt
+    assert "已验证事实" in prompt
+    assert "证据不足" in prompt
+    assert "不要为了节省token删减" in prompt
+
+
+def test_core_discussion_prompts_are_evidence_rich_and_machine_readable():
+    stage2_source = inspect.getsource(stage2_deep_research)
+    stage3_source = inspect.getsource(stage3_ic_discussion)
+
+    assert "只输出合法JSON" in stage2_source
+    assert "证据不足时输出空数组" in stage2_source
+    assert "max_tokens=8000" in stage2_source
+    assert "第一行必须是：【投票】" in stage3_source
+    assert "max_tokens=3000" in stage3_source
 
 
 @pytest.mark.asyncio

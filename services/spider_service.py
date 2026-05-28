@@ -1045,6 +1045,8 @@ class SearchQueryGenerator:
 3. 中英文混合
 4. 每个词3-8个字或单词
 5. 精确描述，便于搜索
+6. 避免泛词和重复词；每个查询词必须有明确可检索事件或主题
+7. 优先生成能验证投资假设的查询词，而不是宽泛新闻词
 
 【输出格式】
 仅返回JSON数组：
@@ -1053,7 +1055,7 @@ class SearchQueryGenerator:
 
         try:
             response = await self.llm.chat(
-                system="你是信息搜索专家，擅长发现投资机会",
+                system="你是投资研究搜索词生成器。只输出JSON数组；避免泛词、重复词和无法检索的概念词。",
                 user=prompt,
                 temperature=0.8,
                 max_tokens=2000,

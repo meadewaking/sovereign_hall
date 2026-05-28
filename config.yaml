@@ -56,8 +56,9 @@ database:
 system:
   mode: "research"  # research/production
 
-  # Token预算护栏（每天1亿；设为 null 或 0 可关闭）
-  daily_token_budget: 100000000
+  # Token预算护栏：本项目按“token 近似无限”运行，默认关闭预算暂停。
+  # 只有明确需要无人值守成本保护时才设置为正数。
+  daily_token_budget: 0
   daily_budget_pause_seconds: 3600
   validation_batch_size: 100
 

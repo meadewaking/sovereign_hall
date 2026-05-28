@@ -282,46 +282,75 @@ def save_completed_topics(topics: set):
         logger.warning(f"保存已完成议题失败: {e}")
 
 
-def load_recent_topics(db_path: Path, hours: int = DEFAULT_TOPIC_COOLDOWN_HOURS) -> set:
-    """加载近期已讨论议题，用于避免在冷却期内重复消耗 token。"""
+def load_recent_topics(db_path: Path, hours: int = DEFAULT_TOPIC_COOLDOWN_HOURS) -> Dict[str, str]:
+    """加载近期已讨论议题和最后讨论时间，用于避免短时间重复消耗 token。"""
     if hours <= 0 or not db_path.exists():
-        return set()
+        return {}
     cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
     try:
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute(
                 """
-                SELECT DISTINCT question
+                SELECT question, MAX(created_at) AS last_discussed_at
                 FROM report_conclusions
                 WHERE created_at >= ?
                   AND question IS NOT NULL
                   AND question != ''
+                GROUP BY question
                 """,
                 (cutoff,),
             ).fetchall()
-        return {row[0] for row in rows}
+        return {row[0]: row[1] for row in rows}
     except sqlite3.Error as exc:
         logger.debug(f"加载近期议题失败: {exc}")
+        return {}
+
+
+def _recent_topic_names(recent_topics) -> set:
+    if not recent_topics:
         return set()
+    if isinstance(recent_topics, dict):
+        return set(recent_topics.keys())
+    return set(recent_topics)
 
 
-def select_next_topic(completed_topics: set, recent_topics: set = None) -> Optional[str]:
+def _oldest_recent_topic(recent_topics) -> Optional[str]:
+    if not recent_topics:
+        return None
+    recent_names = _recent_topic_names(recent_topics)
+    if isinstance(recent_topics, dict):
+        candidates = [
+            (recent_topics.get(topic) or "", index, topic)
+            for index, topic in enumerate(TOPIC_POOL)
+            if topic in recent_names
+        ]
+        if candidates:
+            return min(candidates)[2]
+    return next((topic for topic in TOPIC_POOL if topic in recent_names), None)
+
+
+def select_next_topic(completed_topics: set, recent_topics=None) -> Optional[str]:
     """选择下一个议题：优先选未完成的，其次循环"""
-    recent_topics = recent_topics or set()
-    # 先尝试从未完成的议题中选择
-    remaining = [t for t in TOPIC_POOL if t not in completed_topics and t not in recent_topics]
+    recent_names = _recent_topic_names(recent_topics)
+
+    remaining = [t for t in TOPIC_POOL if t not in completed_topics and t not in recent_names]
     if remaining:
         return remaining[0]
 
-    if len(completed_topics.intersection(TOPIC_POOL)) >= len(TOPIC_POOL):
+    if completed_topics:
         logger.info("议题池已完成一轮，重置完成记录并进入下一轮")
         completed_topics.clear()
         save_completed_topics(completed_topics)
-        remaining = [t for t in TOPIC_POOL if t not in recent_topics]
+        remaining = [t for t in TOPIC_POOL if t not in recent_names]
         if remaining:
             return remaining[0]
 
-    logger.warning("所有议题都在近期冷却期内，暂停新研究轮次")
+    fallback = _oldest_recent_topic(recent_topics)
+    if fallback:
+        logger.warning("所有议题都在近期冷却期内，选择最久未讨论议题继续: %s", fallback)
+        return fallback
+
+    logger.warning("没有可用议题，暂停新研究轮次")
     return None
 
 
@@ -461,6 +490,13 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 资料：
 {content_text[:8000]}
 
+筛选规则：
+1. 只推荐资料中有明确新增证据支持的标的；证据不足时宁可少输出
+2. 不要重复同一行业逻辑，不要为了凑数输出相似提案
+3. 必须把“已验证事实”和“推断”分开写入thesis
+4. 不能确定具体标的时，才允许使用ETF，并把confidence降到0.55以下
+5. 黑名单标的一律排除
+
 请直接输出JSON数组格式（不要输出思考过程，只要JSON）：
 [
     {{
@@ -472,12 +508,14 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         "holding_period": 30,
         "holding_period_reason": "验证窗口选择理由，例如短线催化14天、财报/政策落地30天、产业趋势90-180天",
         "confidence": 0.7,
-        "thesis": "一句话核心逻辑",
-        "sector": "行业分类"
+        "thesis": "事实: ...；推断: ...；新增性: ...",
+        "sector": "行业分类",
+        "evidence": ["来源标题或关键事实1", "来源标题或关键事实2"],
+        "reject_if": "若出现什么情况应否决该提案"
     }}
 ]
 
-如果无法确定具体标的，使用：159995(科技)、159928(消费)、159915(医药)、159990(周期)、512880(半导体)
+如果无法确定具体标的，可使用：159995(科技)、159928(消费)、159915(医药)、159990(周期)、512880(半导体)，但必须说明这是替代ETF而非个股机会。
 
 重要：必须排除黑名单中的标的！
 重要：holding_period 必须根据投资逻辑动态决定，范围3-180天，不要一律填30。
@@ -487,10 +525,10 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         print(f"   🔄 调用LLM批量生成提案...")
         response = await asyncio.wait_for(
             llm.chat(
-                system=f"你是资深投资分析师，擅长从公开资料中挖掘投资机会。",
+                system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；证据不足时输出空数组。",
                 user=prompt,
                 temperature=0.3,
-                max_tokens=5000
+                max_tokens=8000
             ),
             timeout=600
         )
@@ -644,6 +682,11 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
         thesis = proposal.get('thesis', '')
         sector = proposal.get('sector', '')
         learned_context = f"\n\n{lessons_prompt}" if lessons_prompt else ""
+        analysis_format = (
+            "\n\n输出要求：只讲新增判断，不复述提案；"
+            "按【证据】【风险/机会】【反证/压力测试】【结论】输出；"
+            "不限制必要展开，但每条都必须承担不同验证角度；结论必须含买入/卖出/观望、置信度和否决条件。"
+        )
 
         print(f"\n### 提案 {i+1}: {ticker} ({proposal.get('direction')}) | 置信度: {proposal.get('confidence', 0):.0%}")
 
@@ -653,20 +696,20 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
         print("   📝 第一轮：14路并发分析...")
 
         round1_tasks = [
-            (agents[AgentRole.RISK_OFFICER], "风控-财务风险", f"作为风控官，分析{ticker}的财务造假风险。核心观点：{thesis}。请找出潜在风险。{learned_context}", [f"{ticker} 财务", f"{ticker} 风险"]),
-            (agents[AgentRole.RISK_OFFICER], "风控-最坏情况", f"作为风控官，分析{ticker}最坏情况可能跌多少。{learned_context}", [f"{ticker} 历史跌幅"]),
-            (agents[AgentRole.QUANT_RESEARCHER], "量化-技术面", f"作为量化分析师，分析{ticker}的技术走势。{learned_context}", [f"{ticker} K线", f"{ticker} 技术分析"]),
-            (agents[AgentRole.QUANT_RESEARCHER], "量化-估值", f"作为量化分析师，分析{ticker}的估值水平PE/PB。{learned_context}", [f"{ticker} 估值", f"{ticker} PE"]),
-            (agents[AgentRole.MACRO_STRATEGIST], "宏观-政策风险", f"作为宏观策略师，分析{ticker}面临的政策风险。{learned_context}", [f"{ticker} 政策", f"{sector} 政策"]),
-            (agents[AgentRole.MACRO_STRATEGIST], "宏观-时机", f"作为宏观策略师，分析当前是否是买入{ticker}的时机。{learned_context}", ["A股 买入时机", "2025 投资"]),
-            (agents[AgentRole.TMT_ANALYST], "TMT-行业", f"作为TMT分析师，从行业角度点评{ticker}。{learned_context}", [f"{sector} 行业", f"{ticker} 动态"]),
-            (agents[AgentRole.CONSUMER_ANALYST], "消费-行业", f"作为消费分析师，从行业角度点评{ticker}。{learned_context}", [f"{sector} 消费", f"{ticker} 消费"]),
-            (agents[AgentRole.CYCLE_ANALYST], "周期-行业", f"作为周期分析师，从行业周期角度点评{ticker}。{learned_context}", [f"{sector} 周期"]),
-            (agents[AgentRole.CIO], "CIO-综合", f"作为CIO，综合分析{ticker}的投资价值。{learned_context}", [f"{ticker} 机构观点", f"{ticker} 评级"]),
-            (agents[AgentRole.TMT_ANALYST], "TMT-机会", f"作为TMT分析师，分析{ticker}的增长机会。{learned_context}", [f"{ticker} 增长", f"{ticker} 前景"]),
-            (agents[AgentRole.CONSUMER_ANALYST], "消费-机会", f"作为消费分析师，分析{ticker}的增长机会。{learned_context}", [f"{ticker} 业绩", f"{ticker} 增长"]),
-            (agents[AgentRole.CYCLE_ANALYST], "周期-机会", f"作为周期分析师，分析{ticker}的周期位置。{learned_context}", [f"{sector} 供需"]),
-            (agents[AgentRole.QUANT_RESEARCHER], "量化-资金", f"作为量化分析师，分析{ticker}的资金流向。{learned_context}", [f"{ticker} 主力资金"]),
+            (agents[AgentRole.RISK_OFFICER], "风控-财务风险", f"作为风控官，分析{ticker}的财务造假风险。核心观点：{thesis}。请找出潜在风险。{learned_context}{analysis_format}", [f"{ticker} 财务", f"{ticker} 风险"]),
+            (agents[AgentRole.RISK_OFFICER], "风控-最坏情况", f"作为风控官，分析{ticker}最坏情况可能跌多少。{learned_context}{analysis_format}", [f"{ticker} 历史跌幅"]),
+            (agents[AgentRole.QUANT_RESEARCHER], "量化-技术面", f"作为量化分析师，分析{ticker}的技术走势。{learned_context}{analysis_format}", [f"{ticker} K线", f"{ticker} 技术分析"]),
+            (agents[AgentRole.QUANT_RESEARCHER], "量化-估值", f"作为量化分析师，分析{ticker}的估值水平PE/PB。{learned_context}{analysis_format}", [f"{ticker} 估值", f"{ticker} PE"]),
+            (agents[AgentRole.MACRO_STRATEGIST], "宏观-政策风险", f"作为宏观策略师，分析{ticker}面临的政策风险。{learned_context}{analysis_format}", [f"{ticker} 政策", f"{sector} 政策"]),
+            (agents[AgentRole.MACRO_STRATEGIST], "宏观-时机", f"作为宏观策略师，分析当前是否是买入{ticker}的时机。{learned_context}{analysis_format}", ["A股 买入时机", "2025 投资"]),
+            (agents[AgentRole.TMT_ANALYST], "TMT-行业", f"作为TMT分析师，从行业角度点评{ticker}。{learned_context}{analysis_format}", [f"{sector} 行业", f"{ticker} 动态"]),
+            (agents[AgentRole.CONSUMER_ANALYST], "消费-行业", f"作为消费分析师，从行业角度点评{ticker}。{learned_context}{analysis_format}", [f"{sector} 消费", f"{ticker} 消费"]),
+            (agents[AgentRole.CYCLE_ANALYST], "周期-行业", f"作为周期分析师，从行业周期角度点评{ticker}。{learned_context}{analysis_format}", [f"{sector} 周期"]),
+            (agents[AgentRole.CIO], "CIO-综合", f"作为CIO，综合分析{ticker}的投资价值。{learned_context}{analysis_format}", [f"{ticker} 机构观点", f"{ticker} 评级"]),
+            (agents[AgentRole.TMT_ANALYST], "TMT-机会", f"作为TMT分析师，分析{ticker}的增长机会。{learned_context}{analysis_format}", [f"{ticker} 增长", f"{ticker} 前景"]),
+            (agents[AgentRole.CONSUMER_ANALYST], "消费-机会", f"作为消费分析师，分析{ticker}的增长机会。{learned_context}{analysis_format}", [f"{ticker} 业绩", f"{ticker} 增长"]),
+            (agents[AgentRole.CYCLE_ANALYST], "周期-机会", f"作为周期分析师，分析{ticker}的周期位置。{learned_context}{analysis_format}", [f"{sector} 供需"]),
+            (agents[AgentRole.QUANT_RESEARCHER], "量化-资金", f"作为量化分析师，分析{ticker}的资金流向。{learned_context}{analysis_format}", [f"{ticker} 主力资金"]),
         ]
 
         try:
@@ -699,13 +742,13 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             round1_summary = "\n".join([f"{name}: {r[:300]}" for name, r in zip(task_names, round1_results)])
 
             debate_tasks = [
-                (agents[AgentRole.RISK_OFFICER], "质疑", f"基于以下分析提出最尖锐的质疑：\n{round1_summary[:500]}", [f"{ticker} 风险", f"{ticker} 问题"]),
-                (agents[AgentRole.QUANT_RESEARCHER], "数据质疑", f"基于以下分析指出数据问题：\n{round1_summary[:500]}", [f"{ticker} 数据"]),
-                (agents[AgentRole.MACRO_STRATEGIST], "宏观质疑", f"基于以下分析指出宏观风险：\n{round1_summary[:500]}", ["宏观经济 风险"]),
-                (agents[AgentRole.TMT_ANALYST], "行业反驳", f"从行业角度反驳其他观点：\n{round1_summary[:500]}", [f"{sector} 趋势"]),
-                (agents[AgentRole.CONSUMER_ANALYST], "消费反驳", f"从消费角度反驳其他观点：\n{round1_summary[:500]}", [f"{sector} 消费"]),
-                (agents[AgentRole.CYCLE_ANALYST], "周期反驳", f"从周期角度反驳其他观点：\n{round1_summary[:500]}", [f"{sector} 周期"]),
-                (agents[AgentRole.CIO], "CIO回应", f"回应各方质疑，给出最终立场：\n{round1_summary[:500]}", [f"{ticker} 机构"]),
+                (agents[AgentRole.RISK_OFFICER], "质疑", f"基于以下分析提出最尖锐的质疑：\n{round1_summary[:500]}{analysis_format}", [f"{ticker} 风险", f"{ticker} 问题"]),
+                (agents[AgentRole.QUANT_RESEARCHER], "数据质疑", f"基于以下分析指出数据问题：\n{round1_summary[:500]}{analysis_format}", [f"{ticker} 数据"]),
+                (agents[AgentRole.MACRO_STRATEGIST], "宏观质疑", f"基于以下分析指出宏观风险：\n{round1_summary[:500]}{analysis_format}", ["宏观经济 风险"]),
+                (agents[AgentRole.TMT_ANALYST], "行业反驳", f"从行业角度反驳其他观点：\n{round1_summary[:500]}{analysis_format}", [f"{sector} 趋势"]),
+                (agents[AgentRole.CONSUMER_ANALYST], "消费反驳", f"从消费角度反驳其他观点：\n{round1_summary[:500]}{analysis_format}", [f"{sector} 消费"]),
+                (agents[AgentRole.CYCLE_ANALYST], "周期反驳", f"从周期角度反驳其他观点：\n{round1_summary[:500]}{analysis_format}", [f"{sector} 周期"]),
+                (agents[AgentRole.CIO], "CIO回应", f"回应各方质疑，给出最终立场：\n{round1_summary[:500]}{analysis_format}", [f"{ticker} 机构"]),
             ]
 
             round2_results = await asyncio.wait_for(
@@ -747,13 +790,13 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             ]
 
             vote_prompts = [
-                f"基于以下所有讨论，对{ticker}给出最终投票：\n{full_context[:1000]}{learned_context}\n\n输出格式：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX% | 止损: XX%",
-                f"从TMT行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
-                f"从消费行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
-                f"从周期行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
-                f"从宏观角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
-                f"从风控角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
-                f"从量化角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n【投票】",
+                f"基于以下所有讨论，对{ticker}给出最终投票：\n{full_context[:1000]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX% | 止损: XX%。之后可补充关键证据、反证和失效条件。",
+                f"从TMT行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
+                f"从消费行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
+                f"从周期行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
+                f"从宏观角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
+                f"从风控角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
+                f"从量化角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
             ]
 
             # 第三轮投票 - 增加错误处理和日志
@@ -761,7 +804,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             try:
                 round3_results = await asyncio.wait_for(
                     asyncio.gather(*[
-                        agent.think(task=prompt, temperature=0.6, max_tokens=3000)
+                        agent.think(task=prompt, temperature=0.4, max_tokens=3000)
                         for agent, prompt in zip([a for a, _ in vote_tasks], vote_prompts)
                     ]),
                     timeout=300
@@ -868,23 +911,25 @@ async def stage4_final_conclusion(llm, discussions: str, decisions: List[Dict], 
 讨论内容：
 {discussions[:6000]}
 
-请输出简洁的结构化结论：
+请输出简洁的结构化结论。不要复述讨论过程，只写最终可执行判断：
 ## 核心判断
 [买/卖/观望] [标的] | 置信度: XX%
 
 ## 关键逻辑（3条）
-1.
-2.
-3.
+1. 已验证事实：
+2. 核心推断：
+3. 触发/否决条件：
 
 ## 操作建议
 仓位: XX% | 止损: XX% | 止盈: XX%
 
 ## 风险提示
 （1-2条）
+
+若证据不足，请明确给出“观望”，仓位填0%。
 """,
                 temperature=0.5,
-                max_tokens=3000
+                max_tokens=5000
             ),
             timeout=300
         )

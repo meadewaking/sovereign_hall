@@ -170,15 +170,15 @@ class ResearchDiscussionSystem:
 【关键事实验证结果】
 {verification_results if verification_results else "无验证结果"}
 
-请进行反思分析（800字以内）：
-1. 这些历史结论的准确性如何？事后验证是否正确？
-2. 有什么模式和规律？
-3. 有什么教训和经验？
-4. 对当前问题有什么启示？
-
-输出反思总结。
+请只输出对当前问题有用的反思，不复述历史结论；能提升判断质量的反例和验证路径可以充分展开：
+## 命中/失误
+- 哪些判断被验证，哪些没有
+## 可复用教训
+- 最多3条，必须可操作
+## 对当前问题的影响
+- 维持/降低/提高风险偏好；原因
 """
-        response = await self.cio.think(prompt, max_tokens=15000)
+        response = await self.cio.think(prompt, max_tokens=5000)
         reflection = extract_actual_response(response)
 
         db = await self._get_db()
@@ -272,10 +272,10 @@ class ResearchDiscussionSystem:
 {context_str}
 
 请以资深风控官{agent.persona.name}的身份，提出最严格的风险质疑。要求：
-1. 找出每个观点的漏洞和风险点
-2. 引用历史暴雷案例
-3. 问"如果你错了怎么办"
-4. 1500字以上，深入分析
+1. 只列最关键的3个风险，不复述背景
+2. 每个风险给出证据、影响路径、否决条件
+3. 若证据不足，直接标注“证据不足”
+4. 可以充分展开关键反证、压力测试和验证路径
 """
         elif is_quant:
             prompt = f"""
@@ -288,11 +288,10 @@ class ResearchDiscussionSystem:
 {context_str}
 
 请以量化研究员{agent.persona.name}的身份，从数据分析角度补充。要求：
-1. 技术面信号
-2. 资金流向
-3. 统计规律
-4. 历史相似情况
-5. 1500字以上，数据说话
+1. 只列会改变投资判断的数据点
+2. 区分已观察数据和推断
+3. 给出买入/卖出/观望信号、置信度、失效条件
+4. 可以充分展开会改变投资判断的数据和反证
 """
         elif is_macro:
             prompt = f"""
@@ -305,11 +304,10 @@ class ResearchDiscussionSystem:
 {context_str}
 
 请以宏观策略师{agent.persona.name}的身份，从宏观角度分析。要求：
-1. 美联储货币政策
-2. 全球流动性
-3. 地缘政治风险
-4. 汇率波动
-5. 2000字以上
+1. 只分析与当前问题直接相关的宏观变量
+2. 给出传导路径、方向、强度和关键观察指标
+3. 无直接影响时回答“宏观无新增约束”
+4. 可以充分展开宏观传导路径和情景分支
 """
         else:
             prompt = f"""
@@ -322,14 +320,14 @@ class ResearchDiscussionSystem:
 {context_str}
 
 请以{agent.persona.name}的身份发表专业分析。要求：
-1. 结合你的投资风格和专业背景
-2. 引用支撑你观点的证据
-3. 给出明确结论
-4. 1500字以上
+1. 只输出新增洞察，不复述资料
+2. 引用支撑观点的证据
+3. 给出明确结论、置信度和失效条件
+4. 可以充分展开能提升判断质量的证据、反例和验证路径
 
 你的投资哲学：{agent.persona.personality}
 """
-        response = await agent.think(prompt, max_tokens=15000)
+        response = await agent.think(prompt, max_tokens=8000)
         return extract_actual_response(response)
 
     def _generate_search_keywords(self, question: str, role: AgentRole) -> List[str]:
@@ -449,11 +447,11 @@ class ResearchDiscussionSystem:
 {all_views}
 
 要求：
-1. 找出每个分析逻辑中的漏洞和盲点
-2. 引用历史暴雷案例和市场规律作为反证
-3. 提出最坏情况下的风险敞口
+1. 只保留最可能改变结论的3个漏洞
+2. 每个漏洞写清证据、影响路径、需要验证的数据
+3. 给出最坏情况下的风险敞口
 4. 如果你是CIO，会要求什么条件才通过这个投资建议？
-5. 特别关注：流动性风险、估值风险、基本面风险、黑天鹅事件
+5. 可以充分展开关键反证和验证条件
 """
         risk_response = await self._agent_think_with_retrieval(
             risk_agent, question, additional_instruction=risk_instruction, is_risk_officer=True
@@ -479,8 +477,8 @@ class ResearchDiscussionSystem:
 1. 技术面信号：趋势、动量、支撑阻力位
 2. 资金流向：主力资金、北上资金、融资融券
 3. 统计规律：胜率、赔率、夏普比率
-4. 历史相似情况的表现统计
-5. 如果数据不支持上述分析师的观点，请明确指出
+4. 如果数据不支持上述分析师的观点，请明确指出
+5. 只输出会改变结论的数据；可充分展开统计检验和反例
 """
         quant_response = await self._agent_think_with_retrieval(
             quant_agent, question, additional_instruction=quant_instruction, is_quant=True
@@ -497,13 +495,10 @@ class ResearchDiscussionSystem:
 从宏观角度深度分析这个问题。
 
 要求：
-1. 美联储货币政策走向及利率路径
-2. 全球流动性环境（QE/QT）
-3. 地缘政治风险（中美关系等）
-4. 汇率波动及跨境资本流动
-5. 全球经济周期定位
-6. 通胀预期与实际走势
-分析宏观因素对这个问题的影响路径。
+1. 只保留与问题直接相关的宏观变量
+2. 写清传导路径、方向、强度、观察指标
+3. 无直接影响时回答“宏观无新增约束”
+4. 可以充分展开直接相关的宏观路径和情景分支
 """
         macro_response = await self._agent_think_with_retrieval(
             macro_agent, question, additional_instruction=macro_instruction, is_macro=True
@@ -531,11 +526,10 @@ class ResearchDiscussionSystem:
 {other_views}
 
 要求：
-1. 逐条回应风控官的质疑，承认合理部分，反驳不合理部分
-2. 回应量化分析师的数据质疑
-3. 回应宏观策略师的宏观风险担忧
-4. 坚持核心逻辑，修正细节判断
-5. 如果观点有调整，说明调整原因
+1. 只回应会改变结论的质疑
+2. 明确承认、反驳或修正
+3. 如果观点有调整，说明调整原因
+4. 可以充分展开会改变结论的回应和修正
 """
             reply_response = await self._agent_think_with_retrieval(agent, question, reply_instruction)
             context.discussion_history.append(f"【第五轮 · {agent.persona.name}回应质疑】\n{reply_response[:8000]}...")
@@ -554,9 +548,9 @@ class ResearchDiscussionSystem:
 
 要求：
 1. 综合所有观点，做出最终判断
-2. 承认反对意见的合理之处
-3. 强调支持你观点的核心逻辑
-4. 给出最终投资建议和置信度
+2. 只列2条支持理由和1条反对理由
+3. 给出最终投资建议、置信度、失效条件
+4. 可以充分展开关键支持理由、反对理由和失效条件
 """
         final_response = await self._agent_think_with_retrieval(tmt_agent, question, final_instruction)
         context.discussion_history.append(f"【第六轮 · 总结陈词】\n{final_response[:8000]}...")
@@ -571,7 +565,7 @@ class ResearchDiscussionSystem:
         reflection_text = "\n".join([r.get('reflection_text', '')[:500] for r in recent_reflections])
 
         prompt = f"""
-基于多智能体深度讨论，请作为投资总监陈总监给出结论（1500字以内）。
+基于多智能体深度讨论，请作为投资总监陈总监给出结论。
 
 【原始问题】
 {context.question}
@@ -582,15 +576,15 @@ class ResearchDiscussionSystem:
 【讨论摘要】
 {all_views[:10000]}...
 
-请输出极简结论：
+请输出极简结论，不复述讨论过程：
 
 ## 结论
 ### 核心判断
 [一句话：买/卖/观望 + 标的 + 仓位]
 
 ### 逻辑（2条）
-1. 核心逻辑
-2. 关键依据
+1. 已验证事实
+2. 核心推断
 
 ### 风险
 - 1条主要风险
@@ -602,9 +596,9 @@ class ResearchDiscussionSystem:
 XX%（核心不确定性：XXX）
 
 ---
-越简洁越好，不超过1500字
+证据不足时必须输出观望和0%仓位；如展开能提高判断质量，可以补充关键证据、反证和跟踪条件。
 """
-        response = await self.cio.think(prompt, max_tokens=5000)
+        response = await self.cio.think(prompt, max_tokens=8000)
         return extract_actual_response(response, max_length=20000)
 
 
