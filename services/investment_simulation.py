@@ -14,6 +14,7 @@ import aiosqlite
 
 from ..core import DATA_DIR
 from ..services.llm_client import LLMClient
+from ..services.heuristic_policy import apply_heuristic_risk_cap
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +245,16 @@ class InvestmentSimulation:
                     'reason': '模拟账户不支持裸做空，空仓不交易'
                 }
             target_position = 0.0
+
+        if direction_norm == "long":
+            capped_position, cap_reason = apply_heuristic_risk_cap(
+                ticker,
+                float(target_position),
+                None,
+            )
+            if cap_reason:
+                reason = f"{reason}; {cap_reason}" if reason else cap_reason
+            target_position = capped_position
 
         current_position_value = current_shares * price
         total_assets = self.cash + current_position_value

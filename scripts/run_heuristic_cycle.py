@@ -61,6 +61,7 @@ class PolicyConfig:
     rebalance_threshold: float = 0.0
     min_signal_count: int = 1
     max_stop_gap: float = 0.55
+    universe: str = "all"
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,11 @@ class CostConfig:
 def normalize_ticker(ticker: Any) -> str:
     code = str(ticker or "").strip().upper()
     return code.split(".")[0] if "." in code else code
+
+
+def is_etf_ticker(ticker: Any) -> bool:
+    code = normalize_ticker(ticker)
+    return code.startswith(("15", "51", "56", "58"))
 
 
 def score_metrics(metrics: dict[str, Any]) -> float:
@@ -242,6 +248,15 @@ def pick_targets(
     ].copy()
 
     reasons: list[str] = []
+    if policy.universe != "all" and not candidates.empty:
+        before = len(candidates)
+        etf_mask = candidates["ticker"].map(is_etf_ticker)
+        if policy.universe == "etf":
+            candidates = candidates[etf_mask]
+        elif policy.universe == "single_stock":
+            candidates = candidates[~etf_mask]
+        reasons.append(f"{policy.universe}_universe_removed={before - len(candidates)}")
+
     if policy.require_positive_trend and policy.trend_lookback:
         col = f"momentum_{policy.trend_lookback}d"
         before = len(candidates)
@@ -798,9 +813,9 @@ def write_readme(
 ## What Changed
 - Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
 - Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, minimum holding periods, no-new-risk pauses, and rebalance friction.
-- Added a cost-robust 4-day minimum holding policy with wider rebalance friction to reduce churn under slippage stress.
-- Enforced `max_names` after reserving minimum-hold positions, and removed zero-weight placeholder holdings from simulated positions.
-- Added a local compatibility shim so `python -m sovereign_hall.check_db` works from the package directory used by this automation.
+- Added ETF-only and single-stock-only sleeve trials so the cycle no longer evaluates every universe mix as one undifferentiated basket.
+- Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display and simulated-trading position caps.
+- Kept the latest best as a conservative risk constraint because sample-out split risk is still explicitly measured before user-entry adoption.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
 
 ## Best Metrics
@@ -824,6 +839,14 @@ def write_readme(
 
 Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe split/cost-stress failure detected"}.
 
+## User Entry Impact
+- Improved entry: `python -m sovereign_hall.check_db` now shows latest best policy, score, overfit warning, single-name cap, and recent failure cases.
+- Local-only guard: `check_db` now uses local cost basis for position valuation by default; realtime quote lookup requires `SOVEREIGN_HALL_REALTIME_QUOTES=1`.
+- Improved simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` now cap simulated long positions using the latest local heuristic max position; overfit-flagged policies are used only as warnings/risk caps, not as return-seeking default rules.
+- User-visible change: before simulated trades, users see the active heuristic risk context; oversized proposed positions are reduced with an explicit reason in trade logs.
+- Not fully integrated yet: `research_interactive` still does not quote the latest policy snapshot in its final prose.
+- Next minimum loop closure: inject `format_heuristic_status()` into `research_interactive.print_report` so manual investment advice cites the same failure cases and overfit flag.
+
 ## Reproduce
 ```bash
 {command}
@@ -831,7 +854,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 
 ## Next 3 Directions
 - Add a ticker-level age/volatility stop for worst-trade reversals without increasing turnover.
-- Separate ETF and single-stock universes before mixing them in one portfolio.
+- Turn ETF-only and single-stock-only sleeve results into an explicit portfolio allocator only if both pass split/cost stress.
 - Replace prediction-current-price fallback with validated local daily prices when available.
 """
     path.write_text(text, encoding="utf-8")
@@ -908,6 +931,14 @@ def main() -> int:
     daily.to_csv(run_dir / "daily_signal_tape.csv", index=False)
 
     costs = CostConfig()
+    changed_files = [
+        "scripts/run_heuristic_cycle.py",
+        "services/heuristic_policy.py",
+        "services/investment_simulation.py",
+        "run_discussion.py",
+        "check_db.py",
+        "tests/test_refactor_pipeline.py",
+    ]
     policies = [
         PolicyConfig(name="baseline_default_policy"),
         PolicyConfig(name="trend_filter", require_positive_trend=True, trend_lookback=3),
@@ -1036,6 +1067,46 @@ def main() -> int:
             rebalance_threshold=0.05,
         ),
         PolicyConfig(
+            name="etf_only_cost_guard",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.10,
+            max_gross=0.45,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.50,
+            drawdown_guard_threshold=0.025,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.55,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            rebalance_threshold=0.05,
+            universe="etf",
+        ),
+        PolicyConfig(
+            name="single_stock_cost_guard",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.08,
+            max_gross=0.40,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+        ),
+        PolicyConfig(
             name="compact_cost_robust_hold4",
             min_confidence=0.66,
             max_names=4,
@@ -1068,7 +1139,7 @@ def main() -> int:
             "trial_index": index,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "trial_name": policy.name,
-            "changed_files": ["scripts/run_heuristic_cycle.py"],
+            "changed_files": changed_files,
             "config": asdict(policy),
             "eval_period": f"{metrics['sample_start']}..{metrics['sample_end']}",
             "total_return": metrics["total_return"],
@@ -1103,7 +1174,7 @@ def main() -> int:
             "trial_index": len(trial_rows),
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "trial_name": simplified.name,
-            "changed_files": ["scripts/run_heuristic_cycle.py"],
+            "changed_files": changed_files,
             "config": asdict(simplified),
             "eval_period": f"{simplified_metrics['sample_start']}..{simplified_metrics['sample_end']}",
             "total_return": simplified_metrics["total_return"],

@@ -10,6 +10,10 @@ from sovereign_hall.agents import get_persona
 from sovereign_hall.services.database import DatabaseService
 from sovereign_hall.services.decision_tracker import DecisionRecorder
 from sovereign_hall.services.investment_simulation import InvestmentSimulation
+from sovereign_hall.services.heuristic_policy import (
+    HeuristicRiskContext,
+    apply_heuristic_risk_cap,
+)
 from sovereign_hall.services.market_data import MarketDataService
 from sovereign_hall.services.prediction_tracker import PredictionTracker
 from sovereign_hall.services.backtest_engine import get_backtest_engine
@@ -179,6 +183,46 @@ async def test_simulation_does_not_buy_for_short_without_position(monkeypatch):
     assert result["success"] is False
     assert result["action"] == "hold"
     assert sim.positions == {}
+
+
+def test_heuristic_risk_cap_uses_latest_policy_as_constraint(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="cost_robust_hold4",
+        score=0.29,
+        max_position=0.10,
+        overfit_risk=True,
+        warning="sample split weak",
+        failure_cases=[],
+    )
+
+    capped, reason = apply_heuristic_risk_cap("600519", 0.25, 0.7, context=context)
+
+    assert capped == 0.10
+    assert "限制" in reason
+    assert "样本外风险" in reason
+
+
+@pytest.mark.asyncio
+async def test_simulation_applies_heuristic_position_cap(monkeypatch):
+    sim = InvestmentSimulation()
+    fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)})()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+    monkeypatch.setattr(
+        "sovereign_hall.services.investment_simulation.apply_heuristic_risk_cap",
+        lambda ticker, target_position, confidence: (0.10, "heuristic cap"),
+    )
+
+    result = await sim.execute_trade(
+        ticker="600519",
+        direction="long",
+        target_position=0.25,
+        current_price=9.0,
+        reason="committee",
+    )
+
+    assert result["action"] == "buy"
+    assert sim.positions["600519"]["shares"] == 100
 
 
 @pytest.mark.asyncio

@@ -88,9 +88,10 @@ def show_investment_status(db_path):
 
     conn.close()
 
-    # 获取实时价格
+    # 默认只使用本地数据库数据；显式设置环境变量时才查询实时行情。
+    use_realtime_quotes = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES") == "1"
     tickers = [pos[0] for pos in positions]
-    realtime_prices = get_realtime_prices(tickers) if tickers else {}
+    realtime_prices = get_realtime_prices(tickers) if tickers and use_realtime_quotes else {}
 
     # 计算当前资产（使用实时价格）
     total_value = cash
@@ -99,12 +100,15 @@ def show_investment_status(db_path):
         ticker = pos[0]
         shares = pos[1]
         cost = pos[2]
-        current_price = realtime_prices.get(ticker, cost)  # 优先用实时价，没有则用成本价
+        current_price = realtime_prices.get(ticker, cost)
         position_value = shares * current_price
         total_value += position_value
         change = (current_price - cost) / cost * 100 if cost > 0 else 0
         sign = '+' if change >= 0 else ''
-        position_details.append(f"  {ticker}: {shares}股 @ 现价{current_price:.3f} 成本{cost:.3f} ({sign}{change:.1f}%)")
+        price_label = "现价" if ticker in realtime_prices else "本地成本价"
+        position_details.append(
+            f"  {ticker}: {shares}股 @ {price_label}{current_price:.3f} 成本{cost:.3f} ({sign}{change:.1f}%)"
+        )
 
     profit = total_value - initial_capital
     profit_pct = (profit / initial_capital) * 100
@@ -143,6 +147,12 @@ def show_stats(db_path):
 
     # 先显示投资状态
     show_investment_status(db_path)
+    try:
+        from sovereign_hall.services.heuristic_policy import format_heuristic_status
+
+        print(format_heuristic_status())
+    except Exception as exc:
+        print(f"\n🧭 Heuristic 学习状态: 无法读取 ({exc})")
 
     print(f"\n   数据库: {db_path.name}")
     print(f"   大小: {format_size(os.path.getsize(db_path))}")

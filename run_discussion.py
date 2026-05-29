@@ -49,6 +49,10 @@ from sovereign_hall.services.database import DatabaseService
 from sovereign_hall.services.llm_client import LLMClient
 from sovereign_hall.services.spider_service import SpiderSwarm, SearchQueryGenerator
 from sovereign_hall.services.decision_tracker import DecisionRecorder
+from sovereign_hall.services.heuristic_policy import (
+    apply_heuristic_risk_cap,
+    load_latest_heuristic_context,
+)
 from sovereign_hall.services.learning_engine import LearningEngine
 from sovereign_hall.services.market_data import get_market_data
 from sovereign_hall.core import AgentRole
@@ -983,7 +987,14 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
     print(f"\n💰 根据投委会裁决执行每日投资模拟...")
     history_reflection = await simulation.get_recent_reflection(limit=2)
     assets = await simulation.calculate_assets()
+    heuristic_context = load_latest_heuristic_context()
     print(f"   当前资产: {assets['total_assets']:.2f}元 | 现金: {assets['cash']:.2f}元 | 持仓: {assets['positions_value']:.2f}元")
+    if heuristic_context.available:
+        print(
+            f"   Heuristic风控: {heuristic_context.policy_name} "
+            f"score={heuristic_context.score if heuristic_context.score is not None else 'N/A'} | "
+            f"单标的上限{heuristic_context.max_position:.0%} | {heuristic_context.warning}"
+        )
 
     current_positions = assets.get('positions', {})
     current_tickers = set(current_positions.keys())
@@ -1031,6 +1042,16 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             else:
                 trade_position = target_position
                 trade_reason = f"投委会置信度{confidence:.0%}，按裁决执行"
+
+            capped_position, cap_reason = apply_heuristic_risk_cap(
+                ticker,
+                trade_position,
+                confidence,
+                context=heuristic_context,
+            )
+            if cap_reason:
+                trade_reason = f"{trade_reason}；{cap_reason}"
+            trade_position = capped_position
 
             result = await simulation.execute_trade(
                 ticker=ticker,
