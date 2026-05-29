@@ -36,6 +36,7 @@ colorama >= 0.4.6
 # Utilities
 tqdm >= 4.66.0
 rich >= 13.7.0
+Pillow >= 10.0.0
 
 # Testing
 pytest >= 8.0.0

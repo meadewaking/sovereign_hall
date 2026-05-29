@@ -39,6 +39,42 @@ def get_realtime_prices(tickers: list) -> dict:
     return asyncio.run(fetch())
 
 
+def get_latest_local_prices(conn: sqlite3.Connection, tickers: list) -> dict:
+    """从 daily_prices 读取每只持仓最近的本地收盘价。"""
+    if not tickers:
+        return {}
+
+    c = conn.cursor()
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_prices'")
+    if not c.fetchone():
+        return {}
+
+    placeholders = ",".join("?" for _ in tickers)
+    c.execute(f"""
+        SELECT p.ticker, p.close, p.date
+        FROM daily_prices p
+        JOIN (
+            SELECT ticker, MAX(date) AS latest_date
+            FROM daily_prices
+            WHERE ticker IN ({placeholders})
+            GROUP BY ticker
+        ) latest
+          ON p.ticker = latest.ticker
+         AND p.date = latest.latest_date
+        WHERE p.close IS NOT NULL AND p.close > 0
+    """, tickers)
+    return {
+        row[0]: {"price": float(row[1]), "date": row[2]}
+        for row in c.fetchall()
+    }
+
+
+def realtime_quotes_enabled() -> bool:
+    """默认启用实时行情；需要离线检查时可设 SOVEREIGN_HALL_REALTIME_QUOTES=0。"""
+    value = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def show_investment_status(db_path):
     """显示投资模拟状态"""
     conn = sqlite3.connect(str(db_path))
@@ -86,26 +122,34 @@ def show_investment_status(db_path):
     except:
         trades = []
 
+    tickers = [pos[0] for pos in positions]
+    local_prices = get_latest_local_prices(conn, tickers)
     conn.close()
 
-    # 默认只使用本地数据库数据；显式设置环境变量时才查询实时行情。
-    use_realtime_quotes = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES") == "1"
-    tickers = [pos[0] for pos in positions]
+    # 投资状态应按可用的最新价格估值：实时行情 > 本地最近收盘价 > 成本价兜底。
+    use_realtime_quotes = realtime_quotes_enabled()
     realtime_prices = get_realtime_prices(tickers) if tickers and use_realtime_quotes else {}
 
-    # 计算当前资产（使用实时价格）
+    # 计算当前资产
     total_value = cash
     position_details = []
     for pos in positions:
         ticker = pos[0]
         shares = pos[1]
         cost = pos[2]
-        current_price = realtime_prices.get(ticker, cost)
+        if ticker in realtime_prices:
+            current_price = realtime_prices[ticker]
+            price_label = "实时现价"
+        elif ticker in local_prices:
+            current_price = local_prices[ticker]["price"]
+            price_label = f"本地收盘({local_prices[ticker]['date']})"
+        else:
+            current_price = cost
+            price_label = "成本价兜底"
         position_value = shares * current_price
         total_value += position_value
         change = (current_price - cost) / cost * 100 if cost > 0 else 0
         sign = '+' if change >= 0 else ''
-        price_label = "现价" if ticker in realtime_prices else "本地成本价"
         position_details.append(
             f"  {ticker}: {shares}股 @ {price_label}{current_price:.3f} 成本{cost:.3f} ({sign}{change:.1f}%)"
         )

@@ -149,7 +149,7 @@ class MarketDataService:
         if not secid:
             return None
         url = "http://push2.eastmoney.com/api/qt/stock/get"
-        params = {"secid": secid, "fields": "f43,f57,f58"}
+        params = {"secid": secid, "fields": "f43,f57,f58,f59"}
         try:
             resp = await self._client.get(url, params=params)
             resp.raise_for_status()
@@ -157,11 +157,30 @@ class MarketDataService:
             raw = data.get("f43")
             if raw in (None, "-", ""):
                 return None
-            value = float(raw)
-            return value / 100 if value > 1000 else value
+            return self._parse_eastmoney_price(raw, data.get("f59"), ticker)
         except Exception as exc:
             logger.debug("Eastmoney quote failed for %s: %s", ticker, exc)
         return None
+
+    @staticmethod
+    def _parse_eastmoney_price(raw: object, precision: object = None, ticker: str = "") -> Optional[float]:
+        """Convert Eastmoney scaled integer quote fields to a decimal price."""
+        try:
+            value = float(raw)
+            if precision not in (None, "-", ""):
+                decimals = int(precision)
+                if decimals >= 0:
+                    return value / (10 ** decimals)
+
+            code = MarketDataService.normalize_ticker(ticker)
+            fund_prefixes = (
+                "159", "510", "511", "512", "513", "515", "516", "517",
+                "518", "560", "561", "562", "563", "588",
+            )
+            decimals = 3 if code.startswith(fund_prefixes) else 2
+            return value / (10 ** decimals)
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     async def get_ohlc(
         self,
