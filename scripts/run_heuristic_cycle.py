@@ -68,6 +68,10 @@ class PolicyConfig:
     excluded_tickers: tuple[str, ...] = ()
     excluded_ticker_mode: str = "none"
     excluded_ticker_scale: float = 1.0
+    failure_memory_mode: str = "none"
+    failure_memory_loss_threshold: float = -1.0
+    failure_memory_days: int = 0
+    failure_memory_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -242,6 +246,7 @@ def pick_targets(
     position_age_days: dict[str, int],
     current_drawdown: float,
     consecutive_loss_days: int = 0,
+    failure_memory_tickers: set[str] | None = None,
 ) -> tuple[dict[str, float], list[str]]:
     if signal_rows.empty:
         return {}, ["no_signal_rows"]
@@ -273,6 +278,16 @@ def pick_targets(
         elif policy.excluded_ticker_mode == "scale" and policy.excluded_ticker_scale < 1.0:
             candidates.loc[excluded_mask, "signal_strength"] *= policy.excluded_ticker_scale
             reasons.append(f"recent_failure_scaled={int(excluded_mask.sum())}")
+
+    if policy.failure_memory_mode != "none" and failure_memory_tickers and not candidates.empty:
+        memory_mask = candidates["ticker"].map(normalize_ticker).isin(failure_memory_tickers)
+        if policy.failure_memory_mode == "veto":
+            before = len(candidates)
+            candidates = candidates[~memory_mask]
+            reasons.append(f"no_lookahead_failure_veto_removed={before - len(candidates)}")
+        elif policy.failure_memory_mode == "scale" and policy.failure_memory_scale < 1.0:
+            candidates.loc[memory_mask, "signal_strength"] *= policy.failure_memory_scale
+            reasons.append(f"no_lookahead_failure_scaled={int(memory_mask.sum())}")
 
     if policy.require_positive_trend and policy.trend_lookback:
         col = f"momentum_{policy.trend_lookback}d"
@@ -487,10 +502,15 @@ def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
     total_turnover = 0.0
     total_cost = 0.0
     consecutive_loss_days = 0
+    failure_memory: dict[str, int] = {}
 
     for idx in range(1, len(dates)):
         signal_date = dates[idx - 1]
         date = dates[idx]
+        active_failure_memory = {
+            ticker for ticker, days_left in failure_memory.items() if days_left > 0
+        }
+        refreshed_failure_memory: dict[str, int] = {}
         current_dd = equity / peak - 1.0
         targets, reasons = pick_targets(
             by_date[signal_date],
@@ -499,6 +519,7 @@ def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
             position_age_days,
             current_dd,
             consecutive_loss_days,
+            active_failure_memory,
         )
         turnover, rebalance_cost, _, trade_count = cost_for_rebalance(positions, targets, costs)
 
@@ -520,6 +541,12 @@ def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
                             "exit_reason": "filtered_or_rebalanced_to_zero",
                         }
                     )
+                    if (
+                        policy.failure_memory_mode != "none"
+                        and policy.failure_memory_days > 0
+                        and pnl_pct <= policy.failure_memory_loss_threshold
+                    ):
+                        refreshed_failure_memory[normalize_ticker(ticker)] = policy.failure_memory_days
                 entry_price.pop(ticker, None)
                 entry_date.pop(ticker, None)
         for ticker, new_weight in targets.items():
@@ -546,6 +573,12 @@ def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
             ticker: previous_age.get(ticker, -1) + 1
             for ticker in targets
         }
+        failure_memory = {
+            ticker: days_left - 1
+            for ticker, days_left in failure_memory.items()
+            if days_left > 1
+        }
+        failure_memory.update(refreshed_failure_memory)
         positions = targets
         rows.append(
             {
@@ -903,6 +936,8 @@ def write_readme(
 ## What Changed
 - Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
 - Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, minimum holding periods, no-new-risk pauses, and rebalance friction.
+- Advanced the prior no-lookahead direction by adding failure-memory replay trials that only penalize tickers after their own closed backtest loss is already known at that simulated date.
+- Kept no-lookahead failure memory as a replay validation unless it produces a real score/trade-path improvement; equal-score behavior is not enough to change the default policy.
 - Advanced the prior failure-pattern direction by testing recent-failure ticker half-size/veto diagnostics for: {failure_ticker_text}.
 - Kept recent-failure ticker rules out of promotable best selection because they depend on prior failure labels and can overfit the same local tape.
 - Added ETF-only and single-stock-only sleeve trials so the cycle no longer evaluates every universe mix as one undifferentiated basket.
@@ -941,8 +976,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved manual advice path: `python -m sovereign_hall.research_interactive` now prints and saves the latest heuristic policy, overfit warning, and recent failure cases alongside the generated report.
 - Improved research prompt path: `run_discussion` and `research_interactive` now pass the latest local heuristic policy, failure-case tickers, and overfit warning into proposal, voting, and conclusion prompts as explicit risk constraints.
 - User-visible change: before simulated trades and in manual research reports, users see the active heuristic risk context; oversized proposed positions are reduced with an explicit reason in trade logs, and repeated failure-case tickers must be justified or reduced.
-- Still not fully integrated: `check_db` displays the latest learning status but does not yet drill into ticker-specific prompt constraints.
-- Next minimum loop closure: add a check_db table that maps each recent failure ticker to the exact cap/prompt warning currently applied.
+- Improved status display: `check_db`/manual research now show recent failure tickers with the exact simulated-position cap and prompt action currently applied by `services/heuristic_policy.py`.
+- Still not fully integrated: live simulated positions do not yet keep their own durable closed-trade failure memory; current caps are derived from the latest heuristic-cycle failure cases.
+- Next minimum loop closure: persist closed simulated trade failures into a local risk memory table and apply the same no-lookahead decay rule outside the offline backtest.
 
 ## Reproduce
 ```bash
@@ -950,7 +986,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Keep recent-failure ticker rules as prompt/cap warnings until a no-lookahead replay can prove they improve OOS without churn.
+- Promote no-lookahead failure memory into simulated-investment state only if replay remains OOS/cost robust across another local tape update.
 - Turn ETF-only and single-stock-only sleeve results into an explicit portfolio allocator only if both pass split/cost stress.
 - Replace prediction-current-price fallback with validated local daily prices when available.
 """
@@ -1250,6 +1286,53 @@ def main() -> int:
             min_holding_days=4,
             rebalance_threshold=0.05,
             universe="single_stock",
+        ),
+        PolicyConfig(
+            name="no_lookahead_failure_half_size",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.08,
+            max_gross=0.40,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+            failure_memory_mode="scale",
+            failure_memory_loss_threshold=-0.03,
+            failure_memory_days=8,
+            failure_memory_scale=0.5,
+        ),
+        PolicyConfig(
+            name="no_lookahead_failure_veto",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.08,
+            max_gross=0.40,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+            failure_memory_mode="veto",
+            failure_memory_loss_threshold=-0.03,
+            failure_memory_days=8,
         ),
         PolicyConfig(
             name="recent_failure_half_size_diagnostic",

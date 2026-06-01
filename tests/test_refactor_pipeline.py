@@ -13,6 +13,7 @@ from sovereign_hall.services.investment_simulation import InvestmentSimulation
 from sovereign_hall.services.heuristic_policy import (
     HeuristicRiskContext,
     apply_heuristic_risk_cap,
+    failure_ticker_constraints,
     format_heuristic_prompt_context,
     format_heuristic_status,
 )
@@ -276,7 +277,38 @@ def test_format_heuristic_prompt_context_marks_failure_tickers(tmp_path):
     assert "本地Heuristic风控约束" in prompt
     assert "688256" in prompt
     assert "不得编造成外部市场事实" in prompt
-    assert "减半仓位或观望" in prompt
+    assert "限制到4.0%或观望" in prompt
+
+
+def test_failure_ticker_constraints_explain_exact_cap(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="no_lookahead_failure_half_size",
+        score=0.08,
+        max_position=0.08,
+        overfit_risk=False,
+        warning="split/cost passed",
+        failure_cases=[
+            {
+                "case_type": "worst_trade",
+                "time_range": "2026-05-27..2026-05-30",
+                "market_state": {"ticker": "688256"},
+                "suspected_reason": "entry reversed quickly",
+            }
+        ],
+        failure_ticker_scale=0.5,
+    )
+
+    constraints = failure_ticker_constraints(context)
+
+    assert constraints == [
+        {
+            "ticker": "688256",
+            "max_simulated_position": 0.04,
+            "action": "cap_to_failure_scale_and_require_new_evidence",
+            "reason": "worst_trade",
+        }
+    ]
 
 
 def test_run_discussion_appends_heuristic_context(monkeypatch):
