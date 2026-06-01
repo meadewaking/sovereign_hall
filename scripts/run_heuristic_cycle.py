@@ -58,10 +58,16 @@ class PolicyConfig:
     loss_streak_guard: float = 1.0
     new_entry_loss_streak_threshold: int = 0
     min_holding_days: int = 0
+    forced_exit_return_threshold: float = -1.0
+    forced_exit_vol_lookback: int = 0
+    forced_exit_vol_threshold: float = 1.0
     rebalance_threshold: float = 0.0
     min_signal_count: int = 1
     max_stop_gap: float = 0.55
     universe: str = "all"
+    excluded_tickers: tuple[str, ...] = ()
+    excluded_ticker_mode: str = "none"
+    excluded_ticker_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -257,6 +263,17 @@ def pick_targets(
             candidates = candidates[~etf_mask]
         reasons.append(f"{policy.universe}_universe_removed={before - len(candidates)}")
 
+    if policy.excluded_tickers and not candidates.empty:
+        excluded = {normalize_ticker(ticker) for ticker in policy.excluded_tickers}
+        excluded_mask = candidates["ticker"].map(normalize_ticker).isin(excluded)
+        if policy.excluded_ticker_mode == "veto":
+            before = len(candidates)
+            candidates = candidates[~excluded_mask]
+            reasons.append(f"recent_failure_veto_removed={before - len(candidates)}")
+        elif policy.excluded_ticker_mode == "scale" and policy.excluded_ticker_scale < 1.0:
+            candidates.loc[excluded_mask, "signal_strength"] *= policy.excluded_ticker_scale
+            reasons.append(f"recent_failure_scaled={int(excluded_mask.sum())}")
+
     if policy.require_positive_trend and policy.trend_lookback:
         col = f"momentum_{policy.trend_lookback}d"
         before = len(candidates)
@@ -274,7 +291,7 @@ def pick_targets(
         reasons.append(f"new_entry_pause_removed={before - len(candidates)}")
 
     if candidates.empty:
-        forced = forced_holding_positions(policy, current_positions, position_age_days)
+        forced = forced_holding_positions(policy, current_positions, position_age_days, signal_rows)
         if forced:
             reasons.append("min_holding_retained_existing")
             return forced, reasons
@@ -289,7 +306,7 @@ def pick_targets(
         gross *= policy.loss_streak_guard
         reasons.append("loss_streak_guard_scaled_gross")
 
-    weights = forced_holding_positions(policy, current_positions, position_age_days)
+    weights = forced_holding_positions(policy, current_positions, position_age_days, signal_rows)
     if weights:
         reasons.append("min_holding_reserved_gross")
     reserved_gross = sum(weights.values())
@@ -330,14 +347,40 @@ def forced_holding_positions(
     policy: PolicyConfig,
     current_positions: dict[str, float],
     position_age_days: dict[str, int],
+    signal_rows: pd.DataFrame | None = None,
 ) -> dict[str, float]:
     if policy.min_holding_days <= 0:
         return {}
-    return {
-        ticker: float(weight)
-        for ticker, weight in current_positions.items()
-        if weight > 0 and position_age_days.get(ticker, 0) < policy.min_holding_days
-    }
+    signal_by_ticker = (
+        signal_rows.set_index("ticker") if signal_rows is not None and not signal_rows.empty else pd.DataFrame()
+    )
+    forced: dict[str, float] = {}
+    for ticker, weight in current_positions.items():
+        if weight <= 0 or position_age_days.get(ticker, 0) >= policy.min_holding_days:
+            continue
+        if should_release_forced_hold(policy, ticker, signal_by_ticker):
+            continue
+        forced[ticker] = float(weight)
+    return forced
+
+
+def should_release_forced_hold(policy: PolicyConfig, ticker: str, signal_by_ticker: pd.DataFrame) -> bool:
+    """Allow a young position to exit when the latest local tape shows a sharp reversal."""
+    if signal_by_ticker.empty or ticker not in signal_by_ticker.index:
+        return False
+    row = signal_by_ticker.loc[ticker]
+    latest_return = float(row.get("return_1d", 0.0) or 0.0)
+    vol = 0.0
+    if policy.forced_exit_vol_lookback:
+        vol_value = row.get(f"vol_{policy.forced_exit_vol_lookback}d")
+        vol = float(vol_value) if pd.notna(vol_value) else 0.0
+    return (
+        latest_return <= policy.forced_exit_return_threshold
+        and (
+            policy.forced_exit_vol_lookback <= 0
+            or vol >= policy.forced_exit_vol_threshold
+        )
+    )
 
 
 def cost_for_rebalance(old: dict[str, float], new: dict[str, float], costs: CostConfig) -> tuple[float, float, float, int]:
@@ -728,6 +771,46 @@ def previous_best_score(root: Path) -> tuple[float | None, Path | None]:
     return best_score, best_path
 
 
+def latest_completed_run(root: Path) -> Path | None:
+    latest = root / "LATEST"
+    if latest.exists():
+        try:
+            candidate = Path(latest.read_text(encoding="utf-8").strip())
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+        except Exception:
+            pass
+    candidates = [path.parent for path in root.glob("*/README.md") if path.parent.is_dir()]
+    return sorted(candidates)[-1] if candidates else None
+
+
+def extract_failure_tickers_from_run(run_dir: Path | None) -> tuple[str, ...]:
+    if run_dir is None:
+        return ()
+    path = run_dir / "failure_cases.jsonl"
+    if not path.exists():
+        return ()
+    tickers: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            case = json.loads(line)
+        except Exception:
+            continue
+        for key in ("market_state", "signals", "positions"):
+            value = case.get(key)
+            if not isinstance(value, dict):
+                continue
+            ticker = value.get("ticker")
+            if ticker:
+                tickers.add(normalize_ticker(ticker))
+            for maybe_ticker, maybe_weight in value.items():
+                if isinstance(maybe_weight, (int, float)) and maybe_weight > 0:
+                    normalized = normalize_ticker(maybe_ticker)
+                    if normalized and normalized[0].isdigit():
+                        tickers.add(normalized)
+    return tuple(sorted(tickers))
+
+
 def split_checks(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -> dict[str, Any]:
     dates = sorted(daily["date"].unique())
     if len(dates) < 6:
@@ -788,6 +871,7 @@ def write_readme(
     sample_count: int,
     db_path: Path,
     command: str,
+    recent_failure_tickers: tuple[str, ...] = (),
 ) -> None:
     failed = [t for t in trials if t["trial_name"] != best_name]
     comparison = "No previous heuristic_cycle best was found."
@@ -800,6 +884,12 @@ def write_readme(
         f"- {t['trial_name']}: score={t['score']:.6f}, notes={t['notes']}" for t in failed
     )
     checks_text = json.dumps(checks, ensure_ascii=False, indent=2)
+    diagnostic_trials = [t for t in trials if t["trial_name"].endswith("_diagnostic")]
+    diagnostic_lines = "\n".join(
+        f"- {t['trial_name']}: score={t['score']:.6f}; not promotable because it uses previous failure-case tickers and can leak sample-specific knowledge."
+        for t in diagnostic_trials
+    )
+    failure_ticker_text = ", ".join(recent_failure_tickers) if recent_failure_tickers else "none"
     text = f"""# Heuristic Learning Cycle
 
 ## Run
@@ -813,9 +903,11 @@ def write_readme(
 ## What Changed
 - Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
 - Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, minimum holding periods, no-new-risk pauses, and rebalance friction.
+- Advanced the prior failure-pattern direction by testing recent-failure ticker half-size/veto diagnostics for: {failure_ticker_text}.
+- Kept recent-failure ticker rules out of promotable best selection because they depend on prior failure labels and can overfit the same local tape.
 - Added ETF-only and single-stock-only sleeve trials so the cycle no longer evaluates every universe mix as one undifferentiated basket.
-- Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display and simulated-trading position caps.
-- Kept the latest best as a conservative risk constraint because sample-out split risk is still explicitly measured before user-entry adoption.
+- Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display, manual research warnings, simulated-trading position caps, and prompt-level failure-case constraints.
+- Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
 
 ## Best Metrics
@@ -832,6 +924,9 @@ def write_readme(
 ## Failed Or Weaker Directions
 {failed_lines or "- None; only one trial was available."}
 
+## Diagnostic Only
+{diagnostic_lines or "- No recent failure tickers were available for diagnostic tests."}
+
 ## Overfitting Risk
 ```json
 {checks_text}
@@ -842,10 +937,12 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## User Entry Impact
 - Improved entry: `python -m sovereign_hall.check_db` now shows latest best policy, score, overfit warning, single-name cap, and recent failure cases.
 - Local-only guard: `check_db` now uses local cost basis for position valuation by default; realtime quote lookup requires `SOVEREIGN_HALL_REALTIME_QUOTES=1`.
-- Improved simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` now cap simulated long positions using the latest local heuristic max position; overfit-flagged policies are used only as warnings/risk caps, not as return-seeking default rules.
-- User-visible change: before simulated trades, users see the active heuristic risk context; oversized proposed positions are reduced with an explicit reason in trade logs.
-- Not fully integrated yet: `research_interactive` still does not quote the latest policy snapshot in its final prose.
-- Next minimum loop closure: inject `format_heuristic_status()` into `research_interactive.print_report` so manual investment advice cites the same failure cases and overfit flag.
+- Improved simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` now cap simulated long positions using the latest local heuristic max position; weak or lower-scoring policies are used only as warnings/risk caps, not as return-seeking exposure increases.
+- Improved manual advice path: `python -m sovereign_hall.research_interactive` now prints and saves the latest heuristic policy, overfit warning, and recent failure cases alongside the generated report.
+- Improved research prompt path: `run_discussion` and `research_interactive` now pass the latest local heuristic policy, failure-case tickers, and overfit warning into proposal, voting, and conclusion prompts as explicit risk constraints.
+- User-visible change: before simulated trades and in manual research reports, users see the active heuristic risk context; oversized proposed positions are reduced with an explicit reason in trade logs, and repeated failure-case tickers must be justified or reduced.
+- Still not fully integrated: `check_db` displays the latest learning status but does not yet drill into ticker-specific prompt constraints.
+- Next minimum loop closure: add a check_db table that maps each recent failure ticker to the exact cap/prompt warning currently applied.
 
 ## Reproduce
 ```bash
@@ -853,7 +950,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Add a ticker-level age/volatility stop for worst-trade reversals without increasing turnover.
+- Keep recent-failure ticker rules as prompt/cap warnings until a no-lookahead replay can prove they improve OOS without churn.
 - Turn ETF-only and single-stock-only sleeve results into an explicit portfolio allocator only if both pass split/cost stress.
 - Replace prediction-current-price fallback with validated local daily prices when available.
 """
@@ -922,6 +1019,8 @@ def main() -> int:
     run_dir = runs_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
+    previous_latest_run = latest_completed_run(runs_root)
+    recent_failure_tickers = extract_failure_tickers_from_run(previous_latest_run)
     previous_score, previous_path = previous_best_score(runs_root)
     predictions = load_predictions(db_path)
     if predictions.empty:
@@ -935,7 +1034,9 @@ def main() -> int:
         "scripts/run_heuristic_cycle.py",
         "services/heuristic_policy.py",
         "services/investment_simulation.py",
+        "services/research_discussion.py",
         "run_discussion.py",
+        "research_interactive.py",
         "check_db.py",
         "tests/test_refactor_pipeline.py",
     ]
@@ -1067,6 +1168,50 @@ def main() -> int:
             rebalance_threshold=0.05,
         ),
         PolicyConfig(
+            name="age_volatility_reversal_stop",
+            min_confidence=0.66,
+            max_names=5,
+            max_position=0.10,
+            max_gross=0.55,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.50,
+            drawdown_guard_threshold=0.025,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.55,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            forced_exit_return_threshold=-0.025,
+            forced_exit_vol_lookback=3,
+            forced_exit_vol_threshold=0.030,
+            rebalance_threshold=0.05,
+        ),
+        PolicyConfig(
+            name="strict_age_reversal_stop",
+            min_confidence=0.66,
+            max_names=5,
+            max_position=0.10,
+            max_gross=0.55,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.50,
+            drawdown_guard_threshold=0.025,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.55,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            forced_exit_return_threshold=-0.035,
+            forced_exit_vol_lookback=3,
+            forced_exit_vol_threshold=0.040,
+            rebalance_threshold=0.05,
+        ),
+        PolicyConfig(
             name="etf_only_cost_guard",
             min_confidence=0.66,
             max_names=4,
@@ -1105,6 +1250,51 @@ def main() -> int:
             min_holding_days=4,
             rebalance_threshold=0.05,
             universe="single_stock",
+        ),
+        PolicyConfig(
+            name="recent_failure_half_size_diagnostic",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.08,
+            max_gross=0.40,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+            excluded_tickers=recent_failure_tickers,
+            excluded_ticker_mode="scale",
+            excluded_ticker_scale=0.5,
+        ),
+        PolicyConfig(
+            name="recent_failure_veto_diagnostic",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.08,
+            max_gross=0.40,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=4,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+            excluded_tickers=recent_failure_tickers,
+            excluded_ticker_mode="veto",
         ),
         PolicyConfig(
             name="compact_cost_robust_hold4",
@@ -1155,7 +1345,8 @@ def main() -> int:
         trial_rows.append(row)
         append_jsonl(trials_path, [row])
 
-    best_trial = max(trial_rows, key=lambda row: row["score"])
+    promotable_trials = [row for row in trial_rows if not row["trial_name"].endswith("_diagnostic")]
+    best_trial = max(promotable_trials, key=lambda row: row["score"])
     best_policy = next(policy for policy in policies if policy.name == best_trial["trial_name"])
 
     simplified = replace(
@@ -1240,6 +1431,8 @@ def main() -> int:
         "note": "No prior runs/heuristic_cycle outputs were found before this run."
         if previous_score is None
         else f"Previous best read from {previous_path}",
+        "previous_latest_run": str(previous_latest_run) if previous_latest_run else None,
+        "recent_failure_tickers_from_previous_run": list(recent_failure_tickers),
         "price_source": (
             "daily_prices table with fallback to prediction current_price"
             if not price_history.empty
@@ -1259,6 +1452,7 @@ def main() -> int:
         len(predictions),
         db_path,
         f"python scripts/run_heuristic_cycle.py --db {args.db}",
+        recent_failure_tickers=recent_failure_tickers,
     )
 
     latest = runs_root / "LATEST"

@@ -13,6 +13,8 @@ from sovereign_hall.services.investment_simulation import InvestmentSimulation
 from sovereign_hall.services.heuristic_policy import (
     HeuristicRiskContext,
     apply_heuristic_risk_cap,
+    format_heuristic_prompt_context,
+    format_heuristic_status,
 )
 from sovereign_hall.services.market_data import MarketDataService
 from sovereign_hall.services.prediction_tracker import PredictionTracker
@@ -21,6 +23,7 @@ from sovereign_hall.services.prediction_store import ensure_prediction_tables
 from sovereign_hall.run_discussion import (
     TOPIC_POOL,
     aggregate_committee_decision,
+    build_lessons_with_heuristic_context,
     select_next_topic,
     stage2_deep_research,
     stage3_ic_discussion,
@@ -201,6 +204,91 @@ def test_heuristic_risk_cap_uses_latest_policy_as_constraint(tmp_path):
     assert capped == 0.10
     assert "限制" in reason
     assert "样本外风险" in reason
+
+
+def test_heuristic_risk_cap_tightens_recent_failure_ticker(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="cost_robust_hold4",
+        score=0.29,
+        max_position=0.10,
+        overfit_risk=True,
+        warning="sample split weak",
+        failure_cases=[
+            {
+                "case_type": "worst_trade",
+                "market_state": {"ticker": "000977"},
+                "signals": {},
+                "positions": {},
+            }
+        ],
+    )
+
+    capped, reason = apply_heuristic_risk_cap("000977.SZ", 0.10, 0.8, context=context)
+
+    assert capped == 0.05
+    assert "failure case" in reason
+
+
+def test_format_heuristic_status_includes_failure_cases(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="cost_robust_hold4",
+        score=0.29,
+        max_position=0.10,
+        overfit_risk=True,
+        warning="sample split weak",
+        failure_cases=[
+            {
+                "case_type": "worst_trade",
+                "time_range": "2026-05-10..2026-05-15",
+                "suspected_reason": "entry reversed quickly",
+            }
+        ],
+    )
+
+    status = format_heuristic_status(context)
+
+    assert "cost_robust_hold4" in status
+    assert "worst_trade" in status
+
+
+def test_format_heuristic_prompt_context_marks_failure_tickers(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_cost_guard",
+        score=0.067,
+        max_position=0.08,
+        overfit_risk=False,
+        warning="split/cost passed",
+        failure_cases=[
+            {
+                "case_type": "worst_trade",
+                "time_range": "2026-05-27..2026-05-30",
+                "market_state": {"ticker": "688256"},
+                "suspected_reason": "entry reversed quickly",
+            }
+        ],
+    )
+
+    prompt = format_heuristic_prompt_context(context)
+
+    assert "本地Heuristic风控约束" in prompt
+    assert "688256" in prompt
+    assert "不得编造成外部市场事实" in prompt
+    assert "减半仓位或观望" in prompt
+
+
+def test_run_discussion_appends_heuristic_context(monkeypatch):
+    monkeypatch.setattr(
+        "sovereign_hall.run_discussion.format_heuristic_prompt_context",
+        lambda: "【本地Heuristic风控约束】failure tickers: 688256",
+    )
+
+    prompt = build_lessons_with_heuristic_context("【历史教训】控制换手")
+
+    assert "【历史教训】控制换手" in prompt
+    assert "failure tickers: 688256" in prompt
 
 
 @pytest.mark.asyncio

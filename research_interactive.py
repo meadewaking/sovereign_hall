@@ -14,6 +14,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root.parent))
 
 from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
+from sovereign_hall.services.heuristic_policy import format_heuristic_status
 
 
 async def print_report(context):
@@ -28,6 +29,10 @@ async def print_report(context):
     print("="*70)
     print(f"问题: {context.question}")
     print(f"本次讨论轮次: {len(context.discussion_history)} 轮")
+
+    print("\n" + "="*70)
+    print(format_heuristic_status())
+    print("="*70)
 
     print("\n" + "="*70)
     print("🗣️  讨论过程")
@@ -79,6 +84,9 @@ async def main():
                 f.write(f"# 研究报告\n\n")
                 f.write(f"**问题**: {context.question}\n\n")
                 f.write(f"**时间**: {datetime.now().isoformat()}\n\n")
+                f.write("## 本地Heuristic风险提示\n\n")
+                f.write(format_heuristic_status())
+                f.write("\n\n")
                 f.write("---\n\n")
                 f.write("## 结论\n\n")
                 f.write(context.final_conclusion)

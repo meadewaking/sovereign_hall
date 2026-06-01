@@ -51,6 +51,7 @@ from sovereign_hall.services.spider_service import SpiderSwarm, SearchQueryGener
 from sovereign_hall.services.decision_tracker import DecisionRecorder
 from sovereign_hall.services.heuristic_policy import (
     apply_heuristic_risk_cap,
+    format_heuristic_prompt_context,
     load_latest_heuristic_context,
 )
 from sovereign_hall.services.learning_engine import LearningEngine
@@ -371,6 +372,17 @@ def dedupe_proposals(proposals: List[Dict]) -> List[Dict]:
         if previous is None or float(proposal.get("confidence", 0)) > float(previous.get("confidence", 0)):
             by_key[key] = proposal | {"ticker": ticker, "direction": direction}
     return list(by_key.values())
+
+
+def build_lessons_with_heuristic_context(lessons_prompt: str = "") -> str:
+    """Append the latest local heuristic risk constraints to agent prompts."""
+    parts = []
+    if lessons_prompt and lessons_prompt.strip():
+        parts.append(lessons_prompt.strip())
+    heuristic_prompt = format_heuristic_prompt_context()
+    if heuristic_prompt:
+        parts.append(heuristic_prompt)
+    return "\n\n".join(parts)
 
 
 # ============================================================================
@@ -1324,8 +1336,10 @@ async def main():
 
                     print(f"   ✅ 文档已保存 (DB: {saved_docs}, VectorDB自动跳过重复文档)")
 
+                prompt_lessons = build_lessons_with_heuristic_context(lessons_prompt)
+
                 # 阶段2：深度研报 → 提案
-                proposals = await stage2_deep_research(llm, docs, topic, db_service, lessons_prompt=lessons_prompt)
+                proposals = await stage2_deep_research(llm, docs, topic, db_service, lessons_prompt=prompt_lessons)
                 proposals = dedupe_proposals(proposals)
                 for proposal in proposals:
                     try:
@@ -1336,7 +1350,7 @@ async def main():
                 # 阶段3：投委会讨论
                 logger.info(f"开始阶段3投委会审议，提案数: {len(proposals)}")
                 try:
-                    discussions, decisions = await stage3_ic_discussion(llm, spiders, proposals, topic, lessons_prompt=lessons_prompt)
+                    discussions, decisions = await stage3_ic_discussion(llm, spiders, proposals, topic, lessons_prompt=prompt_lessons)
                     logger.info(f"阶段3完成，讨论长度: {len(discussions)}, 决策数: {len(decisions)}")
                 except Exception as e:
                     logger.error(f"阶段3失败: {e}", exc_info=True)

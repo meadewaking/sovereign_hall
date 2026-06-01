@@ -32,6 +32,7 @@ from sovereign_hall.services.llm_client import LLMClient
 from sovereign_hall.services.spider_service import SpiderSwarm
 from sovereign_hall.services.vector_db import VectorDatabase
 from sovereign_hall.services.database import DatabaseService
+from sovereign_hall.services.heuristic_policy import format_heuristic_prompt_context
 from sovereign_hall.utils import extract_actual_response, truncate_text, format_token
 
 # 设置日志
@@ -83,6 +84,7 @@ class ResearchDiscussionSystem:
 
         self.enable_search = enable_search
         self.enable_web = enable_web
+        self.heuristic_prompt_context = format_heuristic_prompt_context()
 
     async def _get_db(self) -> DatabaseService:
         """获取数据库服务（延迟初始化）"""
@@ -265,6 +267,8 @@ class ResearchDiscussionSystem:
             prompt = f"""
 {additional_instruction}
 
+{self.heuristic_prompt_context}
+
 【问题】
 {question}
 
@@ -280,6 +284,8 @@ class ResearchDiscussionSystem:
         elif is_quant:
             prompt = f"""
 {additional_instruction}
+
+{self.heuristic_prompt_context}
 
 【问题】
 {question}
@@ -297,6 +303,8 @@ class ResearchDiscussionSystem:
             prompt = f"""
 {additional_instruction}
 
+{self.heuristic_prompt_context}
+
 【问题】
 {question}
 
@@ -312,6 +320,8 @@ class ResearchDiscussionSystem:
         else:
             prompt = f"""
 {additional_instruction}
+
+{self.heuristic_prompt_context}
 
 【问题】
 {question}
@@ -569,6 +579,8 @@ class ResearchDiscussionSystem:
 
 【原始问题】
 {context.question}
+
+{self.heuristic_prompt_context}
 
 【历史反思参考】
 {reflection_text if reflection_text else "无"}
