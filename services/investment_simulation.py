@@ -14,7 +14,12 @@ import aiosqlite
 
 from ..core import DATA_DIR
 from ..services.llm_client import LLMClient
-from ..services.heuristic_policy import apply_heuristic_risk_cap
+from ..services.heuristic_policy import (
+    SIMULATION_RISK_LOSS_THRESHOLD,
+    SIMULATION_RISK_MEMORY_DAYS,
+    apply_heuristic_risk_cap,
+    derive_simulation_risk_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,8 @@ class InvestmentSimulation:
         # 交易冷却期配置（天）
         self.cooldown_days = 3  # 同一只股票至少隔3天才能再次交易
         self.last_trade_records: Dict[str, str] = {}  # {ticker: last_trade_date isoformat}
+        self.risk_memory_loss_threshold = SIMULATION_RISK_LOSS_THRESHOLD
+        self.risk_memory_days = SIMULATION_RISK_MEMORY_DAYS
 
     def _load_config(self) -> Dict:
         """加载配置"""
@@ -247,6 +254,7 @@ class InvestmentSimulation:
             target_position = 0.0
 
         if direction_norm == "long":
+            await self.refresh_simulation_risk_memory()
             capped_position, cap_reason = apply_heuristic_risk_cap(
                 ticker,
                 float(target_position),
@@ -372,6 +380,7 @@ class InvestmentSimulation:
             )
 
             await self.save_state()
+            await self.refresh_simulation_risk_memory()
 
             return {
                 'success': True,
@@ -410,6 +419,76 @@ class InvestmentSimulation:
             await conn.commit()
         except Exception as e:
             logger.warning(f"Failed to record trade: {e}")
+
+    async def refresh_simulation_risk_memory(self) -> List[Dict]:
+        """Persist recent realized-loss memory derived from local simulated trades."""
+        if not self.db_service:
+            return []
+
+        try:
+            conn = self.db_service._connection
+            if conn is None:
+                return []
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_risk_memory (
+                    ticker TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    failure_count INTEGER NOT NULL,
+                    last_loss_pct REAL NOT NULL,
+                    worst_loss_pct REAL NOT NULL,
+                    last_trade_id INTEGER,
+                    last_updated TEXT NOT NULL,
+                    expires_at TEXT,
+                    reason TEXT
+                )
+            """)
+
+            async with conn.execute("""
+                SELECT id, ticker, direction, shares, price, fee, reason, traded_at
+                FROM simulation_trades
+                ORDER BY datetime(traded_at), id
+            """) as cursor:
+                rows = [dict(row) async for row in cursor]
+
+            failures = derive_simulation_risk_memory(
+                rows,
+                loss_threshold=self.risk_memory_loss_threshold,
+                memory_days=self.risk_memory_days,
+            )
+            for failure in failures:
+                await conn.execute("""
+                    INSERT INTO simulation_risk_memory (
+                        ticker, source, failure_count, last_loss_pct, worst_loss_pct,
+                        last_trade_id, last_updated, expires_at, reason
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        source = excluded.source,
+                        failure_count = excluded.failure_count,
+                        last_loss_pct = excluded.last_loss_pct,
+                        worst_loss_pct = excluded.worst_loss_pct,
+                        last_trade_id = excluded.last_trade_id,
+                        last_updated = excluded.last_updated,
+                        expires_at = excluded.expires_at,
+                        reason = excluded.reason
+                """, (
+                    failure["ticker"],
+                    failure["source"],
+                    failure["failure_count"],
+                    failure["last_loss_pct"],
+                    failure["worst_loss_pct"],
+                    failure["last_trade_id"],
+                    failure["last_updated"],
+                    failure["expires_at"],
+                    failure["reason"],
+                ))
+
+            await conn.commit()
+            return failures
+        except Exception as e:
+            logger.warning(f"Failed to refresh simulation risk memory: {e}")
+            return []
 
     async def calculate_assets(self, prices: Dict[str, float] = None) -> Dict:
         """计算当前总资产"""
@@ -590,7 +669,22 @@ class InvestmentSimulation:
             )
         """)
 
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS simulation_risk_memory (
+                ticker TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                failure_count INTEGER NOT NULL,
+                last_loss_pct REAL NOT NULL,
+                worst_loss_pct REAL NOT NULL,
+                last_trade_id INTEGER,
+                last_updated TEXT NOT NULL,
+                expires_at TEXT,
+                reason TEXT
+            )
+        """)
+
         await conn.commit()
+        await self.refresh_simulation_risk_memory()
 
     async def save_snapshot(self, reflection: str = ""):
         """保存每日资产快照"""

@@ -192,8 +192,13 @@ def show_stats(db_path):
     # 先显示投资状态
     show_investment_status(db_path)
     try:
-        from sovereign_hall.services.heuristic_policy import format_heuristic_status
+        from sovereign_hall.services.heuristic_policy import (
+            format_heuristic_status,
+            sync_simulation_risk_memory_sqlite,
+        )
 
+        with sqlite3.connect(str(db_path)) as conn:
+            sync_simulation_risk_memory_sqlite(conn)
         print(format_heuristic_status())
     except Exception as exc:
         print(f"\n🧭 Heuristic 学习状态: 无法读取 ({exc})")

@@ -13,6 +13,7 @@ from sovereign_hall.services.investment_simulation import InvestmentSimulation
 from sovereign_hall.services.heuristic_policy import (
     HeuristicRiskContext,
     apply_heuristic_risk_cap,
+    derive_simulation_risk_memory,
     failure_ticker_constraints,
     format_heuristic_prompt_context,
     format_heuristic_status,
@@ -229,6 +230,77 @@ def test_heuristic_risk_cap_tightens_recent_failure_ticker(tmp_path):
 
     assert capped == 0.05
     assert "failure case" in reason
+
+
+def test_simulation_trade_losses_derive_risk_memory():
+    failures = derive_simulation_risk_memory([
+        {
+            "id": 1,
+            "ticker": "512880",
+            "direction": "buy",
+            "shares": 1000,
+            "price": 1.0,
+            "fee": 0.3,
+            "traded_at": "2026-06-01T09:30:00",
+        },
+        {
+            "id": 2,
+            "ticker": "512880",
+            "direction": "sell",
+            "shares": 1000,
+            "price": 0.95,
+            "fee": 1.235,
+            "traded_at": "2026-06-02T09:30:00",
+        },
+    ])
+
+    assert len(failures) == 1
+    assert failures[0]["ticker"] == "512880"
+    assert failures[0]["last_loss_pct"] < -0.03
+    assert failures[0]["expires_at"].startswith("2026-06-10")
+
+
+@pytest.mark.asyncio
+async def test_simulation_refreshes_closed_loss_risk_memory(tmp_path):
+    db_path = tmp_path / "test.db"
+    db = DatabaseService(str(db_path))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    conn = db._connection
+    await conn.executemany(
+        """
+        INSERT INTO simulation_trades (ticker, direction, shares, price, fee, reason, traded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("512880", "buy", 1000, 1.0, 0.3, "entry", "2026-06-01T09:30:00"),
+            ("512880", "sell", 1000, 0.95, 1.235, "exit", "2026-06-02T09:30:00"),
+        ],
+    )
+    await conn.commit()
+
+    failures = await sim.refresh_simulation_risk_memory()
+    async with conn.execute("SELECT ticker, last_loss_pct FROM simulation_risk_memory") as cursor:
+        rows = await cursor.fetchall()
+    await db.close()
+
+    assert failures[0]["ticker"] == "512880"
+    assert rows[0][0] == "512880"
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_cost_guard",
+        score=0.03,
+        max_position=0.08,
+        overfit_risk=False,
+        warning="split/cost passed",
+        failure_cases=[],
+        simulation_failures=failures,
+    )
+    capped, reason = apply_heuristic_risk_cap("512880", 0.08, 0.8, context=context)
+
+    assert capped == 0.04
+    assert "模拟账户近期已实现亏损风险记忆" in reason
 
 
 def test_format_heuristic_status_includes_failure_cases(tmp_path):
