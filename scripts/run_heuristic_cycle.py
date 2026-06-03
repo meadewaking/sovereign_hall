@@ -938,11 +938,13 @@ def write_readme(
 - Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, minimum holding periods, no-new-risk pauses, and rebalance friction.
 - Advanced the prior no-lookahead direction by adding failure-memory replay trials that only penalize tickers after their own closed backtest loss is already known at that simulated date.
 - Kept no-lookahead failure memory out of the default offline trading policy unless it produces a real score/trade-path improvement; equal-score behavior is not enough to promote a leaderboard rule.
+- Advanced the prior durable simulated closed-loss memory direction by validating it over this refreshed local tape: active memory remains useful as a cap/warning, but no-lookahead replay only tied the best score and does not justify widening rules.
 - Closed the user-entry loop by persisting simulated-account closed-trade losses into `simulation_risk_memory`; this is used as a conservative position cap/warning in live simulation paths, not as a return-seeking allocator.
 - Advanced the prior failure-pattern direction by testing recent-failure ticker half-size/veto diagnostics for: {failure_ticker_text}.
 - Kept recent-failure ticker rules out of promotable best selection because they depend on prior failure labels and can overfit the same local tape.
 - Added ETF-only and single-stock-only sleeve trials so the cycle no longer evaluates every universe mix as one undifferentiated basket.
 - Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display, manual research warnings, simulated-trading position caps, and prompt-level failure-case constraints.
+- Added thin cost-stress signaling to the shared heuristic context so entry points now show OOS/3x-slippage scores and warn when the cost-stress margin is too thin to expand exposure.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
 
@@ -980,8 +982,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved status display: `check_db`/manual research now show recent failure tickers with the exact simulated-position cap and prompt action currently applied by `services/heuristic_policy.py`.
 - Improved durable simulation memory: `InvestmentSimulation.init_tables()` and `execute_trade()` refresh `simulation_risk_memory` from realized simulated sell trades; `check_db` refreshes and displays the same derived memory before printing heuristic status.
 - User-visible change: tickers with recent realized simulated losses worse than -3% are capped to the failure-scale position limit until the 8-day memory expires, and trade reasons/status output identify this as local simulation risk memory.
+- Improved thin-cost-stress closure: `services/heuristic_policy.py` now exposes OOS and 3x-slippage scores to `check_db`, manual research prompts, and simulated trade reasons; if 3x-slippage score is below 0.02, the latest policy remains a cap/warning only and explicitly forbids exposure expansion.
 - Still not fully integrated: durable simulation risk memory is intentionally a warning/cap layer only; it is not promoted into the offline default policy or an ETF/single-stock allocator because the replay trials only tied, not improved, current best.
-- Next minimum loop closure: validate whether the durable `simulation_risk_memory` cap reduces realized simulated drawdowns over another local tape update before expanding it beyond position caps.
+- Next minimum loop closure: validate whether the durable `simulation_risk_memory` cap reduces realized simulated drawdowns over another local tape update and only widen it if the 3x-slippage margin is no longer thin.
 
 ## Reproduce
 ```bash

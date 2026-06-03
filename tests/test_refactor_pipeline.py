@@ -232,6 +232,29 @@ def test_heuristic_risk_cap_tightens_recent_failure_ticker(tmp_path):
     assert "failure case" in reason
 
 
+def test_heuristic_risk_cap_warns_on_thin_cost_stress(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_cost_guard",
+        score=0.031,
+        max_position=0.08,
+        overfit_risk=False,
+        warning="通过本轮基础样本外与成本扰动检查",
+        failure_cases=[],
+        out_of_sample_score=0.157,
+        cost_stress_score=0.014,
+    )
+
+    capped, reason = apply_heuristic_risk_cap("600519", 0.06, 0.8, context=context)
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert capped == 0.06
+    assert "成本扰动余量很薄" in reason
+    assert "3x滑点 0.014000" in status
+    assert "样本外score=0.157000" in prompt
+
+
 def test_simulation_trade_losses_derive_risk_memory():
     failures = derive_simulation_risk_memory([
         {
