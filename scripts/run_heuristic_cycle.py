@@ -868,6 +868,70 @@ def split_checks(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
     }
 
 
+def _metric_score(metrics: dict[str, Any] | None) -> float | None:
+    if not isinstance(metrics, dict) or "score" not in metrics:
+        return None
+    return float(metrics["score"])
+
+
+def _compact_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "total_return",
+        "annualized_return",
+        "max_drawdown",
+        "sharpe",
+        "turnover",
+        "trade_count",
+        "score",
+    ]
+    return {key: metrics.get(key) for key in keys}
+
+
+def build_sleeve_diagnostics(
+    daily: pd.DataFrame,
+    policies: list[PolicyConfig],
+    results: dict[str, dict[str, Any]],
+    costs: CostConfig,
+) -> dict[str, Any]:
+    """Check whether ETF and single-stock sleeves are robust enough to allocate."""
+    trial_by_sleeve = {
+        "etf": "etf_only_cost_guard",
+        "single_stock": "single_stock_cost_guard",
+    }
+    policies_by_name = {policy.name: policy for policy in policies}
+    sleeves: dict[str, Any] = {}
+    for sleeve_name, trial_name in trial_by_sleeve.items():
+        policy = policies_by_name[trial_name]
+        metrics = results[trial_name]["metrics"]
+        checks = split_checks(daily, policy, costs)
+        oos_score = _metric_score(checks.get("out_of_sample"))
+        cost_stress_score = _metric_score(checks.get("cost_stress_3x_slippage"))
+        reasons: list[str] = []
+        if metrics["score"] <= 0:
+            reasons.append("主样本score未转正")
+        if checks.get("overfit_risk"):
+            reasons.append("样本外/成本扰动检查失败")
+        if cost_stress_score is None or cost_stress_score < 0.02:
+            reasons.append("3x滑点余量低于0.02")
+        promotable = not reasons
+        sleeves[sleeve_name] = {
+            "trial_name": trial_name,
+            **_compact_metrics(metrics),
+            "out_of_sample_score": oos_score,
+            "cost_stress_score": cost_stress_score,
+            "overfit_risk": bool(checks.get("overfit_risk", True)),
+            "promotable": promotable,
+            "reason": "；".join(reasons) if reasons else "通过主样本、样本外和3x滑点检查",
+        }
+
+    allocator_ready = all(row["promotable"] for row in sleeves.values())
+    return {
+        "allocator_status": "promoted_candidate" if allocator_ready else "not_promoted",
+        "rule": "ETF和单股sleeve必须主样本score>0、overfit_risk=false、3x滑点score>=0.02才允许组合allocator推广",
+        "sleeves": sleeves,
+    }
+
+
 def write_policy_snapshot(path: Path, policy: PolicyConfig, costs: CostConfig) -> None:
     policy_literal = pprint.pformat(asdict(policy), sort_dicts=False, width=88)
     costs_literal = pprint.pformat(asdict(costs), sort_dicts=False, width=88)
@@ -905,6 +969,7 @@ def write_readme(
     db_path: Path,
     command: str,
     recent_failure_tickers: tuple[str, ...] = (),
+    sleeve_diagnostics: dict[str, Any] | None = None,
 ) -> None:
     failed = [t for t in trials if t["trial_name"] != best_name]
     comparison = "No previous heuristic_cycle best was found."
@@ -922,6 +987,18 @@ def write_readme(
         f"- {t['trial_name']}: score={t['score']:.6f}; not promotable because it uses previous failure-case tickers and can leak sample-specific knowledge."
         for t in diagnostic_trials
     )
+    sleeve_diagnostics = sleeve_diagnostics or {}
+    sleeve_lines = []
+    sleeves = sleeve_diagnostics.get("sleeves") if isinstance(sleeve_diagnostics, dict) else {}
+    if isinstance(sleeves, dict):
+        for sleeve_name, row in sleeves.items():
+            sleeve_lines.append(
+                f"- {sleeve_name}: score={row['score']:.6f}, "
+                f"OOS={row['out_of_sample_score']:.6f}, "
+                f"3x_slippage={row['cost_stress_score']:.6f}, "
+                f"promotable={row['promotable']}, reason={row['reason']}"
+            )
+    sleeve_text = "\n".join(sleeve_lines) or "- Sleeve diagnostics unavailable."
     failure_ticker_text = ", ".join(recent_failure_tickers) if recent_failure_tickers else "none"
     text = f"""# Heuristic Learning Cycle
 
@@ -943,8 +1020,10 @@ def write_readme(
 - Advanced the prior failure-pattern direction by testing recent-failure ticker half-size/veto diagnostics for: {failure_ticker_text}.
 - Kept recent-failure ticker rules out of promotable best selection because they depend on prior failure labels and can overfit the same local tape.
 - Added ETF-only and single-stock-only sleeve trials so the cycle no longer evaluates every universe mix as one undifferentiated basket.
+- Advanced the prior sleeve-allocation direction by writing `sleeve_diagnostics.json`; ETF and single-stock sleeves must both pass primary score, time split, and non-thin 3x-slippage stress before a portfolio allocator can be promoted.
 - Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display, manual research warnings, simulated-trading position caps, and prompt-level failure-case constraints.
 - Added thin cost-stress signaling to the shared heuristic context so entry points now show OOS/3x-slippage scores and warn when the cost-stress margin is too thin to expand exposure.
+- Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
 
@@ -965,6 +1044,11 @@ def write_readme(
 ## Diagnostic Only
 {diagnostic_lines or "- No recent failure tickers were available for diagnostic tests."}
 
+## Sleeve Allocator Check
+- Allocator status: {sleeve_diagnostics.get("allocator_status", "unknown")}
+- Rule: {sleeve_diagnostics.get("rule", "ETF and single-stock sleeves must pass before allocator promotion.")}
+{sleeve_text}
+
 ## Overfitting Risk
 ```json
 {checks_text}
@@ -983,8 +1067,10 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved durable simulation memory: `InvestmentSimulation.init_tables()` and `execute_trade()` refresh `simulation_risk_memory` from realized simulated sell trades; `check_db` refreshes and displays the same derived memory before printing heuristic status.
 - User-visible change: tickers with recent realized simulated losses worse than -3% are capped to the failure-scale position limit until the 8-day memory expires, and trade reasons/status output identify this as local simulation risk memory.
 - Improved thin-cost-stress closure: `services/heuristic_policy.py` now exposes OOS and 3x-slippage scores to `check_db`, manual research prompts, and simulated trade reasons; if 3x-slippage score is below 0.02, the latest policy remains a cap/warning only and explicitly forbids exposure expansion.
+- Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
 - Still not fully integrated: durable simulation risk memory is intentionally a warning/cap layer only; it is not promoted into the offline default policy or an ETF/single-stock allocator because the replay trials only tied, not improved, current best.
-- Next minimum loop closure: validate whether the durable `simulation_risk_memory` cap reduces realized simulated drawdowns over another local tape update and only widen it if the 3x-slippage margin is no longer thin.
+- Still not fully integrated: portfolio sleeve allocator is not promoted because both sleeves did not pass the required primary/OOS/cost-stress checks.
+- Next minimum loop closure: validate whether ETF-sleeve caps reduce simulated churn/drawdown and only promote a sleeve allocator after both sleeves pass with non-thin 3x-slippage margin.
 
 ## Reproduce
 ```bash
@@ -992,8 +1078,8 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Validate durable simulated closed-loss memory over another tape update before widening it beyond an 8-day cap/warning.
-- Turn ETF-only and single-stock-only sleeve results into an explicit portfolio allocator only if both pass split/cost stress.
+- Keep durable simulated closed-loss memory as an 8-day cap/warning until it improves path under no-lookahead replay.
+- Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
 - Replace prediction-current-price fallback with validated local daily prices when available.
 """
     path.write_text(text, encoding="utf-8")
@@ -1496,6 +1582,8 @@ def main() -> int:
 
     checks = split_checks(daily, best_policy, costs)
     write_json(run_dir / "overfit_checks.json", checks)
+    sleeve_diagnostics = build_sleeve_diagnostics(daily, policies, results, costs)
+    write_json(run_dir / "sleeve_diagnostics.json", sleeve_diagnostics)
     write_policy_snapshot(run_dir / "policy_snapshot.py", best_policy, costs)
     make_plot(run_dir / "sample_efficiency.png", trial_rows)
 
@@ -1542,6 +1630,7 @@ def main() -> int:
         db_path,
         f"python scripts/run_heuristic_cycle.py --db {args.db}",
         recent_failure_tickers=recent_failure_tickers,
+        sleeve_diagnostics=sleeve_diagnostics,
     )
 
     latest = runs_root / "LATEST"

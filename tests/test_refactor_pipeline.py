@@ -255,6 +255,47 @@ def test_heuristic_risk_cap_warns_on_thin_cost_stress(tmp_path):
     assert "样本外score=0.157000" in prompt
 
 
+def test_heuristic_risk_cap_tightens_failed_etf_sleeve(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_cost_guard",
+        score=0.027,
+        max_position=0.08,
+        overfit_risk=False,
+        warning="split/cost passed",
+        failure_cases=[],
+        sleeve_diagnostics={
+            "allocator_status": "not_promoted",
+            "sleeves": {
+                "etf": {
+                    "score": -0.06,
+                    "cost_stress_score": -0.09,
+                    "promotable": False,
+                    "reason": "主样本score未转正；3x滑点余量低于0.02",
+                },
+                "single_stock": {
+                    "score": 0.027,
+                    "cost_stress_score": 0.011,
+                    "promotable": False,
+                    "reason": "3x滑点余量低于0.02",
+                },
+            },
+        },
+    )
+
+    capped, reason = apply_heuristic_risk_cap("512880", 0.08, 0.8, context=context)
+    single_capped, single_reason = apply_heuristic_risk_cap("600519", 0.08, 0.8, context=context)
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert capped == 0.04
+    assert "ETF sleeve" in reason
+    assert single_capped == 0.08
+    assert single_reason is None
+    assert "sleeve allocator: not_promoted" in status
+    assert "etf cap/warning score=-0.060000" in prompt
+
+
 def test_simulation_trade_losses_derive_risk_memory():
     failures = derive_simulation_risk_memory([
         {
