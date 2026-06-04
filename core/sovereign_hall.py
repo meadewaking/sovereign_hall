@@ -426,7 +426,7 @@ class SovereignHall:
                 stop_loss=result.get('stop_loss', 90.0),
                 take_profit=result.get('take_profit', 130.0),
                 holding_period=result.get('holding_period', 90),
-                thesis=report[:5000],  # 限制长度
+                thesis=report,
                 supporting_evidence=[],
                 risks=[],
                 catalysts=[],

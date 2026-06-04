@@ -69,6 +69,24 @@ def _get_agent():
     return Agent
 
 
+def build_proposal_thesis(raw: Dict) -> str:
+    """Preserve the model's full rationale and structured guardrails for storage."""
+    thesis = str(raw.get("thesis") or "").strip()
+    parts = [thesis] if thesis else []
+
+    evidence = raw.get("evidence")
+    if isinstance(evidence, list) and evidence:
+        evidence_text = "；".join(str(item).strip() for item in evidence if str(item).strip())
+        if evidence_text:
+            parts.append(f"证据: {evidence_text}")
+
+    reject_if = str(raw.get("reject_if") or "").strip()
+    if reject_if:
+        parts.append(f"否决条件: {reject_if}")
+
+    return "\n".join(parts)
+
+
 # 基于议题的默认提案映射
 TOPIC_PROPOSALS = {
     "AI算力": [
@@ -572,7 +590,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
                     'stop_loss': float(p.get('stop_loss', 5.0)),
                     'take_profit': float(p.get('take_profit', 15.0)),
                     'confidence': float(p.get('confidence', 0.6)),
-                    'thesis': p.get('thesis', '')[:100],
+                    'thesis': build_proposal_thesis(p),
                     'sector': p.get('sector', '未知'),
                     'holding_period_reason': p.get('holding_period_reason', '')[:200],
                 }
@@ -1363,7 +1381,7 @@ async def main():
                 # 保存结论（包含结构化数据）
                 await db_service.save_report_conclusion(
                     question=topic,
-                    conclusion=conclusion_data.get('conclusion', '')[:30000],
+                    conclusion=conclusion_data.get('conclusion', ''),
                     ticker=conclusion_data.get('key_ticker', ''),
                     confidence=conclusion_data.get('confidence', 0.5)
                 )

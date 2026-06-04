@@ -33,6 +33,8 @@ from .llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
+MAX_STORED_CONTENT_CHARS = 50000
+
 
 class SpiderSwarm:
     """分布式爬虫集群"""
@@ -755,7 +757,7 @@ class SpiderSwarm:
                         return Doc(
                             id=generate_id('doc'),
                             title=title or full_doc.title,
-                            content=full_doc.content[:20000],  # 限制长度
+                            content=full_doc.content[:MAX_STORED_CONTENT_CHARS],
                             url=url,
                             source='duckduckgo',
                             publish_time=datetime.now(),
@@ -889,7 +891,7 @@ class SpiderSwarm:
                 return Doc(
                     id=generate_id('doc'),
                     title=title[:500],  # 限制标题长度
-                    content=content[:10000],  # 限制内容长度
+                    content=content[:MAX_STORED_CONTENT_CHARS],
                     url=url,
                     source=self._extract_domain(url),
                     publish_time=datetime.now(),

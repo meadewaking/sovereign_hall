@@ -547,9 +547,6 @@ def main():
         return
 
     tables = show_stats(db_path)
-    if not sys.stdin.isatty():
-        print("\n非交互环境：已完成数据库与模拟投资状态检查，跳过菜单。")
-        return
 
     print("\n" + "="*60)
     print("请选择操作:")

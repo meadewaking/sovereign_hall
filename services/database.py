@@ -355,7 +355,7 @@ class DatabaseService:
             pget('take_profit', pget('target_price', 0.0)),
             pget('holding_period', 30),
             pget('confidence', 0.0),
-            pget('thesis', '')[:10000] if pget('thesis') else None,
+            pget('thesis', '') if pget('thesis') else None,
             analyst_role,
             pget('sector', None),
             pget('status', 'pending')

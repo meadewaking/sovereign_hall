@@ -212,7 +212,7 @@ class ResearchDiscussionSystem:
         db = await self._get_db()
         await db.save_report_conclusion(
             question=question,
-            conclusion=conclusion[:3000],
+            conclusion=conclusion,
             ticker=ticker,
             position=position,
             stop_loss=stop_loss,

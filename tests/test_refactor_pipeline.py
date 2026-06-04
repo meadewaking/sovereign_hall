@@ -25,6 +25,7 @@ from sovereign_hall.services.prediction_store import ensure_prediction_tables
 from sovereign_hall.run_discussion import (
     TOPIC_POOL,
     aggregate_committee_decision,
+    build_proposal_thesis,
     build_lessons_with_heuristic_context,
     select_next_topic,
     stage2_deep_research,
@@ -75,6 +76,8 @@ async def test_dict_proposal_can_be_stored(tmp_path):
     db = DatabaseService(str(db_path))
     await db._init_db()
 
+    long_thesis = "测试提案" + "完整论证" * 2000
+
     await db.add_proposal({
         "ticker": "512880",
         "direction": "long",
@@ -84,13 +87,14 @@ async def test_dict_proposal_can_be_stored(tmp_path):
         "take_profit": 1.15,
         "holding_period": 30,
         "confidence": 0.6,
-        "thesis": "测试提案",
+        "thesis": long_thesis,
         "sector": "半导体",
     })
 
     proposals = await db.get_proposals(limit=5)
     assert len(proposals) == 1
     assert proposals[0]["ticker"] == "512880"
+    assert proposals[0]["thesis"] == long_thesis
     await db.close()
 
 
@@ -672,6 +676,18 @@ def test_core_discussion_prompts_are_evidence_rich_and_machine_readable():
     assert "max_tokens=8000" in stage2_source
     assert "第一行必须是：【投票】" in stage3_source
     assert "max_tokens=3000" in stage3_source
+
+
+def test_proposal_thesis_preserves_evidence_and_reject_conditions():
+    thesis = build_proposal_thesis({
+        "thesis": "事实: 订单增长；推断: 盈利弹性提升",
+        "evidence": ["公告披露新订单", "行业价格回暖"],
+        "reject_if": "订单取消或毛利率继续下滑",
+    })
+
+    assert "事实: 订单增长" in thesis
+    assert "证据: 公告披露新订单；行业价格回暖" in thesis
+    assert "否决条件: 订单取消或毛利率继续下滑" in thesis
 
 
 @pytest.mark.asyncio
