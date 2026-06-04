@@ -1197,6 +1197,7 @@ async def main():
     db_service = DatabaseService()
     await db_service._init_db()
     await db_service.init_report_tables()
+    vector_db.set_database_service(db_service)
     market_data = get_market_data()
 
     # 初始化投资模拟

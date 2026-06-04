@@ -66,12 +66,24 @@ class Config:
 
             # 向量数据库
             'vector_db': {
-                'provider': 'faiss',
+                'provider': 'legacy',
                 'dimension': 1536,
-                'index_type': 'IVF',
+                'index_type': 'obsidian_wiki',
                 'nlist': 100,
                 'nprobe': 10,
                 'metric': 'cosine',
+            },
+
+            # Obsidian-compatible LLM Wiki knowledge base
+            'knowledge_wiki': {
+                'root': str(DATA_DIR / 'knowledge'),
+                'embedding_enabled': True,
+                'lazy_migration_batch_size': 10,
+                'min_wiki_hits': 5,
+                'chunk_target_chars': 1000,
+                'chunk_max_chars': 1500,
+                'chunk_min_chars': 200,
+                'chunk_overlap_chars': 200,
             },
 
             # 缓存配置

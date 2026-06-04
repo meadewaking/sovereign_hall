@@ -91,6 +91,7 @@ class ResearchDiscussionSystem:
         if self.db_service is None:
             self.db_service = await DatabaseService.get_instance()
             # 初始化向量数据库
+            self.vector_db.set_database_service(self.db_service)
             await self.vector_db.initialize(self.llm)
         return self.db_service
 
@@ -364,6 +365,16 @@ class ResearchDiscussionSystem:
         db = await self._get_db()
         parts = []
         keyword_query = ' '.join(keywords[:5]) if keywords else ""
+
+        wiki_docs = await self.vector_db.search(keyword_query, top_k=8, llm_client=self.llm) if keyword_query else []
+        if wiki_docs:
+            parts.append("【知识库Wiki（高权重）】")
+            for i, doc in enumerate(wiki_docs[:5]):
+                parts.append(f"\nWiki {i+1}: {doc.title or doc.metadata.get('wiki_path', '无标题')}")
+                parts.append(f"   路径: {doc.metadata.get('wiki_path', '')} | 类型: {doc.metadata.get('wiki_type', '')}")
+                snippet = doc.metadata.get('snippet') or doc.content[:2000]
+                parts.append(f"   摘要: {snippet}...")
+            parts.append("")
 
         proposals = await db.get_proposals(limit=10)
         if proposals:

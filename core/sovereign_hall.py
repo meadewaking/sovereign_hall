@@ -113,6 +113,7 @@ class SovereignHall:
         # 数据库服务
         db_config = self.config_obj.get('database', {})
         self.db = DatabaseService(db_config.get('sqlite_path', str(DATA_DIR / 'sovereign_hall.db')))
+        self.vector_db.set_database_service(self.db)
 
     # =========================================================================
     # 主流程

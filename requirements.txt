@@ -20,8 +20,8 @@ numpy >= 1.26.0
 pandas >= 2.2.0
 akshare >= 1.18.0
 
-# Vector Database (optional, for production)
-faiss-cpu >= 1.7.4
+# Legacy vector database (optional; main RAG path uses Obsidian wiki)
+# faiss-cpu >= 1.7.4
 # faiss-gpu >= 1.7.4  # 如果有GPU
 
 # Configuration

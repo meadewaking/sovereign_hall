@@ -44,8 +44,20 @@ simulation:
 
 # 向量数据库
 vector_db:
-  provider: "simple"  # simple/faiss/pinecone
-  dimension: 1024  # 与 embedding_dim 一致
+  provider: "legacy"  # legacy compatibility adapter; main RAG path uses knowledge_wiki
+  dimension: 1024  # kept for old constructor compatibility
+  index_type: "obsidian_wiki"
+
+# Obsidian-compatible LLM Wiki knowledge base
+knowledge_wiki:
+  root: "./data/knowledge"
+  embedding_enabled: true
+  lazy_migration_batch_size: 10
+  min_wiki_hits: 5
+  chunk_target_chars: 1000
+  chunk_max_chars: 1500
+  chunk_min_chars: 200
+  chunk_overlap_chars: 200
 
 # 数据库配置
 database:
