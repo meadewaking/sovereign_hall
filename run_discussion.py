@@ -7,9 +7,6 @@
 
 import asyncio
 import argparse
-import contextlib
-import fcntl
-import os
 import sys
 import sqlite3
 import json
@@ -179,62 +176,6 @@ def parse_args():
     parser.add_argument("--once", action="store_true", help="只运行一轮后退出")
     parser.add_argument("--max-rounds", type=int, default=0, help="最多运行轮数，0 表示无限")
     return parser.parse_args()
-
-
-class SingleInstanceLock:
-    """Prevent two discussion runners from writing the same SQLite DB at once."""
-
-    def __init__(self, lock_path: Path):
-        self.lock_path = lock_path
-        self._handle = None
-
-    def __enter__(self):
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = self.lock_path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self._handle.seek(0)
-            holder = self._handle.read().strip() or "unknown"
-            self._handle.close()
-            self._handle = None
-            raise RuntimeError(
-                f"run_discussion.py is already running (lock: {self.lock_path}, holder: {holder})"
-            )
-
-        self._handle.seek(0)
-        self._handle.truncate()
-        self._handle.write(f"pid={os.getpid()} started_at={datetime.now().isoformat()}\n")
-        self._handle.flush()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if self._handle:
-            with contextlib.suppress(Exception):
-                self._handle.seek(0)
-                self._handle.truncate()
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-                self._handle.close()
-        self._handle = None
-
-
-def count_open_file_handles(target_path: Path) -> int:
-    """Best-effort fd count for long-running resource leak diagnostics."""
-    target = str(target_path.resolve())
-    fd_dir = Path("/proc/self/fd")
-    if not fd_dir.exists():
-        fd_dir = Path("/dev/fd")
-    if not fd_dir.exists():
-        return -1
-
-    count = 0
-    for fd in fd_dir.iterdir():
-        try:
-            if os.path.realpath(fd) == target:
-                count += 1
-        except OSError:
-            continue
-    return count
 
 # ============================================================================
 # 预设议题池 - 定期轮换，避免重复
@@ -1271,7 +1212,7 @@ async def main():
     spider_config = config.get_spider_config()
     spiders = SpiderSwarm(max_concurrent=spider_config.get('max_concurrent', 10))
 
-    db_service = DatabaseService(str(db_path))
+    db_service = DatabaseService()
     await db_service._init_db()
     await db_service.init_report_tables()
     vector_db.set_database_service(db_service)
@@ -1302,7 +1243,7 @@ async def main():
 
         # 初始化验证（处理之前的待验证决策）
         try:
-            recorder = DecisionRecorder(str(db_path))
+            recorder = DecisionRecorder()
             validation_result = await recorder.validate_pending(max_count=20)
             if validation_result.get('validated', 0) > 0:
                 logger.info(f"启动时验证了 {validation_result['validated']} 条历史决策")
@@ -1347,7 +1288,7 @@ async def main():
 
             # 加载历史教训并显示
             try:
-                learning_engine = LearningEngine(str(db_path))
+                learning_engine = LearningEngine()
                 lessons_prompt = await learning_engine.generate_lessons_prompt()
                 stats = await learning_engine.get_accuracy_stats()
                 if stats['total'] > 0:
@@ -1356,7 +1297,7 @@ async def main():
                     print(f"📜 加载了 {lessons_prompt.count('教训') - 1} 条历史教训")
 
                 # 验证待验证决策
-                recorder = DecisionRecorder(str(db_path))
+                recorder = DecisionRecorder()
                 validation_result = await recorder.validate_pending(max_count=validation_batch_size)
                 if validation_result.get('validated', 0) > 0:
                     print(f"🔄 本轮验证了 {validation_result['validated']} 条决策")
@@ -1491,11 +1432,6 @@ async def main():
 
             stats_msg = f"⏱️  本轮用时: {round_time:.1f}秒 | 累计Token: {llm_stats.get('total_tokens', 0):,} | 成本: {llm_stats.get('total_cost_usd', '$0')}"
             logger.info(stats_msg)
-            db_fd_count = count_open_file_handles(db_path)
-            if db_fd_count > 5:
-                logger.warning("SQLite fd count is high: %s handles open for %s", db_fd_count, db_path)
-            elif db_fd_count >= 0:
-                logger.debug("SQLite fd count: %s", db_fd_count)
             print(f"\n⏱️  本轮用时: {round_time:.1f}秒")
             print(f"🔥  累计Token: {llm_stats.get('total_tokens', 0):,}")
             print(f"🚀  峰值Token速率: {llm_stats.get('peak_token_rate', '0/s')}")
@@ -1534,17 +1470,10 @@ async def main():
     finally:
         await spiders.close()
         await market_data.close()
-        await llm.close()
         await vector_db.close()
         await db_service.close()
         print("🔒 资源已释放")
 
 
 if __name__ == "__main__":
-    try:
-        with SingleInstanceLock(project_root / "data" / "run_discussion.lock"):
-            asyncio.run(main())
-    except RuntimeError as exc:
-        logger.error(str(exc))
-        print(f"❌ {exc}")
-        sys.exit(2)
+    asyncio.run(main())

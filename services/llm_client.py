@@ -103,7 +103,6 @@ class LLMClient:
 
         # 初始化API客户端
         self._http_client: Optional[httpx.AsyncClient] = None  # 复用的HTTP客户端
-        self._embedding_client: Optional[httpx.AsyncClient] = None
         self._init_client()
 
         logger.info(f"LLM Client initialized: provider={self.provider}, model={self.model}, max_concurrent={max_concurrent}")
@@ -268,24 +267,13 @@ class LLMClient:
                 except Exception as e:
                     last_exception = e
                     is_retryable = self._is_retryable_error(e)
-                    error_summary = self._format_exception(e)
 
                     if attempt < self.max_retries and is_retryable:
                         delay = self.retry_delay * (2 ** attempt)  # 指数退避
-                        logger.warning(
-                            "LLM call failed (attempt %s/%s): %s. Retrying in %.1fs...",
-                            attempt + 1,
-                            self.max_retries + 1,
-                            error_summary,
-                            delay,
-                        )
+                        logger.warning(f"LLM call failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}. Retrying in {delay:.1f}s...")
                         await asyncio.sleep(delay)
                     else:
-                        logger.error(
-                            "LLM call failed after %s attempts: %s",
-                            attempt + 1,
-                            error_summary,
-                        )
+                        logger.error(f"LLM call failed after {attempt + 1} attempts: {e}")
                         # 使用估算值作为后备，避免变量未定义错误
                         fallback_prompt_tokens = estimated_prompt_tokens if 'estimated_prompt_tokens' in dir() else 0
                         with self._stats_lock:
@@ -302,7 +290,7 @@ class LLMClient:
 
     def _is_retryable_error(self, error: Exception) -> bool:
         """判断错误是否可重试"""
-        error_str = self._format_exception(error).lower()
+        error_str = str(error).lower()
 
         # 网络相关错误
         retryable_patterns = [
@@ -325,34 +313,6 @@ class LLMClient:
         ]
 
         return any(pattern in error_str for pattern in retryable_patterns)
-
-    def _format_exception(self, error: Exception) -> str:
-        """Return useful diagnostics even when an exception string is empty."""
-        details = [error.__class__.__name__]
-        message = str(error)
-        if message:
-            details.append(message)
-
-        response = getattr(error, "response", None)
-        if response is not None:
-            status_code = getattr(response, "status_code", None)
-            if status_code is not None:
-                details.append(f"status={status_code}")
-            try:
-                body = response.text
-            except Exception:
-                body = ""
-            if body:
-                details.append(f"body={body[:500]}")
-
-        request = getattr(error, "request", None)
-        if request is not None:
-            method = getattr(request, "method", "")
-            url = getattr(request, "url", "")
-            if method or url:
-                details.append(f"request={method} {url}".strip())
-
-        return " | ".join(details)
 
     async def _openai_chat(
         self,
@@ -429,7 +389,7 @@ class LLMClient:
             return content, usage
 
         except Exception as e:
-            logger.error("OpenAI chat failed: %s", self._format_exception(e))
+            logger.error(f"OpenAI chat failed: {e}")
             raise
 
     async def _anthropic_chat(
@@ -621,18 +581,6 @@ class LLMClient:
         with self._stats_lock:
             self.token_stats = TokenStats()
         logger.info("Stats reset")
-
-    async def close(self):
-        """Close reusable async HTTP clients."""
-        for attr in ("_http_client", "_embedding_client"):
-            client = getattr(self, attr, None)
-            if client is not None:
-                try:
-                    await client.aclose()
-                except Exception as exc:
-                    logger.debug("Failed to close %s: %s", attr, self._format_exception(exc))
-                finally:
-                    setattr(self, attr, None)
 
     def __repr__(self):
         return f"LLMClient(provider={self.provider}, model={self.model}, concurrent={self.max_concurrent})"
