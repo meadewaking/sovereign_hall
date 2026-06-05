@@ -36,6 +36,28 @@ RRF_K = 60.0
 TITLE_WEIGHT = 5.0
 BODY_WEIGHT = 1.0
 MAX_SEARCH_PAGES = 10000
+IGNORED_ENTITY_TOKENS = {
+    "PDF",
+    "URL",
+    "HTTP",
+    "HTTPS",
+    "WWW",
+    "ISSN",
+    "ISBN",
+    "DOI",
+    "JEL",
+    "NOTE",
+    "FIGURE",
+    "TABLE",
+    "APPENDIX",
+    "I",
+    "II",
+    "III",
+    "IV",
+    "V",
+    "N/A",
+    "NA",
+}
 
 
 @dataclass
@@ -640,7 +662,9 @@ class WikiIngestor:
 
     def _extract_entities(self, doc: Document) -> List[str]:
         entities = []
-        for ticker in re.findall(r"\b(?:[036]\d{5}|[A-Z]{1,6})(?:\.(?:SH|SZ|HK|US))?\b", f"{doc.title} {doc.content}"):
+        for ticker in re.findall(r"\b(?:[036]\d{5}|[A-Z]{2,6})(?:\.(?:SH|SZ|HK|US))?\b", f"{doc.title} {doc.content}"):
+            if ticker.upper() in IGNORED_ENTITY_TOKENS:
+                continue
             entities.append(ticker.upper())
         for keyword in doc.keywords[:6]:
             if len(str(keyword).strip()) >= 2:
