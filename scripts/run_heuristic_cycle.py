@@ -896,7 +896,7 @@ def build_sleeve_diagnostics(
     """Check whether ETF and single-stock sleeves are robust enough to allocate."""
     trial_by_sleeve = {
         "etf": "etf_only_cost_guard",
-        "single_stock": "single_stock_cost_guard",
+        "single_stock": "single_stock_hold6_cap6",
     }
     policies_by_name = {policy.name: policy for policy in policies}
     sleeves: dict[str, Any] = {}
@@ -978,13 +978,20 @@ def write_readme(
             f"Previous best score {previous_score:.6f} from {previous_path}; "
             f"delta {best_metrics['score'] - previous_score:+.6f}."
         )
+    def diagnostic_reason(trial_name: str) -> str:
+        if trial_name.startswith("sparse_"):
+            return "not promotable because it generated too few closed trades to trust as a default rule."
+        if "recent_failure" in trial_name:
+            return "not promotable because it uses previous failure-case tickers and can leak sample-specific knowledge."
+        return "not promotable; diagnostic trial only."
+
     failed_lines = "\n".join(
         f"- {t['trial_name']}: score={t['score']:.6f}, notes={t['notes']}" for t in failed
     )
     checks_text = json.dumps(checks, ensure_ascii=False, indent=2)
     diagnostic_trials = [t for t in trials if t["trial_name"].endswith("_diagnostic")]
     diagnostic_lines = "\n".join(
-        f"- {t['trial_name']}: score={t['score']:.6f}; not promotable because it uses previous failure-case tickers and can leak sample-specific knowledge."
+        f"- {t['trial_name']}: score={t['score']:.6f}; {diagnostic_reason(t['trial_name'])}"
         for t in diagnostic_trials
     )
     sleeve_diagnostics = sleeve_diagnostics or {}
@@ -1021,6 +1028,8 @@ def write_readme(
 - Kept recent-failure ticker rules out of promotable best selection because they depend on prior failure labels and can overfit the same local tape.
 - Added ETF-only and single-stock-only sleeve trials so the cycle no longer evaluates every universe mix as one undifferentiated basket.
 - Advanced the prior sleeve-allocation direction by writing `sleeve_diagnostics.json`; ETF and single-stock sleeves must both pass primary score, time split, and non-thin 3x-slippage stress before a portfolio allocator can be promoted.
+- Advanced the prior thin cost-stress direction by testing a reduced-exposure single-stock sleeve with 6-day minimum holds, 6% single-name cap, and 24% gross cap.
+- Added `sparse_hold8_cap6_diagnostic` to document why very sparse one-trade policies are not promoted even when their leaderboard score is high.
 - Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display, manual research warnings, simulated-trading position caps, and prompt-level failure-case constraints.
 - Added thin cost-stress signaling to the shared heuristic context so entry points now show OOS/3x-slippage scores and warn when the cost-stress margin is too thin to expand exposure.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
@@ -1044,6 +1053,11 @@ def write_readme(
 ## Diagnostic Only
 {diagnostic_lines or "- No recent failure tickers were available for diagnostic tests."}
 
+## Simplification Check
+- Retained best policy is direct and reproducible: no volatility-scaling branch, no previous-run failure ticker labels, and no dense parameter search are required for the default rule.
+- The simplified form is the generated `policy_snapshot.py`; it keeps only confidence/risk-reward filters, trend/anomaly guard, 6-day minimum hold, 6% single-name cap, 24% gross cap, cooldown, and rebalance friction.
+- Sparse high-score branches are not adopted as defaults when the improvement comes from too few closed trades rather than a broader path improvement.
+
 ## Sleeve Allocator Check
 - Allocator status: {sleeve_diagnostics.get("allocator_status", "unknown")}
 - Rule: {sleeve_diagnostics.get("rule", "ETF and single-stock sleeves must pass before allocator promotion.")}
@@ -1058,6 +1072,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 
 ## User Entry Impact
 - Improved entry: `python -m sovereign_hall.check_db` now shows latest best policy, score, overfit warning, single-name cap, and recent failure cases.
+- Improved entry safety: `python -m sovereign_hall.check_db` now treats closed stdin as a safe non-interactive exit after printing status.
 - Local-only guard: `check_db` now uses local cost basis for position valuation by default; realtime quote lookup requires `SOVEREIGN_HALL_REALTIME_QUOTES=1`.
 - Improved simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` now cap simulated long positions using the latest local heuristic max position; weak or lower-scoring policies are used only as warnings/risk caps, not as return-seeking exposure increases.
 - Improved manual advice path: `python -m sovereign_hall.research_interactive` now prints and saves the latest heuristic policy, overfit warning, and recent failure cases alongside the generated report.
@@ -1068,9 +1083,11 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - User-visible change: tickers with recent realized simulated losses worse than -3% are capped to the failure-scale position limit until the 8-day memory expires, and trade reasons/status output identify this as local simulation risk memory.
 - Improved thin-cost-stress closure: `services/heuristic_policy.py` now exposes OOS and 3x-slippage scores to `check_db`, manual research prompts, and simulated trade reasons; if 3x-slippage score is below 0.02, the latest policy remains a cap/warning only and explicitly forbids exposure expansion.
 - Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
+- Improved reduced-exposure closure: if the 6-day/6% single-stock policy is the retained best, all three user entry paths inherit its lower single-name simulation cap from `policy_snapshot.py` without adding a separate trading rule.
 - Still not fully integrated: durable simulation risk memory is intentionally a warning/cap layer only; it is not promoted into the offline default policy or an ETF/single-stock allocator because the replay trials only tied, not improved, current best.
 - Still not fully integrated: portfolio sleeve allocator is not promoted because both sleeves did not pass the required primary/OOS/cost-stress checks.
-- Next minimum loop closure: validate whether ETF-sleeve caps reduce simulated churn/drawdown and only promote a sleeve allocator after both sleeves pass with non-thin 3x-slippage margin.
+- Still not integrated as a default: sparse high-score policies are recorded as diagnostic-only when they produce too few closed trades for a defensible rule.
+- Next minimum loop closure: validate whether the lower single-stock cap and ETF-sleeve caps reduce simulated churn/drawdown over another tape update before widening exposure.
 
 ## Reproduce
 ```bash
@@ -1078,7 +1095,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Keep durable simulated closed-loss memory as an 8-day cap/warning until it improves path under no-lookahead replay.
+- Validate the 6-day/6% reduced-exposure single-stock policy over another tape update before any exposure widening.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
 - Replace prediction-current-price fallback with validated local daily prices when available.
 """
@@ -1376,6 +1393,46 @@ def main() -> int:
             loss_streak_guard=0.50,
             new_entry_loss_streak_threshold=2,
             min_holding_days=4,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+        ),
+        PolicyConfig(
+            name="single_stock_hold6_cap6",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.06,
+            max_gross=0.24,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=6,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+        ),
+        PolicyConfig(
+            name="sparse_hold8_cap6_diagnostic",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.06,
+            max_gross=0.36,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=8,
             rebalance_threshold=0.05,
             universe="single_stock",
         ),

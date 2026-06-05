@@ -75,6 +75,14 @@ def realtime_quotes_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def safe_input(prompt: str) -> str | None:
+    """Read optional interactive input; return None when stdin is closed."""
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+
+
 def show_investment_status(db_path):
     """显示投资模拟状态"""
     conn = sqlite3.connect(str(db_path))
@@ -303,7 +311,11 @@ def browse_table(db_path, table_name):
                 print(f"   {key}: {val_str}")
 
         offset += limit
-        more = input(f"\n   显示更多 {limit} 条? (y/n): ").strip().lower()
+        more_raw = safe_input(f"\n   显示更多 {limit} 条? (y/n): ")
+        if more_raw is None:
+            print("\n   非交互输入结束，停止浏览")
+            break
+        more = more_raw.strip().lower()
         if more != 'y':
             break
 
@@ -560,13 +572,21 @@ def main():
     print("="*60)
 
     while True:
-        choice = input("\n👉 请选择 (1/2/3/4/5/6/q): ").strip().lower()
+        choice_raw = safe_input("\n👉 请选择 (1/2/3/4/5/6/q): ")
+        if choice_raw is None:
+            print("\n👋 非交互输入结束，安全退出")
+            break
+        choice = choice_raw.strip().lower()
 
         if choice == '1':
             show_stats(db_path)
         elif choice == '2':
             print(f"\n   可浏览的表: {', '.join(tables)}")
-            table = input("   输入表名: ").strip()
+            table_raw = safe_input("   输入表名: ")
+            if table_raw is None:
+                print("\n   非交互输入结束，取消浏览")
+                break
+            table = table_raw.strip()
             if table in tables:
                 browse_table(db_path, table)
             else:

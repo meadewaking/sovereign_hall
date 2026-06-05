@@ -41,6 +41,17 @@ def test_entry_imports():
     import sovereign_hall.run_discussion  # noqa: F401
 
 
+def test_check_db_safe_input_handles_closed_stdin(monkeypatch):
+    import sovereign_hall.check_db as check_db
+
+    def raise_eof(_prompt):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+
+    assert check_db.safe_input("choice: ") is None
+
+
 def test_market_data_ticker_mapping():
     svc = MarketDataService()
     assert svc.infer_market("600519") == "sh"
@@ -298,6 +309,44 @@ def test_heuristic_risk_cap_tightens_failed_etf_sleeve(tmp_path):
     assert single_reason is None
     assert "sleeve allocator: not_promoted" in status
     assert "etf cap/warning score=-0.060000" in prompt
+
+
+def test_heuristic_risk_cap_uses_reduced_single_stock_cap(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap6",
+        score=0.061,
+        max_position=0.06,
+        overfit_risk=False,
+        warning="split/cost passed",
+        failure_cases=[],
+        out_of_sample_score=0.073,
+        cost_stress_score=0.053,
+        sleeve_diagnostics={
+            "allocator_status": "not_promoted",
+            "sleeves": {
+                "etf": {
+                    "score": -0.09,
+                    "cost_stress_score": -0.11,
+                    "promotable": False,
+                    "reason": "主样本score未转正；3x滑点余量低于0.02",
+                },
+                "single_stock": {
+                    "score": 0.061,
+                    "cost_stress_score": 0.053,
+                    "promotable": True,
+                    "reason": "通过主样本、样本外和3x滑点检查",
+                },
+            },
+        },
+    )
+
+    capped, reason = apply_heuristic_risk_cap("600519", 0.08, 0.8, context=context)
+    status = format_heuristic_status(context)
+
+    assert capped == pytest.approx(0.06)
+    assert "限制到6.0%" in reason
+    assert "single_stock pass score=0.061000" in status
 
 
 def test_simulation_trade_losses_derive_risk_memory():
