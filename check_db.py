@@ -70,9 +70,9 @@ def get_latest_local_prices(conn: sqlite3.Connection, tickers: list) -> dict:
 
 
 def realtime_quotes_enabled() -> bool:
-    """默认启用实时行情；需要离线检查时可设 SOVEREIGN_HALL_REALTIME_QUOTES=0。"""
-    value = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES", "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
+    """默认只用本地价格；显式设 SOVEREIGN_HALL_REALTIME_QUOTES=1 才查实时行情。"""
+    value = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def safe_input(prompt: str) -> str | None:

@@ -52,6 +52,16 @@ def test_check_db_safe_input_handles_closed_stdin(monkeypatch):
     assert check_db.safe_input("choice: ") is None
 
 
+def test_check_db_realtime_quotes_are_opt_in(monkeypatch):
+    import sovereign_hall.check_db as check_db
+
+    monkeypatch.delenv("SOVEREIGN_HALL_REALTIME_QUOTES", raising=False)
+    assert check_db.realtime_quotes_enabled() is False
+
+    monkeypatch.setenv("SOVEREIGN_HALL_REALTIME_QUOTES", "1")
+    assert check_db.realtime_quotes_enabled() is True
+
+
 def test_market_data_ticker_mapping():
     svc = MarketDataService()
     assert svc.infer_market("600519") == "sh"
@@ -347,6 +357,31 @@ def test_heuristic_risk_cap_uses_reduced_single_stock_cap(tmp_path):
     assert capped == pytest.approx(0.06)
     assert "限制到6.0%" in reason
     assert "single_stock pass score=0.061000" in status
+
+
+def test_heuristic_context_warns_when_price_source_is_unvalidated(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap6",
+        score=0.056,
+        max_position=0.06,
+        overfit_risk=False,
+        warning="通过本轮基础样本外与成本扰动检查",
+        failure_cases=[],
+        out_of_sample_score=0.095,
+        cost_stress_score=0.049,
+        price_source="prediction current_price fallback; daily_prices table unavailable or empty",
+    )
+
+    capped, reason = apply_heuristic_risk_cap("600519", 0.06, 0.8, context=context)
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert capped == 0.06
+    assert "daily_prices缺失" in reason
+    assert "禁止放大仓位" in reason
+    assert "数据质量风险" in status
+    assert "current_price fallback" in prompt
 
 
 def test_simulation_trade_losses_derive_risk_memory():
