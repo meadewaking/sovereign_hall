@@ -384,6 +384,30 @@ def test_heuristic_context_warns_when_price_source_is_unvalidated(tmp_path):
     assert "current_price fallback" in prompt
 
 
+def test_heuristic_context_surfaces_min_signal_count(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs",
+        score=0.056,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="通过本轮基础样本外与成本扰动检查",
+        failure_cases=[],
+        out_of_sample_score=0.068,
+        cost_stress_score=0.052,
+        min_signal_count=2,
+    )
+
+    capped, reason = apply_heuristic_risk_cap("600519", 0.05, 0.8, context=context)
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert capped == 0.05
+    assert "至少2条本地同日预测观察" in reason
+    assert "本地信号观察门槛: >=2" in status
+    assert "本地信号观察门槛=2条" in prompt
+
+
 def test_simulation_trade_losses_derive_risk_memory():
     failures = derive_simulation_risk_memory([
         {

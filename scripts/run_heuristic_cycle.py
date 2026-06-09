@@ -672,6 +672,19 @@ def analyze_failures(result: dict[str, Any], daily: pd.DataFrame, policy: Policy
     if trades:
         worst = min(trades, key=lambda row: row.get("pnl_pct", 0.0))
         ticker_daily = daily[daily["ticker"] == worst["ticker"]]
+        worst_pnl = float(worst.get("pnl_pct", 0.0) or 0.0)
+        if worst_pnl < 0:
+            trade_reason = "entry followed high-confidence signal but subsequent price path reversed"
+            trade_repair = "require positive short-term trend or reduce size when volatility regime is elevated"
+        else:
+            trade_reason = (
+                "no losing closed trades under retained policy; weakest trade is still monitored "
+                "because sparse profitable paths can hide selection fragility"
+            )
+            trade_repair = (
+                "do not loosen gates solely because closed trades are positive; validate signal breadth "
+                "and missed-opportunity costs on another tape update"
+            )
         failures.append(
             {
                 "case_type": "worst_trade",
@@ -689,8 +702,8 @@ def analyze_failures(result: dict[str, Any], daily: pd.DataFrame, policy: Policy
                     "exit_price": worst.get("exit_price"),
                     "exit_reason": worst.get("exit_reason"),
                 },
-                "suspected_reason": "entry followed high-confidence signal but subsequent price path reversed",
-                "repair_direction": "require positive short-term trend or reduce size when volatility regime is elevated",
+                "suspected_reason": trade_reason,
+                "repair_direction": trade_repair,
             }
         )
 
@@ -896,7 +909,7 @@ def build_sleeve_diagnostics(
     """Check whether ETF and single-stock sleeves are robust enough to allocate."""
     trial_by_sleeve = {
         "etf": "etf_only_cost_guard",
-        "single_stock": "single_stock_hold6_cap6",
+        "single_stock": "single_stock_hold6_cap5_min2obs",
     }
     policies_by_name = {policy.name: policy for policy in policies}
     sleeves: dict[str, Any] = {}
@@ -972,6 +985,17 @@ def write_readme(
     sleeve_diagnostics: dict[str, Any] | None = None,
 ) -> None:
     failed = [t for t in trials if t["trial_name"] != best_name]
+    best_row = next((t for t in trials if t["trial_name"] == best_name), {})
+    best_config = best_row.get("config", {}) if isinstance(best_row, dict) else {}
+    best_cap = float(best_config.get("max_position", 0.0) or 0.0)
+    best_gross = float(best_config.get("max_gross", 0.0) or 0.0)
+    best_hold = int(best_config.get("min_holding_days", 0) or 0)
+    best_signal_count = int(best_config.get("min_signal_count", 1) or 1)
+    evidence_text = (
+        f"and at least {best_signal_count} same-day local observations"
+        if best_signal_count > 1
+        else "and the default local observation floor"
+    )
     comparison = "No previous heuristic_cycle best was found."
     if previous_score is not None:
         comparison = (
@@ -1029,6 +1053,7 @@ def write_readme(
 - Added ETF-only and single-stock-only sleeve trials so the cycle no longer evaluates every universe mix as one undifferentiated basket.
 - Advanced the prior sleeve-allocation direction by writing `sleeve_diagnostics.json`; ETF and single-stock sleeves must both pass primary score, time split, and non-thin 3x-slippage stress before a portfolio allocator can be promoted.
 - Advanced the prior thin cost-stress direction by testing a reduced-exposure single-stock sleeve with 6-day minimum holds, 6% single-name cap, and 24% gross cap.
+- Advanced the prior reduced-exposure validation direction by testing an evidence-gated single-stock sleeve with 6-day minimum holds, a 5% single-name cap, and at least 2 same-day local observations before entry.
 - Added `sparse_hold8_cap6_diagnostic` to document why very sparse one-trade policies are not promoted even when their leaderboard score is high.
 - Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display, manual research warnings, simulated-trading position caps, and prompt-level failure-case constraints.
 - Added thin cost-stress signaling to the shared heuristic context so entry points now show OOS/3x-slippage scores and warn when the cost-stress margin is too thin to expand exposure.
@@ -1056,7 +1081,7 @@ def write_readme(
 
 ## Simplification Check
 - Retained best policy is direct and reproducible: no volatility-scaling branch, no previous-run failure ticker labels, and no dense parameter search are required for the default rule.
-- The simplified form is the generated `policy_snapshot.py`; it keeps only confidence/risk-reward filters, trend/anomaly guard, 6-day minimum hold, 6% single-name cap, 24% gross cap, cooldown, and rebalance friction.
+- The simplified form is the generated `policy_snapshot.py`; it keeps only confidence/risk-reward filters, trend/anomaly guard, {best_hold}-day minimum hold, {best_cap:.1%} single-name cap, {best_gross:.1%} gross cap, {evidence_text}, cooldown, and rebalance friction.
 - Sparse high-score branches are not adopted as defaults when the improvement comes from too few closed trades rather than a broader path improvement.
 
 ## Sleeve Allocator Check
@@ -1085,12 +1110,12 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved thin-cost-stress closure: `services/heuristic_policy.py` now exposes OOS and 3x-slippage scores to `check_db`, manual research prompts, and simulated trade reasons; if 3x-slippage score is below 0.02, the latest policy remains a cap/warning only and explicitly forbids exposure expansion.
 - Improved data-source closure: `check_db`, `run_discussion`, `research_interactive`, and simulated trade reasons now surface `daily_prices` absence as a no-expansion warning when the latest run still relies on prediction `current_price` fallback.
 - Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
-- Improved reduced-exposure closure: if the 6-day/6% single-stock policy is the retained best, all three user entry paths inherit its lower single-name simulation cap from `policy_snapshot.py` without adding a separate trading rule.
+- Improved reduced-exposure closure: all three user entry paths inherit the retained single-stock cap and local evidence floor from `policy_snapshot.py` without adding a separate trading rule.
 - Still not fully integrated: durable simulation risk memory is intentionally a warning/cap layer only; it is not promoted into the offline default policy or an ETF/single-stock allocator because the replay trials only tied, not improved, current best.
 - Still not fully integrated: portfolio sleeve allocator is not promoted because both sleeves did not pass the required primary/OOS/cost-stress checks.
 - Still not integrated as a default: sparse high-score policies are recorded as diagnostic-only when they produce too few closed trades for a defensible rule.
 - Still not integrated as an exposure-increasing default: the current best keeps passing basic robustness checks, but local prices are unvalidated because `daily_prices` remains empty.
-- Next minimum loop closure: validate whether the lower single-stock cap and ETF-sleeve caps reduce simulated churn/drawdown over another tape update before widening exposure.
+- Next minimum loop closure: validate whether the lower evidence-gated single-stock cap and ETF-sleeve caps reduce simulated churn/drawdown over another tape update before widening exposure.
 
 ## Reproduce
 ```bash
@@ -1098,7 +1123,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Validate the 6-day/6% reduced-exposure single-stock policy over another tape update before any exposure widening.
+- Validate the 6-day evidence-gated reduced-exposure single-stock policy over another tape update before any exposure widening.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
 - Replace prediction-current-price fallback with validated local daily prices when available.
 """
@@ -1416,6 +1441,27 @@ def main() -> int:
             loss_streak_guard=0.50,
             new_entry_loss_streak_threshold=2,
             min_holding_days=6,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+        ),
+        PolicyConfig(
+            name="single_stock_hold6_cap5_min2obs",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.05,
+            max_gross=0.20,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=6,
+            min_signal_count=2,
             rebalance_threshold=0.05,
             universe="single_stock",
         ),
