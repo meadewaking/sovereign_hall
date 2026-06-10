@@ -945,6 +945,78 @@ def build_sleeve_diagnostics(
     }
 
 
+def _missing_price_count(notes: Any) -> int:
+    for part in str(notes or "").split(";"):
+        if part.startswith("missing_prices="):
+            try:
+                return int(part.split("=", 1)[1])
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def build_price_coverage_report(
+    daily: pd.DataFrame,
+    price_history: pd.DataFrame,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Summarize whether the retained path used validated local prices."""
+    curve = result.get("curve", pd.DataFrame())
+    price_source_counts = (
+        daily["price_source"].value_counts().to_dict()
+        if "price_source" in daily and not daily.empty
+        else {}
+    )
+    daily_price_rows = int(price_source_counts.get("daily_prices", 0))
+    signal_rows = int(len(daily))
+    independent_ratio = daily_price_rows / signal_rows if signal_rows else 0.0
+
+    missing_days = 0
+    missing_slots = 0
+    position_slots = 0
+    if isinstance(curve, pd.DataFrame) and not curve.empty:
+        for _, row in curve.iterrows():
+            missing = _missing_price_count(row.get("notes"))
+            if missing > 0:
+                missing_days += 1
+                missing_slots += missing
+            try:
+                positions = json.loads(row.get("positions", "{}"))
+            except Exception:
+                positions = {}
+            if isinstance(positions, dict):
+                position_slots += len(positions)
+
+    curve_days = int(len(curve)) if isinstance(curve, pd.DataFrame) else 0
+    missing_day_ratio = missing_days / curve_days if curve_days else 0.0
+    missing_slot_ratio = missing_slots / position_slots if position_slots else 0.0
+    status = "validated_daily_prices"
+    if independent_ratio <= 0.0:
+        status = "unvalidated_prediction_current_price_fallback"
+    elif missing_slot_ratio > 0.10:
+        status = "partial_daily_prices_with_missing_hold_prices"
+
+    return {
+        "status": status,
+        "daily_signal_rows": signal_rows,
+        "daily_signal_price_source_counts": {
+            str(key): int(value) for key, value in price_source_counts.items()
+        },
+        "daily_prices_rows_loaded": int(len(price_history)),
+        "independent_price_row_ratio": float(independent_ratio),
+        "best_curve_days": curve_days,
+        "days_with_missing_prices": int(missing_days),
+        "missing_price_day_ratio": float(missing_day_ratio),
+        "held_position_slots": int(position_slots),
+        "missing_position_price_slots": int(missing_slots),
+        "missing_position_price_slot_ratio": float(missing_slot_ratio),
+        "rule": (
+            "Do not use latest local score to expand exposure until daily_prices "
+            "coverage is validated and held-position missing-price slots are low."
+        ),
+    }
+
+
 def write_policy_snapshot(path: Path, policy: PolicyConfig, costs: CostConfig) -> None:
     policy_literal = pprint.pformat(asdict(policy), sort_dicts=False, width=88)
     costs_literal = pprint.pformat(asdict(costs), sort_dicts=False, width=88)
@@ -983,6 +1055,7 @@ def write_readme(
     command: str,
     recent_failure_tickers: tuple[str, ...] = (),
     sleeve_diagnostics: dict[str, Any] | None = None,
+    price_coverage: dict[str, Any] | None = None,
 ) -> None:
     failed = [t for t in trials if t["trial_name"] != best_name]
     best_row = next((t for t in trials if t["trial_name"] == best_name), {})
@@ -1031,6 +1104,24 @@ def write_readme(
             )
     sleeve_text = "\n".join(sleeve_lines) or "- Sleeve diagnostics unavailable."
     failure_ticker_text = ", ".join(recent_failure_tickers) if recent_failure_tickers else "none"
+    price_coverage = price_coverage or {}
+    source_counts = price_coverage.get("daily_signal_price_source_counts", {})
+    source_counts_text = ", ".join(f"{key}={value}" for key, value in source_counts.items()) or "unknown"
+    price_coverage_text = (
+        f"- Status: {price_coverage.get('status', 'unknown')}\n"
+        f"- daily_signal rows: {price_coverage.get('daily_signal_rows', 0)}; "
+        f"source counts: {source_counts_text}; "
+        f"daily_prices rows loaded: {price_coverage.get('daily_prices_rows_loaded', 0)}; "
+        f"independent row ratio: {float(price_coverage.get('independent_price_row_ratio', 0.0)):.2%}\n"
+        f"- Best path missing prices: {price_coverage.get('days_with_missing_prices', 0)}/"
+        f"{price_coverage.get('best_curve_days', 0)} days "
+        f"({float(price_coverage.get('missing_price_day_ratio', 0.0)):.2%}); "
+        f"{price_coverage.get('missing_position_price_slots', 0)}/"
+        f"{price_coverage.get('held_position_slots', 0)} held-position slots "
+        f"({float(price_coverage.get('missing_position_price_slot_ratio', 0.0)):.2%})\n"
+        "- Integration decision: keep the best policy as a cap/warning only; do not expand "
+        "exposure until local daily_prices coverage is validated."
+    )
     text = f"""# Heuristic Learning Cycle
 
 ## Run
@@ -1058,6 +1149,7 @@ def write_readme(
 - Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display, manual research warnings, simulated-trading position caps, and prompt-level failure-case constraints.
 - Added thin cost-stress signaling to the shared heuristic context so entry points now show OOS/3x-slippage scores and warn when the cost-stress margin is too thin to expand exposure.
 - Closed the price-source risk loop: because `daily_prices` is still empty, `services/heuristic_policy.py` now treats prediction-current-price fallback as an explicit no-expansion warning in status, research prompts, and simulated trade cap reasons.
+- Advanced the prior data-source direction by writing `price_coverage.json`, including price-source counts and missing held-position price slots for the retained path.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
@@ -1089,6 +1181,9 @@ def write_readme(
 - Rule: {sleeve_diagnostics.get("rule", "ETF and single-stock sleeves must pass before allocator promotion.")}
 {sleeve_text}
 
+## Price Coverage Check
+{price_coverage_text}
+
 ## Overfitting Risk
 ```json
 {checks_text}
@@ -1109,12 +1204,14 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - User-visible change: tickers with recent realized simulated losses worse than -3% are capped to the failure-scale position limit until the 8-day memory expires, and trade reasons/status output identify this as local simulation risk memory.
 - Improved thin-cost-stress closure: `services/heuristic_policy.py` now exposes OOS and 3x-slippage scores to `check_db`, manual research prompts, and simulated trade reasons; if 3x-slippage score is below 0.02, the latest policy remains a cap/warning only and explicitly forbids exposure expansion.
 - Improved data-source closure: `check_db`, `run_discussion`, `research_interactive`, and simulated trade reasons now surface `daily_prices` absence as a no-expansion warning when the latest run still relies on prediction `current_price` fallback.
+- Improved price-coverage closure: `check_db`, research prompt context, and simulated trade reasons now surface the latest `price_coverage.json` ratios, including held-position missing-price slots.
 - Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
 - Improved reduced-exposure closure: all three user entry paths inherit the retained single-stock cap and local evidence floor from `policy_snapshot.py` without adding a separate trading rule.
 - Still not fully integrated: durable simulation risk memory is intentionally a warning/cap layer only; it is not promoted into the offline default policy or an ETF/single-stock allocator because the replay trials only tied, not improved, current best.
 - Still not fully integrated: portfolio sleeve allocator is not promoted because both sleeves did not pass the required primary/OOS/cost-stress checks.
 - Still not integrated as a default: sparse high-score policies are recorded as diagnostic-only when they produce too few closed trades for a defensible rule.
 - Still not integrated as an exposure-increasing default: the current best keeps passing basic robustness checks, but local prices are unvalidated because `daily_prices` remains empty.
+- Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
 - Next minimum loop closure: validate whether the lower evidence-gated single-stock cap and ETF-sleeve caps reduce simulated churn/drawdown over another tape update before widening exposure.
 
 ## Reproduce
@@ -1125,7 +1222,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## Next 3 Directions
 - Validate the 6-day evidence-gated reduced-exposure single-stock policy over another tape update before any exposure widening.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
-- Replace prediction-current-price fallback with validated local daily prices when available.
+- Replace prediction-current-price fallback with validated local daily prices; require visible price coverage before any exposure expansion.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -1690,6 +1787,8 @@ def main() -> int:
     write_json(run_dir / "overfit_checks.json", checks)
     sleeve_diagnostics = build_sleeve_diagnostics(daily, policies, results, costs)
     write_json(run_dir / "sleeve_diagnostics.json", sleeve_diagnostics)
+    price_coverage = build_price_coverage_report(daily, price_history, best_result)
+    write_json(run_dir / "price_coverage.json", price_coverage)
     write_policy_snapshot(run_dir / "policy_snapshot.py", best_policy, costs)
     make_plot(run_dir / "sample_efficiency.png", trial_rows)
 
@@ -1721,6 +1820,7 @@ def main() -> int:
             if not price_history.empty
             else "prediction current_price fallback; daily_prices table unavailable or empty"
         ),
+        "price_coverage": price_coverage,
     }
     write_json(run_dir / "project_context.json", code_context)
     write_readme(
@@ -1737,6 +1837,7 @@ def main() -> int:
         f"python scripts/run_heuristic_cycle.py --db {args.db}",
         recent_failure_tickers=recent_failure_tickers,
         sleeve_diagnostics=sleeve_diagnostics,
+        price_coverage=price_coverage,
     )
 
     latest = runs_root / "LATEST"

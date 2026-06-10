@@ -408,6 +408,34 @@ def test_heuristic_context_surfaces_min_signal_count(tmp_path):
     assert "本地信号观察门槛=2条" in prompt
 
 
+def test_heuristic_context_surfaces_price_coverage(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs",
+        score=0.055,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="通过本轮基础样本外与成本扰动检查",
+        failure_cases=[],
+        price_source="prediction current_price fallback; daily_prices table unavailable or empty",
+        price_coverage={
+            "status": "unvalidated_prediction_current_price_fallback",
+            "independent_price_row_ratio": 0.0,
+            "missing_position_price_slot_ratio": 0.3778,
+            "missing_price_day_ratio": 0.2791,
+        },
+    )
+
+    capped, reason = apply_heuristic_risk_cap("600519", 0.08, 0.8, context=context)
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert capped == pytest.approx(0.05)
+    assert "持仓缺价槽位37.8%" in reason
+    assert "价格覆盖" in status
+    assert "daily_prices覆盖0.0%" in prompt
+
+
 def test_simulation_trade_losses_derive_risk_memory():
     failures = derive_simulation_risk_memory([
         {
