@@ -27,6 +27,10 @@ class MarketDataService:
         self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._quote_cache: Dict[str, Tuple[float, datetime]] = {}
         self._quote_ttl_seconds = 60
+        self._eastmoney_ohlc_failures = 0
+        self._eastmoney_ohlc_cooldown_until: Optional[datetime] = None
+        self._eastmoney_ohlc_failure_threshold = 3
+        self._eastmoney_ohlc_cooldown_seconds = 300
 
     @staticmethod
     def normalize_ticker(ticker: str) -> str:
@@ -206,33 +210,61 @@ class MarketDataService:
             "beg": start_s,
             "end": end_s,
         }
-        try:
-            resp = await self._client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json().get("data") or {}
-            bars = []
-            for raw in data.get("klines") or []:
-                parts = raw.split(",")
-                if len(parts) < 6:
-                    continue
-                bars.append({
-                    "date": parts[0],
-                    "open": float(parts[1]),
-                    "close": float(parts[2]),
-                    "high": float(parts[3]),
-                    "low": float(parts[4]),
-                    "volume": float(parts[5]),
-                })
-            if bars:
-                return bars
-        except Exception as exc:
-            logger.warning("Eastmoney OHLC fetch failed for %s: %s", ticker, exc)
+        if not self._eastmoney_ohlc_in_cooldown():
+            try:
+                resp = await self._client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json().get("data") or {}
+                bars = []
+                for raw in data.get("klines") or []:
+                    parts = raw.split(",")
+                    if len(parts) < 6:
+                        continue
+                    bars.append({
+                        "date": parts[0],
+                        "open": float(parts[1]),
+                        "close": float(parts[2]),
+                        "high": float(parts[3]),
+                        "low": float(parts[4]),
+                        "volume": float(parts[5]),
+                    })
+                if bars:
+                    self._eastmoney_ohlc_failures = 0
+                    self._eastmoney_ohlc_cooldown_until = None
+                    return bars
+            except Exception as exc:
+                self._record_eastmoney_ohlc_failure(ticker, exc)
 
         bars = await self._fetch_tencent_ohlc(ticker, start_s, end_s)
         if bars:
             return bars
 
         return await self._fetch_akshare_ohlc(ticker, start_s, end_s)
+
+    def _eastmoney_ohlc_in_cooldown(self) -> bool:
+        if not self._eastmoney_ohlc_cooldown_until:
+            return False
+        if datetime.now() < self._eastmoney_ohlc_cooldown_until:
+            return True
+        self._eastmoney_ohlc_cooldown_until = None
+        self._eastmoney_ohlc_failures = 0
+        logger.info("Eastmoney OHLC cooldown expired; retrying primary source")
+        return False
+
+    def _record_eastmoney_ohlc_failure(self, ticker: str, exc: Exception):
+        self._eastmoney_ohlc_failures += 1
+        if self._eastmoney_ohlc_failures >= self._eastmoney_ohlc_failure_threshold:
+            if not self._eastmoney_ohlc_cooldown_until:
+                self._eastmoney_ohlc_cooldown_until = datetime.now() + timedelta(seconds=self._eastmoney_ohlc_cooldown_seconds)
+                logger.warning(
+                    "Eastmoney OHLC unavailable after %s failures; cooling down for %ss and using fallbacks",
+                    self._eastmoney_ohlc_failures,
+                    self._eastmoney_ohlc_cooldown_seconds,
+                )
+            else:
+                logger.debug("Eastmoney OHLC still unavailable for %s: %s", ticker, exc)
+        else:
+            logger.warning("Eastmoney OHLC fetch failed for %s: %s", ticker, exc)
 
     async def _fetch_tencent_ohlc(self, ticker: str, start_s: str, end_s: str) -> List[Dict]:
         market = self.infer_market(ticker)

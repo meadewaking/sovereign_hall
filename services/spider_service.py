@@ -102,10 +102,10 @@ class SpiderSwarm:
 
     def __init__(
         self,
-        max_concurrent: int = 50,
-        timeout: int = 30,
+        max_concurrent: Optional[int] = None,
+        timeout: Optional[int] = None,
         user_agent: str = None,
-        retry_times: int = 3,
+        retry_times: Optional[int] = None,
         cache_ttl: int = 3600,  # 缓存有效期（秒），默认1小时
     ):
         """
@@ -121,18 +121,19 @@ class SpiderSwarm:
         config = get_config()
         spider_config = config.get_spider_config()
 
-        self.max_concurrent = max_concurrent
-        self.timeout = timeout or spider_config.get('timeout', 30)
+        self.max_concurrent = int(max_concurrent if max_concurrent is not None else spider_config.get('max_concurrent', 50))
+        self.timeout = int(timeout if timeout is not None else spider_config.get('timeout', 30))
         self.user_agent = user_agent or spider_config.get('user_agent', 'SovereignHall/1.0 (Research Bot)')
-        self.retry_times = retry_times or spider_config.get('retry_times', 3)
+        self.retry_times = int(retry_times if retry_times is not None else spider_config.get('retry_times', 3))
         self.search_interval = spider_config.get('search_interval', 0.5)  # 搜索间隔
 
         # 搜索结果缓存（类级别共享，同一轮次内有效）
         self._search_cache: Dict[str, Tuple[List[Doc], float]] = {}  # query -> (docs, timestamp)
         self._cache_ttl = cache_ttl
+        self._empty_cache_ttl = min(300, cache_ttl)
 
         # 并发控制
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
 
         # 统计
         self.success_count = ThreadSafeCounter()
@@ -140,15 +141,21 @@ class SpiderSwarm:
 
         # 速率限制
         rate_config = config.get_spider_config()
+        nested_rate_config = rate_config.get('rate_limit') or {}
+        requests_per_minute = nested_rate_config.get(
+            'requests_per_minute',
+            rate_config.get('requests_per_minute', 30)
+        )
+        burst = nested_rate_config.get('burst', rate_config.get('burst', 10))
         self.rate_limiter = RateLimiter(
-            rate=rate_config.get('requests_per_minute', 30) / 60,
-            burst=rate_config.get('burst', 10)
+            rate=requests_per_minute / 60,
+            burst=burst
         )
 
         # HTTP客户端
         self._init_client()
 
-        logger.info(f"Spider Swarm initialized: max_concurrent={max_concurrent}, timeout={timeout}, cache_ttl={cache_ttl}s")
+        logger.info(f"Spider Swarm initialized: max_concurrent={self.max_concurrent}, timeout={self.timeout}, cache_ttl={cache_ttl}s")
 
     def _init_client(self):
         """初始化HTTP客户端（走代理）"""
@@ -202,9 +209,13 @@ class SpiderSwarm:
                 cached_docs, cached_time = self._search_cache[query]
                 # 检查缓存是否过期
                 if current_time - cached_time < self._cache_ttl:
-                    cached_results[query] = cached_docs
-                    cache_hits += 1
-                    logger.info(f"🔍 Cache HIT: {query} ({len(cached_docs)} docs)")
+                    ttl = self._empty_cache_ttl if not cached_docs else self._cache_ttl
+                    if current_time - cached_time < ttl:
+                        cached_results[query] = cached_docs
+                        cache_hits += 1
+                        logger.info(f"🔍 Cache HIT: {query} ({len(cached_docs)} docs)")
+                    else:
+                        queries_to_search.append(query)
                 else:
                     # 缓存过期，需要重新搜索
                     queries_to_search.append(query)
@@ -248,8 +259,8 @@ class SpiderSwarm:
 
             # 缓存搜索结果
             if query_docs:
-                self._search_cache[query] = (query_docs, current_time)
                 newly_cached += 1
+            self._search_cache[query] = (query_docs, current_time)
 
         # 添加缓存结果到最终结果（去重）
         for query, docs in cached_results.items():
@@ -699,7 +710,8 @@ class SpiderSwarm:
                 from ddgs import DDGS
 
                 # 使用代理
-                ddgs = DDGS(proxy="http://127.0.0.1:7890", timeout=15)
+                proxy = get_config().get_spider_config().get("proxy")
+                ddgs = DDGS(proxy=proxy, timeout=min(15, self.timeout))
                 results = ddgs.text(query, max_results=max_results)
             finally:
                 # 恢复日志级别

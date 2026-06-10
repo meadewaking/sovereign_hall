@@ -37,14 +37,14 @@ class LLMClient:
 
     def __init__(
         self,
-        max_concurrent: int = 16,
+        max_concurrent: Optional[int] = None,
         model: str = None,
         provider: str = None,
         api_key: str = None,
         base_url: str = None,
-        timeout: int = 120,
-        max_retries: int = 3,
-        retry_delay: float = 2.0,
+        timeout: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        retry_delay: Optional[float] = None,
     ):
         """
         初始化LLM客户端
@@ -73,9 +73,9 @@ class LLMClient:
 
         self.model = model or llm_config.get('model', 'claude-sonnet-4-5')
         self.provider = provider or llm_config.get('provider', 'anthropic')
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
+        self.timeout = int(timeout if timeout is not None else llm_config.get('timeout', 120))
+        self.max_retries = int(max_retries if max_retries is not None else llm_config.get('max_retries', 3))
+        self.retry_delay = float(retry_delay if retry_delay is not None else llm_config.get('retry_delay', 2.0))
 
         # API配置
         self.api_key = api_key or llm_config.get('api_key', 'empty')
@@ -83,8 +83,8 @@ class LLMClient:
         self.model_uuid = llm_config.get('model_uuid')  # 用于本地API的Host header
 
         # 并发控制
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.max_concurrent = max_concurrent
+        self.max_concurrent = int(max_concurrent if max_concurrent is not None else llm_config.get('max_concurrent', 16))
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
 
         # 统计
         self.token_stats = TokenStats()
@@ -106,7 +106,7 @@ class LLMClient:
         self._embedding_client: Optional[httpx.AsyncClient] = None
         self._init_client()
 
-        logger.info(f"LLM Client initialized: provider={self.provider}, model={self.model}, max_concurrent={max_concurrent}")
+        logger.info(f"LLM Client initialized: provider={self.provider}, model={self.model}, max_concurrent={self.max_concurrent}, timeout={self.timeout}s")
 
     def _init_client(self):
         """初始化API客户端"""
@@ -545,7 +545,7 @@ class LLMClient:
                 if 'embedding' in data and data['embedding']:
                     embeddings = data['embedding']
                     if embeddings and len(embeddings) > 0:
-                        logger.info(f"Embedding API success: dim={len(embeddings[0])}")
+                        logger.debug(f"Embedding API success: dim={len(embeddings[0])}")
                         return embeddings[0]
             except Exception as e:
                 logger.warning(f"Embedding API failed: {e}, using mock")

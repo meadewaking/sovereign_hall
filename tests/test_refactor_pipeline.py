@@ -3,9 +3,11 @@ import json
 import inspect
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from sovereign_hall.core import AgentRole, Document, PlaybookEntry
+from sovereign_hall.core.config import get_config
 from sovereign_hall.agents import get_persona
 from sovereign_hall.services.database import DatabaseService
 from sovereign_hall.services.decision_tracker import DecisionRecorder
@@ -19,6 +21,8 @@ from sovereign_hall.services.heuristic_policy import (
     format_heuristic_status,
 )
 from sovereign_hall.services.market_data import MarketDataService
+from sovereign_hall.services.llm_client import LLMClient
+from sovereign_hall.services.spider_service import SpiderSwarm
 from sovereign_hall.services.prediction_tracker import PredictionTracker
 from sovereign_hall.services.backtest_engine import get_backtest_engine
 from sovereign_hall.services.prediction_store import ensure_prediction_tables
@@ -67,6 +71,74 @@ def test_market_data_ticker_mapping():
     assert svc.infer_market("600519") == "sh"
     assert svc.infer_market("159995") == "sz"
     assert svc.eastmoney_secid("512880") == "1.512880"
+
+
+def test_llm_client_uses_configured_defaults():
+    client = LLMClient(provider="local")
+    llm_config = get_config().get_llm_config()
+
+    assert client.timeout == llm_config.get("timeout")
+    assert client.max_retries == llm_config.get("max_retries", 3)
+    assert client.retry_delay == llm_config.get("retry_delay", 2.0)
+    assert client.max_concurrent == llm_config.get("max_concurrent")
+
+
+@pytest.mark.asyncio
+async def test_spider_uses_nested_rate_limit_config():
+    config = get_config()
+    original = dict(config.get_spider_config())
+    config.set("spider.max_concurrent", 4)
+    config.set("spider.rate_limit", {"requests_per_minute": 6, "burst": 2})
+
+    spider = None
+    try:
+        spider = SpiderSwarm()
+        assert spider.max_concurrent == 4
+        assert spider.rate_limiter.rate == pytest.approx(0.1)
+        assert spider.rate_limiter.burst == 2
+    finally:
+        if spider:
+            await spider.close()
+        config._config["spider"] = original
+
+
+@pytest.mark.asyncio
+async def test_market_data_cools_down_eastmoney_after_repeated_ohlc_failures(monkeypatch):
+    class FailingClient:
+        is_closed = False
+
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, url, params=None):
+            self.calls += 1
+            request = httpx.Request("GET", url, params=params)
+            response = httpx.Response(502, request=request)
+            raise httpx.HTTPStatusError("bad gateway", request=request, response=response)
+
+        async def aclose(self):
+            pass
+
+    svc = MarketDataService()
+    await svc._client.aclose()
+    failing_client = FailingClient()
+    svc._client = failing_client
+
+    async def fake_tencent(*_args, **_kwargs):
+        return []
+
+    async def fake_akshare(*_args, **_kwargs):
+        return [{"date": "2026-06-10", "open": 1.0, "close": 1.0, "high": 1.0, "low": 1.0, "volume": 0}]
+
+    monkeypatch.setattr(svc, "_fetch_tencent_ohlc", fake_tencent)
+    monkeypatch.setattr(svc, "_fetch_akshare_ohlc", fake_akshare)
+
+    for _ in range(4):
+        bars = await svc.get_ohlc("600519", "2026-06-01", "2026-06-10")
+        assert bars
+
+    assert failing_client.calls == 3
+    await svc.close()
 
 
 @pytest.mark.asyncio
