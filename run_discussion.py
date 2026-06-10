@@ -16,7 +16,7 @@ import json
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -679,9 +679,31 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 
 def parse_committee_vote(text: str) -> Dict:
     """Parse a loose committee vote into a small structured signal."""
+    parsed_json = safe_parse_json(str(text or ""), None)
+    if isinstance(parsed_json, dict):
+        direction = normalize_vote_direction(
+            parsed_json.get("direction")
+            or parsed_json.get("vote")
+            or parsed_json.get("action")
+            or parsed_json.get("decision")
+        )
+        confidence = parse_ratio_value(parsed_json.get("confidence"))
+        position = parse_ratio_value(parsed_json.get("position") or parsed_json.get("target_position"))
+        risk_flags = parsed_json.get("risk_flags") or parsed_json.get("risks") or []
+        if isinstance(risk_flags, str):
+            risk_flags = [risk_flags]
+        return {
+            "direction": direction,
+            "confidence": confidence,
+            "position": position,
+            "risk_flags": [str(flag)[:80] for flag in risk_flags[:5]] if isinstance(risk_flags, list) else [],
+            "invalid_if": str(parsed_json.get("invalid_if") or parsed_json.get("reject_if") or "")[:200],
+            "key_evidence": parsed_json.get("key_evidence") or parsed_json.get("evidence") or [],
+        }
+
     value = str(text or "").lower()
     if not value:
-        return {"direction": "hold", "confidence": None, "position": None}
+        return {"direction": "hold", "confidence": None, "position": None, "risk_flags": []}
 
     has_sell = any(word in value for word in ("卖出", "看空", "做空", "short", "sell"))
     has_hold = any(word in value for word in ("观望", "暂缓", "不建议", "反对", "拒绝", "hold", "defer"))
@@ -699,22 +721,113 @@ def parse_committee_vote(text: str) -> Dict:
     confidence = None
     confidence_match = re.search(r"(?:置信度|confidence)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%?", value)
     if confidence_match:
-        confidence = float(confidence_match.group(1))
-        confidence = confidence / 100 if confidence > 1 else confidence
+        confidence = parse_ratio_value(confidence_match.group(1))
 
     position = None
     position_match = re.search(r"(?:仓位|position)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%?", value)
     if position_match:
-        position = float(position_match.group(1))
-        position = position / 100 if position > 1 else position
+        position = parse_ratio_value(position_match.group(1))
 
-    return {"direction": direction, "confidence": confidence, "position": position}
+    return {"direction": direction, "confidence": confidence, "position": position, "risk_flags": []}
 
 
-def aggregate_committee_decision(proposal: Dict, vote_results: List[str]) -> Dict:
+def normalize_vote_direction(value: Any) -> str:
+    """Normalize structured or natural-language vote direction."""
+    text = str(value or "").strip().lower()
+    if any(word in text for word in ("short", "sell", "卖出", "看空", "做空")):
+        return "short"
+    if any(word in text for word in ("long", "buy", "买入", "看多", "做多")):
+        return "long"
+    return "hold"
+
+
+def parse_ratio_value(value: Any) -> Optional[float]:
+    """Parse percentages or decimal ratios into [0, 1]."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+        if not match:
+            return None
+        number = float(match.group(0))
+    if number > 1:
+        number /= 100
+    return max(0.0, min(1.0, number))
+
+
+def proposal_priority_score(proposal: Dict) -> float:
+    """Score how much deliberation a proposal deserves."""
+    confidence = float(proposal.get("confidence", 0.5) or 0.5)
+    position = float(proposal.get("target_position", 0.0) or 0.0)
+    thesis = str(proposal.get("thesis", "") or "")
+    ticker = str(proposal.get("ticker", "") or "")
+    score = confidence * 0.45 + min(position, 0.25) * 1.2
+    score += min(len(thesis) / 1200, 0.2)
+    if not is_substitute_etf(ticker):
+        score += 0.12
+    if "证据:" in thesis or "事实:" in thesis:
+        score += 0.08
+    if "否决条件:" in thesis:
+        score += 0.05
+    return round(score, 4)
+
+
+def is_substitute_etf(ticker: str) -> bool:
+    return str(ticker or "").startswith(("159", "510", "511", "512", "513", "515", "516", "517", "518", "560", "561", "562", "563", "588"))
+
+
+def choose_review_depth(proposal: Dict) -> str:
+    """Choose review depth by impact and evidence quality, not by token budget."""
+    score = proposal_priority_score(proposal)
+    confidence = float(proposal.get("confidence", 0.5) or 0.5)
+    if score >= 0.58 or confidence >= 0.72:
+        return "full"
+    if score >= 0.42 or confidence >= 0.55:
+        return "focused"
+    return "light"
+
+
+def select_committee_proposals(proposals: List[Dict], limit: int = 3) -> List[Dict]:
+    """Discuss the strongest proposals first, preserving all proposal details."""
+    ranked = sorted(
+        proposals,
+        key=lambda item: (proposal_priority_score(item), float(item.get("confidence", 0.0) or 0.0)),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+def build_structured_vote_prompt(ticker: str, role_view: str, context: str, learned_context: str) -> str:
+    """Ask each committee role for a machine-readable vote."""
+    return f"""
+基于以下讨论，对 {ticker} 从{role_view}给出最终投票。
+
+讨论摘要：
+{context}
+{learned_context}
+
+只输出JSON对象，不要Markdown，不要解释。字段：
+{{
+  "direction": "long/short/hold",
+  "confidence": 0.0,
+  "position": 0.0,
+  "key_evidence": ["最关键证据1", "最关键证据2"],
+  "risk_flags": ["主要风险1", "主要风险2"],
+  "invalid_if": "什么情况会推翻该判断"
+}}
+
+约束：
+- 证据不足或反证更强时 direction 必须是 hold，position 必须是 0。
+- confidence 用0到1小数，position 用0到1小数。
+""".strip()
+
+
+def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_weights: Optional[List[float]] = None) -> Dict:
     """Aggregate loose text votes into the decision used by downstream systems."""
     parsed = [parse_committee_vote(vote) for vote in vote_results]
-    weights = [2.0, 1.0, 1.0, 1.0, 1.0, 1.5, 1.0]
+    weights = vote_weights or [2.0, 1.0, 1.0, 1.0, 1.0, 1.5, 1.0]
     scores = {"long": 0.0, "short": 0.0, "hold": 0.0}
     for index, vote in enumerate(parsed):
         scores[vote["direction"]] += weights[index] if index < len(weights) else 1.0
@@ -732,12 +845,21 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str]) -> Dic
     target_position = sum(positions) / len(positions) if positions else float(proposal.get("target_position", 0.1))
     if direction == "hold":
         target_position = 0.0
+    total_weight = sum(weights[:len(parsed)]) if parsed else 0.0
+    sorted_scores = sorted(scores.values(), reverse=True)
+    margin = (sorted_scores[0] - sorted_scores[1]) / total_weight if total_weight and len(sorted_scores) > 1 else 0.0
+    risk_flags = []
+    for vote in parsed:
+        risk_flags.extend(vote.get("risk_flags") or [])
 
     return {
         "direction": direction,
         "confidence": max(0.0, min(1.0, confidence)),
         "target_position": max(0.0, min(1.0, target_position)),
         "vote_summary": scores,
+        "vote_margin": round(margin, 4),
+        "vote_count": len(parsed),
+        "risk_flags": list(dict.fromkeys(risk_flags))[:8],
     }
 
 
@@ -769,11 +891,14 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
     all_discussions = []
     final_decisions = []
 
-    # 每轮只讨论前3个提案，避免太长
-    for i, proposal in enumerate(proposals[:3]):
+    # 每轮优先讨论最高价值提案；弱提案走轻量裁决，避免低信号内容稀释学习样本。
+    committee_proposals = select_committee_proposals(proposals, limit=3)
+    for i, proposal in enumerate(committee_proposals):
         ticker = proposal.get('ticker', '')
         thesis = proposal.get('thesis', '')
         sector = proposal.get('sector', '')
+        review_depth = choose_review_depth(proposal)
+        priority_score = proposal_priority_score(proposal)
         learned_context = f"\n\n{lessons_prompt}" if lessons_prompt else ""
         analysis_format = (
             "\n\n输出要求：只讲新增判断，不复述提案；"
@@ -781,7 +906,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             "不限制必要展开，但每条都必须承担不同验证角度；结论必须含买入/卖出/观望、置信度和否决条件。"
         )
 
-        print(f"\n### 提案 {i+1}: {ticker} ({proposal.get('direction')}) | 置信度: {proposal.get('confidence', 0):.0%}")
+        print(f"\n### 提案 {i+1}: {ticker} ({proposal.get('direction')}) | 置信度: {proposal.get('confidence', 0):.0%} | 深度: {review_depth} | score={priority_score:.2f}")
 
         # ============================================================
         # 第一轮：14路并发分析
@@ -804,6 +929,12 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             (agents[AgentRole.CYCLE_ANALYST], "周期-机会", f"作为周期分析师，分析{ticker}的周期位置。{learned_context}{analysis_format}", [f"{sector} 供需"]),
             (agents[AgentRole.QUANT_RESEARCHER], "量化-资金", f"作为量化分析师，分析{ticker}的资金流向。{learned_context}{analysis_format}", [f"{ticker} 主力资金"]),
         ]
+        if review_depth == "focused":
+            focused_names = {"风控-财务风险", "风控-最坏情况", "量化-技术面", "量化-估值", "宏观-时机", "CIO-综合", "TMT-机会", "消费-机会", "周期-机会"}
+            round1_tasks = [task for task in round1_tasks if task[1] in focused_names]
+        elif review_depth == "light":
+            light_names = {"风控-最坏情况", "量化-技术面", "宏观-时机", "CIO-综合"}
+            round1_tasks = [task for task in round1_tasks if task[1] in light_names]
 
         try:
             round1_results = await asyncio.wait_for(
@@ -827,11 +958,6 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
 
             print(f"      ✅ 第一轮完成")
 
-            # ============================================================
-            # 第二轮：7路深度辩论
-            # ============================================================
-            print("   📝 第二轮：深度辩论...")
-
             round1_summary = "\n".join([f"{name}: {r[:300]}" for name, r in zip(task_names, round1_results)])
 
             debate_tasks = [
@@ -843,27 +969,41 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                 (agents[AgentRole.CYCLE_ANALYST], "周期反驳", f"从周期角度反驳其他观点：\n{round1_summary[:500]}{analysis_format}", [f"{sector} 周期"]),
                 (agents[AgentRole.CIO], "CIO回应", f"回应各方质疑，给出最终立场：\n{round1_summary[:500]}{analysis_format}", [f"{ticker} 机构"]),
             ]
+            if review_depth == "focused":
+                focused_debate_names = {"质疑", "数据质疑", "宏观质疑", "CIO回应"}
+                debate_tasks = [task for task in debate_tasks if task[1] in focused_debate_names]
+            elif review_depth == "light":
+                debate_tasks = []
 
-            round2_results = await asyncio.wait_for(
-                asyncio.gather(*[
-                    agent.think_with_search(
-                        task=task,
-                        search_queries=queries,
-                        context=round1_summary[:300],
-                        temperature=0.7,
-                        max_tokens=6000
-                    )
-                    for agent, name, task, queries in debate_tasks
-                ]),
-                timeout=600
-            )
+            # ============================================================
+            # 第二轮：按需深度辩论
+            # ============================================================
+            debate_names = []
+            round2_results = []
+            if debate_tasks:
+                print(f"   📝 第二轮：深度辩论 ({len(debate_tasks)}路)...")
+                round2_results = await asyncio.wait_for(
+                    asyncio.gather(*[
+                        agent.think_with_search(
+                            task=task,
+                            search_queries=queries,
+                            context=round1_summary[:300],
+                            temperature=0.7,
+                            max_tokens=6000
+                        )
+                        for agent, name, task, queries in debate_tasks
+                    ]),
+                    timeout=600
+                )
 
-            debate_names = [name for _, name, _, _ in debate_tasks]
-            all_discussions.append(f"\n{'='*50}\n【{ticker}】第二轮辩论\n{'='*50}")
-            for name, result in zip(debate_names, round2_results):
-                all_discussions.append(f"\n[{name}]\n{result[:500]}")
+                debate_names = [name for _, name, _, _ in debate_tasks]
+                all_discussions.append(f"\n{'='*50}\n【{ticker}】第二轮辩论\n{'='*50}")
+                for name, result in zip(debate_names, round2_results):
+                    all_discussions.append(f"\n[{name}]\n{result[:500]}")
 
-            print(f"      ✅ 第二轮完成")
+                print(f"      ✅ 第二轮完成")
+            else:
+                print("   📝 第二轮：轻量提案，跳过深度辩论")
 
             # ============================================================
             # 第三轮：投票裁决
@@ -873,23 +1013,22 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             full_context = f"【第一轮】{round1_summary[:800]}\n\n【第二轮】" + "\n".join([f"{n}: {r[:200]}" for n, r in zip(debate_names, round2_results)])
 
             vote_tasks = [
-                (agents[AgentRole.CIO], f"CIO投票-买入/卖出/观望 | 置信度 | 仓位建议"),
-                (agents[AgentRole.TMT_ANALYST], f"TMT分析师投票"),
-                (agents[AgentRole.CONSUMER_ANALYST], f"消费分析师投票"),
-                (agents[AgentRole.CYCLE_ANALYST], f"周期分析师投票"),
-                (agents[AgentRole.MACRO_STRATEGIST], f"宏观策略师投票"),
-                (agents[AgentRole.RISK_OFFICER], f"风控官投票"),
-                (agents[AgentRole.QUANT_RESEARCHER], f"量化研究员投票"),
+                (agents[AgentRole.CIO], "CIO综合视角", 2.0),
+                (agents[AgentRole.TMT_ANALYST], "TMT行业视角", 1.0),
+                (agents[AgentRole.CONSUMER_ANALYST], "消费行业视角", 1.0),
+                (agents[AgentRole.CYCLE_ANALYST], "周期行业视角", 1.0),
+                (agents[AgentRole.MACRO_STRATEGIST], "宏观策略视角", 1.0),
+                (agents[AgentRole.RISK_OFFICER], "风控视角", 1.5),
+                (agents[AgentRole.QUANT_RESEARCHER], "量化视角", 1.0),
             ]
+            if review_depth == "focused":
+                vote_tasks = [task for task in vote_tasks if task[1] in {"CIO综合视角", "宏观策略视角", "风控视角", "量化视角"}]
+            elif review_depth == "light":
+                vote_tasks = [task for task in vote_tasks if task[1] in {"CIO综合视角", "风控视角", "量化视角"}]
 
             vote_prompts = [
-                f"基于以下所有讨论，对{ticker}给出最终投票：\n{full_context[:1000]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX% | 止损: XX%。之后可补充关键证据、反证和失效条件。",
-                f"从TMT行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
-                f"从消费行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
-                f"从周期行业角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
-                f"从宏观角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
-                f"从风控角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
-                f"从量化角度，对{ticker}投票：\n{full_context[:800]}{learned_context}\n\n第一行必须是：【投票】买入/卖出/观望 | 置信度: XX% | 仓位: XX%。之后可补充关键证据、反证和失效条件。",
+                build_structured_vote_prompt(ticker, role_view, full_context[:1200], learned_context)
+                for _, role_view, _ in vote_tasks
             ]
 
             # 第三轮投票 - 增加错误处理和日志
@@ -898,7 +1037,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                 round3_results = await asyncio.wait_for(
                     asyncio.gather(*[
                         agent.think(task=prompt, temperature=0.4, max_tokens=3000)
-                        for agent, prompt in zip([a for a, _ in vote_tasks], vote_prompts)
+                        for agent, prompt in zip([a for a, _, _ in vote_tasks], vote_prompts)
                     ]),
                     timeout=300
                 )
@@ -908,17 +1047,20 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                 # 返回空结果继续
                 round3_results = [f"投票失败: {str(e)[:100]}" for _ in vote_tasks]
 
-            vote_names = [name for _, name in vote_tasks]
+            vote_names = [name for _, name, _ in vote_tasks]
+            vote_weights = [weight for _, _, weight in vote_tasks]
             all_discussions.append(f"\n{'='*50}\n【{ticker}】第三轮投票\n{'='*50}")
             for name, result in zip(vote_names, round3_results):
                 all_discussions.append(f"\n[{name}]\n{result[:300]}")
 
-            committee_decision = aggregate_committee_decision(proposal, round3_results)
+            committee_decision = aggregate_committee_decision(proposal, round3_results, vote_weights=vote_weights)
             expected_days = normalize_proposal_holding_period(proposal, topic)
             committee_decision.update({
                 'ticker': ticker,
                 'thesis': thesis,
                 'cio_vote': round3_results[0][:200],
+                'review_depth': review_depth,
+                'priority_score': priority_score,
                 'target_price': proposal.get('take_profit', 15.0),
                 'stop_loss': proposal.get('stop_loss', 5.0),
                 'take_profit': proposal.get('take_profit', 15.0),
@@ -938,7 +1080,14 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                         confidence=committee_decision.get('confidence', 0.5),
                         target_price=float(proposal.get('take_profit', 15.0)),
                         stop_loss=float(proposal.get('stop_loss', 5.0)),
-                        discussion_context=f"{thesis[:500]}\n验证窗口: {expected_days}天。{proposal.get('holding_period_reason', '')[:200]}",
+                        discussion_context=(
+                            f"{thesis[:500]}\n"
+                            f"验证窗口: {expected_days}天。{proposal.get('holding_period_reason', '')[:200]}\n"
+                            f"审议深度: {review_depth}; priority_score={priority_score:.2f}; "
+                            f"vote_margin={committee_decision.get('vote_margin', 0):.2f}; "
+                            f"vote_summary={committee_decision.get('vote_summary')}; "
+                            f"risk_flags={committee_decision.get('risk_flags', [])}"
+                        ),
                         expected_days=expected_days,
                     )
                     print(f"      📊 决策已记录，{expected_days}天后验证")

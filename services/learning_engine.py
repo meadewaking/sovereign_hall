@@ -63,10 +63,80 @@ class LearningEngine:
 
         return lessons[:10]
 
+    async def analyze_error_profiles(self, limit: int = 80) -> List[Dict]:
+        """Build reusable error profiles from validated prediction outcomes."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT * FROM price_predictions
+                WHERE status = 'validated'
+                ORDER BY validated_at DESC, predicted_at DESC
+                LIMIT ?
+            """, (limit,)) as cursor:
+                rows = [dict(row) for row in await cursor.fetchall()]
+
+        if not rows:
+            return []
+
+        groups = defaultdict(list)
+        for row in rows:
+            key = (
+                row.get("direction") or "unknown",
+                self._confidence_bucket(row.get("confidence")),
+                self._horizon_bucket(row.get("expected_days")),
+            )
+            groups[key].append(row)
+
+        profiles = []
+        for (direction, confidence_bucket, horizon_bucket), decisions in groups.items():
+            total = len(decisions)
+            wrong = sum(1 for item in decisions if item.get("result") == "wrong")
+            partial = sum(1 for item in decisions if item.get("result") == "partial")
+            avg_accuracy = sum(float(item.get("accuracy_score") or 0.0) for item in decisions) / total
+            if total < 2 and wrong == 0:
+                continue
+            if wrong == 0 and avg_accuracy >= 0.45:
+                continue
+
+            tickers = []
+            for item in decisions:
+                ticker = item.get("ticker")
+                if ticker and ticker not in tickers:
+                    tickers.append(ticker)
+
+            examples = []
+            for item in decisions:
+                if item.get("result") not in ("wrong", "partial"):
+                    continue
+                context = (item.get("discussion_context") or "").replace("\n", " ")[:120]
+                examples.append(f"{item.get('ticker')}:{item.get('result')}({context})")
+                if len(examples) >= 3:
+                    break
+
+            profiles.append({
+                "direction": direction,
+                "confidence_bucket": confidence_bucket,
+                "horizon_bucket": horizon_bucket,
+                "total": total,
+                "wrong": wrong,
+                "partial": partial,
+                "avg_accuracy": avg_accuracy,
+                "tickers": tickers[:5],
+                "examples": examples,
+                "description": (
+                    f"{direction}/{confidence_bucket}/{horizon_bucket}: "
+                    f"{total}次验证，wrong={wrong}, partial={partial}, 平均准确度{avg_accuracy:.0%}"
+                ),
+            })
+
+        profiles.sort(key=lambda item: (item["wrong"], -item["avg_accuracy"], item["total"]), reverse=True)
+        return profiles[:8]
+
     async def generate_lessons_prompt(self) -> str:
         """生成教训Prompt，注入到讨论中"""
         lessons = await self.analyze_errors()
-        if not lessons:
+        profiles = await self.analyze_error_profiles()
+        if not lessons and not profiles:
             return ""
 
         prompt = "\n【历史投资教训】\n"
@@ -75,11 +145,40 @@ class LearningEngine:
         for i, lesson in enumerate(lessons[:5], 1):
             prompt += f"{i}. {lesson['description'][:160]}\n"
 
+        if profiles:
+            prompt += "\n【错误画像】\n"
+            prompt += "优先检查当前提案是否落入这些低胜率模式；若落入，必须降低仓位或给出新证据：\n"
+            for i, profile in enumerate(profiles[:5], 1):
+                tickers = ",".join(profile.get("tickers") or [])
+                examples = "；".join(profile.get("examples") or [])
+                prompt += (
+                    f"{i}. {profile['description']}；样本: {tickers or '无'}"
+                    f"{'；例: ' + examples[:180] if examples else ''}\n"
+                )
+
         stats = await self.get_accuracy_stats()
         if stats['total'] > 0:
             prompt += f"\n当前历史预测胜率: {stats['accuracy']:.1%} ({stats['correct']}/{stats['total']})"
 
         return prompt
+
+    @staticmethod
+    def _confidence_bucket(confidence) -> str:
+        value = float(confidence or 0.0)
+        if value >= 0.75:
+            return "high_confidence"
+        if value >= 0.55:
+            return "medium_confidence"
+        return "low_confidence"
+
+    @staticmethod
+    def _horizon_bucket(expected_days) -> str:
+        days = int(expected_days or 30)
+        if days <= 14:
+            return "short_horizon"
+        if days <= 60:
+            return "medium_horizon"
+        return "long_horizon"
 
     async def get_accuracy_stats(self) -> Dict:
         """获取准确率统计"""

@@ -16,6 +16,7 @@ python -m sovereign_hall.services.research_discussion "你对A股市场近期走
 import asyncio
 import json
 import logging
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -343,7 +344,7 @@ class ResearchDiscussionSystem:
 
     def _generate_search_keywords(self, question: str, role: AgentRole) -> List[str]:
         """根据问题和角色生成检索关键词"""
-        base_keywords = list(question)
+        base_keywords = self._extract_question_keywords(question)
 
         role_keywords = {
             AgentRole.TMT_ANALYST: ["科技", "AI", "半导体", "芯片", "软件", "互联网", "电子", "通信"],
@@ -358,7 +359,39 @@ class ResearchDiscussionSystem:
         if role in role_keywords:
             keywords.update(role_keywords[role])
 
-        return list(keywords)
+        return list(dict.fromkeys(keywords))
+
+    def _extract_question_keywords(self, question: str) -> List[str]:
+        """Extract searchable phrases instead of splitting Chinese text into characters."""
+        text = question or ""
+        keywords = set()
+
+        if text.strip():
+            keywords.add(text.strip()[:80])
+
+        for token in re.split(r"[\s,，。！？、；：:()（）]+", text):
+            token = token.strip()
+            if len(token) >= 2:
+                keywords.add(token)
+
+        for match in re.finditer(r"([一二三四五六七八九十\d]+)\s*(天|日|周|个月|月|季度|季|年)", text):
+            horizon = "".join(match.groups())
+            keywords.add(horizon)
+            keywords.add(f"持有期{horizon}")
+
+        intent_terms = [
+            "股票", "ETF", "基金", "可转债", "买入", "卖出", "持有", "观望",
+            "止盈", "止损", "仓位", "估值", "风险", "行业", "公司", "财报",
+            "成长", "周期", "红利", "高股息", "景气度", "资金流",
+        ]
+        for term in intent_terms:
+            if term in text:
+                keywords.add(term)
+
+        stock_codes = re.findall(r"\b(?:[036]\d{5}|15\d{4}|51\d{4}|68\d{4})\b", text)
+        keywords.update(stock_codes)
+
+        return list(dict.fromkeys(keywords)) or [text[:20]]
 
     async def _build_context_with_db_priority(self, keywords: List[str]) -> str:
         """构建上下文，数据库内容优先"""
@@ -619,7 +652,10 @@ class ResearchDiscussionSystem:
 XX%（核心不确定性：XXX）
 
 ---
-证据不足时必须输出观望和0%仓位；如展开能提高判断质量，可以补充关键证据、反证和跟踪条件。
+证据不足时必须输出观望和0%仓位；仓位必须服从本地Heuristic风控约束，不能超过其单标的模拟仓位上限。
+必须显式写出“本地Heuristic校验”：候选是否满足置信度、风险收益比、最短持有、同日观察数、failure ticker约束；不满足则降仓或观望。
+若问题指定持有期，操作建议必须贴合该持有期，并给出到期复核条件。
+如展开能提高判断质量，可以补充关键证据、反证和跟踪条件。
 """
         response = await self.cio.think(prompt, max_tokens=8000)
         return extract_actual_response(response, max_length=20000)

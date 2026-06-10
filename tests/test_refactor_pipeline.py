@@ -19,18 +19,24 @@ from sovereign_hall.services.heuristic_policy import (
     failure_ticker_constraints,
     format_heuristic_prompt_context,
     format_heuristic_status,
+    format_policy_checklist,
 )
 from sovereign_hall.services.market_data import MarketDataService
 from sovereign_hall.services.llm_client import LLMClient
 from sovereign_hall.services.spider_service import SpiderSwarm
+from sovereign_hall.services.learning_engine import LearningEngine
+from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
 from sovereign_hall.services.prediction_tracker import PredictionTracker
 from sovereign_hall.services.backtest_engine import get_backtest_engine
 from sovereign_hall.services.prediction_store import ensure_prediction_tables
 from sovereign_hall.run_discussion import (
     TOPIC_POOL,
     aggregate_committee_decision,
+    choose_review_depth,
     build_proposal_thesis,
     build_lessons_with_heuristic_context,
+    parse_committee_vote,
+    proposal_priority_score,
     select_next_topic,
     stage2_deep_research,
     stage3_ic_discussion,
@@ -628,6 +634,33 @@ def test_format_heuristic_prompt_context_marks_failure_tickers(tmp_path):
     assert "限制到4.0%或观望" in prompt
 
 
+def test_heuristic_policy_checklist_surfaces_promoted_gates(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs",
+        score=0.05,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="split/cost passed",
+        failure_cases=[],
+        min_signal_count=2,
+        min_confidence=0.66,
+        min_risk_reward=0.9,
+        min_holding_days=6,
+        max_gross=0.2,
+        universe="single_stock",
+    )
+
+    checklist = format_policy_checklist(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert "置信度>=66%" in checklist
+    assert "风险收益比>=0.90" in checklist
+    assert "最短持有>=6天" in checklist
+    assert "组合总模拟仓位<=20%" in checklist
+    assert "Heuristic入场校验" in prompt
+
+
 def test_failure_ticker_constraints_explain_exact_cap(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
@@ -669,6 +702,17 @@ def test_run_discussion_appends_heuristic_context(monkeypatch):
 
     assert "【历史教训】控制换手" in prompt
     assert "failure tickers: 688256" in prompt
+
+
+def test_interactive_research_extracts_general_investment_keywords():
+    system = ResearchDiscussionSystem.__new__(ResearchDiscussionSystem)
+
+    keywords = system._generate_search_keywords("选择一只三个月左右适合持有的矿业股票", AgentRole.CYCLE_ANALYST)
+
+    assert "选择一只三个月左右适合持有的矿业股票" in keywords
+    assert "持有期三个月" in keywords
+    assert "股票" in keywords
+    assert "周期" in keywords
 
 
 @pytest.mark.asyncio
@@ -798,6 +842,39 @@ async def test_prediction_schema_migrates_existing_table(tmp_path):
     assert daily_prices_exists is not None
 
 
+@pytest.mark.asyncio
+async def test_learning_engine_generates_error_profiles(tmp_path):
+    db_path = tmp_path / "test.db"
+    await ensure_prediction_tables(str(db_path))
+    conn = sqlite3.connect(db_path)
+    rows = [
+        ("p1", "600519", "long", 0.82, 30, "wrong", 0.0, "事实: 估值修复 审议深度: full; vote_margin=0.10"),
+        ("p2", "000858", "long", 0.78, 30, "partial", 0.3, "事实: 消费修复 审议深度: focused; vote_margin=0.05"),
+        ("p3", "512880", "short", 0.45, 7, "correct", 1.0, "事实: 交易拥挤"),
+    ]
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO price_predictions (
+                id, ticker, direction, confidence, expected_days, status, result,
+                accuracy_score, discussion_context, predicted_at, validated_at
+            ) VALUES (?, ?, ?, ?, ?, 'validated', ?, ?, ?, datetime('now'), datetime('now'))
+            """,
+            row,
+        )
+    conn.commit()
+    conn.close()
+
+    engine = LearningEngine(str(db_path))
+    profiles = await engine.analyze_error_profiles()
+    prompt = await engine.generate_lessons_prompt()
+
+    assert profiles
+    assert profiles[0]["direction"] == "long"
+    assert "错误画像" in prompt
+    assert "600519" in prompt
+
+
 def test_committee_votes_can_defer_to_hold():
     decision = aggregate_committee_decision(
         {"confidence": 0.8, "target_position": 0.2},
@@ -806,6 +883,48 @@ def test_committee_votes_can_defer_to_hold():
 
     assert decision["direction"] == "hold"
     assert decision["target_position"] == 0.0
+
+
+def test_committee_vote_accepts_structured_json():
+    vote = parse_committee_vote(
+        '{"direction":"long","confidence":0.62,"position":0.08,'
+        '"risk_flags":["估值偏高"],"invalid_if":"跌破支撑"}'
+    )
+
+    assert vote["direction"] == "long"
+    assert vote["confidence"] == pytest.approx(0.62)
+    assert vote["position"] == pytest.approx(0.08)
+    assert vote["risk_flags"] == ["估值偏高"]
+
+
+def test_committee_aggregation_uses_custom_vote_weights():
+    decision = aggregate_committee_decision(
+        {"confidence": 0.5, "target_position": 0.1},
+        [
+            '{"direction":"hold","confidence":0.7,"position":0}',
+            '{"direction":"short","confidence":0.6,"position":0.05}',
+            '{"direction":"short","confidence":0.6,"position":0.05}',
+        ],
+        vote_weights=[2.0, 1.5, 1.0],
+    )
+
+    assert decision["direction"] == "short"
+    assert decision["vote_summary"]["hold"] == pytest.approx(2.0)
+    assert decision["vote_margin"] > 0
+
+
+def test_proposal_review_depth_tracks_priority():
+    weak = {"ticker": "159995", "confidence": 0.42, "target_position": 0.03, "thesis": "推断: 主题轮动"}
+    strong = {
+        "ticker": "600519",
+        "confidence": 0.76,
+        "target_position": 0.18,
+        "thesis": "事实: 业绩改善；证据: 财报；否决条件: 需求回落",
+    }
+
+    assert proposal_priority_score(strong) > proposal_priority_score(weak)
+    assert choose_review_depth(weak) == "light"
+    assert choose_review_depth(strong) == "full"
 
 
 def test_topic_pool_resets_after_full_cycle_and_skips_recent(monkeypatch):
@@ -882,7 +1001,8 @@ def test_core_discussion_prompts_are_evidence_rich_and_machine_readable():
     assert "只输出合法JSON" in stage2_source
     assert "证据不足时输出空数组" in stage2_source
     assert "max_tokens=8000" in stage2_source
-    assert "第一行必须是：【投票】" in stage3_source
+    assert "build_structured_vote_prompt" in stage3_source
+    assert "review_depth" in stage3_source
     assert "max_tokens=3000" in stage3_source
 
 
