@@ -212,6 +212,45 @@ async def test_lazy_migration_compiles_old_sqlite_documents(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_database_skips_wiki_feedback_and_duplicate_urls(tmp_path):
+    db = DatabaseService(str(tmp_path / "dedupe.db"))
+    await db._init_db()
+
+    first = Document(
+        title="云计算产业更新",
+        content="云计算产业链需求改善，AI 推理带动算力基础设施扩容。" * 10,
+        url="https://example.com/cloud?utm_source=test#frag",
+        source="duckduckgo",
+        sector="TMT",
+        keywords=["云计算"],
+    )
+    duplicate = Document(
+        title="云计算产业更新 重复",
+        content="云计算产业链需求改善，AI 推理带动算力基础设施扩容。" * 8,
+        url="https://example.com/cloud",
+        source="duckduckgo",
+        sector="TMT",
+        keywords=["云计算"],
+    )
+    wiki_doc = Document(
+        title="Wiki 云计算产业更新",
+        content="这是从 wiki 检索出来的派生内容。" * 10,
+        source="obsidian_wiki",
+        doc_id="wiki:wiki/sources/cloud.md",
+    )
+
+    assert await db.add_document(first) is True
+    assert await db.add_document(duplicate) is False
+    assert await db.add_document(wiki_doc) is False
+
+    rows = await db.search_documents(query="云计算", limit=10)
+    assert len(rows) == 1
+    assert rows[0]["url"] == "https://example.com/cloud"
+    assert await db.count_documents() == 1
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_vector_database_adapter_uses_wiki_backend(tmp_path, sample_doc):
     vector_db = VectorDatabase(wiki_root=str(tmp_path / "knowledge"), embedding_enabled=False)
     await vector_db.initialize()

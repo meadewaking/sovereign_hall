@@ -1119,8 +1119,9 @@ def write_readme(
         f"{price_coverage.get('missing_position_price_slots', 0)}/"
         f"{price_coverage.get('held_position_slots', 0)} held-position slots "
         f"({float(price_coverage.get('missing_position_price_slot_ratio', 0.0)):.2%})\n"
-        "- Integration decision: keep the best policy as a cap/warning only; do not expand "
-        "exposure until local daily_prices coverage is validated."
+        "- Integration decision: keep the best policy as a cap/warning only; weak price "
+        "coverage caps simulated long proposals to half of the latest policy cap, and "
+        "exposure must not expand until local daily_prices coverage is validated."
     )
     text = f"""# Heuristic Learning Cycle
 
@@ -1150,6 +1151,7 @@ def write_readme(
 - Added thin cost-stress signaling to the shared heuristic context so entry points now show OOS/3x-slippage scores and warn when the cost-stress margin is too thin to expand exposure.
 - Closed the price-source risk loop: because `daily_prices` is still empty, `services/heuristic_policy.py` now treats prediction-current-price fallback as an explicit no-expansion warning in status, research prompts, and simulated trade cap reasons.
 - Advanced the prior data-source direction by writing `price_coverage.json`, including price-source counts and missing held-position price slots for the retained path.
+- Converted the latest price-coverage warning into a real simulated-investment constraint: weak or unvalidated local price coverage now caps long proposals to half of the latest policy single-name cap.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
@@ -1205,6 +1207,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved thin-cost-stress closure: `services/heuristic_policy.py` now exposes OOS and 3x-slippage scores to `check_db`, manual research prompts, and simulated trade reasons; if 3x-slippage score is below 0.02, the latest policy remains a cap/warning only and explicitly forbids exposure expansion.
 - Improved data-source closure: `check_db`, `run_discussion`, `research_interactive`, and simulated trade reasons now surface `daily_prices` absence as a no-expansion warning when the latest run still relies on prediction `current_price` fallback.
 - Improved price-coverage closure: `check_db`, research prompt context, and simulated trade reasons now surface the latest `price_coverage.json` ratios, including held-position missing-price slots.
+- Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals to half of the latest policy cap rather than only adding an explanatory warning.
 - Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
 - Improved reduced-exposure closure: all three user entry paths inherit the retained single-stock cap and local evidence floor from `policy_snapshot.py` without adding a separate trading rule.
 - Still not fully integrated: durable simulation risk memory is intentionally a warning/cap layer only; it is not promoted into the offline default policy or an ETF/single-stock allocator because the replay trials only tied, not improved, current best.
@@ -1212,7 +1215,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Still not integrated as a default: sparse high-score policies are recorded as diagnostic-only when they produce too few closed trades for a defensible rule.
 - Still not integrated as an exposure-increasing default: the current best keeps passing basic robustness checks, but local prices are unvalidated because `daily_prices` remains empty.
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
-- Next minimum loop closure: validate whether the lower evidence-gated single-stock cap and ETF-sleeve caps reduce simulated churn/drawdown over another tape update before widening exposure.
+- Next minimum loop closure: validate whether the lower evidence-gated single-stock cap, weak-price-coverage half-cap, and ETF-sleeve caps reduce simulated churn/drawdown over another tape update before widening exposure.
 
 ## Reproduce
 ```bash
@@ -1222,7 +1225,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## Next 3 Directions
 - Validate the 6-day evidence-gated reduced-exposure single-stock policy over another tape update before any exposure widening.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
-- Replace prediction-current-price fallback with validated local daily prices; require visible price coverage before any exposure expansion.
+- Replace prediction-current-price fallback with validated local daily prices; require visible coverage thresholds before any exposure expansion and retire the weak-coverage half-cap only after coverage passes.
 """
     path.write_text(text, encoding="utf-8")
 

@@ -1548,20 +1548,26 @@ async def main():
 
                 # 保存文档
                 if docs:
-                    print(f"\n💾 保存 {len(docs)} 篇文档...")
+                    external_docs = [
+                        doc for doc in docs
+                        if getattr(doc, "source", "") != "obsidian_wiki"
+                        and not str(getattr(doc, "id", "") or getattr(doc, "doc_id", "")).startswith("wiki:")
+                    ]
+                    skipped_docs = len(docs) - len(external_docs)
+                    print(f"\n💾 保存 {len(external_docs)} 篇新外部文档...")
                     saved_docs = 0
                     # 先保存到数据库
-                    for doc in docs:
+                    for doc in external_docs:
                         try:
-                            await db_service.add_document(doc)
-                            saved_docs += 1
+                            if await db_service.add_document(doc):
+                                saved_docs += 1
                         except Exception as e:
                             logger.warning(f"保存文档失败: {e}")
 
                     # 批量添加到 VectorDB（带 embedding）
-                    await vector_db.add_documents_batch(docs, llm_client=llm)
+                    vector_saved = await vector_db.add_documents_batch(external_docs, llm_client=llm)
 
-                    print(f"   ✅ 文档已保存 (DB: {saved_docs}, VectorDB自动跳过重复文档)")
+                    print(f"   ✅ 文档已保存 (DB: {saved_docs}, Wiki: {vector_saved}, 跳过本地派生: {skipped_docs})")
 
                 prompt_lessons = build_lessons_with_heuristic_context(lessons_prompt)
 

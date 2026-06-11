@@ -269,8 +269,10 @@ class SovereignHall:
         # 过滤和清洗
         cleaned_docs = await self._clean_documents(raw_docs)
 
-        # 存入向量库和数据库
+        # 存入向量库和数据库；wiki 检索结果是派生内容，不能再回写。
         for doc in cleaned_docs:
+            if getattr(doc, "source", "") == "obsidian_wiki":
+                continue
             await self.vector_db.add_document(doc, llm_client=self.llm)
             await self.db.add_document(doc)
 
@@ -285,15 +287,21 @@ class SovereignHall:
         if not docs:
             return []
 
-        # 过滤太短的文档
-        cleaned = [d for d in docs if len(d.content) >= 200]
+        # 过滤太短的文档和 wiki 派生文档
+        cleaned = [
+            d for d in docs
+            if len(d.content) >= 200 and getattr(d, "source", "") != "obsidian_wiki"
+        ]
 
         # 去除重复URL
         seen_urls = set()
         unique_docs = []
         for doc in cleaned:
-            if doc.url not in seen_urls:
-                seen_urls.add(doc.url)
+            url_key = (doc.url or "").strip().strip("\"'")
+            content_key = " ".join((doc.content or "").split())
+            dedupe_key = url_key or content_key
+            if dedupe_key and dedupe_key not in seen_urls:
+                seen_urls.add(dedupe_key)
                 unique_docs.append(doc)
 
         return unique_docs

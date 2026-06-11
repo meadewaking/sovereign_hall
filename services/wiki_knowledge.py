@@ -36,6 +36,12 @@ RRF_K = 60.0
 TITLE_WEIGHT = 5.0
 BODY_WEIGHT = 1.0
 MAX_SEARCH_PAGES = 10000
+MIN_WIKI_SOURCE_CHARS = 80
+NOISY_SOURCE_TITLE_RE = re.compile(
+    r"(?:^|\b)(403|404|operations too frequent|google search|microsoft bing|search -|"
+    r"youtube|tiktok|doubao\.com|chrome web store)(?:\b|$)",
+    re.IGNORECASE,
+)
 IGNORED_ENTITY_TOKENS = {
     "PDF",
     "URL",
@@ -103,6 +109,31 @@ def normalize_path(path: Path | str) -> str:
 
 def stable_hash(value: str, length: int = 12) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+
+
+def compact_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def is_wiki_generated_document(doc: Document) -> bool:
+    metadata = getattr(doc, "metadata", {}) or {}
+    doc_id = str(getattr(doc, "id", "") or getattr(doc, "doc_id", "") or "")
+    source = str(getattr(doc, "source", "") or "")
+    return source == "obsidian_wiki" or doc_id.startswith("wiki:") or bool(metadata.get("wiki_path"))
+
+
+def is_ingestable_source_document(doc: Document) -> bool:
+    if is_wiki_generated_document(doc):
+        return False
+    title = compact_text(getattr(doc, "title", ""))
+    content = compact_text(getattr(doc, "content", ""))
+    if len(content) < MIN_WIKI_SOURCE_CHARS:
+        return False
+    if len(title) < 4 or NOISY_SOURCE_TITLE_RE.search(title):
+        return False
+    if len(set(content)) < 8:
+        return False
+    return True
 
 
 def slugify(value: str, fallback: str = "untitled") -> str:
@@ -954,16 +985,23 @@ class WikiKnowledgeBase:
         self._refresh_documents()
         self._initialized = True
 
-    async def add_document(self, doc: Document | Dict[str, Any], embedding: List[float] = None, llm_client: Any = None) -> None:
+    async def add_document(self, doc: Document | Dict[str, Any], embedding: List[float] = None, llm_client: Any = None) -> bool:
         await self._ensure_initialized(llm_client)
         if isinstance(doc, dict):
             doc = Document.from_dict(doc)
+        if not is_ingestable_source_document(doc):
+            logger.debug("Skipped wiki ingest for generated or low-quality document: %s", doc.title or doc.id)
+            return False
         self.ingestor.ingest_document(doc)
         self.documents[doc.id] = doc
+        return True
 
-    async def add_documents_batch(self, docs: List[Document | Dict[str, Any]], llm_client: Any = None) -> None:
+    async def add_documents_batch(self, docs: List[Document | Dict[str, Any]], llm_client: Any = None) -> int:
+        added = 0
         for doc in docs or []:
-            await self.add_document(doc, llm_client=llm_client)
+            if await self.add_document(doc, llm_client=llm_client):
+                added += 1
+        return added
 
     async def has_document(self, doc_id: str = None, url: str = None) -> bool:
         await self._ensure_initialized()
@@ -1047,8 +1085,8 @@ class WikiKnowledgeBase:
             doc = Document.from_dict(dict(row))
             if await self.has_document(doc_id=doc.id, url=doc.url):
                 continue
-            await self.add_document(doc, llm_client=self.llm_client)
-            migrated += 1
+            if await self.add_document(doc, llm_client=self.llm_client):
+                migrated += 1
         if migrated:
             self.store.append_log("lazy-migrate", f"- query: {query}\n- migrated: {migrated}")
         return migrated

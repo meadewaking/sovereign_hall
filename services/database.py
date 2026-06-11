@@ -5,17 +5,88 @@
 
 import asyncio
 import aiosqlite
+import hashlib
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..core import DATA_DIR
 from .prediction_store import ensure_prediction_schema
 
 logger = logging.getLogger(__name__)
+
+MIN_STORED_DOCUMENT_CHARS = 20
+IGNORED_DOCUMENT_SOURCES = {"obsidian_wiki"}
+TRACKING_QUERY_PREFIXES = ("utm_",)
+TRACKING_QUERY_KEYS = {"from", "spm", "fbclid", "gclid", "yclid"}
+NOISY_TITLE_RE = re.compile(
+    r"(?:^|\b)(403|404|operations too frequent|google search|microsoft bing|search -|"
+    r"youtube|tiktok|doubao\.com|chrome web store)(?:\b|$)",
+    re.IGNORECASE,
+)
+
+
+def normalize_document_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def normalize_document_url(value: Any) -> str:
+    url = str(value or "").strip().strip("\"'")
+    if not url:
+        return ""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    query = [
+        (key, val)
+        for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in TRACKING_QUERY_KEYS
+        and not key.lower().startswith(TRACKING_QUERY_PREFIXES)
+    ]
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path.rstrip("/") or parsed.path,
+            urlencode(query, doseq=True),
+            "",
+        )
+    )
+
+
+def document_content_hash(content: Any) -> str:
+    return hashlib.sha256(normalize_document_text(content).encode("utf-8")).hexdigest()
+
+
+def is_storable_document(title: Any, content: Any, source: Any, doc_id: Any = "") -> bool:
+    source_text = str(source or "").strip()
+    doc_id_text = str(doc_id or "").strip()
+    title_text = normalize_document_text(title)
+    content_text = normalize_document_text(content)
+    if source_text in IGNORED_DOCUMENT_SOURCES or doc_id_text.startswith("wiki:"):
+        return False
+    if len(content_text) < MIN_STORED_DOCUMENT_CHARS:
+        return False
+    if len(title_text) < 4 or NOISY_TITLE_RE.search(title_text):
+        return False
+    if content_text in {
+        "暂无内容",
+        "内容获取失败",
+        "关于的搜索结果",
+        "关于的深度分析报告",
+    }:
+        return False
+    if len(set(content_text)) < 8:
+        return False
+    return True
 
 
 class DatabaseService:
@@ -126,6 +197,8 @@ class DatabaseService:
             """)
 
         await self._add_column_if_missing(conn, "documents", "crawled_at", "TEXT")
+        await self._add_column_if_missing(conn, "documents", "content_hash", "TEXT")
+        await self._backfill_document_hashes(conn)
 
         # 创建索引
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_sector ON documents(sector)")
@@ -234,17 +307,47 @@ class DatabaseService:
 
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_sector ON documents(sector)")
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_url ON documents(url)")
+        await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)")
+        await self._create_index_if_possible(
+            conn,
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_url "
+            "ON documents(url) WHERE url IS NOT NULL AND url <> ''",
+        )
+        await self._create_index_if_possible(
+            conn,
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_content_hash "
+            "ON documents(content_hash) WHERE content_hash IS NOT NULL AND content_hash <> ''",
+        )
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_proposals_ticker ON proposals(ticker)")
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_meetings_proposal ON meetings(proposal_id)")
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_playbook_ticker ON playbook(ticker)")
 
         await conn.commit()
+        self._initialized = True
         logger.info(f"Database initialized: {self.db_path}")
+
+    async def _ensure_initialized(self):
+        if not self._initialized:
+            await self._init_db()
+
+    async def _backfill_document_hashes(self, conn):
+        columns = await self._get_table_columns(conn, "documents")
+        if "content_hash" not in columns:
+            return
+        async with conn.execute(
+            "SELECT id, content FROM documents WHERE content_hash IS NULL OR content_hash = ''"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for row in rows:
+            await conn.execute(
+                "UPDATE documents SET content_hash = ? WHERE id = ?",
+                (document_content_hash(row["content"]), row["id"]),
+            )
 
     # ===================== 文档操作 =====================
 
-    async def add_document(self, doc: Any):
+    async def add_document(self, doc: Any) -> bool:
         """添加文档"""
         if isinstance(doc, dict):
             from ..core import Document
@@ -259,26 +362,87 @@ class DatabaseService:
         if isinstance(publish_time, datetime):
             publish_time = publish_time.isoformat()
 
+        title = normalize_document_text(_attr('title', ''))
+        content = normalize_document_text(_attr('content', ''))
+        url = normalize_document_url(_attr('url', ''))
+        source = str(_attr('source', '') or '').strip()
+        sector = str(_attr('sector', '') or '').strip()
+        content_hash = document_content_hash(content)
+        doc_id = _attr('id') or _attr('doc_id') or f"doc_{content_hash[:16]}"
+
+        if not is_storable_document(title, content, source, doc_id):
+            logger.debug("Skipped non-storable document: source=%s title=%r", source, title[:80])
+            return False
+
         conn = await self._get_connection()
-        await conn.execute("""
-            INSERT OR REPLACE INTO documents
-            (id, title, content, url, source, sector, keywords, publish_time, embedding, crawled_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """, (
-            _attr('id') or _attr('doc_id'),
-            _attr('title', ''),
-            _attr('content', ''),
-            _attr('url', ''),
-            _attr('source', ''),
-            _attr('sector', ''),
-            json.dumps(_attr('keywords', []), ensure_ascii=False) if _attr('keywords', []) else None,
+        await self._ensure_initialized()
+
+        async with conn.execute(
+            """
+            SELECT id, LENGTH(COALESCE(content, '')) AS content_len
+            FROM documents
+            WHERE id = ?
+               OR (? <> '' AND url = ?)
+               OR content_hash = ?
+            ORDER BY
+                CASE
+                    WHEN id = ? THEN 0
+                    WHEN ? <> '' AND url = ? THEN 1
+                    ELSE 2
+                END
+            LIMIT 1
+            """,
+            (doc_id, url, url, content_hash, doc_id, url, url),
+        ) as cursor:
+            existing = await cursor.fetchone()
+
+        keywords = _attr('keywords', [])
+        if isinstance(keywords, str):
+            try:
+                keywords = json.loads(keywords)
+            except json.JSONDecodeError:
+                keywords = [keywords] if keywords.strip() else []
+
+        values = (
+            doc_id,
+            title,
+            content,
+            url,
+            source,
+            sector,
+            json.dumps(keywords, ensure_ascii=False) if keywords else None,
             publish_time,
-            json.dumps(_attr('embedding')) if _attr('embedding') else None
-        ))
+            json.dumps(_attr('embedding')) if _attr('embedding') else None,
+            content_hash,
+        )
+
+        if existing:
+            if len(content) > int(existing["content_len"] or 0):
+                await conn.execute(
+                    """
+                    UPDATE documents
+                    SET title = ?, content = ?, url = ?, source = ?, sector = ?,
+                        keywords = ?, publish_time = ?, embedding = ?, content_hash = ?,
+                        crawled_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    values[1:] + (existing["id"],),
+                )
+                await conn.commit()
+                return True
+            return False
+
+        await conn.execute("""
+            INSERT INTO documents
+            (id, title, content, url, source, sector, keywords, publish_time, embedding, content_hash, crawled_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, values)
         await conn.commit()
+        return True
 
     async def get_document(self, doc_id: str) -> Optional[Dict]:
         """获取文档"""
+        await self._ensure_initialized()
         conn = await self._get_connection()
         async with conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)) as cursor:
             row = await cursor.fetchone()
@@ -291,8 +455,9 @@ class DatabaseService:
         limit: int = 100
     ) -> List[Dict]:
         """搜索文档"""
+        await self._ensure_initialized()
         conn = await self._get_connection()
-        sql = "SELECT * FROM documents WHERE 1=1"
+        sql = "SELECT * FROM documents WHERE COALESCE(source, '') <> 'obsidian_wiki'"
         params = []
 
         if sector:
@@ -312,6 +477,7 @@ class DatabaseService:
 
     async def count_documents(self) -> int:
         """统计文档数量"""
+        await self._ensure_initialized()
         conn = await self._get_connection()
         async with conn.execute("SELECT COUNT(*) FROM documents") as cursor:
             row = await cursor.fetchone()

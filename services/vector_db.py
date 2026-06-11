@@ -55,13 +55,15 @@ class VectorDatabase:
     async def has_document(self, doc_id: str = None, url: str = None) -> bool:
         return await self.knowledge.has_document(doc_id=doc_id, url=url)
 
-    async def add_document(self, doc: Document, embedding: List[float] = None, llm_client: Any = None):
-        await self.knowledge.add_document(doc, embedding=embedding, llm_client=llm_client)
+    async def add_document(self, doc: Document, embedding: List[float] = None, llm_client: Any = None) -> bool:
+        added = await self.knowledge.add_document(doc, embedding=embedding, llm_client=llm_client)
         self.documents = self.knowledge.documents
+        return added
 
-    async def add_documents_batch(self, docs: List[Document], llm_client: Any = None):
-        await self.knowledge.add_documents_batch(docs, llm_client=llm_client)
+    async def add_documents_batch(self, docs: List[Document], llm_client: Any = None) -> int:
+        added = await self.knowledge.add_documents_batch(docs, llm_client=llm_client)
         self.documents = self.knowledge.documents
+        return added
 
     async def search(
         self,

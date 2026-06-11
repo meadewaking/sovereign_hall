@@ -455,10 +455,13 @@ def test_heuristic_context_warns_when_price_source_is_unvalidated(tmp_path):
     status = format_heuristic_status(context)
     prompt = format_heuristic_prompt_context(context)
 
-    assert capped == 0.06
+    assert capped == pytest.approx(0.03)
+    assert "限制到3.0%" in reason
     assert "daily_prices缺失" in reason
     assert "禁止放大仓位" in reason
     assert "数据质量风险" in status
+    assert "弱价格覆盖模拟买入上限: 3.0%" in status
+    assert "弱价格覆盖仓位<=3.0%" in prompt
     assert "current_price fallback" in prompt
 
 
@@ -508,10 +511,13 @@ def test_heuristic_context_surfaces_price_coverage(tmp_path):
     status = format_heuristic_status(context)
     prompt = format_heuristic_prompt_context(context)
 
-    assert capped == pytest.approx(0.05)
+    assert capped == pytest.approx(0.025)
     assert "持仓缺价槽位37.8%" in reason
+    assert "弱覆盖模拟买入上限2.5%" in reason
     assert "价格覆盖" in status
+    assert "弱价格覆盖模拟买入上限: 2.5%" in status
     assert "daily_prices覆盖0.0%" in prompt
+    assert "弱覆盖模拟买入上限=2.5%" in prompt
 
 
 def test_simulation_trade_losses_derive_risk_memory():
