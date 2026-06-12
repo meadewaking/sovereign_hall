@@ -19,6 +19,7 @@ from ..services.heuristic_policy import (
     SIMULATION_RISK_MEMORY_DAYS,
     apply_heuristic_risk_cap,
     derive_simulation_risk_memory,
+    recent_prediction_observation_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -187,7 +188,10 @@ class InvestmentSimulation:
         target_position: float,
         current_price: float,
         llm: LLMClient = None,
-        reason: str = ""
+        reason: str = "",
+        confidence: float | None = None,
+        signal_count: int | None = None,
+        risk_cap_already_applied: bool = False,
     ) -> Dict:
         """
         执行交易（支持买入、卖出、持有）
@@ -253,12 +257,18 @@ class InvestmentSimulation:
                 }
             target_position = 0.0
 
-        if direction_norm == "long":
+        if direction_norm == "long" and not risk_cap_already_applied:
             await self.refresh_simulation_risk_memory()
+            observed_signal_count = (
+                signal_count
+                if signal_count is not None
+                else recent_prediction_observation_count(ticker)
+            )
             capped_position, cap_reason = apply_heuristic_risk_cap(
                 ticker,
                 float(target_position),
-                None,
+                confidence,
+                signal_count=observed_signal_count,
             )
             if cap_reason:
                 reason = f"{reason}; {cap_reason}" if reason else cap_reason

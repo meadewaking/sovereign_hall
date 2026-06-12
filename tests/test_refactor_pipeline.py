@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import inspect
+from datetime import datetime
 from unittest.mock import AsyncMock
 
 import httpx
@@ -20,6 +21,7 @@ from sovereign_hall.services.heuristic_policy import (
     format_heuristic_prompt_context,
     format_heuristic_status,
     format_policy_checklist,
+    recent_prediction_observation_count,
 )
 from sovereign_hall.services.market_data import MarketDataService
 from sovereign_hall.services.llm_client import LLMClient
@@ -489,6 +491,57 @@ def test_heuristic_context_surfaces_min_signal_count(tmp_path):
     assert "本地信号观察门槛=2条" in prompt
 
 
+def test_heuristic_risk_cap_tightens_insufficient_signal_count(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs",
+        score=0.056,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="通过本轮基础样本外与成本扰动检查",
+        failure_cases=[],
+        min_signal_count=2,
+    )
+
+    capped, reason = apply_heuristic_risk_cap("600519", 0.05, 0.8, signal_count=1, context=context)
+
+    assert capped == pytest.approx(0.015)
+    assert "本地同日预测观察1/2不足" in reason
+    assert "孤证仓位上限1.5%" in reason
+
+
+def test_recent_prediction_observation_count_uses_latest_fresh_day(tmp_path):
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE price_predictions (ticker TEXT, predicted_at TEXT)")
+    conn.executemany(
+        "INSERT INTO price_predictions (ticker, predicted_at) VALUES (?, ?)",
+        [
+            ("600519", "2026-06-09T10:00:00"),
+            ("600519.SH", "2026-06-11T10:00:00"),
+            ("600519", "2026-06-11T14:30:00"),
+            ("000858", "2026-06-11T14:30:00"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    count = recent_prediction_observation_count(
+        "600519.SH",
+        db_path=db_path,
+        now=datetime.fromisoformat("2026-06-12T09:00:00"),
+    )
+    stale_count = recent_prediction_observation_count(
+        "600519",
+        db_path=db_path,
+        max_age_days=0,
+        now=datetime.fromisoformat("2026-06-12T09:00:00"),
+    )
+
+    assert count == 2
+    assert stale_count == 0
+
+
 def test_heuristic_context_surfaces_price_coverage(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
@@ -728,7 +781,7 @@ async def test_simulation_applies_heuristic_position_cap(monkeypatch):
     monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
     monkeypatch.setattr(
         "sovereign_hall.services.investment_simulation.apply_heuristic_risk_cap",
-        lambda ticker, target_position, confidence: (0.10, "heuristic cap"),
+        lambda ticker, target_position, confidence, **kwargs: (0.10, "heuristic cap"),
     )
 
     result = await sim.execute_trade(
@@ -737,6 +790,8 @@ async def test_simulation_applies_heuristic_position_cap(monkeypatch):
         target_position=0.25,
         current_price=9.0,
         reason="committee",
+        confidence=0.7,
+        signal_count=1,
     )
 
     assert result["action"] == "buy"

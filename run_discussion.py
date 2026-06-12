@@ -56,6 +56,7 @@ from sovereign_hall.services.heuristic_policy import (
     apply_heuristic_risk_cap,
     format_heuristic_prompt_context,
     load_latest_heuristic_context,
+    recent_prediction_observation_count,
 )
 from sovereign_hall.services.learning_engine import LearningEngine
 from sovereign_hall.services.market_data import get_market_data
@@ -1281,10 +1282,12 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 trade_position = target_position
                 trade_reason = f"投委会置信度{confidence:.0%}，按裁决执行"
 
+            signal_count = recent_prediction_observation_count(ticker)
             capped_position, cap_reason = apply_heuristic_risk_cap(
                 ticker,
                 trade_position,
                 confidence,
+                signal_count=signal_count,
                 context=heuristic_context,
             )
             if cap_reason:
@@ -1298,6 +1301,9 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 current_price=current_price,
                 llm=llm,
                 reason=trade_reason,
+                confidence=confidence,
+                signal_count=signal_count,
+                risk_cap_already_applied=True,
             )
 
             if result.get('success') is False:
