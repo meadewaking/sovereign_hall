@@ -14,6 +14,7 @@ import json
 import math
 import os
 import pprint
+import re
 import sqlite3
 import sys
 import types
@@ -631,6 +632,13 @@ def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def analyze_failures(result: dict[str, Any], daily: pd.DataFrame, policy: PolicyConfig) -> list[dict[str, Any]]:
     curve = result["curve"]
     trades = result["trades"]
@@ -828,6 +836,92 @@ def latest_completed_run(root: Path) -> Path | None:
             pass
     candidates = [path.parent for path in root.glob("*/README.md") if path.parent.is_dir()]
     return sorted(candidates)[-1] if candidates else None
+
+
+def _samples_from_readme(run_dir: Path | None) -> int | None:
+    if run_dir is None:
+        return None
+    readme = run_dir / "README.md"
+    if not readme.exists():
+        return None
+    match = re.search(r"Samples consumed:\s*([0-9]+)", readme.read_text(encoding="utf-8"))
+    return int(match.group(1)) if match else None
+
+
+def previous_tape_stats(run_dir: Path | None) -> dict[str, Any]:
+    if run_dir is None:
+        return {}
+    tape = read_json(run_dir / "tape_update.json")
+    if tape:
+        return tape
+    context = read_json(run_dir / "project_context.json")
+    embedded = context.get("tape_update") if isinstance(context, dict) else None
+    if isinstance(embedded, dict) and embedded:
+        return embedded
+    sample_count = _samples_from_readme(run_dir)
+    return {"current_prediction_rows": sample_count} if sample_count is not None else {}
+
+
+def build_tape_update_report(
+    predictions: pd.DataFrame,
+    previous_run: Path | None,
+    min_new_rows_for_validation: int = 20,
+    min_latest_date_rows_for_validation: int = 5,
+    max_latest_prediction_age_days: int = 3,
+) -> dict[str, Any]:
+    """Describe whether this cycle has enough fresh local tape to validate changes."""
+    if predictions.empty or "predicted_at" not in predictions:
+        return {
+            "validation_status": "empty_prediction_tape",
+            "rule": "Do not widen exposure without local prediction tape.",
+        }
+
+    latest_ts = predictions["predicted_at"].max()
+    earliest_ts = predictions["predicted_at"].min()
+    latest_date = latest_ts.date()
+    latest_date_rows = int((predictions["predicted_at"].dt.date == latest_date).sum())
+    previous_stats = previous_tape_stats(previous_run)
+    previous_rows = previous_stats.get("current_prediction_rows")
+    try:
+        previous_rows_int = int(previous_rows) if previous_rows is not None else None
+    except (TypeError, ValueError):
+        previous_rows_int = None
+
+    new_rows = len(predictions) - previous_rows_int if previous_rows_int is not None else None
+    age_days = max(0, (datetime.now().date() - latest_date).days)
+    if age_days > max_latest_prediction_age_days:
+        status = "stale_tape"
+    elif previous_rows_int is not None and (
+        (new_rows is not None and new_rows < min_new_rows_for_validation)
+        or latest_date_rows < min_latest_date_rows_for_validation
+    ):
+        status = "thin_tape_update"
+    elif previous_rows_int is None:
+        status = "no_previous_run_baseline"
+    else:
+        status = "fresh_tape_update"
+
+    return {
+        "validation_status": status,
+        "current_prediction_rows": int(len(predictions)),
+        "previous_prediction_rows": previous_rows_int,
+        "new_prediction_rows_since_previous": new_rows,
+        "current_earliest_prediction_at": earliest_ts.isoformat(),
+        "current_latest_prediction_at": latest_ts.isoformat(),
+        "current_latest_prediction_date": latest_date.isoformat(),
+        "latest_date_prediction_rows": latest_date_rows,
+        "latest_prediction_age_days": int(age_days),
+        "min_new_rows_for_validation": int(min_new_rows_for_validation),
+        "min_latest_date_rows_for_validation": int(min_latest_date_rows_for_validation),
+        "max_latest_prediction_age_days": int(max_latest_prediction_age_days),
+        "enough_for_policy_widening": status == "fresh_tape_update",
+        "previous_run": str(previous_run) if previous_run else None,
+        "rule": (
+            "Do not widen exposure or relax caps when the cycle has fewer than "
+            f"{min_new_rows_for_validation} new local prediction rows, fewer than "
+            f"{min_latest_date_rows_for_validation} latest-day rows, or stale latest predictions."
+        ),
+    }
 
 
 def extract_failure_tickers_from_run(run_dir: Path | None) -> tuple[str, ...]:
@@ -1068,6 +1162,7 @@ def write_readme(
     recent_failure_tickers: tuple[str, ...] = (),
     sleeve_diagnostics: dict[str, Any] | None = None,
     price_coverage: dict[str, Any] | None = None,
+    tape_update: dict[str, Any] | None = None,
 ) -> None:
     failed = [t for t in trials if t["trial_name"] != best_name]
     best_row = next((t for t in trials if t["trial_name"] == best_name), {})
@@ -1088,6 +1183,8 @@ def write_readme(
             f"delta {best_metrics['score'] - previous_score:+.6f}."
         )
     def diagnostic_reason(trial_name: str) -> str:
+        if "min3obs" in trial_name:
+            return "not promotable until stricter observation breadth improves path quality on a fresh tape update."
         if trial_name.startswith("sparse_"):
             return "not promotable because it generated too few closed trades to trust as a default rule."
         if "max3" in trial_name:
@@ -1138,6 +1235,20 @@ def write_readme(
         "independent daily_prices coverage is zero), and exposure must not expand until "
         "local daily_prices coverage is validated."
     )
+    tape_update = tape_update or {}
+    new_rows = tape_update.get("new_prediction_rows_since_previous")
+    new_rows_text = "unknown" if new_rows is None else str(new_rows)
+    tape_update_text = (
+        f"- Status: {tape_update.get('validation_status', 'unknown')}\n"
+        f"- Prediction rows: current={tape_update.get('current_prediction_rows', 0)}, "
+        f"previous={tape_update.get('previous_prediction_rows', 'unknown')}, "
+        f"new_since_previous={new_rows_text}\n"
+        f"- Latest local prediction date: {tape_update.get('current_latest_prediction_date', 'unknown')} "
+        f"with {tape_update.get('latest_date_prediction_rows', 0)} rows; "
+        f"age={tape_update.get('latest_prediction_age_days', 'unknown')} days\n"
+        f"- Rule: {tape_update.get('rule', 'Do not widen exposure without fresh local validation tape.')}\n"
+        f"- Integration decision: {'fresh enough for validation review' if tape_update.get('enough_for_policy_widening') else 'not enough fresh local tape for exposure widening; keep as cap/warning and apply thin-tape observational sizing.'}"
+    )
     text = f"""# Heuristic Learning Cycle
 
 ## Run
@@ -1164,6 +1275,7 @@ def write_readme(
 - Tested a stricter 4% single-name cap on the same 6-day, 2-observation single-stock rule; it is promoted only if it improves the same score path after split and cost checks.
 - Advanced the prior evidence-gated reduced-exposure direction with a stricter 12% abnormal-move veto; it exits locally anomalous signal days sooner without adding a new data source.
 - Tested a 3-name/15% gross-cap diagnostic; it scored higher but is kept out of default promotion because only two closed trades drive the improvement.
+- Tested a stricter 3-observation diagnostic for the retained single-stock rule; it is not promotable unless it improves path quality without collapsing trade breadth.
 - Closed the live evidence-gate loop: simulated long proposals now pass local same-day prediction observation counts into `services/heuristic_policy.py`, and insufficient evidence caps them to a small observation-size position instead of only printing a warning.
 - Added `sparse_hold8_cap6_diagnostic` to document why very sparse one-trade policies are not promoted even when their leaderboard score is high.
 - Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display, manual research warnings, simulated-trading position caps, and prompt-level failure-case constraints.
@@ -1171,6 +1283,7 @@ def write_readme(
 - Closed the price-source risk loop: because `daily_prices` is still empty, `services/heuristic_policy.py` now treats prediction-current-price fallback as an explicit no-expansion warning in status, research prompts, and simulated trade cap reasons.
 - Advanced the prior data-source direction by writing `price_coverage.json`, including price-source counts and missing held-position price slots for the retained path.
 - Converted the latest price-coverage warning into a real simulated-investment constraint: weak or unvalidated local price coverage now applies a coverage-adjusted cap; zero independent daily_prices coverage allows at most one-quarter of the latest policy single-name cap.
+- Advanced the prior fresh-tape validation direction by writing `tape_update.json`; thin tape updates are surfaced as a user-entry warning and an observational simulated-buy cap instead of being treated as validation for wider exposure.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
 - Closed the portfolio-gross loop: simulated long proposals now enforce the retained policy `max_gross` as a real local cap instead of only showing it in the policy checklist.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
@@ -1206,6 +1319,9 @@ def write_readme(
 ## Price Coverage Check
 {price_coverage_text}
 
+## Tape Update Check
+{tape_update_text}
+
 ## Overfitting Risk
 ```json
 {checks_text}
@@ -1228,6 +1344,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved data-source closure: `check_db`, `run_discussion`, `research_interactive`, and simulated trade reasons now surface `daily_prices` absence as a no-expansion warning when the latest run still relies on prediction `current_price` fallback.
 - Improved price-coverage closure: `check_db`, research prompt context, and simulated trade reasons now surface the latest `price_coverage.json` ratios, including held-position missing-price slots.
 - Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals by coverage quality; with zero independent daily_prices rows the user-entry cap is one-quarter of the latest policy cap rather than a fixed half-cap.
+- Improved fresh-tape closure: `check_db`, research prompt context, and simulated trade reasons now surface `tape_update.json`; when the current cycle only adds a thin local tape update, simulated long proposals are capped to observational sizing and the policy is not treated as validation for widening.
 - Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
 - Improved reduced-exposure closure: all three user entry paths inherit the retained single-stock cap and local evidence floor from `policy_snapshot.py` without adding a separate trading rule.
 - Improved evidence-gate closure: `run_discussion` and `InvestmentSimulation.execute_trade` now apply the retained `min_signal_count` requirement to actual simulated long proposals; proposals with fewer fresh same-day local prediction observations are limited to a small observation-size cap.
@@ -1238,6 +1355,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Still not integrated as a default: the 3-name/15% gross-cap diagnostic needs another tape update because its score is driven by only two closed trades.
 - Still not integrated as an exposure-increasing default: the current best keeps passing basic robustness checks, but local prices are unvalidated because `daily_prices` remains empty.
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
+- Still not integrated as validation for exposure widening: `tape_update.json` does not meet the minimum fresh-row/latest-day observation thresholds when marked as thin or stale.
 - Next minimum loop closure: validate whether the lower evidence-gated single-stock cap, observation-count cap, coverage-adjusted weak-price cap, and ETF-sleeve caps reduce simulated churn/drawdown over another tape update before widening exposure.
 
 ## Reproduce
@@ -1246,7 +1364,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Validate the 6-day evidence-gated reduced-exposure single-stock policy and the live insufficient-observation cap over another tape update before any exposure widening.
+- Validate the 6-day evidence-gated reduced-exposure single-stock policy and the live insufficient-observation/薄tape cap only after a meaningful fresh tape update meets the `tape_update.json` thresholds.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
 - Replace prediction-current-price fallback with validated local daily prices; require visible coverage thresholds before any exposure expansion and relax the coverage-adjusted weak-price cap only after coverage passes.
 """
@@ -1321,6 +1439,7 @@ def main() -> int:
     predictions = load_predictions(db_path)
     if predictions.empty:
         raise SystemExit(f"No local predictions found in {db_path}")
+    tape_update = build_tape_update_report(predictions, previous_latest_run)
     price_history = load_daily_prices(db_path, predictions)
     daily = build_daily_tape(predictions, price_history)
     daily.to_csv(run_dir / "daily_signal_tape.csv", index=False)
@@ -1610,6 +1729,27 @@ def main() -> int:
             universe="single_stock",
         ),
         PolicyConfig(
+            name="single_stock_hold6_cap5_min3obs_diagnostic",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.05,
+            max_gross=0.20,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.12,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=6,
+            min_signal_count=3,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+        ),
+        PolicyConfig(
             name="single_stock_hold6_cap4_min2obs",
             min_confidence=0.66,
             max_names=4,
@@ -1878,6 +2018,7 @@ def main() -> int:
     write_json(run_dir / "sleeve_diagnostics.json", sleeve_diagnostics)
     price_coverage = build_price_coverage_report(daily, price_history, best_result)
     write_json(run_dir / "price_coverage.json", price_coverage)
+    write_json(run_dir / "tape_update.json", tape_update)
     write_policy_snapshot(run_dir / "policy_snapshot.py", best_policy, costs)
     make_plot(run_dir / "sample_efficiency.png", trial_rows)
 
@@ -1904,6 +2045,11 @@ def main() -> int:
         else f"Previous best read from {previous_path}",
         "previous_latest_run": str(previous_latest_run) if previous_latest_run else None,
         "recent_failure_tickers_from_previous_run": list(recent_failure_tickers),
+        "prediction_tape": {
+            "prediction_rows": int(len(predictions)),
+            "latest_prediction_at": predictions["predicted_at"].max().isoformat(),
+        },
+        "tape_update": tape_update,
         "price_source": (
             "daily_prices table with fallback to prediction current_price"
             if not price_history.empty
@@ -1927,6 +2073,7 @@ def main() -> int:
         recent_failure_tickers=recent_failure_tickers,
         sleeve_diagnostics=sleeve_diagnostics,
         price_coverage=price_coverage,
+        tape_update=tape_update,
     )
 
     latest = runs_root / "LATEST"

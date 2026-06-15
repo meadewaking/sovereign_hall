@@ -622,6 +622,34 @@ def test_heuristic_price_coverage_cap_scales_with_partial_coverage(tmp_path):
     assert "弱覆盖模拟买入上限1.7%" in reason
 
 
+def test_heuristic_risk_cap_tightens_thin_tape_update(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
+        score=0.065,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="通过本轮基础样本外与成本扰动检查",
+        failure_cases=[],
+        tape_update={
+            "validation_status": "thin_tape_update",
+            "new_prediction_rows_since_previous": 1,
+            "current_latest_prediction_date": "2026-06-14",
+            "latest_date_prediction_rows": 1,
+            "latest_prediction_age_days": 1,
+        },
+    )
+
+    capped, reason = apply_heuristic_risk_cap("600519", 0.05, 0.8, context=context)
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert capped == pytest.approx(0.01)
+    assert "薄样本验证模拟买入上限1.0%" in reason
+    assert "较上轮新增1行" in status
+    assert "薄tape验证仓位<=1.0%" in prompt
+
+
 def test_simulation_trade_losses_derive_risk_memory():
     failures = derive_simulation_risk_memory([
         {
