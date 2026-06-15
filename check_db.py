@@ -69,6 +69,43 @@ def get_latest_local_prices(conn: sqlite3.Connection, tickers: list) -> dict:
     }
 
 
+def normalize_ticker(ticker: str) -> str:
+    code = str(ticker or "").strip().upper()
+    return code.split(".")[0] if "." in code else code
+
+
+def get_latest_prediction_prices(conn: sqlite3.Connection, tickers: list) -> dict:
+    """Use the latest locally recorded prediction entry price as a weak fallback."""
+    wanted = {normalize_ticker(ticker) for ticker in tickers if normalize_ticker(ticker)}
+    if not wanted:
+        return {}
+
+    c = conn.cursor()
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='price_predictions'")
+    if not c.fetchone():
+        return {}
+
+    latest: dict[str, dict] = {}
+    c.execute(
+        """
+        SELECT ticker, current_price, predicted_at
+        FROM price_predictions
+        WHERE current_price IS NOT NULL
+          AND current_price > 0
+          AND predicted_at IS NOT NULL
+        ORDER BY datetime(predicted_at) DESC
+        """
+    )
+    for ticker, price, predicted_at in c.fetchall():
+        code = normalize_ticker(ticker)
+        if code not in wanted or code in latest:
+            continue
+        latest[code] = {"price": float(price), "date": str(predicted_at)[:10]}
+        if len(latest) == len(wanted):
+            break
+    return latest
+
+
 def realtime_quotes_enabled() -> bool:
     """默认只用本地价格；显式设 SOVEREIGN_HALL_REALTIME_QUOTES=1 才查实时行情。"""
     value = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES", "0").strip().lower()
@@ -132,9 +169,10 @@ def show_investment_status(db_path):
 
     tickers = [pos[0] for pos in positions]
     local_prices = get_latest_local_prices(conn, tickers)
+    prediction_prices = get_latest_prediction_prices(conn, tickers)
     conn.close()
 
-    # 投资状态应按可用的最新价格估值：实时行情 > 本地最近收盘价 > 成本价兜底。
+    # 投资状态按可用价格估值：实时行情 > 本地收盘价 > 本地最近预测入场价 > 成本价。
     use_realtime_quotes = realtime_quotes_enabled()
     realtime_prices = get_realtime_prices(tickers) if tickers and use_realtime_quotes else {}
 
@@ -151,6 +189,9 @@ def show_investment_status(db_path):
         elif ticker in local_prices:
             current_price = local_prices[ticker]["price"]
             price_label = f"本地收盘({local_prices[ticker]['date']})"
+        elif normalize_ticker(ticker) in prediction_prices:
+            current_price = prediction_prices[normalize_ticker(ticker)]["price"]
+            price_label = f"本地最近预测价({prediction_prices[normalize_ticker(ticker)]['date']})"
         else:
             current_price = cost
             price_label = "成本价兜底"
@@ -180,6 +221,8 @@ def show_investment_status(db_path):
     if position_details:
         for pd in position_details:
             print(pd)
+        if not use_realtime_quotes:
+            print("   提示: 当前为本地估值；实时估值请设置 SOVEREIGN_HALL_REALTIME_QUOTES=1")
     else:
         print("   (空仓)")
 

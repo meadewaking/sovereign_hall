@@ -195,6 +195,53 @@ class InvestmentSimulation:
 
         return await get_market_data().get_current_price(ticker)
 
+    @staticmethod
+    def _normalize_ticker(ticker: str) -> str:
+        code = str(ticker or "").strip().upper()
+        return code.split(".")[0] if "." in code else code
+
+    async def _latest_prediction_prices(self, tickers: List[str]) -> Dict[str, float]:
+        """Return latest locally recorded prediction prices as a weak valuation fallback."""
+        if not self.db_service or not tickers:
+            return {}
+        wanted = {self._normalize_ticker(ticker) for ticker in tickers if self._normalize_ticker(ticker)}
+        if not wanted:
+            return {}
+
+        try:
+            conn = self.db_service._connection
+            async with conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='price_predictions'"
+            ) as cursor:
+                exists = await cursor.fetchone()
+            if not exists:
+                return {}
+
+            async with conn.execute(
+                """
+                SELECT ticker, current_price, predicted_at
+                FROM price_predictions
+                WHERE current_price IS NOT NULL
+                  AND current_price > 0
+                  AND predicted_at IS NOT NULL
+                ORDER BY datetime(predicted_at) DESC
+                """
+            ) as cursor:
+                rows = await cursor.fetchall()
+        except Exception as exc:
+            logger.warning("Failed to read latest local prediction prices: %s", exc)
+            return {}
+
+        latest: Dict[str, float] = {}
+        for ticker, price, _predicted_at in rows:
+            code = self._normalize_ticker(ticker)
+            if code not in wanted or code in latest:
+                continue
+            latest[code] = float(price)
+            if len(latest) == len(wanted):
+                break
+        return latest
+
     async def execute_trade(
         self,
         ticker: str,
@@ -520,9 +567,17 @@ class InvestmentSimulation:
     async def calculate_assets(self, prices: Dict[str, float] = None) -> Dict:
         """计算当前总资产"""
         total_value = self.cash
+        prediction_prices = await self._latest_prediction_prices(list(self.positions)) if not prices else {}
 
         for ticker, pos in self.positions.items():
-            price = (prices or {}).get(ticker) or await self.get_current_price(ticker) or pos['avg_cost']
+            code = self._normalize_ticker(ticker)
+            price = (
+                (prices or {}).get(ticker)
+                or (prices or {}).get(code)
+                or await self.get_current_price(ticker)
+                or prediction_prices.get(code)
+                or pos['avg_cost']
+            )
             total_value += pos['shares'] * price
 
         return {

@@ -74,6 +74,40 @@ def test_check_db_realtime_quotes_are_opt_in(monkeypatch):
     assert check_db.realtime_quotes_enabled() is True
 
 
+def test_check_db_uses_latest_prediction_price_before_cost_fallback(tmp_path, monkeypatch, capsys):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE system_stats (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO system_stats (key, value) VALUES ('simulation_cash', '9000')")
+    conn.execute("CREATE TABLE simulation_positions (ticker TEXT, shares INTEGER, avg_cost REAL)")
+    conn.execute("INSERT INTO simulation_positions VALUES ('600519', 100, 10.0)")
+    conn.execute(
+        "CREATE TABLE simulation_trades (ticker TEXT, direction TEXT, shares INTEGER, price REAL, reason TEXT, traded_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE price_predictions (ticker TEXT, current_price REAL, predicted_at TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO price_predictions VALUES (?, ?, ?)",
+        [
+            ("600519", 10.5, "2026-06-12T10:00:00"),
+            ("600519.SH", 12.3, "2026-06-15T10:00:00"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.delenv("SOVEREIGN_HALL_REALTIME_QUOTES", raising=False)
+
+    check_db.show_investment_status(db_path)
+    output = capsys.readouterr().out
+
+    assert "本地最近预测价(2026-06-15)12.300" in output
+    assert "成本10.000 (+23.0%)" in output
+    assert "实时估值请设置 SOVEREIGN_HALL_REALTIME_QUOTES=1" in output
+
+
 def test_market_data_ticker_mapping():
     svc = MarketDataService()
     assert svc.infer_market("600519") == "sh"
@@ -906,6 +940,35 @@ async def test_simulation_passes_portfolio_gross_to_heuristic_cap(monkeypatch):
     assert result["action"] == "buy"
     assert seen["current_position"] == pytest.approx(0.0)
     assert seen["current_gross_exposure"] == pytest.approx(0.20)
+
+
+@pytest.mark.asyncio
+async def test_simulation_assets_use_latest_prediction_price_when_quote_missing(tmp_path):
+    db_path = tmp_path / "test.db"
+    db = DatabaseService(str(db_path))
+    await db._init_db()
+    await ensure_prediction_tables(str(db_path))
+    conn = db._connection
+    await conn.execute(
+        """
+        INSERT INTO price_predictions (
+            id, ticker, current_price, predicted_at, direction, confidence
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        ("p1", "600519.SH", 12.3, "2026-06-15T10:00:00", "long", 0.7),
+    )
+    await conn.commit()
+
+    sim = InvestmentSimulation(db)
+    sim.cash = 9000.0
+    sim.positions = {"600519": {"shares": 100, "avg_cost": 10.0}}
+    sim.get_current_price = AsyncMock(return_value=None)
+
+    assets = await sim.calculate_assets()
+    await db.close()
+
+    assert assets["total_assets"] == pytest.approx(10230.0)
+    assert assets["positions_value"] == pytest.approx(1230.0)
 
 
 @pytest.mark.asyncio
