@@ -134,6 +134,20 @@ class InvestmentSimulation:
             logger.warning("解析最近交易日期失败 %s=%r: %s", ticker, last_trade, exc)
             return False
 
+    def _estimate_trade_assets(self, ticker: str, price: float) -> tuple[Dict[str, float], float]:
+        """Estimate local portfolio value for risk caps without external quote calls."""
+        position_values: Dict[str, float] = {}
+        for held_ticker, pos in self.positions.items():
+            shares = float(pos.get('shares', 0) or 0)
+            if shares <= 0:
+                continue
+            mark = price if held_ticker == ticker else float(pos.get('avg_cost', 0.0) or 0.0)
+            if mark <= 0:
+                continue
+            position_values[held_ticker] = shares * mark
+        total_assets = self.cash + sum(position_values.values())
+        return position_values, total_assets
+
     async def save_state(self):
         """保存状态到数据库"""
         if not self.db_service:
@@ -257,6 +271,11 @@ class InvestmentSimulation:
                 }
             target_position = 0.0
 
+        position_values, total_assets = self._estimate_trade_assets(ticker, price)
+        current_position_value = position_values.get(ticker, 0.0)
+        current_gross_exposure = sum(position_values.values()) / total_assets if total_assets > 0 else 0.0
+        current_position_pct = current_position_value / total_assets if total_assets > 0 else 0.0
+
         if direction_norm == "long" and not risk_cap_already_applied:
             await self.refresh_simulation_risk_memory()
             observed_signal_count = (
@@ -269,14 +288,12 @@ class InvestmentSimulation:
                 float(target_position),
                 confidence,
                 signal_count=observed_signal_count,
+                current_position=current_position_pct,
+                current_gross_exposure=current_gross_exposure,
             )
             if cap_reason:
                 reason = f"{reason}; {cap_reason}" if reason else cap_reason
             target_position = capped_position
-
-        current_position_value = current_shares * price
-        total_assets = self.cash + current_position_value
-        current_position_pct = current_position_value / total_assets if total_assets > 0 else 0
 
         target_value = total_assets * target_position
         diff_value = target_value - current_position_value

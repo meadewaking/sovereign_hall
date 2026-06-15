@@ -313,6 +313,31 @@ def test_heuristic_risk_cap_uses_latest_policy_as_constraint(tmp_path):
     assert "样本外风险" in reason
 
 
+def test_heuristic_risk_cap_enforces_portfolio_gross_limit(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
+        score=0.067,
+        max_position=0.05,
+        max_gross=0.15,
+        overfit_risk=False,
+        warning="split/cost passed",
+        failure_cases=[],
+    )
+
+    capped, reason = apply_heuristic_risk_cap(
+        "600519",
+        0.05,
+        0.8,
+        current_position=0.0,
+        current_gross_exposure=0.13,
+        context=context,
+    )
+
+    assert capped == pytest.approx(0.02)
+    assert "组合总模拟仓位上限15.0%" in reason
+
+
 def test_heuristic_risk_cap_tightens_recent_failure_ticker(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
@@ -457,13 +482,13 @@ def test_heuristic_context_warns_when_price_source_is_unvalidated(tmp_path):
     status = format_heuristic_status(context)
     prompt = format_heuristic_prompt_context(context)
 
-    assert capped == pytest.approx(0.03)
-    assert "限制到3.0%" in reason
+    assert capped == pytest.approx(0.015)
+    assert "限制到1.5%" in reason
     assert "daily_prices缺失" in reason
     assert "禁止放大仓位" in reason
     assert "数据质量风险" in status
-    assert "弱价格覆盖模拟买入上限: 3.0%" in status
-    assert "弱价格覆盖仓位<=3.0%" in prompt
+    assert "弱价格覆盖模拟买入上限: 1.5%" in status
+    assert "弱价格覆盖仓位<=1.5%" in prompt
     assert "current_price fallback" in prompt
 
 
@@ -564,13 +589,37 @@ def test_heuristic_context_surfaces_price_coverage(tmp_path):
     status = format_heuristic_status(context)
     prompt = format_heuristic_prompt_context(context)
 
-    assert capped == pytest.approx(0.025)
+    assert capped == pytest.approx(0.0125)
     assert "持仓缺价槽位37.8%" in reason
-    assert "弱覆盖模拟买入上限2.5%" in reason
+    assert "弱覆盖模拟买入上限1.2%" in reason
     assert "价格覆盖" in status
-    assert "弱价格覆盖模拟买入上限: 2.5%" in status
+    assert "弱价格覆盖模拟买入上限: 1.2%" in status
     assert "daily_prices覆盖0.0%" in prompt
-    assert "弱覆盖模拟买入上限=2.5%" in prompt
+    assert "弱覆盖模拟买入上限=1.2%" in prompt
+
+
+def test_heuristic_price_coverage_cap_scales_with_partial_coverage(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs",
+        score=0.055,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="通过本轮基础样本外与成本扰动检查",
+        failure_cases=[],
+        price_source="daily_prices table with fallback to prediction current_price",
+        price_coverage={
+            "status": "partial_daily_prices_with_missing_hold_prices",
+            "independent_price_row_ratio": 0.60,
+            "missing_position_price_slot_ratio": 0.18,
+            "missing_price_day_ratio": 0.10,
+        },
+    )
+
+    capped, reason = apply_heuristic_risk_cap("600519", 0.05, 0.8, context=context)
+
+    assert capped == pytest.approx(0.0175)
+    assert "弱覆盖模拟买入上限1.7%" in reason
 
 
 def test_simulation_trade_losses_derive_risk_memory():
@@ -796,6 +845,39 @@ async def test_simulation_applies_heuristic_position_cap(monkeypatch):
 
     assert result["action"] == "buy"
     assert sim.positions["600519"]["shares"] == 100
+
+
+@pytest.mark.asyncio
+async def test_simulation_passes_portfolio_gross_to_heuristic_cap(monkeypatch):
+    sim = InvestmentSimulation()
+    sim.cash = 8000.0
+    sim.positions = {"000001": {"shares": 100, "avg_cost": 20.0}}
+    fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)})()
+    seen = {}
+
+    def fake_cap(ticker, target_position, confidence, **kwargs):
+        seen.update(kwargs)
+        return 0.05, "gross cap"
+
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+    monkeypatch.setattr(
+        "sovereign_hall.services.investment_simulation.apply_heuristic_risk_cap",
+        fake_cap,
+    )
+
+    result = await sim.execute_trade(
+        ticker="600519",
+        direction="long",
+        target_position=0.25,
+        current_price=4.0,
+        reason="committee",
+        confidence=0.7,
+        signal_count=2,
+    )
+
+    assert result["action"] == "buy"
+    assert seen["current_position"] == pytest.approx(0.0)
+    assert seen["current_gross_exposure"] == pytest.approx(0.20)
 
 
 @pytest.mark.asyncio

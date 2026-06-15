@@ -908,6 +908,7 @@ def build_sleeve_diagnostics(
 ) -> dict[str, Any]:
     """Check whether ETF and single-stock sleeves are robust enough to allocate."""
     single_stock_candidates = [
+        "single_stock_hold6_cap5_min2obs_anomaly12",
         "single_stock_hold6_cap5_min2obs",
         "single_stock_hold6_cap4_min2obs",
     ]
@@ -1089,6 +1090,8 @@ def write_readme(
     def diagnostic_reason(trial_name: str) -> str:
         if trial_name.startswith("sparse_"):
             return "not promotable because it generated too few closed trades to trust as a default rule."
+        if "max3" in trial_name:
+            return "not promotable as a default yet because the higher score came from only two closed trades."
         if "recent_failure" in trial_name:
             return "not promotable because it uses previous failure-case tickers and can leak sample-specific knowledge."
         return "not promotable; diagnostic trial only."
@@ -1131,8 +1134,9 @@ def write_readme(
         f"{price_coverage.get('held_position_slots', 0)} held-position slots "
         f"({float(price_coverage.get('missing_position_price_slot_ratio', 0.0)):.2%})\n"
         "- Integration decision: keep the best policy as a cap/warning only; weak price "
-        "coverage caps simulated long proposals to half of the latest policy cap, and "
-        "exposure must not expand until local daily_prices coverage is validated."
+        "coverage applies a coverage-adjusted simulated cap (one-quarter cap when "
+        "independent daily_prices coverage is zero), and exposure must not expand until "
+        "local daily_prices coverage is validated."
     )
     text = f"""# Heuristic Learning Cycle
 
@@ -1158,14 +1162,17 @@ def write_readme(
 - Advanced the prior thin cost-stress direction by testing a reduced-exposure single-stock sleeve with 6-day minimum holds, 6% single-name cap, and 24% gross cap.
 - Advanced the prior reduced-exposure validation direction by testing an evidence-gated single-stock sleeve with 6-day minimum holds, a 5% single-name cap, and at least 2 same-day local observations before entry.
 - Tested a stricter 4% single-name cap on the same 6-day, 2-observation single-stock rule; it is promoted only if it improves the same score path after split and cost checks.
+- Advanced the prior evidence-gated reduced-exposure direction with a stricter 12% abnormal-move veto; it exits locally anomalous signal days sooner without adding a new data source.
+- Tested a 3-name/15% gross-cap diagnostic; it scored higher but is kept out of default promotion because only two closed trades drive the improvement.
 - Closed the live evidence-gate loop: simulated long proposals now pass local same-day prediction observation counts into `services/heuristic_policy.py`, and insufficient evidence caps them to a small observation-size position instead of only printing a warning.
 - Added `sparse_hold8_cap6_diagnostic` to document why very sparse one-trade policies are not promoted even when their leaderboard score is high.
 - Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display, manual research warnings, simulated-trading position caps, and prompt-level failure-case constraints.
 - Added thin cost-stress signaling to the shared heuristic context so entry points now show OOS/3x-slippage scores and warn when the cost-stress margin is too thin to expand exposure.
 - Closed the price-source risk loop: because `daily_prices` is still empty, `services/heuristic_policy.py` now treats prediction-current-price fallback as an explicit no-expansion warning in status, research prompts, and simulated trade cap reasons.
 - Advanced the prior data-source direction by writing `price_coverage.json`, including price-source counts and missing held-position price slots for the retained path.
-- Converted the latest price-coverage warning into a real simulated-investment constraint: weak or unvalidated local price coverage now caps long proposals to half of the latest policy single-name cap.
+- Converted the latest price-coverage warning into a real simulated-investment constraint: weak or unvalidated local price coverage now applies a coverage-adjusted cap; zero independent daily_prices coverage allows at most one-quarter of the latest policy single-name cap.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
+- Closed the portfolio-gross loop: simulated long proposals now enforce the retained policy `max_gross` as a real local cap instead of only showing it in the policy checklist.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
 
@@ -1220,16 +1227,18 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved thin-cost-stress closure: `services/heuristic_policy.py` now exposes OOS and 3x-slippage scores to `check_db`, manual research prompts, and simulated trade reasons; if 3x-slippage score is below 0.02, the latest policy remains a cap/warning only and explicitly forbids exposure expansion.
 - Improved data-source closure: `check_db`, `run_discussion`, `research_interactive`, and simulated trade reasons now surface `daily_prices` absence as a no-expansion warning when the latest run still relies on prediction `current_price` fallback.
 - Improved price-coverage closure: `check_db`, research prompt context, and simulated trade reasons now surface the latest `price_coverage.json` ratios, including held-position missing-price slots.
-- Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals to half of the latest policy cap rather than only adding an explanatory warning.
+- Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals by coverage quality; with zero independent daily_prices rows the user-entry cap is one-quarter of the latest policy cap rather than a fixed half-cap.
 - Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
 - Improved reduced-exposure closure: all three user entry paths inherit the retained single-stock cap and local evidence floor from `policy_snapshot.py` without adding a separate trading rule.
 - Improved evidence-gate closure: `run_discussion` and `InvestmentSimulation.execute_trade` now apply the retained `min_signal_count` requirement to actual simulated long proposals; proposals with fewer fresh same-day local prediction observations are limited to a small observation-size cap.
+- Improved portfolio-risk closure: `run_discussion` and `InvestmentSimulation.execute_trade` now pass current local gross exposure into `apply_heuristic_risk_cap`, so simulated buys cannot push the portfolio above the latest policy `max_gross`.
 - Still not fully integrated: durable simulation risk memory is intentionally a warning/cap layer only; it is not promoted into the offline default policy or an ETF/single-stock allocator because the replay trials only tied, not improved, current best.
 - Still not fully integrated: portfolio sleeve allocator is not promoted because both sleeves did not pass the required primary/OOS/cost-stress checks.
 - Still not integrated as a default: sparse high-score policies are recorded as diagnostic-only when they produce too few closed trades for a defensible rule.
+- Still not integrated as a default: the 3-name/15% gross-cap diagnostic needs another tape update because its score is driven by only two closed trades.
 - Still not integrated as an exposure-increasing default: the current best keeps passing basic robustness checks, but local prices are unvalidated because `daily_prices` remains empty.
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
-- Next minimum loop closure: validate whether the lower evidence-gated single-stock cap, observation-count cap, weak-price-coverage half-cap, and ETF-sleeve caps reduce simulated churn/drawdown over another tape update before widening exposure.
+- Next minimum loop closure: validate whether the lower evidence-gated single-stock cap, observation-count cap, coverage-adjusted weak-price cap, and ETF-sleeve caps reduce simulated churn/drawdown over another tape update before widening exposure.
 
 ## Reproduce
 ```bash
@@ -1239,7 +1248,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## Next 3 Directions
 - Validate the 6-day evidence-gated reduced-exposure single-stock policy and the live insufficient-observation cap over another tape update before any exposure widening.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
-- Replace prediction-current-price fallback with validated local daily prices; require visible coverage thresholds before any exposure expansion and retire the weak-coverage half-cap only after coverage passes.
+- Replace prediction-current-price fallback with validated local daily prices; require visible coverage thresholds before any exposure expansion and relax the coverage-adjusted weak-price cap only after coverage passes.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -1580,11 +1589,53 @@ def main() -> int:
             universe="single_stock",
         ),
         PolicyConfig(
+            name="single_stock_hold6_cap5_min2obs_anomaly12",
+            min_confidence=0.66,
+            max_names=4,
+            max_position=0.05,
+            max_gross=0.20,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.12,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=6,
+            min_signal_count=2,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+        ),
+        PolicyConfig(
             name="single_stock_hold6_cap4_min2obs",
             min_confidence=0.66,
             max_names=4,
             max_position=0.04,
             max_gross=0.16,
+            min_risk_reward=0.9,
+            require_positive_trend=True,
+            trend_lookback=2,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=0.45,
+            drawdown_guard_threshold=0.02,
+            loss_streak_threshold=2,
+            loss_streak_guard=0.50,
+            new_entry_loss_streak_threshold=2,
+            min_holding_days=6,
+            min_signal_count=2,
+            rebalance_threshold=0.05,
+            universe="single_stock",
+        ),
+        PolicyConfig(
+            name="single_stock_hold6_cap5_max3_min2obs_diagnostic",
+            min_confidence=0.66,
+            max_names=3,
+            max_position=0.05,
+            max_gross=0.15,
             min_risk_reward=0.9,
             require_positive_trend=True,
             trend_lookback=2,

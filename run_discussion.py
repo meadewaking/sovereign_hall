@@ -1283,11 +1283,25 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 trade_reason = f"投委会置信度{confidence:.0%}，按裁决执行"
 
             signal_count = recent_prediction_observation_count(ticker)
+            position_values, total_assets_for_cap = simulation._estimate_trade_assets(ticker, current_price)
+            current_position_value = position_values.get(ticker, 0.0)
+            current_gross_exposure = (
+                sum(position_values.values()) / total_assets_for_cap
+                if total_assets_for_cap > 0
+                else 0.0
+            )
+            current_position_pct = (
+                current_position_value / total_assets_for_cap
+                if total_assets_for_cap > 0
+                else 0.0
+            )
             capped_position, cap_reason = apply_heuristic_risk_cap(
                 ticker,
                 trade_position,
                 confidence,
                 signal_count=signal_count,
+                current_position=current_position_pct,
+                current_gross_exposure=current_gross_exposure,
                 context=heuristic_context,
             )
             if cap_reason:
