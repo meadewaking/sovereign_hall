@@ -1238,6 +1238,15 @@ def write_readme(
     tape_update = tape_update or {}
     new_rows = tape_update.get("new_prediction_rows_since_previous")
     new_rows_text = "unknown" if new_rows is None else str(new_rows)
+    try:
+        zero_new_tape = int(new_rows or 0) <= 0
+    except (TypeError, ValueError):
+        zero_new_tape = False
+    tape_cap_decision = (
+        "no new local predictions since the previous cycle; keep as cap/warning and apply a stricter zero-new-tape observational size (10% of policy cap)."
+        if zero_new_tape
+        else "not enough fresh local tape for exposure widening; keep as cap/warning and apply thin-tape observational sizing."
+    )
     tape_update_text = (
         f"- Status: {tape_update.get('validation_status', 'unknown')}\n"
         f"- Prediction rows: current={tape_update.get('current_prediction_rows', 0)}, "
@@ -1247,7 +1256,7 @@ def write_readme(
         f"with {tape_update.get('latest_date_prediction_rows', 0)} rows; "
         f"age={tape_update.get('latest_prediction_age_days', 'unknown')} days\n"
         f"- Rule: {tape_update.get('rule', 'Do not widen exposure without fresh local validation tape.')}\n"
-        f"- Integration decision: {'fresh enough for validation review' if tape_update.get('enough_for_policy_widening') else 'not enough fresh local tape for exposure widening; keep as cap/warning and apply thin-tape observational sizing.'}"
+        f"- Integration decision: {'fresh enough for validation review' if tape_update.get('enough_for_policy_widening') else tape_cap_decision}"
     )
     text = f"""# Heuristic Learning Cycle
 
@@ -1284,6 +1293,7 @@ def write_readme(
 - Advanced the prior data-source direction by writing `price_coverage.json`, including price-source counts and missing held-position price slots for the retained path.
 - Converted the latest price-coverage warning into a real simulated-investment constraint: weak or unvalidated local price coverage now applies a coverage-adjusted cap; zero independent daily_prices coverage allows at most one-quarter of the latest policy single-name cap.
 - Advanced the prior fresh-tape validation direction by writing `tape_update.json`; thin tape updates are surfaced as a user-entry warning and an observational simulated-buy cap instead of being treated as validation for wider exposure.
+- Tightened the fresh-tape entry loop: if the latest cycle has zero new local prediction rows, simulated long proposals are capped to 10% of the retained policy single-name cap until a meaningful tape update arrives.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
 - Closed the portfolio-gross loop: simulated long proposals now enforce the retained policy `max_gross` as a real local cap instead of only showing it in the policy checklist.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
@@ -1345,6 +1355,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved price-coverage closure: `check_db`, research prompt context, and simulated trade reasons now surface the latest `price_coverage.json` ratios, including held-position missing-price slots.
 - Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals by coverage quality; with zero independent daily_prices rows the user-entry cap is one-quarter of the latest policy cap rather than a fixed half-cap.
 - Improved fresh-tape closure: `check_db`, research prompt context, and simulated trade reasons now surface `tape_update.json`; when the current cycle only adds a thin local tape update, simulated long proposals are capped to observational sizing and the policy is not treated as validation for widening.
+- Improved zero-new-tape closure: when `tape_update.json` reports no new prediction rows since the previous run, `check_db`, research prompts, and simulated trade reasons show the stricter zero-new-tape cap instead of treating repeated samples as validation.
 - Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
 - Improved reduced-exposure closure: all three user entry paths inherit the retained single-stock cap and local evidence floor from `policy_snapshot.py` without adding a separate trading rule.
 - Improved evidence-gate closure: `run_discussion` and `InvestmentSimulation.execute_trade` now apply the retained `min_signal_count` requirement to actual simulated long proposals; proposals with fewer fresh same-day local prediction observations are limited to a small observation-size cap.
