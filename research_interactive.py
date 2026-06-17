@@ -13,7 +13,6 @@ from datetime import datetime
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root.parent))
 
-from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
 from sovereign_hall.services.heuristic_policy import format_heuristic_status
 
 
@@ -71,6 +70,8 @@ async def main():
             break
 
         try:
+            from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
+
             system = ResearchDiscussionSystem(
                 enable_search=True,
                 enable_web=False

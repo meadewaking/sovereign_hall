@@ -48,21 +48,12 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger("sovereign_hall")
-from sovereign_hall.services.database import DatabaseService
-from sovereign_hall.services.llm_client import LLMClient
-from sovereign_hall.services.spider_service import SpiderSwarm, SearchQueryGenerator
-from sovereign_hall.services.decision_tracker import DecisionRecorder
 from sovereign_hall.services.heuristic_policy import (
     apply_heuristic_risk_cap,
     format_heuristic_prompt_context,
     load_latest_heuristic_context,
     recent_prediction_observation_count,
 )
-from sovereign_hall.services.learning_engine import LearningEngine
-from sovereign_hall.services.market_data import get_market_data
-from sovereign_hall.core import AgentRole
-from sovereign_hall.core.config import get_config
-from sovereign_hall.utils import safe_parse_json, estimate_tokens
 
 # 延迟导入Agent避免循环引用
 Agent = None
@@ -71,6 +62,18 @@ def _get_agent():
     if Agent is None:
         from sovereign_hall.agents.agent import Agent
     return Agent
+
+
+def _normalize_expected_days(value, context: str) -> int:
+    from sovereign_hall.services.decision_tracker import DecisionRecorder
+
+    return DecisionRecorder.normalize_expected_days(value, context)
+
+
+def _safe_parse_json(text: str, default=None):
+    from sovereign_hall.utils import safe_parse_json
+
+    return safe_parse_json(text, default)
 
 
 def build_proposal_thesis(raw: Dict) -> str:
@@ -159,7 +162,7 @@ def generate_default_proposals(topic: str) -> List[Dict]:
 
 def infer_default_holding_period(topic: str) -> int:
     """根据议题给默认验证窗口，作为模型缺省值的后备。"""
-    return DecisionRecorder.normalize_expected_days(None, topic)
+    return _normalize_expected_days(None, topic)
 
 
 def normalize_proposal_holding_period(proposal: Dict, topic: str) -> int:
@@ -167,7 +170,7 @@ def normalize_proposal_holding_period(proposal: Dict, topic: str) -> int:
         str(proposal.get(key, ""))
         for key in ("thesis", "sector", "holding_period_reason")
     )
-    return DecisionRecorder.normalize_expected_days(
+    return _normalize_expected_days(
         proposal.get("holding_period"),
         f"{topic} {context}",
     )
@@ -493,6 +496,8 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
     ]
 
     # 生成搜索词
+    from sovereign_hall.services.spider_service import SearchQueryGenerator
+
     query_gen = SearchQueryGenerator(llm)
     queries = await query_gen.generate_queries(count=query_count, seeds=seeds)
 
@@ -630,7 +635,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         print(f"   📥 LLM响应: {response[:200]}...")
 
         # 解析JSON
-        proposals = safe_parse_json(response, [])
+        proposals = _safe_parse_json(response, [])
         if not isinstance(proposals, list):
             proposals = [proposals]
 
@@ -680,7 +685,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 
 def parse_committee_vote(text: str) -> Dict:
     """Parse a loose committee vote into a small structured signal."""
-    parsed_json = safe_parse_json(str(text or ""), None)
+    parsed_json = _safe_parse_json(str(text or ""), None)
     if isinstance(parsed_json, dict):
         direction = normalize_vote_direction(
             parsed_json.get("direction")
@@ -872,6 +877,9 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
     if not proposals:
         logger.warning("阶段3：无提案，跳过审议")
         return "", []
+
+    from sovereign_hall.core import AgentRole
+    from sovereign_hall.services.decision_tracker import DecisionRecorder
 
     logger.info("========== 阶段3：投委会审议 ==========")
     print("\n" + "="*60)
@@ -1358,6 +1366,14 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
 # 主循环
 # ============================================================================
 async def main():
+    from sovereign_hall.core.config import get_config
+    from sovereign_hall.services.database import DatabaseService
+    from sovereign_hall.services.decision_tracker import DecisionRecorder
+    from sovereign_hall.services.learning_engine import LearningEngine
+    from sovereign_hall.services.llm_client import LLMClient
+    from sovereign_hall.services.market_data import get_market_data
+    from sovereign_hall.services.spider_service import SearchQueryGenerator, SpiderSwarm
+
     args = parse_args()
 
     print("\n" + "="*60)

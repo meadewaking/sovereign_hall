@@ -16,6 +16,7 @@ import os
 import pprint
 import re
 import sqlite3
+import subprocess
 import sys
 import types
 from dataclasses import asdict, dataclass, replace
@@ -33,6 +34,49 @@ if "pyarrow" not in sys.modules:
     _pyarrow_stub.Array = type("Array", (), {})
     _pyarrow_stub.ChunkedArray = type("ChunkedArray", (), {})
     sys.modules["pyarrow"] = _pyarrow_stub
+
+
+def _scientific_stack_ready(timeout_seconds: float = 8.0) -> bool:
+    """Return False when numpy/pandas import hangs or is unavailable locally."""
+    if os.environ.get("SOVEREIGN_HALL_FORCE_PANDAS_CYCLE") == "1":
+        return True
+    if os.environ.get("SOVEREIGN_HALL_FORCE_STDLIB_CYCLE") == "1":
+        return False
+    env = dict(os.environ)
+    env["SOVEREIGN_HALL_NUMPY_PREFLIGHT_CHILD"] = "1"
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import numpy; import pandas; print('ok')",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+            check=True,
+            env=env,
+        )
+        return True
+    except Exception:
+        return False
+
+
+if __name__ == "__main__" and os.environ.get("SOVEREIGN_HALL_NUMPY_PREFLIGHT_CHILD") != "1":
+    if not _scientific_stack_ready():
+        fallback_path = Path(__file__).with_name("run_heuristic_cycle_stdlib.py")
+        system_python = Path("/usr/bin/python3")
+        if system_python.exists():
+            os.execv(str(system_python), [str(system_python), str(fallback_path), *sys.argv[1:]])
+
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("run_heuristic_cycle_stdlib", fallback_path)
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"Cannot load fallback evaluator: {fallback_path}")
+        fallback = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fallback)
+        raise SystemExit(fallback.main())
 
 import numpy as np
 import pandas as pd

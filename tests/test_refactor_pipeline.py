@@ -550,6 +550,28 @@ def test_heuristic_context_surfaces_min_signal_count(tmp_path):
     assert "本地信号观察门槛=2条" in prompt
 
 
+def test_heuristic_context_surfaces_evaluation_engine(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
+        score=0.065,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="通过本轮基础样本外与成本扰动检查",
+        failure_cases=[],
+        evaluation_engine="stdlib_fallback",
+        evaluation_warning="numpy/pandas import did not complete during preflight",
+    )
+
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert "评估引擎: stdlib_fallback" in status
+    assert "评估提示: numpy/pandas import did not complete during preflight" in status
+    assert "评估引擎: stdlib_fallback" in prompt
+    assert "numpy/pandas import did not complete during preflight" in prompt
+
+
 def test_heuristic_risk_cap_tightens_insufficient_signal_count(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
