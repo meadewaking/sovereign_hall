@@ -140,14 +140,16 @@ class LLMClient:
         self._http_client = httpx.AsyncClient(
             timeout=self.timeout,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
-            proxy=None  # 内网直连，不走代理
+            proxy=None,  # 内网直连，不走代理
+            trust_env=False,
         )
         # 用于 embedding 的内网客户端（使用 AsyncHTTPTransport，不走代理）
         transport = httpx.AsyncHTTPTransport(retries=3)
         self._embedding_client = httpx.AsyncClient(
             timeout=self.timeout,
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
-            transport=transport  # 不走代理
+            transport=transport,  # 不走代理
+            trust_env=False,
         )
 
     def _init_anthropic_client(self):

@@ -182,7 +182,68 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Sovereign Hall continuous discussion runner")
     parser.add_argument("--once", action="store_true", help="只运行一轮后退出")
     parser.add_argument("--max-rounds", type=int, default=0, help="最多运行轮数，0 表示无限")
+    parser.add_argument("--skip-preflight", action="store_true", help="跳过 LLM/Embedding/搜索联通性检查")
     return parser.parse_args()
+
+
+async def run_startup_preflight(llm, spiders) -> bool:
+    """Verify external dependencies before burning a research round."""
+    print("\n🔌 启动前联通性检查...")
+    checks = []
+
+    async def _check_llm():
+        response = await asyncio.wait_for(
+            llm.chat(
+                system="只输出最终答案。",
+                user="联通性检查：只回复 OK",
+                temperature=0.0,
+                max_tokens=80,
+                use_cache=False,
+            ),
+            timeout=90,
+        )
+        if not response or "OK" not in str(response).upper():
+            raise RuntimeError(f"LLM 响应异常: {str(response)[:120]}")
+
+    async def _check_embedding():
+        vector = await asyncio.wait_for(
+            llm.get_embedding("联通性检查"),
+            timeout=60,
+        )
+        if not isinstance(vector, list) or not vector:
+            raise RuntimeError("Embedding 返回空向量")
+
+    async def _check_search():
+        docs = await asyncio.wait_for(
+            spiders.aggressive_search(["A股 最新消息"], max_results_per_query=1, sources=["ddg"]),
+            timeout=90,
+        )
+        if not docs:
+            raise RuntimeError("搜索返回空结果")
+
+    for name, check in [
+        ("LLM", _check_llm),
+        ("Embedding", _check_embedding),
+        ("搜索", _check_search),
+    ]:
+        try:
+            await check()
+            checks.append((name, True, "OK"))
+            print(f"   ✅ {name}: OK")
+        except Exception as exc:
+            detail = str(exc)[:300] or exc.__class__.__name__
+            checks.append((name, False, detail))
+            print(f"   ❌ {name}: {detail}")
+
+    failed = [item for item in checks if not item[1]]
+    if failed:
+        print("\n❌ 联通性检查未通过，本次不启动 run_discussion。")
+        for name, _, detail in failed:
+            print(f"   - {name}: {detail}")
+        return False
+
+    print("✅ 联通性检查通过\n")
+    return True
 
 
 class SingleInstanceLock:
@@ -1455,6 +1516,15 @@ async def main():
     # 从配置中读取 Spider 并发数（已降低防止被封）
     spider_config = config.get_spider_config()
     spiders = SpiderSwarm(max_concurrent=spider_config.get('max_concurrent', 10))
+
+    if not args.skip_preflight:
+        preflight_ok = await run_startup_preflight(llm, spiders)
+        if not preflight_ok:
+            await spiders.close()
+            await llm.close()
+            raise RuntimeError("启动前联通性检查未通过")
+    else:
+        print("⚠️ 已跳过启动前 LLM/Embedding/搜索联通性检查")
 
     db_service = DatabaseService(str(db_path))
     await db_service._init_db()

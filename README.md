@@ -203,9 +203,9 @@ sovereign_hall/
 ```yaml
 llm:
   provider: "openai"
-  base_url: "http://172.18.1.128:30618/v1"
+  base_url: "http://172.18.1.128:30300/v1"
   model: "MiniMax-M2.7-INT8"
-  model_uuid: "60afd721-8164-452b-bff4-1a0c863664f9"
+  model_uuid: ""
   max_concurrent: 16
   max_tokens: 15000
 
