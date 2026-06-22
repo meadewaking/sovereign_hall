@@ -40,10 +40,10 @@ class Config:
             # LLM配置
             'llm': {
                 'provider': 'openai',
-                'model': 'MiniMax/MiniMax-M2.5',
+                'model': 'MiniMax-M2.7-INT8',
                 'api_key_env': 'OPENAI_API_KEY',
                 'base_url': 'http://172.18.1.128:30977/v1',
-                'model_uuid': '142ebd20-ee7f-4607-b0a3-4375fb99b714',
+                'model_uuid': '60afd721-8164-452b-bff4-1a0c863664f9',
                 'max_concurrent': 16,
                 'temperature': 0.7,
                 'max_tokens': 4000,
@@ -229,8 +229,8 @@ class Config:
                 'profile_output': './profiles',
             },
 
-            # Token计费配置（用于估算成本）- 人民币
-            # MiniMax-M2.5: 输入 ¥1.20/百万，输出 ¥8.40/百万（半价）
+            # Token计费配置（用于估算成本）
+            # MiniMax-M2.7-INT8 pricing should be adjusted here if the internal endpoint uses a different rate.
             'pricing': {
                 'anthropic': {
                     'input_per_1k': 0.0006,   # ¥1.20/百万 → ¥0.0006/千 (半价)
@@ -238,6 +238,7 @@ class Config:
                 },
                 'openai': {
                     'MiniMax/MiniMax-M2.5': {'input_per_1k': 0.0006, 'output_per_1k': 0.0042},
+                    'MiniMax-M2.7-INT8': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
                     'gpt-4': {'input_per_1k': 0.03, 'output_per_1k': 0.06},
                     'gpt-4-turbo': {'input_per_1k': 0.01, 'output_per_1k': 0.03},
                     'gpt-3.5-turbo': {'input_per_1k': 0.0005, 'output_per_1k': 0.0015},

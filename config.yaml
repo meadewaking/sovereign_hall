@@ -5,9 +5,9 @@
 llm:
   provider: "openai"  # openai/anthropic/local
   base_url: "http://172.18.1.128:30618/v1"
-  model: "MiniMax/MiniMax-M2.5"
+  model: "MiniMax-M2.7-INT8"
   api_key: "not_need"
-  model_uuid: ""  # 用于Host header
+  model_uuid: "60afd721-8164-452b-bff4-1a0c863664f9"  # 用于Host header
   max_concurrent: 16
   temperature: 0.7
   max_tokens: 15000
