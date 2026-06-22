@@ -572,6 +572,35 @@ def test_heuristic_context_surfaces_evaluation_engine(tmp_path):
     assert "numpy/pandas import did not complete during preflight" in prompt
 
 
+def test_heuristic_context_surfaces_evaluator_health(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
+        score=0.063373,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="主评估器已本地复核fallback结果",
+        failure_cases=[],
+        evaluation_engine="stdlib_fallback",
+        evaluator_health={
+            "validation_status": "matched",
+            "baseline_engine": "stdlib_fallback",
+            "validation_engine": "pandas_primary",
+            "baseline_score": 0.06337303806043082,
+            "validation_score": 0.06337303806043082,
+            "score_abs_diff": 0.0,
+            "score_tolerance": 1e-9,
+        },
+    )
+
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert "评估器复核: matched: stdlib_fallback vs pandas_primary" in status
+    assert "score差=0" in status
+    assert "baseline=0.063373, validation=0.063373" in prompt
+
+
 def test_heuristic_risk_cap_tightens_insufficient_signal_count(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
@@ -676,6 +705,69 @@ def test_heuristic_price_coverage_cap_scales_with_partial_coverage(tmp_path):
 
     assert capped == pytest.approx(0.0175)
     assert "弱覆盖模拟买入上限1.7%" in reason
+
+
+def test_heuristic_context_surfaces_price_readiness(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs",
+        score=0.055,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="通过本轮基础样本外与成本扰动检查",
+        failure_cases=[],
+        price_readiness={
+            "status": "blocked_no_daily_prices",
+            "total_signal_ticker_count": 12,
+            "priced_signal_ticker_count": 0,
+            "missing_signal_ticker_count": 12,
+            "latest_signal_date": "2026-06-20",
+            "latest_missing_tickers": ["600519", "688256"],
+            "minimum_next_rows": 2,
+            "next_action": "Backfill latest local daily_prices first.",
+        },
+    )
+
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+
+    assert "daily_prices补齐: blocked_no_daily_prices" in status
+    assert "daily_prices阻塞模拟买入上限: 0.5%" in status
+    assert "缺少12/12个signal ticker" in status
+    assert "最新缺价ticker=600519, 688256" in prompt
+    assert "daily_prices阻塞模拟买入上限=0.5%" in prompt
+    assert "本地数据质量任务" in prompt
+
+
+def test_heuristic_risk_cap_tightens_blocked_price_readiness(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs",
+        score=0.055,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="daily_prices缺失",
+        failure_cases=[],
+        price_readiness={
+            "status": "blocked_no_daily_prices",
+            "total_signal_ticker_count": 12,
+            "priced_signal_ticker_count": 0,
+            "missing_signal_ticker_count": 12,
+            "latest_missing_tickers": ["159995"],
+            "minimum_next_rows": 1,
+        },
+    )
+
+    capped, reason = apply_heuristic_risk_cap(
+        "159995",
+        0.10,
+        confidence=0.8,
+        context=context,
+    )
+
+    assert capped == pytest.approx(0.005)
+    assert "daily_prices补齐blocked_no_daily_prices" in reason
+    assert "补齐前模拟买入上限0.5%" in reason
 
 
 def test_heuristic_risk_cap_tightens_thin_tape_update(tmp_path):
