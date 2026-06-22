@@ -20,6 +20,7 @@ from sovereign_hall.services.heuristic_policy import (
     failure_ticker_constraints,
     format_heuristic_prompt_context,
     format_heuristic_status,
+    format_price_readiness_backfill_queue,
     format_policy_checklist,
     recent_prediction_observation_count,
 )
@@ -724,19 +725,37 @@ def test_heuristic_context_surfaces_price_readiness(tmp_path):
             "latest_signal_date": "2026-06-20",
             "latest_missing_tickers": ["600519", "688256"],
             "minimum_next_rows": 2,
+            "missing_tickers_top10": [
+                {
+                    "ticker": "600519",
+                    "signal_days": 45,
+                    "last_signal_date": "2026-06-20",
+                    "total_signal_observations": 1585,
+                },
+                {
+                    "ticker": "512880",
+                    "signal_days": 44,
+                    "last_signal_date": "2026-06-10",
+                    "total_signal_observations": 1197,
+                },
+            ],
             "next_action": "Backfill latest local daily_prices first.",
         },
     )
 
     status = format_heuristic_status(context)
     prompt = format_heuristic_prompt_context(context)
+    queue = format_price_readiness_backfill_queue(context)
 
     assert "daily_prices补齐: blocked_no_daily_prices" in status
     assert "daily_prices阻塞模拟买入上限: 0.5%" in status
+    assert "daily_prices优先补齐队列: 600519(45d, 1585obs, last=2026-06-20)" in status
     assert "缺少12/12个signal ticker" in status
     assert "最新缺价ticker=600519, 688256" in prompt
+    assert "daily_prices优先补齐队列: 600519(45d, 1585obs, last=2026-06-20)" in prompt
     assert "daily_prices阻塞模拟买入上限=0.5%" in prompt
     assert "本地数据质量任务" in prompt
+    assert queue.startswith("600519(45d, 1585obs, last=2026-06-20), 512880")
 
 
 def test_heuristic_risk_cap_tightens_blocked_price_readiness(tmp_path):

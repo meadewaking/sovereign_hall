@@ -1252,6 +1252,34 @@ def build_price_readiness_report(
     }
 
 
+def format_missing_price_queue(price_readiness: dict[str, Any], limit: int = 5) -> str:
+    rows = price_readiness.get("missing_tickers_top10", [])
+    if not isinstance(rows, list):
+        return ""
+
+    parts: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("ticker"):
+            continue
+        details: list[str] = []
+        try:
+            details.append(f"{int(row.get('signal_days', 0))}d")
+        except (TypeError, ValueError):
+            pass
+        try:
+            details.append(f"{int(row.get('total_signal_observations', 0))}obs")
+        except (TypeError, ValueError):
+            pass
+        last_signal = str(row.get("last_signal_date", "") or "")[:10]
+        if last_signal:
+            details.append(f"last={last_signal}")
+        ticker = normalize_ticker(row["ticker"])
+        parts.append(f"{ticker}({', '.join(details)})" if details else ticker)
+        if len(parts) >= limit:
+            break
+    return ", ".join(parts)
+
+
 def write_policy_snapshot(path: Path, policy: PolicyConfig, costs: CostConfig) -> None:
     policy_literal = pprint.pformat(asdict(policy), sort_dicts=False, width=88)
     costs_literal = pprint.pformat(asdict(costs), sort_dicts=False, width=88)
@@ -1370,6 +1398,7 @@ def write_readme(
     price_readiness = price_readiness or {}
     latest_missing = price_readiness.get("latest_missing_tickers", [])
     latest_missing_text = ", ".join(str(ticker) for ticker in latest_missing[:8]) if isinstance(latest_missing, list) else ""
+    missing_queue = format_missing_price_queue(price_readiness)
     price_readiness_text = (
         f"- Status: {price_readiness.get('status', 'unknown')}\n"
         f"- Signal tickers with local daily_prices: {price_readiness.get('priced_signal_ticker_count', 0)}/"
@@ -1378,6 +1407,7 @@ def write_readme(
         f"- Latest signal date: {price_readiness.get('latest_signal_date', 'unknown')}; "
         f"latest missing tickers: {latest_missing_text or 'none'}; "
         f"minimum next rows={price_readiness.get('minimum_next_rows', 0)}\n"
+        f"- Priority backfill queue: {missing_queue or 'none'}\n"
         "- Integration decision: do not synthesize `daily_prices` from prediction current_price; "
         "surface this as a local backfill checklist in user entries and keep exposure caps active."
     )
@@ -1503,7 +1533,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved thin-cost-stress closure: `services/heuristic_policy.py` now exposes OOS and 3x-slippage scores to `check_db`, manual research prompts, and simulated trade reasons; if 3x-slippage score is below 0.02, the latest policy remains a cap/warning only and explicitly forbids exposure expansion.
 - Improved data-source closure: `check_db`, `run_discussion`, `research_interactive`, and simulated trade reasons now surface `daily_prices` absence as a no-expansion warning when the latest run still relies on prediction `current_price` fallback.
 - Improved price-coverage closure: `check_db`, research prompt context, and simulated trade reasons now surface the latest `price_coverage.json` ratios, including held-position missing-price slots.
-- Improved daily-price-readiness closure: `check_db`, research prompt context, and manual research reports now surface `price_readiness.json`, including the latest signal tickers still missing local `daily_prices`.
+- Improved daily-price-readiness closure: `check_db`, research prompt context, and manual research reports now surface `price_readiness.json`, including the prioritized missing-price queue.
 - Improved daily-price-readiness simulation closure: blocked independent `daily_prices` readiness now applies a simulated-buy cap through `services/heuristic_policy.py`, so missing local prices constrain entries rather than only appearing in reports.
 - Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals by coverage quality; with zero independent daily_prices rows the user-entry cap is one-quarter of the latest policy cap rather than a fixed half-cap.
 - Improved fresh-tape closure: `check_db`, research prompt context, and simulated trade reasons now surface `tape_update.json`; when the current cycle only adds a thin local tape update, simulated long proposals are capped to observational sizing and the policy is not treated as validation for widening.
@@ -1529,7 +1559,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## Next 3 Directions
 - Validate the 6-day evidence-gated reduced-exposure single-stock policy and the live insufficient-observation/薄tape cap only after a meaningful fresh tape update meets the `tape_update.json` thresholds.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
-- Replace prediction-current-price fallback with validated local daily prices; start with `price_readiness.json` latest missing tickers and relax the coverage-adjusted weak-price cap only after coverage passes.
+- Replace prediction-current-price fallback with validated local daily prices; start with the priority queue in `price_readiness.json` and relax the coverage-adjusted weak-price cap only after coverage passes.
 """
     path.write_text(text, encoding="utf-8")
 
