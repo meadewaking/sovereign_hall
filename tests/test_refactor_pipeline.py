@@ -109,6 +109,39 @@ def test_check_db_uses_latest_prediction_price_before_cost_fallback(tmp_path, mo
     assert "实时估值请设置 SOVEREIGN_HALL_REALTIME_QUOTES=1" in output
 
 
+def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE daily_prices (ticker TEXT, date TEXT, close REAL)")
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
+        score=0.061,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="daily_prices缺失",
+        failure_cases=[],
+        price_readiness={
+            "status": "blocked_no_daily_prices",
+            "missing_tickers_top10": [
+                {"ticker": "600519", "signal_days": 45},
+                {"ticker": "512880", "signal_days": 44},
+            ],
+        },
+    )
+
+    text = check_db.format_daily_price_backfill_progress(conn, context=context)
+    conn.close()
+
+    assert "优先队列覆盖: 0/2 tickers" in text
+    assert "优先队列: 600519, 512880" in text
+    assert "下一步本地补齐: 600519" in text
+    assert "模拟买入上限维持 <= 0.5%" in text
+    assert "不得扩仓" in text
+
+
 def test_market_data_ticker_mapping():
     svc = MarketDataService()
     assert svc.infer_market("600519") == "sh"

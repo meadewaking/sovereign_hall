@@ -9,6 +9,7 @@ import sys
 import os
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root.parent))
@@ -118,6 +119,125 @@ def safe_input(prompt: str) -> str | None:
         return input(prompt)
     except EOFError:
         return None
+
+
+def daily_price_backfill_progress(
+    conn: sqlite3.Connection,
+    context: Any = None,
+    limit: int = 5,
+) -> dict[str, Any]:
+    """Compare the latest heuristic backfill queue with live local daily_prices rows."""
+    try:
+        from sovereign_hall.services.heuristic_policy import (
+            load_latest_heuristic_context,
+            price_readiness_position_cap,
+            thin_tape_update_position_cap,
+            weak_price_coverage_position_cap,
+        )
+    except Exception:
+        return {}
+
+    ctx = context or load_latest_heuristic_context()
+    readiness = getattr(ctx, "price_readiness", {}) or {}
+    if not isinstance(readiness, dict):
+        return {}
+
+    queue: list[str] = []
+    top_missing = readiness.get("missing_tickers_top10") or []
+    if isinstance(top_missing, list):
+        for row in top_missing:
+            if not isinstance(row, dict) or not row.get("ticker"):
+                continue
+            ticker = normalize_ticker(str(row["ticker"]))
+            if ticker and ticker not in queue:
+                queue.append(ticker)
+            if len(queue) >= limit:
+                break
+    if not queue:
+        latest_missing = readiness.get("latest_missing_tickers") or []
+        if isinstance(latest_missing, list):
+            queue = [normalize_ticker(str(ticker)) for ticker in latest_missing[:limit] if ticker]
+    queue = [ticker for ticker in queue if ticker]
+    if not queue:
+        return {}
+
+    c = conn.cursor()
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_prices'")
+    table_exists = c.fetchone() is not None
+    c.execute("SELECT COUNT(*) FROM daily_prices" if table_exists else "SELECT 0")
+    total_rows = int(c.fetchone()[0])
+
+    priced: dict[str, dict[str, Any]] = {}
+    if table_exists and total_rows > 0:
+        placeholders = ",".join("?" for _ in queue)
+        c.execute(
+            f"""
+            SELECT ticker, COUNT(*) AS row_count, MAX(date) AS latest_date
+            FROM daily_prices
+            WHERE ticker IN ({placeholders})
+            GROUP BY ticker
+            """,
+            queue,
+        )
+        for ticker, row_count, latest_date in c.fetchall():
+            priced[normalize_ticker(ticker)] = {
+                "row_count": int(row_count),
+                "latest_date": latest_date,
+            }
+
+    missing = [ticker for ticker in queue if priced.get(ticker, {}).get("row_count", 0) <= 0]
+    cap_candidates = [
+        price_readiness_position_cap(ctx),
+        weak_price_coverage_position_cap(ctx),
+        thin_tape_update_position_cap(ctx),
+    ]
+    active_caps = [float(cap) for cap in cap_candidates if cap is not None]
+    return {
+        "status": readiness.get("status", "unknown"),
+        "queue": queue,
+        "covered_count": len(queue) - len(missing),
+        "total_count": len(queue),
+        "missing": missing,
+        "priced": priced,
+        "next_ticker": missing[0] if missing else None,
+        "daily_prices_rows": total_rows,
+        "active_cap": min(active_caps) if active_caps else None,
+    }
+
+
+def format_daily_price_backfill_progress(
+    conn: sqlite3.Connection,
+    context: Any = None,
+    limit: int = 5,
+) -> str:
+    """Format live local daily_prices progress for check_db."""
+    progress = daily_price_backfill_progress(conn, context=context, limit=limit)
+    if not progress:
+        return ""
+
+    queue_text = ", ".join(progress["queue"])
+    lines = [
+        "\n🧱 daily_prices 本地补齐进度",
+        "=" * 60,
+        f"   状态: {progress['status']}",
+        (
+            f"   优先队列覆盖: {progress['covered_count']}/"
+            f"{progress['total_count']} tickers have local daily_prices rows"
+        ),
+        f"   优先队列: {queue_text}",
+        f"   daily_prices 当前总行数: {progress['daily_prices_rows']:,}",
+    ]
+    if progress.get("next_ticker"):
+        lines.append(f"   下一步本地补齐: {progress['next_ticker']}")
+    else:
+        lines.append("   下一步本地补齐: 优先队列已覆盖，需重新运行 heuristic cycle 验证")
+    if progress.get("active_cap") is not None:
+        lines.append(
+            f"   系统动作: 补齐并重新评估前，模拟买入上限维持 <= {progress['active_cap']:.1%}，不得扩仓"
+        )
+    else:
+        lines.append("   系统动作: 仅作为本地数据质量提示，不触发扩仓")
+    return "\n".join(lines) + "\n"
 
 
 def show_investment_status(db_path):
@@ -250,7 +370,10 @@ def show_stats(db_path):
 
         with sqlite3.connect(str(db_path)) as conn:
             sync_simulation_risk_memory_sqlite(conn)
+            backfill_progress = format_daily_price_backfill_progress(conn)
         print(format_heuristic_status())
+        if backfill_progress:
+            print(backfill_progress)
     except Exception as exc:
         print(f"\n🧭 Heuristic 学习状态: 无法读取 ({exc})")
 
