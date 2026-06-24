@@ -16,11 +16,13 @@ from sovereign_hall.services.investment_simulation import InvestmentSimulation
 from sovereign_hall.services.heuristic_policy import (
     HeuristicRiskContext,
     apply_heuristic_risk_cap,
+    build_price_readiness_stall_report,
     derive_simulation_risk_memory,
     failure_ticker_constraints,
     format_heuristic_prompt_context,
     format_heuristic_status,
     format_price_readiness_backfill_queue,
+    format_price_readiness_stall_note,
     format_policy_checklist,
     recent_prediction_observation_count,
 )
@@ -820,6 +822,72 @@ def test_heuristic_risk_cap_tightens_blocked_price_readiness(tmp_path):
     assert capped == pytest.approx(0.005)
     assert "daily_prices补齐blocked_no_daily_prices" in reason
     assert "补齐前模拟买入上限0.5%" in reason
+
+
+def test_price_readiness_stall_report_counts_consecutive_blocked_runs(tmp_path):
+    readiness_payload = {
+        "status": "blocked_no_daily_prices",
+        "total_signal_ticker_count": 307,
+        "priced_signal_ticker_count": 0,
+        "missing_signal_ticker_count": 307,
+        "latest_missing_tickers": ["159995"],
+        "missing_tickers_top10": [{"ticker": "159995", "signal_days": 45}],
+    }
+    for run_id in ("20260622_123523", "20260623_123529", "20260624_123500"):
+        run_dir = tmp_path / run_id
+        run_dir.mkdir()
+        (run_dir / "README.md").write_text("# run\n", encoding="utf-8")
+        (run_dir / "price_readiness.json").write_text(
+            json.dumps(readiness_payload),
+            encoding="utf-8",
+        )
+
+    report = build_price_readiness_stall_report(tmp_path)
+
+    assert report["status"] == "stalled_no_daily_prices"
+    assert report["consecutive_blocked_runs"] == 3
+    assert report["first_blocked_run"] == "20260622_123523"
+    assert report["latest_blocked_run"] == "20260624_123500"
+    assert report["next_ticker"] == "159995"
+    assert report["same_next_ticker_runs"] == 3
+
+
+def test_heuristic_context_surfaces_price_readiness_stall(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
+        score=0.061,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="daily_prices缺失",
+        failure_cases=[],
+        price_readiness_stall={
+            "status": "stalled_no_daily_prices",
+            "consecutive_blocked_runs": 3,
+            "minimum_blocked_runs": 3,
+            "blocked_run_ids": ["20260622_123523", "20260623_123529", "20260624_123500"],
+            "first_blocked_run": "20260622_123523",
+            "latest_blocked_run": "20260624_123500",
+            "next_ticker": "159995",
+            "same_next_ticker_runs": 3,
+            "next_action": "Backfill independently validated local daily_prices for 159995, then rerun the cycle.",
+        },
+    )
+
+    capped, reason = apply_heuristic_risk_cap("159995", 0.05, 0.8, context=context)
+    status = format_heuristic_status(context)
+    prompt = format_heuristic_prompt_context(context)
+    checklist = format_policy_checklist(context)
+    note = format_price_readiness_stall_note(context)
+
+    assert capped == pytest.approx(0.0025)
+    assert "连续3/3轮daily_prices为0" in reason
+    assert "数据补齐未推进仓位上限0.25%" in reason
+    assert "daily_prices连续阻塞" in status
+    assert "连续阻塞模拟买入上限=0.25%" in prompt
+    assert "不得新增leaderboard分支" in prompt
+    assert "daily_prices连续阻塞仓位<=0.25%" in checklist
+    assert "下一步ticker=159995" in note
 
 
 def test_heuristic_risk_cap_tightens_thin_tape_update(tmp_path):

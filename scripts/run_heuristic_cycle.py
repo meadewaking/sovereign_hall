@@ -1320,6 +1320,7 @@ def write_readme(
     sleeve_diagnostics: dict[str, Any] | None = None,
     price_coverage: dict[str, Any] | None = None,
     price_readiness: dict[str, Any] | None = None,
+    price_readiness_stall: dict[str, Any] | None = None,
     tape_update: dict[str, Any] | None = None,
 ) -> None:
     failed = [t for t in trials if t["trial_name"] != best_name]
@@ -1411,6 +1412,21 @@ def write_readme(
         "- Integration decision: do not synthesize `daily_prices` from prediction current_price; "
         "surface this as a local backfill checklist in user entries and keep exposure caps active."
     )
+    price_readiness_stall = price_readiness_stall or {}
+    stall_blocked_runs = int(price_readiness_stall.get("consecutive_blocked_runs", 0) or 0)
+    stall_min_runs = int(price_readiness_stall.get("minimum_blocked_runs", 3) or 3)
+    stall_cap = best_cap * 0.05 if price_readiness_stall.get("status") == "stalled_no_daily_prices" else None
+    price_readiness_stall_text = (
+        f"- Status: {price_readiness_stall.get('status', 'unknown')}\n"
+        f"- Consecutive blocked runs: {stall_blocked_runs}/{stall_min_runs}; "
+        f"blocked run ids: {', '.join(price_readiness_stall.get('blocked_run_ids', [])[-6:]) or 'none'}\n"
+        f"- Next ticker: {price_readiness_stall.get('next_ticker', 'none') or 'none'}; "
+        f"same-next-ticker runs={price_readiness_stall.get('same_next_ticker_runs', 0)}\n"
+        f"- Rule: {price_readiness_stall.get('rule', 'Do not widen exposure while local daily_prices are repeatedly blocked.')}\n"
+        f"- Integration decision: repeated empty daily_prices is treated as a user-entry warning and "
+        f"{'a stricter simulated-buy cap of ' + format(stall_cap, '.2%') if stall_cap is not None else 'the existing no-expansion data-quality gate'}; "
+        "do not add new leaderboard branches until local price validation moves."
+    )
     tape_update = tape_update or {}
     new_rows = tape_update.get("new_prediction_rows_since_previous")
     new_rows_text = "unknown" if new_rows is None else str(new_rows)
@@ -1470,6 +1486,7 @@ def write_readme(
 - Advanced the prior data-source direction by writing `price_coverage.json`, including price-source counts and missing held-position price slots for the retained path.
 - Converted the latest price-coverage warning into a real simulated-investment constraint: weak or unvalidated local price coverage now applies a coverage-adjusted cap; zero independent daily_prices coverage allows at most one-quarter of the latest policy single-name cap.
 - Advanced the daily_prices closure into `check_db`: the entry now compares the latest priority backfill queue with live local `daily_prices` rows and prints the still-missing next ticker plus the active no-expansion cap.
+- Advanced the prior data-quality closure by measuring consecutive `blocked_no_daily_prices` cycles; when the same local price gap repeats, user entries and simulated-buy reasons treat it as a stalled backfill task instead of another leaderboard signal.
 - Advanced the prior fresh-tape validation direction by writing `tape_update.json`; thin tape updates are surfaced as a user-entry warning and an observational simulated-buy cap instead of being treated as validation for wider exposure.
 - Tightened the fresh-tape entry loop: if the latest cycle has zero new local prediction rows, simulated long proposals are capped to 10% of the retained policy single-name cap until a meaningful tape update arrives.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
@@ -1510,6 +1527,9 @@ def write_readme(
 ## Daily Price Readiness
 {price_readiness_text}
 
+## Persistent Data-Quality Stall
+{price_readiness_stall_text}
+
 ## Tape Update Check
 {tape_update_text}
 
@@ -1537,6 +1557,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved daily-price-readiness closure: `check_db`, research prompt context, and manual research reports now surface `price_readiness.json`, including the prioritized missing-price queue.
 - Improved live daily-price-readiness closure: `check_db` now validates that priority queue against the current SQLite `daily_prices` table and prints covered/missing queue tickers, the next local backfill target, and the active no-expansion cap before the user starts simulation.
 - Improved daily-price-readiness simulation closure: blocked independent `daily_prices` readiness now applies a simulated-buy cap through `services/heuristic_policy.py`, so missing local prices constrain entries rather than only appearing in reports.
+- Improved stalled-readiness closure: `check_db`, research prompt context, and simulated trade reasons now show consecutive empty-daily_prices cycles; after repeated blockage, simulated buys use an extra-small observation cap and the cycle explicitly avoids new leaderboard branches.
 - Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals by coverage quality; with zero independent daily_prices rows the user-entry cap is one-quarter of the latest policy cap rather than a fixed half-cap.
 - Improved fresh-tape closure: `check_db`, research prompt context, and simulated trade reasons now surface `tape_update.json`; when the current cycle only adds a thin local tape update, simulated long proposals are capped to observational sizing and the policy is not treated as validation for widening.
 - Improved zero-new-tape closure: when `tape_update.json` reports no new prediction rows since the previous run, `check_db`, research prompts, and simulated trade reasons show the stricter zero-new-tape cap instead of treating repeated samples as validation.
@@ -1561,7 +1582,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## Next 3 Directions
 - Validate the 6-day evidence-gated reduced-exposure single-stock policy and the live insufficient-observation/薄tape cap only after a meaningful fresh tape update meets the `tape_update.json` thresholds.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
-- Replace prediction-current-price fallback with validated local daily prices; start with the priority queue in `price_readiness.json` and relax the coverage-adjusted weak-price cap only after coverage passes.
+- Replace prediction-current-price fallback with validated local daily prices; if it is still empty next run, continue local backfill tooling/status work and do not add return-seeking leaderboard branches.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -1621,6 +1642,8 @@ def main() -> int:
     args = parser.parse_args()
 
     project_root = Path.cwd()
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
     db_path = (project_root / args.db).resolve()
     runs_root = (project_root / args.runs_root).resolve()
     run_started = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1642,6 +1665,7 @@ def main() -> int:
     costs = CostConfig()
     changed_files = [
         "scripts/run_heuristic_cycle.py",
+        "scripts/run_heuristic_cycle_stdlib.py",
         "services/heuristic_policy.py",
         "services/investment_simulation.py",
         "services/research_discussion.py",
@@ -2237,6 +2261,14 @@ def main() -> int:
     write_json(run_dir / "price_coverage.json", price_coverage)
     price_readiness = build_price_readiness_report(daily, price_history)
     write_json(run_dir / "price_readiness.json", price_readiness)
+    from services.heuristic_policy import build_price_readiness_stall_report
+
+    price_readiness_stall = build_price_readiness_stall_report(
+        runs_root,
+        pending_run_dir=run_dir,
+        pending_price_readiness=price_readiness,
+    )
+    write_json(run_dir / "price_readiness_stall.json", price_readiness_stall)
     write_json(run_dir / "tape_update.json", tape_update)
     write_policy_snapshot(run_dir / "policy_snapshot.py", best_policy, costs)
     make_plot(run_dir / "sample_efficiency.png", trial_rows)
@@ -2276,6 +2308,7 @@ def main() -> int:
         ),
         "price_coverage": price_coverage,
         "price_readiness": price_readiness,
+        "price_readiness_stall": price_readiness_stall,
     }
     write_json(run_dir / "project_context.json", code_context)
     write_readme(
@@ -2294,6 +2327,7 @@ def main() -> int:
         sleeve_diagnostics=sleeve_diagnostics,
         price_coverage=price_coverage,
         price_readiness=price_readiness,
+        price_readiness_stall=price_readiness_stall,
         tape_update=tape_update,
     )
 

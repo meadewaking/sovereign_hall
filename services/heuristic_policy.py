@@ -28,6 +28,8 @@ THIN_TAPE_UPDATE_POSITION_SCALE = 0.2
 ZERO_NEW_TAPE_UPDATE_POSITION_SCALE = 0.1
 PRICE_READINESS_BLOCKED_POSITION_SCALE = 0.1
 PRICE_READINESS_PARTIAL_POSITION_SCALE = 0.25
+PRICE_READINESS_STALLED_POSITION_SCALE = 0.05
+PRICE_READINESS_STALLED_MIN_RUNS = 3
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,7 @@ class HeuristicRiskContext:
     price_coverage: dict[str, Any] = field(default_factory=dict)
     tape_update: dict[str, Any] = field(default_factory=dict)
     price_readiness: dict[str, Any] = field(default_factory=dict)
+    price_readiness_stall: dict[str, Any] = field(default_factory=dict)
     evaluation_engine: str = ""
     evaluation_warning: str = ""
     evaluator_health: dict[str, Any] = field(default_factory=dict)
@@ -99,6 +102,122 @@ def _read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _recent_run_dirs(runs_root: Path) -> list[Path]:
+    if not runs_root.exists():
+        return []
+    candidates = [path.parent for path in runs_root.glob("*/README.md") if path.parent.is_dir()]
+    return sorted(candidates, key=lambda path: path.name)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_blocked_no_daily_prices(readiness: dict[str, Any]) -> bool:
+    if not isinstance(readiness, dict):
+        return False
+    return (
+        str(readiness.get("status", "")) == "blocked_no_daily_prices"
+        and _safe_int(readiness.get("priced_signal_ticker_count")) == 0
+        and _safe_int(readiness.get("missing_signal_ticker_count")) > 0
+    )
+
+
+def _readiness_next_ticker(readiness: dict[str, Any]) -> str:
+    latest_missing = readiness.get("latest_missing_tickers") if isinstance(readiness, dict) else None
+    if isinstance(latest_missing, list) and latest_missing:
+        return normalize_ticker(str(latest_missing[0]))
+    top_missing = readiness.get("missing_tickers_top10") if isinstance(readiness, dict) else None
+    if isinstance(top_missing, list):
+        for row in top_missing:
+            if isinstance(row, dict) and row.get("ticker"):
+                return normalize_ticker(str(row["ticker"]))
+    return ""
+
+
+def build_price_readiness_stall_report(
+    runs_root: Path = RUNS_ROOT,
+    pending_run_dir: Path | None = None,
+    pending_price_readiness: dict[str, Any] | None = None,
+    min_blocked_runs: int = PRICE_READINESS_STALLED_MIN_RUNS,
+) -> dict[str, Any]:
+    """Report whether local daily_prices readiness has stalled across cycles."""
+    entries: list[dict[str, Any]] = []
+    for run_dir in _recent_run_dirs(runs_root):
+        if pending_run_dir is not None and run_dir.resolve() == pending_run_dir.resolve():
+            continue
+        readiness = _read_json(run_dir / "price_readiness.json")
+        if readiness:
+            entries.append({"run_dir": str(run_dir), "run_id": run_dir.name, "readiness": readiness})
+
+    if pending_run_dir is not None and pending_price_readiness is not None:
+        entries.append(
+            {
+                "run_dir": str(pending_run_dir),
+                "run_id": pending_run_dir.name,
+                "readiness": pending_price_readiness,
+            }
+        )
+
+    if not entries:
+        return {
+            "status": "no_price_readiness_history",
+            "consecutive_blocked_runs": 0,
+            "minimum_blocked_runs": min_blocked_runs,
+            "blocked_run_ids": [],
+            "next_ticker": "",
+            "rule": (
+                "After repeated blocked_no_daily_prices cycles, stop adding leaderboard branches "
+                "and prioritize local validated daily_prices backfill or tooling."
+            ),
+            "next_action": "Run a heuristic cycle after local prediction and price artifacts exist.",
+        }
+
+    blocked_streak: list[dict[str, Any]] = []
+    for entry in reversed(entries):
+        if not _is_blocked_no_daily_prices(entry["readiness"]):
+            break
+        blocked_streak.append(entry)
+
+    latest_readiness = entries[-1]["readiness"]
+    next_ticker = _readiness_next_ticker(latest_readiness)
+    same_next_ticker_runs = 0
+    if next_ticker:
+        for entry in blocked_streak:
+            if _readiness_next_ticker(entry["readiness"]) != next_ticker:
+                break
+            same_next_ticker_runs += 1
+
+    blocked_count = len(blocked_streak)
+    status = "not_stalled"
+    if blocked_count:
+        status = "stalled_no_daily_prices" if blocked_count >= min_blocked_runs else "blocked_no_daily_prices"
+    blocked_run_ids = [entry["run_id"] for entry in reversed(blocked_streak)]
+    return {
+        "status": status,
+        "consecutive_blocked_runs": blocked_count,
+        "minimum_blocked_runs": min_blocked_runs,
+        "blocked_run_ids": blocked_run_ids,
+        "lookback_runs": len(entries),
+        "first_blocked_run": blocked_run_ids[0] if blocked_run_ids else "",
+        "latest_blocked_run": blocked_run_ids[-1] if blocked_run_ids else "",
+        "next_ticker": next_ticker,
+        "same_next_ticker_runs": same_next_ticker_runs,
+        "rule": (
+            "If daily_prices remains empty for repeated cycles, do not add new leaderboard branches "
+            "or widen exposure; focus on validated local daily_prices backfill/tooling."
+        ),
+        "next_action": (
+            f"Backfill independently validated local daily_prices for {next_ticker}, then rerun the cycle."
+            if next_ticker
+            else "Backfill independently validated local daily_prices for the priority queue, then rerun the cycle."
+        ),
+    }
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:
@@ -271,6 +390,44 @@ def price_readiness_position_cap(
     if normalize_ticker(ticker) in price_readiness_missing_tickers(context):
         return context.max_position * PRICE_READINESS_PARTIAL_POSITION_SCALE
     return None
+
+
+def format_price_readiness_stall_note(context: HeuristicRiskContext) -> str:
+    """Summarize repeated local daily_prices backfill stalls across cycles."""
+    stall = context.price_readiness_stall or {}
+    if not isinstance(stall, dict) or not stall:
+        return ""
+
+    status = str(stall.get("status", "unknown"))
+    blocked_runs = _safe_int(stall.get("consecutive_blocked_runs"))
+    min_runs = _safe_int(stall.get("minimum_blocked_runs"), PRICE_READINESS_STALLED_MIN_RUNS)
+    if blocked_runs <= 0:
+        return ""
+
+    parts = [status, f"连续{blocked_runs}/{min_runs}轮daily_prices为0且补齐阻塞"]
+    next_ticker = str(stall.get("next_ticker", "") or "")
+    if next_ticker:
+        same_next = _safe_int(stall.get("same_next_ticker_runs"))
+        repeat_text = f"，同一下一步ticker连续{same_next}轮" if same_next > 1 else ""
+        parts.append(f"下一步ticker={next_ticker}{repeat_text}")
+    first_run = str(stall.get("first_blocked_run", "") or "")
+    latest_run = str(stall.get("latest_blocked_run", "") or "")
+    if first_run and latest_run:
+        parts.append(f"阻塞run={first_run}..{latest_run}")
+    next_action = str(stall.get("next_action", "") or "")
+    if next_action:
+        parts.append(next_action)
+    return "；".join(parts)
+
+
+def price_readiness_stall_position_cap(context: HeuristicRiskContext) -> float | None:
+    """Return an extra-small cap when daily_prices readiness is repeatedly stuck."""
+    stall = context.price_readiness_stall or {}
+    if not isinstance(stall, dict):
+        return None
+    if str(stall.get("status", "")) != "stalled_no_daily_prices":
+        return None
+    return context.max_position * PRICE_READINESS_STALLED_POSITION_SCALE
 
 
 def format_evaluator_health_note(context: HeuristicRiskContext) -> str:
@@ -669,6 +826,11 @@ def load_latest_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskC
     price_coverage = _read_json(run_dir / "price_coverage.json") or project_context.get("price_coverage", {})
     tape_update = _read_json(run_dir / "tape_update.json") or project_context.get("tape_update", {})
     price_readiness = _read_json(run_dir / "price_readiness.json") or project_context.get("price_readiness", {})
+    price_readiness_stall = (
+        _read_json(run_dir / "price_readiness_stall.json")
+        or project_context.get("price_readiness_stall", {})
+        or build_price_readiness_stall_report()
+    )
     evaluator_health = _read_json(run_dir / "evaluator_health.json") or project_context.get("evaluator_health", {})
     if evaluation_warning:
         warning += f"；评估引擎提示: {evaluation_warning}"
@@ -745,6 +907,23 @@ def load_latest_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskC
         readiness_note = format_price_readiness_note(readiness_context)
         if readiness_note:
             warning += f"；daily_prices补齐状态: {readiness_note}"
+    if isinstance(price_readiness_stall, dict) and price_readiness_stall:
+        stall_context = HeuristicRiskContext(
+            run_dir=run_dir,
+            policy_name=policy_name,
+            score=None,
+            max_position=max_position,
+            overfit_risk=overfit_risk,
+            warning="",
+            failure_cases=[],
+            price_readiness_stall=price_readiness_stall,
+        )
+        stall_note = format_price_readiness_stall_note(stall_context)
+        stall_cap = price_readiness_stall_position_cap(stall_context)
+        if stall_note:
+            warning += f"；daily_prices连续阻塞: {stall_note}"
+            if stall_cap is not None:
+                warning += f"，模拟买入上限降至{stall_cap:.2%}"
     if min_signal_count > 1:
         warning += f"；latest policy要求至少{min_signal_count}条本地同日预测观察，单条孤证不得扩仓"
     return HeuristicRiskContext(
@@ -770,6 +949,7 @@ def load_latest_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskC
         price_coverage=price_coverage if isinstance(price_coverage, dict) else {},
         tape_update=tape_update if isinstance(tape_update, dict) else {},
         price_readiness=price_readiness if isinstance(price_readiness, dict) else {},
+        price_readiness_stall=price_readiness_stall if isinstance(price_readiness_stall, dict) else {},
         evaluation_engine=evaluation_engine,
         evaluation_warning=evaluation_warning,
         evaluator_health=evaluator_health if isinstance(evaluator_health, dict) else {},
@@ -800,6 +980,9 @@ def apply_heuristic_risk_cap(
     readiness_cap = price_readiness_position_cap(ctx, ticker)
     if readiness_cap is not None:
         capped = min(capped, readiness_cap)
+    readiness_stall_cap = price_readiness_stall_position_cap(ctx)
+    if readiness_stall_cap is not None:
+        capped = min(capped, readiness_stall_cap)
     tape_update_cap = thin_tape_update_position_cap(ctx)
     if tape_update_cap is not None:
         capped = min(capped, tape_update_cap)
@@ -824,6 +1007,7 @@ def apply_heuristic_risk_cap(
         normalized = normalize_ticker(ticker)
         coverage_note = format_price_coverage_note(ctx)
         readiness_note = format_price_readiness_note(ctx)
+        readiness_stall_note = format_price_readiness_stall_note(ctx)
         tape_note = format_tape_update_note(ctx)
         if normalized in simulation_memory:
             reason += "；该标的在模拟账户近期已实现亏损风险记忆中"
@@ -845,6 +1029,10 @@ def apply_heuristic_risk_cap(
             reason += f"；daily_prices补齐{readiness_note}"
             if readiness_cap is not None:
                 reason += f"，补齐前模拟买入上限{readiness_cap:.1%}"
+        if readiness_stall_note:
+            reason += f"；daily_prices连续阻塞{readiness_stall_note}"
+            if readiness_stall_cap is not None:
+                reason += f"，数据补齐未推进仓位上限{readiness_stall_cap:.2%}"
         if tape_note:
             reason += f"；本地tape验证{tape_note}"
             if tape_update_cap is not None:
@@ -885,6 +1073,15 @@ def apply_heuristic_risk_cap(
             )
         else:
             risk_notes.append(f"daily_prices补齐{readiness_note}，仅作本地数据质量约束")
+    readiness_stall_note = format_price_readiness_stall_note(ctx)
+    if readiness_stall_note:
+        if readiness_stall_cap is not None:
+            risk_notes.append(
+                f"daily_prices连续阻塞{readiness_stall_note}，"
+                f"数据补齐未推进仓位上限{readiness_stall_cap:.2%}，停止新增leaderboard分支"
+            )
+        else:
+            risk_notes.append(f"daily_prices连续阻塞{readiness_stall_note}，优先补齐本地价格")
     if signal_count_cap is not None:
         observed = 0 if signal_count is None else signal_count
         risk_notes.append(
@@ -1056,6 +1253,18 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
         readiness_cap = price_readiness_position_cap(ctx)
         cap_text = f"；daily_prices阻塞模拟买入上限={readiness_cap:.1%}" if readiness_cap is not None else ""
         lines.append(f"- daily_prices补齐: {readiness_note}{cap_text}；这是本地数据质量任务，不得当作市场事实。")
+    readiness_stall_note = format_price_readiness_stall_note(ctx)
+    if readiness_stall_note:
+        readiness_stall_cap = price_readiness_stall_position_cap(ctx)
+        cap_text = (
+            f"；连续阻塞模拟买入上限={readiness_stall_cap:.2%}"
+            if readiness_stall_cap is not None
+            else ""
+        )
+        lines.append(
+            f"- daily_prices连续阻塞: {readiness_stall_note}{cap_text}；"
+            "本轮不得新增leaderboard分支或扩大模拟仓位。"
+        )
     readiness_queue = format_price_readiness_backfill_queue(ctx)
     if readiness_queue:
         lines.append(f"- daily_prices优先补齐队列: {readiness_queue}；先补这些本地价格再评估是否放松弱覆盖/薄tape仓位。")
@@ -1136,6 +1345,12 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
     readiness_cap = price_readiness_position_cap(ctx)
     if readiness_cap is not None:
         lines.append(f"   daily_prices阻塞模拟买入上限: {readiness_cap:.1%}")
+    readiness_stall_note = format_price_readiness_stall_note(ctx)
+    if readiness_stall_note:
+        lines.append(f"   daily_prices连续阻塞: {readiness_stall_note}")
+    readiness_stall_cap = price_readiness_stall_position_cap(ctx)
+    if readiness_stall_cap is not None:
+        lines.append(f"   daily_prices连续阻塞模拟买入上限: {readiness_stall_cap:.2%}")
     sleeve_text = format_sleeve_diagnostics(ctx)
     if sleeve_text:
         lines.append(f"   {sleeve_text}")
@@ -1195,6 +1410,9 @@ def format_policy_checklist(context: HeuristicRiskContext) -> str:
     readiness_cap = price_readiness_position_cap(context)
     if readiness_cap is not None:
         gates.append(f"daily_prices阻塞仓位<={readiness_cap:.1%}")
+    readiness_stall_cap = price_readiness_stall_position_cap(context)
+    if readiness_stall_cap is not None:
+        gates.append(f"daily_prices连续阻塞仓位<={readiness_stall_cap:.2%}")
 
     if not gates:
         return ""

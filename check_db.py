@@ -121,6 +121,11 @@ def safe_input(prompt: str) -> str | None:
         return None
 
 
+def format_position_pct(value: float) -> str:
+    """Keep tiny observation caps readable without changing normal cap formatting."""
+    return f"{value:.2%}" if abs(value) < 0.005 else f"{value:.1%}"
+
+
 def daily_price_backfill_progress(
     conn: sqlite3.Connection,
     context: Any = None,
@@ -129,8 +134,10 @@ def daily_price_backfill_progress(
     """Compare the latest heuristic backfill queue with live local daily_prices rows."""
     try:
         from sovereign_hall.services.heuristic_policy import (
+            format_price_readiness_stall_note,
             load_latest_heuristic_context,
             price_readiness_position_cap,
+            price_readiness_stall_position_cap,
             thin_tape_update_position_cap,
             weak_price_coverage_position_cap,
         )
@@ -188,6 +195,7 @@ def daily_price_backfill_progress(
     missing = [ticker for ticker in queue if priced.get(ticker, {}).get("row_count", 0) <= 0]
     cap_candidates = [
         price_readiness_position_cap(ctx),
+        price_readiness_stall_position_cap(ctx),
         weak_price_coverage_position_cap(ctx),
         thin_tape_update_position_cap(ctx),
     ]
@@ -202,6 +210,7 @@ def daily_price_backfill_progress(
         "next_ticker": missing[0] if missing else None,
         "daily_prices_rows": total_rows,
         "active_cap": min(active_caps) if active_caps else None,
+        "stall_note": format_price_readiness_stall_note(ctx),
     }
 
 
@@ -231,9 +240,12 @@ def format_daily_price_backfill_progress(
         lines.append(f"   下一步本地补齐: {progress['next_ticker']}")
     else:
         lines.append("   下一步本地补齐: 优先队列已覆盖，需重新运行 heuristic cycle 验证")
+    if progress.get("stall_note"):
+        lines.append(f"   连续阻塞: {progress['stall_note']}")
     if progress.get("active_cap") is not None:
         lines.append(
-            f"   系统动作: 补齐并重新评估前，模拟买入上限维持 <= {progress['active_cap']:.1%}，不得扩仓"
+            "   系统动作: 补齐并重新评估前，模拟买入上限维持 <= "
+            f"{format_position_pct(progress['active_cap'])}，不得扩仓"
         )
     else:
         lines.append("   系统动作: 仅作为本地数据质量提示，不触发扩仓")

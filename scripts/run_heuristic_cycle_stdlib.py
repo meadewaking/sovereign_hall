@@ -1202,6 +1202,7 @@ def write_readme(
     sleeve_diagnostics: dict[str, Any],
     price_coverage: dict[str, Any],
     price_readiness: dict[str, Any],
+    price_readiness_stall: dict[str, Any],
     tape_update: dict[str, Any],
     command: str,
 ) -> None:
@@ -1217,6 +1218,10 @@ def write_readme(
         )
     zero_new = safe_float(tape_update.get("new_prediction_rows_since_previous"), 0.0) <= 0
     missing_queue = format_missing_price_queue(price_readiness)
+    stall_blocked_runs = int(price_readiness_stall.get("consecutive_blocked_runs", 0) or 0)
+    stall_min_runs = int(price_readiness_stall.get("minimum_blocked_runs", 3) or 3)
+    best_cap = safe_float(next((trial.get("config", {}).get("max_position") for trial in trials if trial["trial_name"] == best_name), 0.0))
+    stall_cap = best_cap * 0.05 if price_readiness_stall.get("status") == "stalled_no_daily_prices" else None
     text = f"""# Heuristic Learning Cycle
 
 ## Run
@@ -1234,6 +1239,7 @@ def write_readme(
 - Advanced the prior fresh-tape direction by checking whether this run has meaningful new local predictions before treating the retained policy as validation for widening.
 - Kept weak price coverage and failed ETF sleeve checks as real simulated-investment caps/warnings rather than return-seeking allocators.
 - Converted blocked `daily_prices` readiness into a simulated-buy cap, so missing independent local prices constrain entries instead of only appearing in reports.
+- Advanced the data-quality closure by measuring consecutive `blocked_no_daily_prices` cycles; repeated empty daily_prices now appears as a stalled backfill task and stricter simulated-buy cap, not a new leaderboard branch.
 - Wrote `project_context.json` with `evaluation_engine=stdlib_fallback` so user entry points can surface evaluator reliability.
 
 ## Best Metrics
@@ -1276,6 +1282,13 @@ def write_readme(
 - Priority backfill queue: {missing_queue or 'none'}
 - Integration decision: do not synthesize `daily_prices` from prediction current_price; surface this as a local backfill checklist in user entries and keep exposure caps active.
 
+## Persistent Data-Quality Stall
+- Status: {price_readiness_stall.get('status', 'unknown')}
+- Consecutive blocked runs: {stall_blocked_runs}/{stall_min_runs}; blocked run ids: {', '.join(price_readiness_stall.get('blocked_run_ids', [])[-6:]) or 'none'}
+- Next ticker: {price_readiness_stall.get('next_ticker', 'none') or 'none'}; same-next-ticker runs={price_readiness_stall.get('same_next_ticker_runs', 0)}
+- Rule: {price_readiness_stall.get('rule', 'Do not widen exposure while local daily_prices are repeatedly blocked.')}
+- Integration decision: repeated empty daily_prices is treated as a user-entry warning and {"a stricter simulated-buy cap of " + format(stall_cap, ".2%") if stall_cap is not None else "the existing no-expansion data-quality gate"}; do not add new leaderboard branches until local price validation moves.
+
 ## Tape Update Check
 - Status: {tape_update.get('validation_status', 'unknown')}
 - Prediction rows: current={tape_update.get('current_prediction_rows', 0)}, previous={tape_update.get('previous_prediction_rows', 'unknown')}, new_since_previous={tape_update.get('new_prediction_rows_since_previous', 'unknown')}
@@ -1294,6 +1307,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved entry: `python -m sovereign_hall.check_db` now reads this run and can show that the evaluator used `stdlib_fallback` due local scientific-stack import failure.
 - User-visible change: latest heuristic status/research prompts include evaluation-engine reliability, weak price coverage, tape freshness, sleeve diagnostics, and current simulated-buy caps.
 - User-visible change: latest heuristic status/research prompts now include a daily_prices backfill readiness checklist and prioritized missing-price queue, not only the latest missing ticker.
+- User-visible change: latest heuristic status/research prompts now include consecutive empty-daily_prices cycles and the stalled-backfill next ticker; simulated buys receive an extra-small cap after repeated blockage.
 - Simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` continue to apply single-name, gross, weak-price, daily_prices-readiness, thin/zero-new-tape, ETF-sleeve, failure-memory, and observation-count caps through `services/heuristic_policy.py`.
 - Not integrated as an exposure-increasing default: price coverage remains weak and tape validation is not meaningful enough to widen exposure.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers, then rerun the cycle before relaxing weak-price caps.
@@ -1306,7 +1320,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## Next 3 Directions
 - Keep validating the standard-library fallback against the primary evaluator before trusting score deltas for promotion.
 - Wait for at least 20 new prediction rows and 5 latest-day rows before treating `anomaly12`/max3/min3 diagnostics as validation.
-- Replace prediction-current-price fallback with validated local daily prices; start with the priority queue in `price_readiness.json` before relaxing weak-price or thin-tape caps.
+- Replace prediction-current-price fallback with validated local daily prices; if it is still empty next run, continue local backfill tooling/status work and do not add return-seeking leaderboard branches.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -1319,6 +1333,8 @@ def main() -> int:
     args = parser.parse_args()
 
     project_root = Path.cwd()
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
     db_path = (project_root / args.db).resolve()
     runs_root = (project_root / args.runs_root).resolve()
     run_started = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1409,6 +1425,13 @@ def main() -> int:
     sleeve_diagnostics = build_sleeve_diagnostics(daily, policies, results, costs)
     price_coverage = build_price_coverage_report(daily, price_history, best_result)
     price_readiness = build_price_readiness_report(daily, price_history)
+    from services.heuristic_policy import build_price_readiness_stall_report
+
+    price_readiness_stall = build_price_readiness_stall_report(
+        runs_root,
+        pending_run_dir=run_dir,
+        pending_price_readiness=price_readiness,
+    )
     failures = analyze_failures(best_result, daily, best_policy)
     source_counts = price_coverage.get("daily_signal_price_source_counts", {})
     price_source = (
@@ -1425,6 +1448,7 @@ def main() -> int:
         "price_source": price_source,
         "price_coverage": price_coverage,
         "price_readiness": price_readiness,
+        "price_readiness_stall": price_readiness_stall,
         "tape_update": tape_update,
         "previous_run": str(previous_run) if previous_run else None,
     }
@@ -1439,6 +1463,7 @@ def main() -> int:
     write_json(run_dir / "sleeve_diagnostics.json", sleeve_diagnostics)
     write_json(run_dir / "price_coverage.json", price_coverage)
     write_json(run_dir / "price_readiness.json", price_readiness)
+    write_json(run_dir / "price_readiness_stall.json", price_readiness_stall)
     write_json(run_dir / "tape_update.json", tape_update)
     write_jsonl(run_dir / "trials.jsonl", trials)
     write_jsonl(run_dir / "failure_cases.jsonl", failures)
@@ -1474,6 +1499,7 @@ def main() -> int:
         sleeve_diagnostics,
         price_coverage,
         price_readiness,
+        price_readiness_stall,
         tape_update,
         f"/usr/bin/python3 scripts/run_heuristic_cycle_stdlib.py --db {args.db}",
     )
