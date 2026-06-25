@@ -193,6 +193,13 @@ def daily_price_backfill_progress(
             }
 
     missing = [ticker for ticker in queue if priced.get(ticker, {}).get("row_count", 0) <= 0]
+    plan = readiness.get("backfill_plan") if isinstance(readiness, dict) else {}
+    plan_path = str(readiness.get("backfill_plan_path", "") or "") if isinstance(readiness, dict) else ""
+    top_plan = []
+    if isinstance(plan, dict):
+        raw_top = plan.get("top_priority_tickers", [])
+        if isinstance(raw_top, list):
+            top_plan = [normalize_ticker(str(ticker)) for ticker in raw_top if ticker]
     cap_candidates = [
         price_readiness_position_cap(ctx),
         price_readiness_stall_position_cap(ctx),
@@ -209,6 +216,8 @@ def daily_price_backfill_progress(
         "priced": priced,
         "next_ticker": missing[0] if missing else None,
         "daily_prices_rows": total_rows,
+        "backfill_plan_path": plan_path,
+        "backfill_plan_top": top_plan,
         "active_cap": min(active_caps) if active_caps else None,
         "stall_note": format_price_readiness_stall_note(ctx),
     }
@@ -240,6 +249,10 @@ def format_daily_price_backfill_progress(
         lines.append(f"   下一步本地补齐: {progress['next_ticker']}")
     else:
         lines.append("   下一步本地补齐: 优先队列已覆盖，需重新运行 heuristic cycle 验证")
+    if progress.get("backfill_plan_path"):
+        lines.append(f"   机器可读补齐计划: {progress['backfill_plan_path']}")
+    if progress.get("backfill_plan_top"):
+        lines.append(f"   计划优先级Top: {', '.join(progress['backfill_plan_top'][:5])}")
     if progress.get("stall_note"):
         lines.append(f"   连续阻塞: {progress['stall_note']}")
     if progress.get("active_cap") is not None:

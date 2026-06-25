@@ -21,6 +21,7 @@ from sovereign_hall.services.heuristic_policy import (
     failure_ticker_constraints,
     format_heuristic_prompt_context,
     format_heuristic_status,
+    format_price_readiness_backfill_plan,
     format_price_readiness_backfill_queue,
     format_price_readiness_stall_note,
     format_policy_checklist,
@@ -131,6 +132,12 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
                 {"ticker": "600519", "signal_days": 45},
                 {"ticker": "512880", "signal_days": 44},
             ],
+            "backfill_plan_path": str(tmp_path / "daily_price_backfill_plan.csv"),
+            "backfill_plan": {
+                "total_missing_tickers": 2,
+                "minimum_next_rows": 1,
+                "top_priority_tickers": ["600519", "512880"],
+            },
         },
     )
 
@@ -140,6 +147,8 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     assert "优先队列覆盖: 0/2 tickers" in text
     assert "优先队列: 600519, 512880" in text
     assert "下一步本地补齐: 600519" in text
+    assert f"机器可读补齐计划: {tmp_path / 'daily_price_backfill_plan.csv'}" in text
+    assert "计划优先级Top: 600519, 512880" in text
     assert "模拟买入上限维持 <= 0.5%" in text
     assert "不得扩仓" in text
 
@@ -774,6 +783,12 @@ def test_heuristic_context_surfaces_price_readiness(tmp_path):
                     "total_signal_observations": 1197,
                 },
             ],
+            "backfill_plan_path": str(tmp_path / "daily_price_backfill_plan.csv"),
+            "backfill_plan": {
+                "total_missing_tickers": 12,
+                "minimum_next_rows": 2,
+                "top_priority_tickers": ["600519", "512880"],
+            },
             "next_action": "Backfill latest local daily_prices first.",
         },
     )
@@ -781,16 +796,22 @@ def test_heuristic_context_surfaces_price_readiness(tmp_path):
     status = format_heuristic_status(context)
     prompt = format_heuristic_prompt_context(context)
     queue = format_price_readiness_backfill_queue(context)
+    plan = format_price_readiness_backfill_plan(context)
 
     assert "daily_prices补齐: blocked_no_daily_prices" in status
     assert "daily_prices阻塞模拟买入上限: 0.5%" in status
     assert "daily_prices优先补齐队列: 600519(45d, 1585obs, last=2026-06-20)" in status
+    assert "daily_prices补齐计划: plan=" in status
+    assert "top=600519, 512880" in status
     assert "缺少12/12个signal ticker" in status
     assert "最新缺价ticker=600519, 688256" in prompt
     assert "daily_prices优先补齐队列: 600519(45d, 1585obs, last=2026-06-20)" in prompt
+    assert "daily_prices补齐计划: plan=" in prompt
     assert "daily_prices阻塞模拟买入上限=0.5%" in prompt
     assert "本地数据质量任务" in prompt
     assert queue.startswith("600519(45d, 1585obs, last=2026-06-20), 512880")
+    assert "missing_tickers=12" in plan
+    assert "latest_rows_to_unblock=2" in plan
 
 
 def test_heuristic_risk_cap_tightens_blocked_price_readiness(tmp_path):

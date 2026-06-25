@@ -351,6 +351,40 @@ def format_price_readiness_backfill_queue(
     return ", ".join(parts)
 
 
+def format_price_readiness_backfill_plan(context: HeuristicRiskContext) -> str:
+    """Return the latest machine-readable local daily_prices backfill plan."""
+    readiness = context.price_readiness or {}
+    if not isinstance(readiness, dict):
+        return ""
+
+    plan = readiness.get("backfill_plan")
+    plan_path = str(readiness.get("backfill_plan_path", "") or "")
+    if not isinstance(plan, dict) and not plan_path:
+        return ""
+
+    top = []
+    if isinstance(plan, dict):
+        raw_top = plan.get("top_priority_tickers", [])
+        if isinstance(raw_top, list):
+            top = [normalize_ticker(str(ticker)) for ticker in raw_top if ticker]
+        total = _safe_int(plan.get("total_missing_tickers"))
+        min_rows = _safe_int(plan.get("minimum_next_rows"))
+    else:
+        total = 0
+        min_rows = 0
+
+    details = []
+    if plan_path:
+        details.append(f"plan={plan_path}")
+    if top:
+        details.append(f"top={', '.join(top[:5])}")
+    if total:
+        details.append(f"missing_tickers={total}")
+    if min_rows:
+        details.append(f"latest_rows_to_unblock={min_rows}")
+    return "；".join(details)
+
+
 def price_readiness_missing_tickers(context: HeuristicRiskContext) -> set[str]:
     """Return tickers that still need independent local daily_prices rows."""
     readiness = context.price_readiness or {}
@@ -1268,6 +1302,9 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
     readiness_queue = format_price_readiness_backfill_queue(ctx)
     if readiness_queue:
         lines.append(f"- daily_prices优先补齐队列: {readiness_queue}；先补这些本地价格再评估是否放松弱覆盖/薄tape仓位。")
+    readiness_plan = format_price_readiness_backfill_plan(ctx)
+    if readiness_plan:
+        lines.append(f"- daily_prices补齐计划: {readiness_plan}；先完成本地计划再新增收益型规则。")
     if ctx.out_of_sample_score is not None or ctx.cost_stress_score is not None:
         oos = "N/A" if ctx.out_of_sample_score is None else f"{ctx.out_of_sample_score:.6f}"
         stress = "N/A" if ctx.cost_stress_score is None else f"{ctx.cost_stress_score:.6f}"
@@ -1342,6 +1379,9 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
     readiness_queue = format_price_readiness_backfill_queue(ctx)
     if readiness_queue:
         lines.append(f"   daily_prices优先补齐队列: {readiness_queue}")
+    readiness_plan = format_price_readiness_backfill_plan(ctx)
+    if readiness_plan:
+        lines.append(f"   daily_prices补齐计划: {readiness_plan}")
     readiness_cap = price_readiness_position_cap(ctx)
     if readiness_cap is not None:
         lines.append(f"   daily_prices阻塞模拟买入上限: {readiness_cap:.1%}")

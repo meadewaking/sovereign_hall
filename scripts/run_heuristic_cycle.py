@@ -1252,6 +1252,109 @@ def build_price_readiness_report(
     }
 
 
+def build_daily_price_backfill_plan(
+    daily: pd.DataFrame,
+    price_history: pd.DataFrame,
+    run_dir: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Write an actionable local daily_prices backfill plan for user entries."""
+    if daily.empty:
+        return [], {
+            "status": "no_signal_tickers",
+            "plan_csv": str(run_dir / "daily_price_backfill_plan.csv"),
+            "total_missing_tickers": 0,
+            "latest_signal_date": "",
+            "latest_missing_tickers": [],
+            "minimum_next_rows": 0,
+            "top_priority_tickers": [],
+            "rule": "No local signal tickers are available for daily_prices planning.",
+        }
+
+    frame = daily.copy()
+    frame["ticker"] = frame["ticker"].map(normalize_ticker)
+    frame["date"] = frame["date"].astype(str)
+    latest_signal_date = str(frame["date"].max())
+    priced_keys: set[tuple[str, str]] = set()
+    if not price_history.empty and {"ticker", "date"}.issubset(price_history.columns):
+        priced = price_history.copy()
+        priced["ticker"] = priced["ticker"].map(normalize_ticker)
+        priced["date"] = priced["date"].astype(str)
+        priced_keys = set(zip(priced["date"], priced["ticker"], strict=False))
+
+    missing_rows = frame[
+        ~frame.apply(lambda row: (str(row["date"]), normalize_ticker(row["ticker"])) in priced_keys, axis=1)
+    ].copy()
+    if missing_rows.empty:
+        return [], {
+            "status": "ready_validated_daily_prices",
+            "plan_csv": str(run_dir / "daily_price_backfill_plan.csv"),
+            "total_missing_tickers": 0,
+            "latest_signal_date": latest_signal_date,
+            "latest_missing_tickers": [],
+            "minimum_next_rows": 0,
+            "top_priority_tickers": [],
+            "rule": "All local signal ticker/date rows have daily_prices coverage.",
+        }
+
+    grouped = (
+        missing_rows.groupby("ticker", as_index=False)
+        .agg(
+            missing_signal_days=("date", "nunique"),
+            first_missing_signal_date=("date", "min"),
+            last_missing_signal_date=("date", "max"),
+            total_signal_observations=("close_observations", "sum"),
+        )
+        .sort_values(
+            ["missing_signal_days", "last_missing_signal_date", "total_signal_observations"],
+            ascending=[False, False, False],
+        )
+    )
+    latest_missing = sorted(
+        missing_rows.loc[missing_rows["date"].eq(latest_signal_date), "ticker"].dropna().unique()
+    )
+    rows: list[dict[str, Any]] = []
+    for rank, row in enumerate(grouped.to_dict("records"), start=1):
+        ticker = normalize_ticker(row["ticker"])
+        rows.append(
+            {
+                "priority_rank": rank,
+                "ticker": ticker,
+                "missing_signal_days": int(row["missing_signal_days"]),
+                "first_missing_signal_date": row["first_missing_signal_date"],
+                "last_missing_signal_date": row["last_missing_signal_date"],
+                "total_signal_observations": int(row["total_signal_observations"]),
+                "latest_signal_date": latest_signal_date,
+                "missing_latest_signal_date": ticker in latest_missing,
+                "minimum_rows_to_unblock_latest": 1 if ticker in latest_missing else 0,
+                "plan_action": (
+                    "backfill this ticker's latest local daily_prices row first"
+                    if ticker in latest_missing
+                    else "backfill historical local daily_prices before using scores to widen exposure"
+                ),
+            }
+        )
+
+    summary = {
+        "status": "backfill_plan_ready",
+        "plan_csv": str(run_dir / "daily_price_backfill_plan.csv"),
+        "plan_json": str(run_dir / "daily_price_backfill_plan.json"),
+        "total_missing_tickers": len(rows),
+        "latest_signal_date": latest_signal_date,
+        "latest_missing_tickers": latest_missing,
+        "minimum_next_rows": len(latest_missing),
+        "top_priority_tickers": [row["ticker"] for row in rows[:5]],
+        "rule": (
+            "Use only independently validated local OHLC rows; do not synthesize daily_prices "
+            "from prediction current_price."
+        ),
+        "next_action": (
+            "Fill the latest missing ticker/date rows in this plan, rerun the heuristic cycle, "
+            "then check whether weak-price and stale-tape caps can be relaxed."
+        ),
+    }
+    return rows, summary
+
+
 def format_missing_price_queue(price_readiness: dict[str, Any], limit: int = 5) -> str:
     rows = price_readiness.get("missing_tickers_top10", [])
     if not isinstance(rows, list):
@@ -1400,6 +1503,14 @@ def write_readme(
     latest_missing = price_readiness.get("latest_missing_tickers", [])
     latest_missing_text = ", ".join(str(ticker) for ticker in latest_missing[:8]) if isinstance(latest_missing, list) else ""
     missing_queue = format_missing_price_queue(price_readiness)
+    backfill_plan = price_readiness.get("backfill_plan", {}) if isinstance(price_readiness, dict) else {}
+    backfill_plan_path = str(price_readiness.get("backfill_plan_path", "") or "") if isinstance(price_readiness, dict) else ""
+    if isinstance(backfill_plan, dict):
+        top_plan = ", ".join(str(ticker) for ticker in backfill_plan.get("top_priority_tickers", [])[:5])
+        plan_total = backfill_plan.get("total_missing_tickers", 0)
+    else:
+        top_plan = ""
+        plan_total = 0
     price_readiness_text = (
         f"- Status: {price_readiness.get('status', 'unknown')}\n"
         f"- Signal tickers with local daily_prices: {price_readiness.get('priced_signal_ticker_count', 0)}/"
@@ -1409,6 +1520,8 @@ def write_readme(
         f"latest missing tickers: {latest_missing_text or 'none'}; "
         f"minimum next rows={price_readiness.get('minimum_next_rows', 0)}\n"
         f"- Priority backfill queue: {missing_queue or 'none'}\n"
+        f"- Machine-readable backfill plan: `{backfill_plan_path or 'not written'}`; "
+        f"plan tickers={plan_total}; top priority={top_plan or 'none'}\n"
         "- Integration decision: do not synthesize `daily_prices` from prediction current_price; "
         "surface this as a local backfill checklist in user entries and keep exposure caps active."
     )
@@ -1556,6 +1669,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved price-coverage closure: `check_db`, research prompt context, and simulated trade reasons now surface the latest `price_coverage.json` ratios, including held-position missing-price slots.
 - Improved daily-price-readiness closure: `check_db`, research prompt context, and manual research reports now surface `price_readiness.json`, including the prioritized missing-price queue.
 - Improved live daily-price-readiness closure: `check_db` now validates that priority queue against the current SQLite `daily_prices` table and prints covered/missing queue tickers, the next local backfill target, and the active no-expansion cap before the user starts simulation.
+- Improved daily-price backfill closure: this run writes `daily_price_backfill_plan.csv` and `daily_price_backfill_plan.json`; user entries surface the plan path and top priority ticker so repeated empty `daily_prices` runs have a concrete local next step.
 - Improved daily-price-readiness simulation closure: blocked independent `daily_prices` readiness now applies a simulated-buy cap through `services/heuristic_policy.py`, so missing local prices constrain entries rather than only appearing in reports.
 - Improved stalled-readiness closure: `check_db`, research prompt context, and simulated trade reasons now show consecutive empty-daily_prices cycles; after repeated blockage, simulated buys use an extra-small observation cap and the cycle explicitly avoids new leaderboard branches.
 - Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals by coverage quality; with zero independent daily_prices rows the user-entry cap is one-quarter of the latest policy cap rather than a fixed half-cap.
@@ -1573,6 +1687,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
 - Still not integrated as validation for exposure widening: `tape_update.json` does not meet the minimum fresh-row/latest-day observation thresholds when marked as thin or stale.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers shown by `check_db`, then validate whether the evidence-gated cap, observation-count cap, and ETF-sleeve caps reduce churn/drawdown over another tape update before widening exposure.
+- This cycle's minimum local step: use `{backfill_plan_path or 'daily_price_backfill_plan.csv'}` and fill the first missing latest-date row before adding any new return-seeking heuristic branch.
 
 ## Reproduce
 ```bash
@@ -2260,6 +2375,12 @@ def main() -> int:
     price_coverage = build_price_coverage_report(daily, price_history, best_result)
     write_json(run_dir / "price_coverage.json", price_coverage)
     price_readiness = build_price_readiness_report(daily, price_history)
+    backfill_plan_rows, backfill_plan_summary = build_daily_price_backfill_plan(daily, price_history, run_dir)
+    pd.DataFrame(backfill_plan_rows).to_csv(run_dir / "daily_price_backfill_plan.csv", index=False)
+    write_json(run_dir / "daily_price_backfill_plan.json", backfill_plan_summary)
+    price_readiness["backfill_plan"] = backfill_plan_summary
+    price_readiness["backfill_plan_path"] = backfill_plan_summary.get("plan_csv", "")
+    price_readiness["backfill_plan_summary_path"] = backfill_plan_summary.get("plan_json", "")
     write_json(run_dir / "price_readiness.json", price_readiness)
     from services.heuristic_policy import build_price_readiness_stall_report
 
@@ -2309,6 +2430,7 @@ def main() -> int:
         "price_coverage": price_coverage,
         "price_readiness": price_readiness,
         "price_readiness_stall": price_readiness_stall,
+        "daily_price_backfill_plan": backfill_plan_summary,
     }
     write_json(run_dir / "project_context.json", code_context)
     write_readme(
