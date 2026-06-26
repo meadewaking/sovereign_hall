@@ -182,6 +182,43 @@ def load_daily_prices(db_path: Path, predictions: list[dict[str, Any]]) -> dict[
     return prices
 
 
+def build_asof_price_history(
+    price_history: dict[tuple[str, str], float],
+) -> dict[str, list[tuple[datetime, float]]]:
+    by_ticker: dict[str, list[tuple[datetime, float]]] = {}
+    for (date_text, ticker), price in price_history.items():
+        parsed = parse_dt(date_text)
+        if parsed is None or price <= 0:
+            continue
+        by_ticker.setdefault(normalize_ticker(ticker), []).append((parsed, price))
+    for rows in by_ticker.values():
+        rows.sort(key=lambda item: item[0])
+    return by_ticker
+
+
+def asof_daily_price(
+    by_ticker: dict[str, list[tuple[datetime, float]]],
+    ticker: str,
+    signal_date: str,
+    max_age_days: int = 7,
+) -> float | None:
+    parsed_signal = parse_dt(signal_date)
+    if parsed_signal is None:
+        return None
+    latest_price: float | None = None
+    latest_date: datetime | None = None
+    for price_date, price in by_ticker.get(normalize_ticker(ticker), []):
+        if price_date > parsed_signal:
+            break
+        latest_date = price_date
+        latest_price = price
+    if latest_date is None or latest_price is None:
+        return None
+    if (parsed_signal.date() - latest_date.date()).days > max_age_days:
+        return None
+    return latest_price
+
+
 def pct_change(values: list[float], idx: int, lookback: int) -> float | None:
     if idx - lookback < 0:
         return None
@@ -198,6 +235,7 @@ def build_daily_tape(
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in predictions:
         grouped.setdefault((row["date"], row["ticker"]), []).append(row)
+    asof_prices = build_asof_price_history(price_history)
 
     daily: list[dict[str, Any]] = []
     for (date, ticker), rows in grouped.items():
@@ -222,7 +260,7 @@ def build_daily_tape(
                     stop_gaps.append((price - stop) / price)
                     target_gaps.append((target - price) / price)
         fallback_price = median(prices) if prices else 0.0
-        independent_price = price_history.get((date, ticker))
+        independent_price = asof_daily_price(asof_prices, ticker, date)
         price = independent_price if independent_price is not None else fallback_price
         daily.append(
             {
@@ -892,6 +930,8 @@ def build_price_coverage_report(
     missing_slot_ratio = missing_slots / position_slots if position_slots else 0.0
     if independent_ratio <= 0.0:
         status = "unvalidated_prediction_current_price_fallback"
+    elif independent_ratio < 0.80:
+        status = "partial_daily_prices_low_signal_coverage"
     elif missing_slot_ratio > 0.10:
         status = "partial_daily_prices_with_missing_hold_prices"
     return {
@@ -951,6 +991,12 @@ def build_price_readiness_report(
     else:
         status = "ready_validated_daily_prices"
 
+    next_action = (
+        "Backfill latest local daily_prices for latest_missing_tickers first, then rerun the cycle and require validated coverage before relaxing caps."
+        if latest_missing
+        else "Latest signal-date prices are covered; continue historical priority backfill before relaxing weak-coverage caps."
+    )
+
     return {
         "status": status,
         "total_signal_ticker_count": len(signal_tickers),
@@ -961,7 +1007,7 @@ def build_price_readiness_report(
         "minimum_next_rows": len(latest_missing),
         "missing_tickers_top10": stats[:10],
         "rule": "Populate local daily_prices with independently validated OHLC rows before treating heuristic score as exposure-widening evidence.",
-        "next_action": "Backfill latest local daily_prices for latest_missing_tickers first, then rerun the cycle and require validated coverage before relaxing caps.",
+        "next_action": next_action,
     }
 
 
@@ -986,14 +1032,15 @@ def build_daily_price_backfill_plan(
             "rule": "No local signal tickers are available for daily_prices planning.",
         }
 
-    priced_keys = {(str(date), normalize_ticker(ticker)) for date, ticker in price_history}
     latest_signal_date = max(str(row.get("date", "")) for row in daily)
     per_ticker: dict[str, dict[str, Any]] = {}
     latest_missing: set[str] = set()
     for row in daily:
         ticker = normalize_ticker(row.get("ticker"))
         date = str(row.get("date", ""))
-        if not ticker or not date or (date, ticker) in priced_keys:
+        if not ticker or not date:
+            continue
+        if row.get("price_source") == "daily_prices":
             continue
         entry = per_ticker.setdefault(
             ticker,

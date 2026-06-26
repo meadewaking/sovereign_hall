@@ -78,8 +78,14 @@ class HeuristicRiskContext:
         if self.price_source_unvalidated:
             return True
         status = str(self.price_coverage.get("status", ""))
-        return status.startswith("unvalidated") or (
-            float(self.price_coverage.get("missing_position_price_slot_ratio", 0.0) or 0.0) > 0.10
+        independent_raw = self.price_coverage.get("independent_price_row_ratio")
+        independent_ratio = float(independent_raw) if independent_raw is not None else 1.0
+        missing_slot_ratio = float(self.price_coverage.get("missing_position_price_slot_ratio", 0.0) or 0.0)
+        return (
+            status.startswith("unvalidated")
+            or status.startswith("partial")
+            or independent_ratio < 0.80
+            or missing_slot_ratio > 0.10
         )
 
     @property
@@ -302,7 +308,11 @@ def format_price_readiness_note(context: HeuristicRiskContext) -> str:
         parts.append(f"缺少{int(missing)}/{int(total)}个signal ticker的daily_prices")
     min_rows = readiness.get("minimum_next_rows")
     if min_rows is not None:
-        parts.append(f"下一步至少补齐{int(min_rows)}行最新本地日线")
+        min_rows_int = int(min_rows)
+        if min_rows_int > 0:
+            parts.append(f"下一步至少补齐{min_rows_int}行最新本地日线")
+        else:
+            parts.append("最新日缺价已清零")
     if latest_text:
         parts.append(f"最新缺价ticker={latest_text}")
     next_action = str(readiness.get("next_action", "") or "")

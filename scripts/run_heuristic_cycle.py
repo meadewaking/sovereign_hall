@@ -223,6 +223,56 @@ def sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return row is not None
 
 
+def attach_asof_daily_prices(
+    daily: pd.DataFrame,
+    price_history: pd.DataFrame,
+    max_age_days: int = 7,
+) -> pd.DataFrame:
+    """Attach the latest local close on or before the signal date.
+
+    Signal rows can be created on weekends or holidays. Requiring an exact
+    daily_prices date would incorrectly mark those rows as missing, while a
+    bounded as-of match still rejects genuinely stale price history.
+    """
+    if daily.empty or price_history.empty:
+        return daily
+
+    prices = price_history[["date", "ticker", "close"]].copy()
+    prices["ticker"] = prices["ticker"].map(normalize_ticker)
+    prices["_price_date"] = pd.to_datetime(prices["date"], errors="coerce")
+    prices["independent_price"] = pd.to_numeric(prices["close"], errors="coerce")
+    prices = prices.dropna(subset=["ticker", "_price_date", "independent_price"])
+    if prices.empty:
+        return daily
+
+    matched_parts: list[pd.DataFrame] = []
+    tolerance = pd.Timedelta(days=max_age_days)
+    working = daily.copy()
+    working["_row_order"] = np.arange(len(working))
+    working["_signal_date"] = pd.to_datetime(working["date"], errors="coerce")
+    for ticker, signal_rows in working.groupby("ticker", sort=False):
+        ticker_prices = prices[prices["ticker"].eq(normalize_ticker(ticker))]
+        if ticker_prices.empty:
+            signal_rows["independent_price"] = np.nan
+            signal_rows["daily_price_date"] = pd.NaT
+            matched_parts.append(signal_rows)
+            continue
+        left = signal_rows.sort_values("_signal_date")
+        right = ticker_prices[["_price_date", "independent_price"]].sort_values("_price_date")
+        matched = pd.merge_asof(
+            left,
+            right,
+            left_on="_signal_date",
+            right_on="_price_date",
+            direction="backward",
+            tolerance=tolerance,
+        ).rename(columns={"_price_date": "daily_price_date"})
+        matched_parts.append(matched)
+
+    matched_daily = pd.concat(matched_parts, ignore_index=True).sort_values("_row_order")
+    return matched_daily.drop(columns=["_row_order", "_signal_date"])
+
+
 def build_daily_tape(predictions: pd.DataFrame, price_history: pd.DataFrame | None = None) -> pd.DataFrame:
     if predictions.empty:
         return predictions
@@ -259,12 +309,7 @@ def build_daily_tape(predictions: pd.DataFrame, price_history: pd.DataFrame | No
     daily["stop_gap"] = daily["stop_gap"].fillna(1.0)
     daily["target_gap"] = daily["target_gap"].fillna(0.0)
     if price_history is not None and not price_history.empty:
-        independent = price_history.rename(columns={"close": "independent_price"})
-        daily = daily.merge(
-            independent[["date", "ticker", "independent_price"]],
-            on=["date", "ticker"],
-            how="left",
-        )
+        daily = attach_asof_daily_prices(daily, price_history)
         daily["price_source"] = np.where(
             daily["independent_price"].notna(),
             "daily_prices",
@@ -1149,6 +1194,8 @@ def build_price_coverage_report(
     status = "validated_daily_prices"
     if independent_ratio <= 0.0:
         status = "unvalidated_prediction_current_price_fallback"
+    elif independent_ratio < 0.80:
+        status = "partial_daily_prices_low_signal_coverage"
     elif missing_slot_ratio > 0.10:
         status = "partial_daily_prices_with_missing_hold_prices"
 
@@ -1232,6 +1279,13 @@ def build_price_readiness_report(
     else:
         status = "ready_validated_daily_prices"
 
+    next_action = (
+        "Backfill latest local daily_prices for latest_missing_tickers first, then "
+        "rerun the cycle and require validated coverage before relaxing caps."
+        if latest_missing
+        else "Latest signal-date prices are covered; continue historical priority backfill before relaxing weak-coverage caps."
+    )
+
     return {
         "status": status,
         "total_signal_ticker_count": len(signal_tickers),
@@ -1245,10 +1299,7 @@ def build_price_readiness_report(
             "Populate local daily_prices with independently validated OHLC rows before "
             "treating heuristic score as exposure-widening evidence."
         ),
-        "next_action": (
-            "Backfill latest local daily_prices for latest_missing_tickers first, then "
-            "rerun the cycle and require validated coverage before relaxing caps."
-        ),
+        "next_action": next_action,
     }
 
 
@@ -1274,16 +1325,18 @@ def build_daily_price_backfill_plan(
     frame["ticker"] = frame["ticker"].map(normalize_ticker)
     frame["date"] = frame["date"].astype(str)
     latest_signal_date = str(frame["date"].max())
-    priced_keys: set[tuple[str, str]] = set()
-    if not price_history.empty and {"ticker", "date"}.issubset(price_history.columns):
-        priced = price_history.copy()
-        priced["ticker"] = priced["ticker"].map(normalize_ticker)
-        priced["date"] = priced["date"].astype(str)
-        priced_keys = set(zip(priced["date"], priced["ticker"], strict=False))
-
-    missing_rows = frame[
-        ~frame.apply(lambda row: (str(row["date"]), normalize_ticker(row["ticker"])) in priced_keys, axis=1)
-    ].copy()
+    if "price_source" in frame.columns:
+        missing_rows = frame[~frame["price_source"].eq("daily_prices")].copy()
+    else:
+        priced_keys: set[tuple[str, str]] = set()
+        if not price_history.empty and {"ticker", "date"}.issubset(price_history.columns):
+            priced = price_history.copy()
+            priced["ticker"] = priced["ticker"].map(normalize_ticker)
+            priced["date"] = priced["date"].astype(str)
+            priced_keys = set(zip(priced["date"], priced["ticker"], strict=False))
+        missing_rows = frame[
+            ~frame.apply(lambda row: (str(row["date"]), normalize_ticker(row["ticker"])) in priced_keys, axis=1)
+        ].copy()
     if missing_rows.empty:
         return [], {
             "status": "ready_validated_daily_prices",

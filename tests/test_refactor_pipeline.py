@@ -1,7 +1,10 @@
 import sqlite3
 import json
 import inspect
+import importlib.util
+import sys
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
@@ -49,6 +52,18 @@ from sovereign_hall.run_discussion import (
 )
 from sovereign_hall.services.persistence import PersistenceManager
 import sovereign_hall.services.persistence as persistence_module
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_script_module(name: str, relative_path: str):
+    spec = importlib.util.spec_from_file_location(name, PROJECT_ROOT / relative_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_entry_imports():
@@ -750,6 +765,87 @@ def test_heuristic_price_coverage_cap_scales_with_partial_coverage(tmp_path):
 
     assert capped == pytest.approx(0.0175)
     assert "弱覆盖模拟买入上限1.7%" in reason
+
+
+def test_pandas_daily_tape_uses_bounded_asof_daily_prices():
+    import pandas as pd
+
+    module = load_script_module("run_heuristic_cycle_test_module", "scripts/run_heuristic_cycle.py")
+
+    predictions = pd.DataFrame(
+        [
+            {
+                "date": "2026-06-20",
+                "ticker": "159995",
+                "current_price": 2.7,
+                "target_price": 3.0,
+                "stop_loss": 2.5,
+                "direction": "long",
+                "confidence": 0.8,
+                "expected_days": 30,
+            },
+            {
+                "date": "2026-06-30",
+                "ticker": "159995",
+                "current_price": 2.8,
+                "target_price": 3.1,
+                "stop_loss": 2.6,
+                "direction": "long",
+                "confidence": 0.8,
+                "expected_days": 30,
+            },
+        ]
+    )
+    price_history = pd.DataFrame(
+        [{"date": "2026-06-18", "ticker": "159995", "close": 2.55}]
+    )
+
+    daily = module.build_daily_tape(predictions, price_history)
+    by_date = daily.set_index("date")
+
+    assert by_date.loc["2026-06-20", "price"] == pytest.approx(2.55)
+    assert by_date.loc["2026-06-20", "price_source"] == "daily_prices"
+    assert str(by_date.loc["2026-06-20", "daily_price_date"])[:10] == "2026-06-18"
+    assert by_date.loc["2026-06-30", "price"] == pytest.approx(2.8)
+    assert by_date.loc["2026-06-30", "price_source"] == "prediction_current_price"
+
+
+def test_stdlib_daily_tape_uses_bounded_asof_daily_prices():
+    module = load_script_module(
+        "run_heuristic_cycle_stdlib_test_module",
+        "scripts/run_heuristic_cycle_stdlib.py",
+    )
+
+    predictions = [
+        {
+            "date": "2026-06-20",
+            "ticker": "159995",
+            "current_price": 2.7,
+            "target_price": 3.0,
+            "stop_loss": 2.5,
+            "direction": "long",
+            "confidence": 0.8,
+            "expected_days": 30,
+        },
+        {
+            "date": "2026-06-30",
+            "ticker": "159995",
+            "current_price": 2.8,
+            "target_price": 3.1,
+            "stop_loss": 2.6,
+            "direction": "long",
+            "confidence": 0.8,
+            "expected_days": 30,
+        },
+    ]
+
+    daily = module.build_daily_tape(predictions, {("2026-06-18", "159995"): 2.55})
+    by_date = {row["date"]: row for row in daily}
+
+    assert by_date["2026-06-20"]["price"] == pytest.approx(2.55)
+    assert by_date["2026-06-20"]["price_source"] == "daily_prices"
+    assert by_date["2026-06-30"]["price"] == pytest.approx(2.8)
+    assert by_date["2026-06-30"]["price_source"] == "prediction_current_price"
 
 
 def test_heuristic_context_surfaces_price_readiness(tmp_path):
