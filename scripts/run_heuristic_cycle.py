@@ -1564,6 +1564,13 @@ def write_readme(
     else:
         top_plan = ""
         plan_total = 0
+    backfill_dry_run_command = "python scripts/backfill_daily_prices.py --dry-run --limit 5"
+    if backfill_plan_path:
+        backfill_dry_run_command += f" --plan {backfill_plan_path}"
+    backfill_import_command = (
+        "python scripts/backfill_daily_prices.py --import-csv "
+        "data/local_daily_prices.csv --source local_csv --dry-run"
+    )
     price_readiness_text = (
         f"- Status: {price_readiness.get('status', 'unknown')}\n"
         f"- Signal tickers with local daily_prices: {price_readiness.get('priced_signal_ticker_count', 0)}/"
@@ -1575,8 +1582,11 @@ def write_readme(
         f"- Priority backfill queue: {missing_queue or 'none'}\n"
         f"- Machine-readable backfill plan: `{backfill_plan_path or 'not written'}`; "
         f"plan tickers={plan_total}; top priority={top_plan or 'none'}\n"
+        f"- Local repair dry run: `{backfill_dry_run_command}`\n"
+        f"- Local CSV import validation: `{backfill_import_command}`\n"
         "- Integration decision: do not synthesize `daily_prices` from prediction current_price; "
-        "surface this as a local backfill checklist in user entries and keep exposure caps active."
+        "surface this as a local backfill checklist and local CSV import path in user entries; "
+        "keep exposure caps active until the cycle validates coverage."
     )
     price_readiness_stall = price_readiness_stall or {}
     stall_blocked_runs = int(price_readiness_stall.get("consecutive_blocked_runs", 0) or 0)
@@ -1648,9 +1658,10 @@ def write_readme(
 - Added `sparse_hold8_cap6_diagnostic` to document why very sparse one-trade policies are not promoted even when their leaderboard score is high.
 - Shared the latest heuristic result through `services/heuristic_policy.py` for entry-point risk display, manual research warnings, simulated-trading position caps, and prompt-level failure-case constraints.
 - Added thin cost-stress signaling to the shared heuristic context so entry points now show OOS/3x-slippage scores and warn when the cost-stress margin is too thin to expand exposure.
-- Closed the price-source risk loop: because `daily_prices` is still empty, `services/heuristic_policy.py` now treats prediction-current-price fallback as an explicit no-expansion warning in status, research prompts, and simulated trade cap reasons.
+- Closed the price-source risk loop: when `daily_prices` coverage is empty or partial, `services/heuristic_policy.py` treats prediction-current-price fallback as an explicit no-expansion warning in status, research prompts, and simulated trade cap reasons.
 - Advanced the prior data-source direction by writing `price_coverage.json`, including price-source counts and missing held-position price slots for the retained path.
 - Converted the latest price-coverage warning into a real simulated-investment constraint: weak or unvalidated local price coverage now applies a coverage-adjusted cap; zero independent daily_prices coverage allows at most one-quarter of the latest policy single-name cap.
+- Added a local-only CSV validation/import path in `scripts/backfill_daily_prices.py` so daily_prices can be repaired from an independently provided local OHLC file without network calls.
 - Advanced the daily_prices closure into `check_db`: the entry now compares the latest priority backfill queue with live local `daily_prices` rows and prints the still-missing next ticker plus the active no-expansion cap.
 - Advanced the prior data-quality closure by measuring consecutive `blocked_no_daily_prices` cycles; when the same local price gap repeats, user entries and simulated-buy reasons treat it as a stalled backfill task instead of another leaderboard signal.
 - Advanced the prior fresh-tape validation direction by writing `tape_update.json`; thin tape updates are surfaced as a user-entry warning and an observational simulated-buy cap instead of being treated as validation for wider exposure.
@@ -1722,6 +1733,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved price-coverage closure: `check_db`, research prompt context, and simulated trade reasons now surface the latest `price_coverage.json` ratios, including held-position missing-price slots.
 - Improved daily-price-readiness closure: `check_db`, research prompt context, and manual research reports now surface `price_readiness.json`, including the prioritized missing-price queue.
 - Improved live daily-price-readiness closure: `check_db` now validates that priority queue against the current SQLite `daily_prices` table and prints covered/missing queue tickers, the next local backfill target, and the active no-expansion cap before the user starts simulation.
+- Improved local backfill repair path: `check_db` now prints a dry-run command for the current backfill plan and a local CSV import validation command; `scripts/backfill_daily_prices.py --import-csv ... --dry-run` validates OHLC rows without network access.
 - Improved daily-price backfill closure: this run writes `daily_price_backfill_plan.csv` and `daily_price_backfill_plan.json`; user entries surface the plan path and top priority ticker so repeated empty `daily_prices` runs have a concrete local next step.
 - Improved daily-price-readiness simulation closure: blocked independent `daily_prices` readiness now applies a simulated-buy cap through `services/heuristic_policy.py`, so missing local prices constrain entries rather than only appearing in reports.
 - Improved stalled-readiness closure: `check_db`, research prompt context, and simulated trade reasons now show consecutive empty-daily_prices cycles; after repeated blockage, simulated buys use an extra-small observation cap and the cycle explicitly avoids new leaderboard branches.
@@ -1736,11 +1748,11 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Still not fully integrated: portfolio sleeve allocator is not promoted because both sleeves did not pass the required primary/OOS/cost-stress checks.
 - Still not integrated as a default: sparse high-score policies are recorded as diagnostic-only when they produce too few closed trades for a defensible rule.
 - Still not integrated as a default: the 3-name/15% gross-cap diagnostic needs another tape update because its score is driven by only two closed trades.
-- Still not integrated as an exposure-increasing default: the current best keeps passing basic robustness checks, but local prices are unvalidated because `daily_prices` remains empty.
+- Still not integrated as an exposure-increasing default: the current best keeps passing basic robustness checks, but local prices remain only partially validated.
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
 - Still not integrated as validation for exposure widening: `tape_update.json` does not meet the minimum fresh-row/latest-day observation thresholds when marked as thin or stale.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers shown by `check_db`, then validate whether the evidence-gated cap, observation-count cap, and ETF-sleeve caps reduce churn/drawdown over another tape update before widening exposure.
-- This cycle's minimum local step: use `{backfill_plan_path or 'daily_price_backfill_plan.csv'}` and fill the first missing latest-date row before adding any new return-seeking heuristic branch.
+- This cycle's minimum local step: use `{backfill_plan_path or 'daily_price_backfill_plan.csv'}` plus `scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv --source local_csv --dry-run` to validate locally supplied OHLC rows before adding any new return-seeking heuristic branch.
 
 ## Reproduce
 ```bash
@@ -1750,7 +1762,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## Next 3 Directions
 - Validate the 6-day evidence-gated reduced-exposure single-stock policy and the live insufficient-observation/薄tape cap only after a meaningful fresh tape update meets the `tape_update.json` thresholds.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
-- Replace prediction-current-price fallback with validated local daily prices; if it is still empty next run, continue local backfill tooling/status work and do not add return-seeking leaderboard branches.
+- Replace prediction-current-price fallback with validated local daily prices by using the local CSV import path; if priority queue coverage is still incomplete next run, continue backfill tooling/status work and do not add return-seeking leaderboard branches.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -1840,6 +1852,7 @@ def main() -> int:
         "run_discussion.py",
         "research_interactive.py",
         "check_db.py",
+        "scripts/backfill_daily_prices.py",
         "tests/test_refactor_pipeline.py",
     ]
     policies = [

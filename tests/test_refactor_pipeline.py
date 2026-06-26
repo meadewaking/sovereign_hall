@@ -164,8 +164,59 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     assert "下一步本地补齐: 600519" in text
     assert f"机器可读补齐计划: {tmp_path / 'daily_price_backfill_plan.csv'}" in text
     assert "计划优先级Top: 600519, 512880" in text
+    assert "本地计划预检: python scripts/backfill_daily_prices.py --dry-run --limit 5 --plan" in text
+    assert "本地CSV导入预检: python scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv" in text
     assert "模拟买入上限维持 <= 0.5%" in text
     assert "不得扩仓" in text
+
+
+def test_backfill_daily_prices_imports_local_csv_without_network(tmp_path):
+    module = load_script_module("backfill_daily_prices_test_module", "scripts/backfill_daily_prices.py")
+    csv_path = tmp_path / "daily_prices.csv"
+    csv_path.write_text(
+        "ticker,date,open,high,low,close,volume\n"
+        "600519,2026-06-20,10,11,9,10.5,1000\n"
+        "512880,2026-06-20,,,,1.234,\n"
+        "BAD,2026-06-20,1,1,1,0,0\n",
+        encoding="utf-8",
+    )
+
+    rows, invalid = module.rows_from_csv(csv_path)
+
+    assert len(rows) == 2
+    assert rows[0][:2] == ("600519", "2026-06-20")
+    assert rows[1][2:6] == (1.234, 1.234, 1.234, 1.234)
+    assert invalid and invalid[0]["ticker"] == "BAD"
+
+    db_path = tmp_path / "test.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE daily_prices (
+                ticker TEXT NOT NULL,
+                date TEXT NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL,
+                source TEXT,
+                PRIMARY KEY (ticker, date)
+            )
+            """
+        )
+    written = module.upsert_csv_rows(db_path, rows, "unit_csv")
+
+    with sqlite3.connect(db_path) as conn:
+        stored = conn.execute(
+            "SELECT ticker, date, close, source FROM daily_prices ORDER BY ticker"
+        ).fetchall()
+
+    assert written == 2
+    assert stored == [
+        ("512880", "2026-06-20", 1.234, "unit_csv"),
+        ("600519", "2026-06-20", 10.5, "unit_csv"),
+    ]
 
 
 def test_market_data_ticker_mapping():

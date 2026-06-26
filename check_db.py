@@ -207,6 +207,18 @@ def daily_price_backfill_progress(
         thin_tape_update_position_cap(ctx),
     ]
     active_caps = [float(cap) for cap in cap_candidates if cap is not None]
+    dry_run_parts = ["python", "scripts/backfill_daily_prices.py", "--dry-run", "--limit", str(limit)]
+    if plan_path:
+        dry_run_parts.extend(["--plan", plan_path])
+    local_import_parts = [
+        "python",
+        "scripts/backfill_daily_prices.py",
+        "--import-csv",
+        "data/local_daily_prices.csv",
+        "--source",
+        "local_csv",
+        "--dry-run",
+    ]
     return {
         "status": readiness.get("status", "unknown"),
         "queue": queue,
@@ -220,6 +232,8 @@ def daily_price_backfill_progress(
         "backfill_plan_top": top_plan,
         "active_cap": min(active_caps) if active_caps else None,
         "stall_note": format_price_readiness_stall_note(ctx),
+        "dry_run_command": " ".join(dry_run_parts),
+        "local_import_command": " ".join(local_import_parts),
     }
 
 
@@ -253,6 +267,10 @@ def format_daily_price_backfill_progress(
         lines.append(f"   机器可读补齐计划: {progress['backfill_plan_path']}")
     if progress.get("backfill_plan_top"):
         lines.append(f"   计划优先级Top: {', '.join(progress['backfill_plan_top'][:5])}")
+    if progress.get("dry_run_command"):
+        lines.append(f"   本地计划预检: {progress['dry_run_command']}")
+    if progress.get("local_import_command"):
+        lines.append(f"   本地CSV导入预检: {progress['local_import_command']}")
     if progress.get("stall_note"):
         lines.append(f"   连续阻塞: {progress['stall_note']}")
     if progress.get("active_cap") is not None:
