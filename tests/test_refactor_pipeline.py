@@ -44,6 +44,7 @@ from sovereign_hall.run_discussion import (
     choose_review_depth,
     build_proposal_thesis,
     build_lessons_with_heuristic_context,
+    cli_args_can_run_without_instance_lock,
     parse_committee_vote,
     proposal_priority_score,
     select_next_topic,
@@ -70,6 +71,11 @@ def test_entry_imports():
     import sovereign_hall.check_db  # noqa: F401
     import sovereign_hall.research_interactive  # noqa: F401
     import sovereign_hall.run_discussion  # noqa: F401
+
+
+def test_run_discussion_help_does_not_need_instance_lock():
+    assert cli_args_can_run_without_instance_lock(["--help"]) is True
+    assert cli_args_can_run_without_instance_lock(["--once"]) is False
 
 
 def test_check_db_safe_input_handles_closed_stdin(monkeypatch):
@@ -133,6 +139,17 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     db_path = tmp_path / "test.db"
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE daily_prices (ticker TEXT, date TEXT, close REAL)")
+    plan_path = tmp_path / "daily_price_backfill_plan.csv"
+    plan_path.write_text(
+        "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
+        "total_signal_observations,latest_signal_date,missing_latest_signal_date,"
+        "minimum_rows_to_unblock_latest,plan_action\n"
+        "1,600519,45,2026-05-01,2026-06-20,1585,2026-06-20,True,1,"
+        "backfill this ticker's latest local daily_prices row first\n"
+        "2,512880,44,2026-05-02,2026-06-10,1197,2026-06-20,False,0,"
+        "backfill historical local daily_prices before using scores to widen exposure\n",
+        encoding="utf-8",
+    )
     context = HeuristicRiskContext(
         run_dir=tmp_path,
         policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
@@ -144,10 +161,10 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
         price_readiness={
             "status": "blocked_no_daily_prices",
             "missing_tickers_top10": [
-                {"ticker": "600519", "signal_days": 45},
-                {"ticker": "512880", "signal_days": 44},
+                {"ticker": "600519", "signal_days": 45, "last_signal_date": "2026-06-20"},
+                {"ticker": "512880", "signal_days": 44, "last_signal_date": "2026-06-10"},
             ],
-            "backfill_plan_path": str(tmp_path / "daily_price_backfill_plan.csv"),
+            "backfill_plan_path": str(plan_path),
             "backfill_plan": {
                 "total_missing_tickers": 2,
                 "minimum_next_rows": 1,
@@ -159,13 +176,16 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     text = check_db.format_daily_price_backfill_progress(conn, context=context)
     conn.close()
 
-    assert "优先队列覆盖: 0/2 tickers" in text
-    assert "优先队列: 600519, 512880" in text
-    assert "下一步本地补齐: 600519" in text
+    assert "优先队列已有任意本地价格: 0/2 tickers" in text
+    assert "600519(missing 2026-05-01..2026-06-20, 45d, 1585obs)" in text
+    assert "512880(missing 2026-05-02..2026-06-10, 44d, 1197obs)" in text
+    assert "下一步本地补齐: 600519 2026-05-01..2026-06-20 (45 signal days)" in text
     assert f"机器可读补齐计划: {tmp_path / 'daily_price_backfill_plan.csv'}" in text
     assert "计划优先级Top: 600519, 512880" in text
+    assert "本地DB覆盖检查: python scripts/backfill_daily_prices.py --status --limit 5 --plan" in text
     assert "本地计划预检: python scripts/backfill_daily_prices.py --dry-run --limit 5 --plan" in text
     assert "本地CSV导入预检: python scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv" in text
+    assert f"--plan {plan_path}" in text
     assert "模拟买入上限维持 <= 0.5%" in text
     assert "不得扩仓" in text
 
@@ -217,6 +237,132 @@ def test_backfill_daily_prices_imports_local_csv_without_network(tmp_path):
         ("512880", "2026-06-20", 1.234, "unit_csv"),
         ("600519", "2026-06-20", 10.5, "unit_csv"),
     ]
+
+
+def test_backfill_plan_uses_missing_date_range_and_csv_plan_coverage(tmp_path):
+    module = load_script_module("backfill_daily_prices_plan_test_module", "scripts/backfill_daily_prices.py")
+    plan_path = tmp_path / "daily_price_backfill_plan.csv"
+    plan_path.write_text(
+        "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
+        "total_signal_observations,latest_signal_date,missing_latest_signal_date,"
+        "minimum_rows_to_unblock_latest,plan_action\n"
+        "1,159990,43,2026-04-29,2026-06-10,445,2026-06-20,False,0,"
+        "backfill historical local daily_prices before using scores to widen exposure\n"
+        "2,600690,7,2026-05-28,2026-06-09,8,2026-06-20,False,0,"
+        "backfill historical local daily_prices before using scores to widen exposure\n",
+        encoding="utf-8",
+    )
+
+    requests = module.requests_from_plan(plan_path, datetime(2026, 6, 27).date())
+
+    assert requests[0].ticker == "159990"
+    assert requests[0].start.isoformat() == "2026-04-29"
+    assert requests[0].end.isoformat() == "2026-06-10"
+    assert requests[1].end.isoformat() == "2026-06-09"
+    coverage = module.summarize_plan_coverage(
+        [("159990", "2026-06-10", 1.0, 1.0, 1.0, 1.0, 0.0)],
+        requests,
+    )
+    assert "csv_covers=1/2 planned_tickers" in coverage
+    assert "missing_top=600690" in coverage
+
+
+def test_backfill_plan_status_uses_exact_signal_tape_dates(tmp_path):
+    module = load_script_module("backfill_daily_prices_status_test_module", "scripts/backfill_daily_prices.py")
+    plan_path = tmp_path / "daily_price_backfill_plan.csv"
+    plan_path.write_text(
+        "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
+        "total_signal_observations,latest_signal_date,missing_latest_signal_date,"
+        "minimum_rows_to_unblock_latest,plan_action\n"
+        "1,688256,3,2026-05-09,2026-06-26,6,2026-06-26,True,1,"
+        "backfill this ticker's latest local daily_prices row first\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "daily_signal_tape.csv").write_text(
+        "date,ticker,price,close_observations,price_source\n"
+        "2026-05-09,688256,1182.53,2,prediction_current_price\n"
+        "2026-05-10,688256,1182.53,3,prediction_current_price\n"
+        "2026-06-26,688256,1455.69,1,prediction_current_price\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "test.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE daily_prices (
+                ticker TEXT,
+                date TEXT,
+                close REAL
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO daily_prices VALUES (?, ?, ?)",
+            [
+                ("688256", "2026-05-08", 1000.0),
+                ("688256", "2026-06-18", 1200.0),
+            ],
+        )
+
+    summary, details = module.summarize_db_plan_coverage(db_path, plan_path, limit=5, max_age_days=7)
+    assert summary["status"] == "needs_local_daily_prices"
+    assert summary["checked_signal_dates"] == 3
+    assert summary["covered_signal_dates"] == 2
+    assert details[0]["missing_signal_dates"] == ["2026-06-26"]
+    rendered = module.format_db_plan_coverage(summary, details)
+    assert "signal_dates=2/3" in rendered
+    assert "missing_dates=2026-06-26" in rendered
+
+
+def test_price_readiness_uses_signal_date_price_source_not_ticker_level_history(tmp_path):
+    module = load_script_module("heuristic_cycle_stdlib_readiness_test_module", "scripts/run_heuristic_cycle_stdlib.py")
+    daily = [
+        {
+            "ticker": "688256",
+            "date": "2026-06-20",
+            "price_source": "daily_prices",
+            "close_observations": 3,
+        },
+        {
+            "ticker": "688256",
+            "date": "2026-06-26",
+            "price_source": "prediction_current_price",
+            "close_observations": 1,
+        },
+        {
+            "ticker": "159928",
+            "date": "2026-06-26",
+            "price_source": "daily_prices",
+            "close_observations": 2,
+        },
+        {
+            "ticker": "159990",
+            "date": "2026-05-01",
+            "price_source": "prediction_current_price",
+            "close_observations": 100,
+        },
+        {
+            "ticker": "159990",
+            "date": "2026-05-02",
+            "price_source": "prediction_current_price",
+            "close_observations": 100,
+        },
+    ]
+    price_history = {("2026-06-20", "688256"): 10.0, ("2026-06-26", "159928"): 1.0}
+
+    readiness = module.build_price_readiness_report(daily, price_history)
+
+    assert readiness["status"] == "partial_daily_price_backfill_needed"
+    assert readiness["total_signal_ticker_count"] == 3
+    assert readiness["priced_signal_ticker_count"] == 1
+    assert readiness["missing_signal_ticker_count"] == 2
+    assert readiness["latest_missing_tickers"] == ["688256"]
+    assert readiness["minimum_next_rows"] == 1
+    assert readiness["missing_tickers_top10"][0]["ticker"] == "688256"
+    assert readiness["missing_tickers_top10"][0]["last_signal_date"] == "2026-06-26"
+    plan_rows, plan_summary = module.build_daily_price_backfill_plan(daily, price_history, tmp_path)
+    assert plan_summary["top_priority_tickers"][0] == "688256"
+    assert plan_rows[0]["ticker"] == "688256"
 
 
 def test_market_data_ticker_mapping():
@@ -920,12 +1066,14 @@ def test_heuristic_context_surfaces_price_readiness(tmp_path):
                 {
                     "ticker": "600519",
                     "signal_days": 45,
+                    "first_signal_date": "2026-05-01",
                     "last_signal_date": "2026-06-20",
                     "total_signal_observations": 1585,
                 },
                 {
                     "ticker": "512880",
                     "signal_days": 44,
+                    "first_signal_date": "2026-05-02",
                     "last_signal_date": "2026-06-10",
                     "total_signal_observations": 1197,
                 },
@@ -947,16 +1095,16 @@ def test_heuristic_context_surfaces_price_readiness(tmp_path):
 
     assert "daily_prices补齐: blocked_no_daily_prices" in status
     assert "daily_prices阻塞模拟买入上限: 0.5%" in status
-    assert "daily_prices优先补齐队列: 600519(45d, 1585obs, last=2026-06-20)" in status
+    assert "daily_prices优先补齐队列: 600519(missing_days=45d, obs=1585, missing_range=2026-05-01..2026-06-20)" in status
     assert "daily_prices补齐计划: plan=" in status
     assert "top=600519, 512880" in status
     assert "缺少12/12个signal ticker" in status
     assert "最新缺价ticker=600519, 688256" in prompt
-    assert "daily_prices优先补齐队列: 600519(45d, 1585obs, last=2026-06-20)" in prompt
+    assert "daily_prices优先补齐队列: 600519(missing_days=45d, obs=1585, missing_range=2026-05-01..2026-06-20)" in prompt
     assert "daily_prices补齐计划: plan=" in prompt
     assert "daily_prices阻塞模拟买入上限=0.5%" in prompt
     assert "本地数据质量任务" in prompt
-    assert queue.startswith("600519(45d, 1585obs, last=2026-06-20), 512880")
+    assert queue.startswith("600519(missing_days=45d, obs=1585, missing_range=2026-05-01..2026-06-20), 512880")
     assert "missing_tickers=12" in plan
     assert "latest_rows_to_unblock=2" in plan
 

@@ -7,6 +7,7 @@
 
 import sys
 import os
+import csv
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -126,6 +127,79 @@ def format_position_pct(value: float) -> str:
     return f"{value:.2%}" if abs(value) < 0.005 else f"{value:.1%}"
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_backfill_plan_rows(plan_path: str, limit: int) -> dict[str, dict[str, Any]]:
+    if not plan_path:
+        return {}
+    path = Path(plan_path).expanduser()
+    if not path.exists():
+        return {}
+    rows: dict[str, dict[str, Any]] = {}
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                ticker = normalize_ticker(row.get("ticker", ""))
+                if not ticker or ticker in rows:
+                    continue
+                rows[ticker] = {
+                    "first_missing_signal_date": str(row.get("first_missing_signal_date", "") or "")[:10],
+                    "last_missing_signal_date": str(row.get("last_missing_signal_date", "") or "")[:10],
+                    "missing_signal_days": _safe_int(row.get("missing_signal_days")),
+                    "total_signal_observations": _safe_int(row.get("total_signal_observations")),
+                    "missing_latest_signal_date": str(row.get("missing_latest_signal_date", "")).lower()
+                    in {"1", "true", "yes"},
+                    "minimum_rows_to_unblock_latest": _safe_int(row.get("minimum_rows_to_unblock_latest")),
+                    "plan_action": str(row.get("plan_action", "") or ""),
+                }
+                if len(rows) >= limit:
+                    break
+    except Exception:
+        return {}
+    return rows
+
+
+def _format_backfill_queue_item(item: dict[str, Any]) -> str:
+    ticker = item["ticker"]
+    details: list[str] = []
+    first_missing = str(item.get("first_missing_signal_date", "") or "")[:10]
+    last_missing = str(item.get("last_missing_signal_date", "") or "")[:10]
+    if first_missing and last_missing:
+        details.append(f"missing {first_missing}..{last_missing}")
+    elif last_missing:
+        details.append(f"missing_to {last_missing}")
+    missing_days = _safe_int(item.get("missing_signal_days"))
+    if missing_days:
+        details.append(f"{missing_days}d")
+    observations = _safe_int(item.get("total_signal_observations"))
+    if observations:
+        details.append(f"{observations}obs")
+    row_count = _safe_int(item.get("row_count"))
+    latest_date = str(item.get("latest_date", "") or "")[:10]
+    if row_count:
+        details.append(f"local_rows={row_count}")
+    if latest_date:
+        details.append(f"local_latest={latest_date}")
+    return f"{ticker}({', '.join(details)})" if details else ticker
+
+
+def _format_next_backfill_item(item: dict[str, Any]) -> str:
+    text = item["ticker"]
+    first_missing = str(item.get("first_missing_signal_date", "") or "")[:10]
+    last_missing = str(item.get("last_missing_signal_date", "") or "")[:10]
+    if first_missing and last_missing:
+        text += f" {first_missing}..{last_missing}"
+    missing_days = _safe_int(item.get("missing_signal_days"))
+    if missing_days:
+        text += f" ({missing_days} signal days)"
+    return text
+
+
 def daily_price_backfill_progress(
     conn: sqlite3.Connection,
     context: Any = None,
@@ -168,6 +242,17 @@ def daily_price_backfill_progress(
     if not queue:
         return {}
 
+    plan = readiness.get("backfill_plan") if isinstance(readiness, dict) else {}
+    plan_path = str(readiness.get("backfill_plan_path", "") or "") if isinstance(readiness, dict) else ""
+    plan_rows = _read_backfill_plan_rows(plan_path, limit)
+    top_rows: dict[str, dict[str, Any]] = {}
+    if isinstance(top_missing, list):
+        for row in top_missing:
+            if not isinstance(row, dict) or not row.get("ticker"):
+                continue
+            ticker = normalize_ticker(str(row["ticker"]))
+            top_rows[ticker] = row
+
     c = conn.cursor()
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_prices'")
     table_exists = c.fetchone() is not None
@@ -179,27 +264,51 @@ def daily_price_backfill_progress(
         placeholders = ",".join("?" for _ in queue)
         c.execute(
             f"""
-            SELECT ticker, COUNT(*) AS row_count, MAX(date) AS latest_date
+            SELECT ticker, COUNT(*) AS row_count, MIN(date) AS first_date, MAX(date) AS latest_date
             FROM daily_prices
             WHERE ticker IN ({placeholders})
             GROUP BY ticker
             """,
             queue,
         )
-        for ticker, row_count, latest_date in c.fetchall():
+        for ticker, row_count, first_date, latest_date in c.fetchall():
             priced[normalize_ticker(ticker)] = {
                 "row_count": int(row_count),
+                "first_date": first_date,
                 "latest_date": latest_date,
             }
 
-    missing = [ticker for ticker in queue if priced.get(ticker, {}).get("row_count", 0) <= 0]
-    plan = readiness.get("backfill_plan") if isinstance(readiness, dict) else {}
-    plan_path = str(readiness.get("backfill_plan_path", "") or "") if isinstance(readiness, dict) else ""
+    tickers_without_any_local_rows = [
+        ticker for ticker in queue if priced.get(ticker, {}).get("row_count", 0) <= 0
+    ]
     top_plan = []
     if isinstance(plan, dict):
         raw_top = plan.get("top_priority_tickers", [])
         if isinstance(raw_top, list):
             top_plan = [normalize_ticker(str(ticker)) for ticker in raw_top if ticker]
+    queue_details: list[dict[str, Any]] = []
+    for ticker in queue:
+        detail: dict[str, Any] = {"ticker": ticker}
+        top_row = top_rows.get(ticker, {})
+        if isinstance(top_row, dict):
+            detail.update(
+                {
+                    "missing_signal_days": top_row.get("signal_days"),
+                    "first_missing_signal_date": top_row.get("first_signal_date"),
+                    "last_missing_signal_date": top_row.get("last_signal_date"),
+                    "total_signal_observations": top_row.get("total_signal_observations"),
+                }
+            )
+        detail.update({k: v for k, v in plan_rows.get(ticker, {}).items() if v not in ("", 0, None)})
+        detail.update(priced.get(ticker, {}))
+        queue_details.append(detail)
+    needs_plan_backfill = [
+        item
+        for item in queue_details
+        if item.get("first_missing_signal_date")
+        or item.get("last_missing_signal_date")
+        or item["ticker"] in tickers_without_any_local_rows
+    ]
     cap_candidates = [
         price_readiness_position_cap(ctx),
         price_readiness_stall_position_cap(ctx),
@@ -210,6 +319,9 @@ def daily_price_backfill_progress(
     dry_run_parts = ["python", "scripts/backfill_daily_prices.py", "--dry-run", "--limit", str(limit)]
     if plan_path:
         dry_run_parts.extend(["--plan", plan_path])
+    status_parts = ["python", "scripts/backfill_daily_prices.py", "--status", "--limit", str(limit)]
+    if plan_path:
+        status_parts.extend(["--plan", plan_path])
     local_import_parts = [
         "python",
         "scripts/backfill_daily_prices.py",
@@ -219,19 +331,25 @@ def daily_price_backfill_progress(
         "local_csv",
         "--dry-run",
     ]
+    if plan_path:
+        local_import_parts.extend(["--plan", plan_path])
     return {
         "status": readiness.get("status", "unknown"),
         "queue": queue,
-        "covered_count": len(queue) - len(missing),
+        "queue_details": queue_details,
+        "has_local_count": sum(1 for ticker in queue if priced.get(ticker, {}).get("row_count", 0) > 0),
         "total_count": len(queue),
-        "missing": missing,
+        "missing": [item["ticker"] for item in needs_plan_backfill],
+        "missing_details": needs_plan_backfill,
         "priced": priced,
-        "next_ticker": missing[0] if missing else None,
+        "next_ticker": needs_plan_backfill[0]["ticker"] if needs_plan_backfill else None,
+        "next_detail": needs_plan_backfill[0] if needs_plan_backfill else None,
         "daily_prices_rows": total_rows,
         "backfill_plan_path": plan_path,
         "backfill_plan_top": top_plan,
         "active_cap": min(active_caps) if active_caps else None,
         "stall_note": format_price_readiness_stall_note(ctx),
+        "status_command": " ".join(status_parts),
         "dry_run_command": " ".join(dry_run_parts),
         "local_import_command": " ".join(local_import_parts),
     }
@@ -247,26 +365,38 @@ def format_daily_price_backfill_progress(
     if not progress:
         return ""
 
-    queue_text = ", ".join(progress["queue"])
+    queue_text = ", ".join(
+        _format_backfill_queue_item(item)
+        for item in progress.get("queue_details", [])
+    ) or ", ".join(progress["queue"])
+    missing_text = ", ".join(
+        _format_backfill_queue_item(item)
+        for item in progress.get("missing_details", [])
+    )
     lines = [
         "\n🧱 daily_prices 本地补齐进度",
         "=" * 60,
         f"   状态: {progress['status']}",
         (
-            f"   优先队列覆盖: {progress['covered_count']}/"
-            f"{progress['total_count']} tickers have local daily_prices rows"
+            f"   优先队列已有任意本地价格: {progress['has_local_count']}/"
+            f"{progress['total_count']} tickers；仍需按计划补齐后重跑验证"
         ),
         f"   优先队列: {queue_text}",
         f"   daily_prices 当前总行数: {progress['daily_prices_rows']:,}",
     ]
+    if missing_text:
+        lines.append(f"   优先队列仍需补齐/验证: {missing_text}")
     if progress.get("next_ticker"):
-        lines.append(f"   下一步本地补齐: {progress['next_ticker']}")
+        next_detail = progress.get("next_detail") or {"ticker": progress["next_ticker"]}
+        lines.append(f"   下一步本地补齐: {_format_next_backfill_item(next_detail)}")
     else:
         lines.append("   下一步本地补齐: 优先队列已覆盖，需重新运行 heuristic cycle 验证")
     if progress.get("backfill_plan_path"):
         lines.append(f"   机器可读补齐计划: {progress['backfill_plan_path']}")
     if progress.get("backfill_plan_top"):
         lines.append(f"   计划优先级Top: {', '.join(progress['backfill_plan_top'][:5])}")
+    if progress.get("status_command"):
+        lines.append(f"   本地DB覆盖检查: {progress['status_command']}")
     if progress.get("dry_run_command"):
         lines.append(f"   本地计划预检: {progress['dry_run_command']}")
     if progress.get("local_import_command"):

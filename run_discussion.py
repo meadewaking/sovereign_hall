@@ -186,6 +186,12 @@ def parse_args():
     return parser.parse_args()
 
 
+def cli_args_can_run_without_instance_lock(argv: list[str] | None = None) -> bool:
+    """Allow pure CLI help to work while a long discussion runner is active."""
+    args = sys.argv[1:] if argv is None else argv
+    return any(arg in {"-h", "--help"} for arg in args)
+
+
 async def run_startup_preflight(llm, spiders) -> bool:
     """Verify external dependencies before burning a research round."""
     print("\n🔌 启动前联通性检查...")
@@ -1802,6 +1808,9 @@ async def main():
 
 
 if __name__ == "__main__":
+    if cli_args_can_run_without_instance_lock():
+        parse_args()
+        sys.exit(0)
     try:
         with SingleInstanceLock(project_root / "data" / "run_discussion.lock"):
             asyncio.run(main())

@@ -325,7 +325,13 @@ def format_price_readiness_backfill_queue(
     context: HeuristicRiskContext,
     limit: int = 5,
 ) -> str:
-    """Return a prioritized local daily_prices backfill queue."""
+    """Return a prioritized local daily_prices backfill queue.
+
+    ``last_signal_date`` in price_readiness means the last signal date still
+    missing independent daily_prices coverage, not the latest local price date.
+    The rendered labels keep that distinction explicit for user entries and
+    agent prompts.
+    """
     readiness = context.price_readiness or {}
     if not isinstance(readiness, dict):
         return ""
@@ -342,19 +348,24 @@ def format_price_readiness_backfill_queue(
         details: list[str] = []
         signal_days = row.get("signal_days")
         observations = row.get("total_signal_observations")
+        first_signal = str(row.get("first_signal_date", "") or "")[:10]
         last_signal = str(row.get("last_signal_date", "") or "")[:10]
         try:
             if signal_days is not None:
-                details.append(f"{int(signal_days)}d")
+                details.append(f"missing_days={int(signal_days)}d")
         except (TypeError, ValueError):
             pass
         try:
             if observations is not None:
-                details.append(f"{int(observations)}obs")
+                details.append(f"obs={int(observations)}")
         except (TypeError, ValueError):
             pass
-        if last_signal:
-            details.append(f"last={last_signal}")
+        if first_signal and last_signal:
+            details.append(f"missing_range={first_signal}..{last_signal}")
+        elif first_signal:
+            details.append(f"missing_from={first_signal}")
+        elif last_signal:
+            details.append(f"missing_to={last_signal}")
         parts.append(f"{ticker}({', '.join(details)})" if details else ticker)
         if len(parts) >= limit:
             break

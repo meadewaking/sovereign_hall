@@ -1238,24 +1238,32 @@ def build_price_readiness_report(
             "next_action": "Accumulate local prediction and price history, then rerun the cycle.",
         }
 
-    signal_tickers = sorted(daily["ticker"].dropna().map(normalize_ticker).unique())
-    priced_tickers: set[str] = set()
-    if not price_history.empty and "ticker" in price_history:
-        priced_tickers = set(price_history["ticker"].dropna().map(normalize_ticker).unique())
-    missing = [ticker for ticker in signal_tickers if ticker not in priced_tickers]
-    latest_date = str(daily["date"].max())
+    frame = daily.copy()
+    frame["ticker"] = frame["ticker"].map(normalize_ticker)
+    frame["date"] = frame["date"].astype(str)
+    signal_tickers = sorted(frame["ticker"].dropna().unique())
+    latest_date = str(frame["date"].max())
+    if "price_source" in frame.columns:
+        missing_rows = frame[~frame["price_source"].eq("daily_prices")].copy()
+        priced_row_count = int(frame["price_source"].eq("daily_prices").sum())
+    else:
+        priced_keys: set[tuple[str, str]] = set()
+        if not price_history.empty and {"ticker", "date"}.issubset(price_history.columns):
+            priced = price_history.copy()
+            priced["ticker"] = priced["ticker"].map(normalize_ticker)
+            priced["date"] = priced["date"].astype(str)
+            priced_keys = set(zip(priced["date"], priced["ticker"], strict=False))
+        missing_rows = frame[
+            ~frame.apply(lambda row: (str(row["date"]), normalize_ticker(row["ticker"])) in priced_keys, axis=1)
+        ].copy()
+        priced_row_count = len(frame) - len(missing_rows)
+    missing = sorted(missing_rows["ticker"].dropna().unique())
     latest_missing = sorted(
-        daily.loc[
-            (daily["date"] == latest_date)
-            & (daily["ticker"].map(normalize_ticker).isin(missing)),
-            "ticker",
-        ].dropna().map(normalize_ticker).unique()
+        missing_rows.loc[missing_rows["date"].eq(latest_date), "ticker"].dropna().unique()
     )
 
     grouped = (
-        daily[daily["ticker"].map(normalize_ticker).isin(missing)]
-        .assign(ticker=lambda frame: frame["ticker"].map(normalize_ticker))
-        .groupby("ticker", as_index=False)
+        missing_rows.groupby("ticker", as_index=False)
         .agg(
             signal_days=("date", "nunique"),
             first_signal_date=("date", "min"),
@@ -1265,14 +1273,15 @@ def build_price_readiness_report(
     )
     if not grouped.empty:
         grouped["total_signal_observations"] = grouped["total_signal_observations"].astype(int)
+        grouped["missing_latest_signal_date"] = grouped["ticker"].isin(latest_missing)
         grouped = grouped.sort_values(
-            ["signal_days", "last_signal_date", "total_signal_observations"],
-            ascending=[False, False, False],
+            ["missing_latest_signal_date", "signal_days", "last_signal_date", "total_signal_observations"],
+            ascending=[False, False, False, False],
         )
 
     if not signal_tickers:
         status = "no_signal_tickers"
-    elif not priced_tickers:
+    elif priced_row_count <= 0:
         status = "blocked_no_daily_prices"
     elif missing:
         status = "partial_daily_price_backfill_needed"
@@ -1349,6 +1358,9 @@ def build_daily_price_backfill_plan(
             "rule": "All local signal ticker/date rows have daily_prices coverage.",
         }
 
+    latest_missing = sorted(
+        missing_rows.loc[missing_rows["date"].eq(latest_signal_date), "ticker"].dropna().unique()
+    )
     grouped = (
         missing_rows.groupby("ticker", as_index=False)
         .agg(
@@ -1357,13 +1369,16 @@ def build_daily_price_backfill_plan(
             last_missing_signal_date=("date", "max"),
             total_signal_observations=("close_observations", "sum"),
         )
-        .sort_values(
-            ["missing_signal_days", "last_missing_signal_date", "total_signal_observations"],
-            ascending=[False, False, False],
-        )
     )
-    latest_missing = sorted(
-        missing_rows.loc[missing_rows["date"].eq(latest_signal_date), "ticker"].dropna().unique()
+    grouped["missing_latest_signal_date"] = grouped["ticker"].isin(latest_missing)
+    grouped = grouped.sort_values(
+        [
+            "missing_latest_signal_date",
+            "missing_signal_days",
+            "last_missing_signal_date",
+            "total_signal_observations",
+        ],
+        ascending=[False, False, False, False],
     )
     rows: list[dict[str, Any]] = []
     for rank, row in enumerate(grouped.to_dict("records"), start=1):
@@ -1418,17 +1433,22 @@ def format_missing_price_queue(price_readiness: dict[str, Any], limit: int = 5) 
         if not isinstance(row, dict) or not row.get("ticker"):
             continue
         details: list[str] = []
+        first_signal = str(row.get("first_signal_date", "") or "")[:10]
         try:
-            details.append(f"{int(row.get('signal_days', 0))}d")
+            details.append(f"missing_days={int(row.get('signal_days', 0))}d")
         except (TypeError, ValueError):
             pass
         try:
-            details.append(f"{int(row.get('total_signal_observations', 0))}obs")
+            details.append(f"obs={int(row.get('total_signal_observations', 0))}")
         except (TypeError, ValueError):
             pass
         last_signal = str(row.get("last_signal_date", "") or "")[:10]
-        if last_signal:
-            details.append(f"last={last_signal}")
+        if first_signal and last_signal:
+            details.append(f"missing_range={first_signal}..{last_signal}")
+        elif first_signal:
+            details.append(f"missing_from={first_signal}")
+        elif last_signal:
+            details.append(f"missing_to={last_signal}")
         ticker = normalize_ticker(row["ticker"])
         parts.append(f"{ticker}({', '.join(details)})" if details else ticker)
         if len(parts) >= limit:
@@ -1567,13 +1587,18 @@ def write_readme(
     backfill_dry_run_command = "python scripts/backfill_daily_prices.py --dry-run --limit 5"
     if backfill_plan_path:
         backfill_dry_run_command += f" --plan {backfill_plan_path}"
+    backfill_status_command = "python scripts/backfill_daily_prices.py --status --limit 5"
+    if backfill_plan_path:
+        backfill_status_command += f" --plan {backfill_plan_path}"
     backfill_import_command = (
         "python scripts/backfill_daily_prices.py --import-csv "
         "data/local_daily_prices.csv --source local_csv --dry-run"
     )
+    if backfill_plan_path:
+        backfill_import_command += f" --plan {backfill_plan_path}"
     price_readiness_text = (
         f"- Status: {price_readiness.get('status', 'unknown')}\n"
-        f"- Signal tickers with local daily_prices: {price_readiness.get('priced_signal_ticker_count', 0)}/"
+        f"- Signal tickers fully covered by local daily_prices: {price_readiness.get('priced_signal_ticker_count', 0)}/"
         f"{price_readiness.get('total_signal_ticker_count', 0)}; "
         f"missing={price_readiness.get('missing_signal_ticker_count', 0)}\n"
         f"- Latest signal date: {price_readiness.get('latest_signal_date', 'unknown')}; "
@@ -1582,6 +1607,7 @@ def write_readme(
         f"- Priority backfill queue: {missing_queue or 'none'}\n"
         f"- Machine-readable backfill plan: `{backfill_plan_path or 'not written'}`; "
         f"plan tickers={plan_total}; top priority={top_plan or 'none'}\n"
+        f"- Local DB plan coverage check: `{backfill_status_command}`\n"
         f"- Local repair dry run: `{backfill_dry_run_command}`\n"
         f"- Local CSV import validation: `{backfill_import_command}`\n"
         "- Integration decision: do not synthesize `daily_prices` from prediction current_price; "
@@ -1663,6 +1689,9 @@ def write_readme(
 - Converted the latest price-coverage warning into a real simulated-investment constraint: weak or unvalidated local price coverage now applies a coverage-adjusted cap; zero independent daily_prices coverage allows at most one-quarter of the latest policy single-name cap.
 - Added a local-only CSV validation/import path in `scripts/backfill_daily_prices.py` so daily_prices can be repaired from an independently provided local OHLC file without network calls.
 - Advanced the daily_prices closure into `check_db`: the entry now compares the latest priority backfill queue with live local `daily_prices` rows and prints the still-missing next ticker plus the active no-expansion cap.
+- Clarified the repeated priority-queue warning by rendering missing date ranges explicitly and aligning the local CSV validation command with the machine-readable backfill plan.
+- Added a no-network `scripts/backfill_daily_prices.py --status` check that compares the current SQLite `daily_prices` table against exact missing signal dates from the latest plan/tape before users rerun the cycle.
+- Fixed `python -m sovereign_hall.run_discussion --help` so CLI help is available even while a long-running discussion instance holds the single-instance lock.
 - Advanced the prior data-quality closure by measuring consecutive `blocked_no_daily_prices` cycles; when the same local price gap repeats, user entries and simulated-buy reasons treat it as a stalled backfill task instead of another leaderboard signal.
 - Advanced the prior fresh-tape validation direction by writing `tape_update.json`; thin tape updates are surfaced as a user-entry warning and an observational simulated-buy cap instead of being treated as validation for wider exposure.
 - Tightened the fresh-tape entry loop: if the latest cycle has zero new local prediction rows, simulated long proposals are capped to 10% of the retained policy single-name cap until a meaningful tape update arrives.
@@ -1734,7 +1763,10 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved daily-price-readiness closure: `check_db`, research prompt context, and manual research reports now surface `price_readiness.json`, including the prioritized missing-price queue.
 - Improved live daily-price-readiness closure: `check_db` now validates that priority queue against the current SQLite `daily_prices` table and prints covered/missing queue tickers, the next local backfill target, and the active no-expansion cap before the user starts simulation.
 - Improved local backfill repair path: `check_db` now prints a dry-run command for the current backfill plan and a local CSV import validation command; `scripts/backfill_daily_prices.py --import-csv ... --dry-run` validates OHLC rows without network access.
+- Improved backfill-readiness closure: user entries and reports now label priority queue dates as missing ranges, and local CSV validation can compare supplied rows with the current plan before import.
+- Improved backfill verification path: `check_db` now prints a no-network DB coverage command, and `scripts/backfill_daily_prices.py --status` reports exact still-missing signal dates before any exposure cap can be relaxed.
 - Improved daily-price backfill closure: this run writes `daily_price_backfill_plan.csv` and `daily_price_backfill_plan.json`; user entries surface the plan path and top priority ticker so repeated empty `daily_prices` runs have a concrete local next step.
+- Improved `run_discussion` operability: `python -m sovereign_hall.run_discussion --help` no longer fails behind the active single-instance lock, while real runs remain lock-protected.
 - Improved daily-price-readiness simulation closure: blocked independent `daily_prices` readiness now applies a simulated-buy cap through `services/heuristic_policy.py`, so missing local prices constrain entries rather than only appearing in reports.
 - Improved stalled-readiness closure: `check_db`, research prompt context, and simulated trade reasons now show consecutive empty-daily_prices cycles; after repeated blockage, simulated buys use an extra-small observation cap and the cycle explicitly avoids new leaderboard branches.
 - Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals by coverage quality; with zero independent daily_prices rows the user-entry cap is one-quarter of the latest policy cap rather than a fixed half-cap.
@@ -1752,7 +1784,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
 - Still not integrated as validation for exposure widening: `tape_update.json` does not meet the minimum fresh-row/latest-day observation thresholds when marked as thin or stale.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers shown by `check_db`, then validate whether the evidence-gated cap, observation-count cap, and ETF-sleeve caps reduce churn/drawdown over another tape update before widening exposure.
-- This cycle's minimum local step: use `{backfill_plan_path or 'daily_price_backfill_plan.csv'}` plus `scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv --source local_csv --dry-run` to validate locally supplied OHLC rows before adding any new return-seeking heuristic branch.
+- This cycle's minimum local step: run `{backfill_status_command}` to verify current DB coverage, then use `scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv --source local_csv --dry-run --plan {backfill_plan_path or 'daily_price_backfill_plan.csv'}` to validate independently supplied OHLC rows before adding any new return-seeking heuristic branch.
 
 ## Reproduce
 ```bash
