@@ -9,6 +9,7 @@ import sys
 import os
 import csv
 import sqlite3
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +157,7 @@ def _read_backfill_plan_rows(plan_path: str, limit: int) -> dict[str, dict[str, 
                     in {"1", "true", "yes"},
                     "minimum_rows_to_unblock_latest": _safe_int(row.get("minimum_rows_to_unblock_latest")),
                     "plan_action": str(row.get("plan_action", "") or ""),
+                    "missing_signal_dates": str(row.get("missing_signal_dates", "") or ""),
                 }
                 if len(rows) >= limit:
                     break
@@ -179,6 +181,11 @@ def _format_backfill_queue_item(item: dict[str, Any]) -> str:
     observations = _safe_int(item.get("total_signal_observations"))
     if observations:
         details.append(f"{observations}obs")
+    checked_signal_dates = _safe_int(item.get("checked_signal_dates"))
+    if checked_signal_dates:
+        details.append(
+            f"plan_covered={_safe_int(item.get('covered_signal_dates'))}/{checked_signal_dates}"
+        )
     row_count = _safe_int(item.get("row_count"))
     latest_date = str(item.get("latest_date", "") or "")[:10]
     if row_count:
@@ -186,6 +193,73 @@ def _format_backfill_queue_item(item: dict[str, Any]) -> str:
     if latest_date:
         details.append(f"local_latest={latest_date}")
     return f"{ticker}({', '.join(details)})" if details else ticker
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    try:
+        text = str(value or "").strip()[:10]
+        return date.fromisoformat(text) if text else None
+    except ValueError:
+        return None
+
+
+def _split_signal_dates(raw: Any) -> list[date]:
+    dates: list[date] = []
+    for part in str(raw or "").replace("|", ";").replace(",", ";").split(";"):
+        parsed = _parse_iso_date(part)
+        if parsed is not None:
+            dates.append(parsed)
+    return sorted(set(dates))
+
+
+def _read_exact_missing_signal_dates(plan_path: str, queue: list[str]) -> dict[str, list[date]]:
+    """Read exact missing signal dates from the latest run artifacts when present."""
+    wanted = {normalize_ticker(ticker) for ticker in queue}
+    if not plan_path or not wanted:
+        return {}
+
+    path = Path(plan_path).expanduser()
+    dates_by_ticker: dict[str, set[date]] = {ticker: set() for ticker in wanted}
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    ticker = normalize_ticker(row.get("ticker", ""))
+                    if ticker not in wanted:
+                        continue
+                    for day in _split_signal_dates(row.get("missing_signal_dates")):
+                        dates_by_ticker.setdefault(ticker, set()).add(day)
+        except Exception:
+            pass
+
+    tape_path = path.with_name("daily_signal_tape.csv")
+    if tape_path.exists():
+        try:
+            with tape_path.open("r", encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    if str(row.get("price_source", "")).strip() == "daily_prices":
+                        continue
+                    ticker = normalize_ticker(row.get("ticker", ""))
+                    if ticker not in wanted:
+                        continue
+                    day = _parse_iso_date(row.get("date"))
+                    if day is not None:
+                        dates_by_ticker.setdefault(ticker, set()).add(day)
+        except Exception:
+            pass
+
+    return {
+        ticker: sorted(days)
+        for ticker, days in dates_by_ticker.items()
+        if days
+    }
+
+
+def _asof_covered(signal_day: date, local_days: set[date], max_age_days: int = 7) -> bool:
+    candidates = [day for day in local_days if day <= signal_day]
+    if not candidates:
+        return False
+    return (signal_day - max(candidates)).days <= max_age_days
 
 
 def _format_next_backfill_item(item: dict[str, Any]) -> str:
@@ -260,6 +334,7 @@ def daily_price_backfill_progress(
     total_rows = int(c.fetchone()[0])
 
     priced: dict[str, dict[str, Any]] = {}
+    local_dates: dict[str, set[date]] = {ticker: set() for ticker in queue}
     if table_exists and total_rows > 0:
         placeholders = ",".join("?" for _ in queue)
         c.execute(
@@ -277,10 +352,24 @@ def daily_price_backfill_progress(
                 "first_date": first_date,
                 "latest_date": latest_date,
             }
+        c.execute(
+            f"""
+            SELECT ticker, date
+            FROM daily_prices
+            WHERE ticker IN ({placeholders})
+              AND date IS NOT NULL
+            """,
+            queue,
+        )
+        for ticker, day_text in c.fetchall():
+            day = _parse_iso_date(day_text)
+            if day is not None:
+                local_dates.setdefault(normalize_ticker(ticker), set()).add(day)
 
     tickers_without_any_local_rows = [
         ticker for ticker in queue if priced.get(ticker, {}).get("row_count", 0) <= 0
     ]
+    exact_missing_dates = _read_exact_missing_signal_dates(plan_path, queue)
     top_plan = []
     if isinstance(plan, dict):
         raw_top = plan.get("top_priority_tickers", [])
@@ -301,14 +390,33 @@ def daily_price_backfill_progress(
             )
         detail.update({k: v for k, v in plan_rows.get(ticker, {}).items() if v not in ("", 0, None)})
         detail.update(priced.get(ticker, {}))
+        signal_dates = exact_missing_dates.get(ticker, [])
+        if not signal_dates:
+            last_missing = _parse_iso_date(detail.get("last_missing_signal_date"))
+            signal_dates = [last_missing] if last_missing is not None else []
+        missing_signal_dates: list[str] = []
+        covered_signal_dates = 0
+        for signal_day in signal_dates:
+            if _asof_covered(signal_day, local_dates.get(ticker, set())):
+                covered_signal_dates += 1
+            else:
+                missing_signal_dates.append(signal_day.isoformat())
+        detail["checked_signal_dates"] = len(signal_dates)
+        detail["covered_signal_dates"] = covered_signal_dates
+        detail["missing_signal_dates"] = missing_signal_dates
         queue_details.append(detail)
-    needs_plan_backfill = [
-        item
-        for item in queue_details
-        if item.get("first_missing_signal_date")
-        or item.get("last_missing_signal_date")
-        or item["ticker"] in tickers_without_any_local_rows
-    ]
+    def _needs_plan_backfill(item: dict[str, Any]) -> bool:
+        if _safe_int(item.get("checked_signal_dates")) > 0:
+            return bool(item.get("missing_signal_dates"))
+        return (
+            bool(item.get("first_missing_signal_date"))
+            or bool(item.get("last_missing_signal_date"))
+            or item["ticker"] in tickers_without_any_local_rows
+        )
+
+    needs_plan_backfill = [item for item in queue_details if _needs_plan_backfill(item)]
+    checked_signal_dates_total = sum(_safe_int(item.get("checked_signal_dates")) for item in queue_details)
+    covered_signal_dates_total = sum(_safe_int(item.get("covered_signal_dates")) for item in queue_details)
     cap_candidates = [
         price_readiness_position_cap(ctx),
         price_readiness_stall_position_cap(ctx),
@@ -339,6 +447,9 @@ def daily_price_backfill_progress(
         "queue_details": queue_details,
         "has_local_count": sum(1 for ticker in queue if priced.get(ticker, {}).get("row_count", 0) > 0),
         "total_count": len(queue),
+        "checked_signal_dates": checked_signal_dates_total,
+        "covered_signal_dates": covered_signal_dates_total,
+        "missing_signal_dates": max(0, checked_signal_dates_total - covered_signal_dates_total),
         "missing": [item["ticker"] for item in needs_plan_backfill],
         "missing_details": needs_plan_backfill,
         "priced": priced,
@@ -378,8 +489,13 @@ def format_daily_price_backfill_progress(
         "=" * 60,
         f"   状态: {progress['status']}",
         (
-            f"   优先队列已有任意本地价格: {progress['has_local_count']}/"
-            f"{progress['total_count']} tickers；仍需按计划补齐后重跑验证"
+            f"   优先队列任意本地价格(非解锁口径): {progress['has_local_count']}/"
+            f"{progress['total_count']} tickers"
+        ),
+        (
+            f"   计划日期覆盖: {progress.get('covered_signal_dates', 0)}/"
+            f"{progress.get('checked_signal_dates', 0)} signal dates；"
+            f"缺口={progress.get('missing_signal_dates', 0)}，补齐后重跑验证"
         ),
         f"   优先队列: {queue_text}",
         f"   daily_prices 当前总行数: {progress['daily_prices_rows']:,}",

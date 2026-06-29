@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import argparse
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -14,6 +15,23 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root.parent))
 
 from sovereign_hall.services.heuristic_policy import format_heuristic_status
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Sovereign Hall interactive local research entry")
+    parser.add_argument(
+        "--question",
+        help="直接运行一个研究问题；省略时进入交互模式",
+    )
+    return parser.parse_args(argv)
+
+
+def safe_input(prompt: str) -> str | None:
+    """Return None when stdin is closed so automation can exit cleanly."""
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
 
 
 async def print_report(context):
@@ -48,7 +66,51 @@ async def print_report(context):
     print("\n" + "="*70)
 
 
-async def main():
+async def run_research_question(question: str) -> None:
+    from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
+
+    system = ResearchDiscussionSystem(
+        enable_search=True,
+        enable_web=False
+    )
+    context = await system.research(question)
+    await print_report(context)
+
+    # 保存到文件
+    report_file = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    with open(report_file, 'w', encoding='utf-8') as f:
+        f.write(f"# 研究报告\n\n")
+        f.write(f"**问题**: {context.question}\n\n")
+        f.write(f"**时间**: {datetime.now().isoformat()}\n\n")
+        f.write("## 本地Heuristic风险提示\n\n")
+        f.write(format_heuristic_status())
+        f.write("\n\n")
+        f.write("---\n\n")
+        f.write("## 结论\n\n")
+        f.write(context.final_conclusion)
+        f.write("\n\n---\n\n")
+        f.write("## 讨论过程\n\n")
+        for i, view in enumerate(context.discussion_history, 1):
+            f.write(f"### 第{i}轮\n\n")
+            f.write(view)
+            f.write("\n\n")
+
+    print(f"\n💾 报告已保存到: {report_file}")
+
+
+async def main(argv: list[str] | None = None):
+    args = parse_args(argv)
+    if args.question:
+        try:
+            await run_research_question(args.question.strip())
+        except KeyboardInterrupt:
+            print("\n\n🛑 用户中断")
+        except Exception as e:
+            print(f"\n❌ 错误: {e}")
+            import traceback
+            traceback.print_exc()
+        return
+
     print("\n" + "="*60)
     print("🏛️ Sovereign Hall - 交互式研究系统")
     print("="*60)
@@ -59,7 +121,11 @@ async def main():
     default_question = "我最近看好存储行业，特别是ai方面的，选几个A股值得投资的股票"
 
     while True:
-        question = input("❓ 问题: ").strip()
+        raw_question = safe_input("❓ 问题: ")
+        if raw_question is None:
+            print("\n👋 非交互输入结束，安全退出")
+            break
+        question = raw_question.strip()
 
         if not question:
             question = default_question
@@ -70,35 +136,7 @@ async def main():
             break
 
         try:
-            from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
-
-            system = ResearchDiscussionSystem(
-                enable_search=True,
-                enable_web=False
-            )
-            context = await system.research(question)
-            await print_report(context)
-
-            # 保存到文件
-            report_file = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-            with open(report_file, 'w', encoding='utf-8') as f:
-                f.write(f"# 研究报告\n\n")
-                f.write(f"**问题**: {context.question}\n\n")
-                f.write(f"**时间**: {datetime.now().isoformat()}\n\n")
-                f.write("## 本地Heuristic风险提示\n\n")
-                f.write(format_heuristic_status())
-                f.write("\n\n")
-                f.write("---\n\n")
-                f.write("## 结论\n\n")
-                f.write(context.final_conclusion)
-                f.write("\n\n---\n\n")
-                f.write("## 讨论过程\n\n")
-                for i, view in enumerate(context.discussion_history, 1):
-                    f.write(f"### 第{i}轮\n\n")
-                    f.write(view)
-                    f.write("\n\n")
-
-            print(f"\n💾 报告已保存到: {report_file}")
+            await run_research_question(question)
 
         except KeyboardInterrupt:
             print("\n\n🛑 用户中断")

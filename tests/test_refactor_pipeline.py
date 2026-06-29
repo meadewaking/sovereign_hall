@@ -89,6 +89,26 @@ def test_check_db_safe_input_handles_closed_stdin(monkeypatch):
     assert check_db.safe_input("choice: ") is None
 
 
+def test_research_interactive_safe_input_handles_closed_stdin(monkeypatch):
+    import sovereign_hall.research_interactive as research_interactive
+
+    def raise_eof(_prompt):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+
+    assert research_interactive.safe_input("question: ") is None
+
+
+def test_research_interactive_help_is_cli_only():
+    import sovereign_hall.research_interactive as research_interactive
+
+    with pytest.raises(SystemExit) as exc:
+        research_interactive.parse_args(["--help"])
+
+    assert exc.value.code == 0
+
+
 def test_check_db_realtime_quotes_are_opt_in(monkeypatch):
     import sovereign_hall.check_db as check_db
 
@@ -139,6 +159,8 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     db_path = tmp_path / "test.db"
     conn = sqlite3.connect(db_path)
     conn.execute("CREATE TABLE daily_prices (ticker TEXT, date TEXT, close REAL)")
+    conn.execute("INSERT INTO daily_prices VALUES ('600519', '2026-06-18', 10.5)")
+    conn.commit()
     plan_path = tmp_path / "daily_price_backfill_plan.csv"
     plan_path.write_text(
         "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
@@ -148,6 +170,13 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
         "backfill this ticker's latest local daily_prices row first\n"
         "2,512880,44,2026-05-02,2026-06-10,1197,2026-06-20,False,0,"
         "backfill historical local daily_prices before using scores to widen exposure\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "daily_signal_tape.csv").write_text(
+        "date,ticker,price_source\n"
+        "2026-06-19,600519,prediction_current_price\n"
+        "2026-06-20,600519,prediction_current_price\n"
+        "2026-06-10,512880,prediction_current_price\n",
         encoding="utf-8",
     )
     context = HeuristicRiskContext(
@@ -176,10 +205,11 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     text = check_db.format_daily_price_backfill_progress(conn, context=context)
     conn.close()
 
-    assert "优先队列已有任意本地价格: 0/2 tickers" in text
-    assert "600519(missing 2026-05-01..2026-06-20, 45d, 1585obs)" in text
-    assert "512880(missing 2026-05-02..2026-06-10, 44d, 1197obs)" in text
-    assert "下一步本地补齐: 600519 2026-05-01..2026-06-20 (45 signal days)" in text
+    assert "优先队列任意本地价格(非解锁口径): 1/2 tickers" in text
+    assert "计划日期覆盖: 2/3 signal dates；缺口=1，补齐后重跑验证" in text
+    assert "600519(missing 2026-05-01..2026-06-20, 45d, 1585obs, plan_covered=2/2" in text
+    assert "512880(missing 2026-05-02..2026-06-10, 44d, 1197obs, plan_covered=0/1)" in text
+    assert "下一步本地补齐: 512880 2026-05-02..2026-06-10 (44 signal days)" in text
     assert f"机器可读补齐计划: {tmp_path / 'daily_price_backfill_plan.csv'}" in text
     assert "计划优先级Top: 600519, 512880" in text
     assert "本地DB覆盖检查: python scripts/backfill_daily_prices.py --status --limit 5 --plan" in text
