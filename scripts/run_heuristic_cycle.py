@@ -1608,8 +1608,10 @@ def write_readme(
         f"- Machine-readable backfill plan: `{backfill_plan_path or 'not written'}`; "
         f"plan tickers={plan_total}; top priority={top_plan or 'none'}\n"
         f"- Local DB plan coverage check: `{backfill_status_command}`\n"
-        f"- Local repair dry run: `{backfill_dry_run_command}`\n"
-        f"- Local CSV import validation: `{backfill_import_command}`\n"
+        f"- Local request preview, no network: `{backfill_dry_run_command}`\n"
+        f"- Local CSV exact signal-date validation: `{backfill_import_command}`\n"
+        "- Market-data fetch guard: `scripts/backfill_daily_prices.py` blocks MarketDataService fetches "
+        "unless `--allow-market-fetch` or `SOVEREIGN_HALL_ALLOW_MARKET_BACKFILL=1` is set.\n"
         "- Integration decision: do not synthesize `daily_prices` from prediction current_price; "
         "surface this as a local backfill checklist and local CSV import path in user entries; "
         "keep exposure caps active until the cycle validates coverage."
@@ -1662,6 +1664,13 @@ def write_readme(
 - Current best score: {best_metrics['score']:.6f}
 - Previous best comparison: {comparison}
 
+## Blocking & Repeated Warning Review
+- Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
+- Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
+- Root cause advanced this cycle: local CSV validation could previously report ticker-level plan coverage when a row merely landed inside a planned date range; that was weaker than the DB/status gate, which requires exact missing signal-date coverage with bounded as-of matching.
+- System fix: `scripts/backfill_daily_prices.py --import-csv ... --dry-run --plan ...` now reports exact signal-date coverage, and MarketDataService fetches are blocked unless explicitly opted in with `--allow-market-fetch` or `SOVEREIGN_HALL_ALLOW_MARKET_BACKFILL=1`.
+- Integration decision: do not promote a return-seeking default or relax caps this round; use the retained policy only as a risk cap/warning until independently supplied local OHLC rows pass exact plan-date validation and a new cycle confirms coverage.
+
 ## What Changed
 - Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
 - Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, minimum holding periods, no-new-risk pauses, and rebalance friction.
@@ -1688,6 +1697,7 @@ def write_readme(
 - Advanced the prior data-source direction by writing `price_coverage.json`, including price-source counts and missing held-position price slots for the retained path.
 - Converted the latest price-coverage warning into a real simulated-investment constraint: weak or unvalidated local price coverage now applies a coverage-adjusted cap; zero independent daily_prices coverage allows at most one-quarter of the latest policy single-name cap.
 - Added a local-only CSV validation/import path in `scripts/backfill_daily_prices.py` so daily_prices can be repaired from an independently provided local OHLC file without network calls.
+- Tightened local CSV validation to exact missing signal dates from the plan/tape, and disabled MarketDataService fetches by default so this automation remains local-only unless explicitly opted in.
 - Advanced the daily_prices closure into `check_db`: the entry now compares the latest priority backfill queue with live local `daily_prices` rows and prints the still-missing next ticker plus the active no-expansion cap.
 - Clarified the repeated priority-queue warning by rendering missing date ranges explicitly and aligning the local CSV validation command with the machine-readable backfill plan.
 - Added a no-network `scripts/backfill_daily_prices.py --status` check that compares the current SQLite `daily_prices` table against exact missing signal dates from the latest plan/tape before users rerun the cycle.
@@ -1762,7 +1772,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved price-coverage closure: `check_db`, research prompt context, and simulated trade reasons now surface the latest `price_coverage.json` ratios, including held-position missing-price slots.
 - Improved daily-price-readiness closure: `check_db`, research prompt context, and manual research reports now surface `price_readiness.json`, including the prioritized missing-price queue.
 - Improved live daily-price-readiness closure: `check_db` now validates that priority queue against the current SQLite `daily_prices` table and prints covered/missing queue tickers, the next local backfill target, and the active no-expansion cap before the user starts simulation.
-- Improved local backfill repair path: `check_db` now prints a dry-run command for the current backfill plan and a local CSV import validation command; `scripts/backfill_daily_prices.py --import-csv ... --dry-run` validates OHLC rows without network access.
+- Improved local backfill repair path: `check_db` now prints a no-network plan preview and a local CSV exact signal-date validation command; `scripts/backfill_daily_prices.py --import-csv ... --dry-run` validates OHLC rows without network access.
 - Improved backfill-readiness closure: user entries and reports now label priority queue dates as missing ranges, and local CSV validation can compare supplied rows with the current plan before import.
 - Improved backfill verification path: `check_db` now prints a no-network DB coverage command, and `scripts/backfill_daily_prices.py --status` reports exact still-missing signal dates before any exposure cap can be relaxed.
 - Improved daily-price backfill closure: this run writes `daily_price_backfill_plan.csv` and `daily_price_backfill_plan.json`; user entries surface the plan path and top priority ticker so repeated empty `daily_prices` runs have a concrete local next step.
@@ -1784,7 +1794,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
 - Still not integrated as validation for exposure widening: `tape_update.json` does not meet the minimum fresh-row/latest-day observation thresholds when marked as thin or stale.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers shown by `check_db`, then validate whether the evidence-gated cap, observation-count cap, and ETF-sleeve caps reduce churn/drawdown over another tape update before widening exposure.
-- This cycle's minimum local step: run `{backfill_status_command}` to verify current DB coverage, then use `scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv --source local_csv --dry-run --plan {backfill_plan_path or 'daily_price_backfill_plan.csv'}` to validate independently supplied OHLC rows before adding any new return-seeking heuristic branch.
+- This cycle's minimum local step: run `{backfill_status_command}` to verify current DB coverage, then use `{backfill_import_command}` to validate independently supplied OHLC rows against exact missing signal dates before adding any new return-seeking heuristic branch.
 
 ## Reproduce
 ```bash

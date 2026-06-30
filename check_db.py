@@ -463,6 +463,7 @@ def daily_price_backfill_progress(
         "status_command": " ".join(status_parts),
         "dry_run_command": " ".join(dry_run_parts),
         "local_import_command": " ".join(local_import_parts),
+        "market_fetch_note": "MarketDataService fetch 默认关闭；本入口只建议 status 与本地CSV精确日期校验",
     }
 
 
@@ -514,9 +515,11 @@ def format_daily_price_backfill_progress(
     if progress.get("status_command"):
         lines.append(f"   本地DB覆盖检查: {progress['status_command']}")
     if progress.get("dry_run_command"):
-        lines.append(f"   本地计划预检: {progress['dry_run_command']}")
+        lines.append(f"   不联网计划查看: {progress['dry_run_command']}")
     if progress.get("local_import_command"):
-        lines.append(f"   本地CSV导入预检: {progress['local_import_command']}")
+        lines.append(f"   本地CSV精确日期校验: {progress['local_import_command']}")
+    if progress.get("market_fetch_note"):
+        lines.append(f"   数据安全门: {progress['market_fetch_note']}")
     if progress.get("stall_note"):
         lines.append(f"   连续阻塞: {progress['stall_note']}")
     if progress.get("active_cap") is not None:

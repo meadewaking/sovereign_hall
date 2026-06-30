@@ -213,8 +213,9 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     assert f"机器可读补齐计划: {tmp_path / 'daily_price_backfill_plan.csv'}" in text
     assert "计划优先级Top: 600519, 512880" in text
     assert "本地DB覆盖检查: python scripts/backfill_daily_prices.py --status --limit 5 --plan" in text
-    assert "本地计划预检: python scripts/backfill_daily_prices.py --dry-run --limit 5 --plan" in text
-    assert "本地CSV导入预检: python scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv" in text
+    assert "不联网计划查看: python scripts/backfill_daily_prices.py --dry-run --limit 5 --plan" in text
+    assert "本地CSV精确日期校验: python scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv" in text
+    assert "MarketDataService fetch 默认关闭" in text
     assert f"--plan {plan_path}" in text
     assert "模拟买入上限维持 <= 0.5%" in text
     assert "不得扩仓" in text
@@ -269,6 +270,55 @@ def test_backfill_daily_prices_imports_local_csv_without_network(tmp_path):
     ]
 
 
+def test_backfill_daily_prices_validates_exact_plan_dates(tmp_path):
+    module = load_script_module("backfill_daily_prices_exact_plan_module", "scripts/backfill_daily_prices.py")
+    plan_path = tmp_path / "daily_price_backfill_plan.csv"
+    plan_path.write_text(
+        "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
+        "total_signal_observations,latest_signal_date,missing_latest_signal_date,"
+        "minimum_rows_to_unblock_latest,plan_action\n"
+        "1,600519,2,2026-06-05,2026-06-20,2,2026-06-20,True,1,backfill latest\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "daily_signal_tape.csv").write_text(
+        "date,ticker,price_source\n"
+        "2026-06-05,600519,prediction_current_price\n"
+        "2026-06-20,600519,prediction_current_price\n",
+        encoding="utf-8",
+    )
+    requests = module.requests_from_plan(plan_path, module.parse_date("2026-06-20"))
+    rows = [("600519", "2026-06-20", 10.0, 10.0, 10.0, 10.0, 100.0)]
+
+    summary = module.summarize_plan_coverage(rows, requests, plan_path, max_age_days=7)
+
+    assert "csv_exact_ticker_coverage=0/1" in summary
+    assert "signal_dates=1/2" in summary
+    assert "missing_top=600519" in summary
+
+
+def test_backfill_daily_prices_blocks_market_fetch_by_default(tmp_path, capsys):
+    module = load_script_module("backfill_daily_prices_local_guard_module", "scripts/backfill_daily_prices.py")
+    args = module.build_parser().parse_args(
+        [
+            "--db",
+            str(tmp_path / "test.db"),
+            "--ticker",
+            "600519",
+            "--start",
+            "2026-06-01",
+            "--end",
+            "2026-06-02",
+        ]
+    )
+
+    result = __import__("asyncio").run(module.run(args))
+    output = capsys.readouterr().out
+
+    assert result == 3
+    assert "MarketDataService fetch disabled by default" in output
+    assert "--import-csv data/local_daily_prices.csv" in output
+
+
 def test_backfill_plan_uses_missing_date_range_and_csv_plan_coverage(tmp_path):
     module = load_script_module("backfill_daily_prices_plan_test_module", "scripts/backfill_daily_prices.py")
     plan_path = tmp_path / "daily_price_backfill_plan.csv"
@@ -293,7 +343,8 @@ def test_backfill_plan_uses_missing_date_range_and_csv_plan_coverage(tmp_path):
         [("159990", "2026-06-10", 1.0, 1.0, 1.0, 1.0, 0.0)],
         requests,
     )
-    assert "csv_covers=1/2 planned_tickers" in coverage
+    assert "csv_exact_ticker_coverage=1/2" in coverage
+    assert "signal_dates=1/2" in coverage
     assert "missing_top=600690" in coverage
 
 

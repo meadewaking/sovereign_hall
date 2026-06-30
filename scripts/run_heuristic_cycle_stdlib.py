@@ -1431,6 +1431,13 @@ def write_readme(
 - Current best score: {best_metrics['score']:.6f}
 - Previous best comparison: {comparison}
 
+## Blocking & Repeated Warning Review
+- Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
+- Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
+- Root cause advanced this cycle: local CSV validation could previously report ticker-level plan coverage when a row merely landed inside a planned date range; that was weaker than the DB/status gate, which requires exact missing signal-date coverage with bounded as-of matching.
+- System fix: `scripts/backfill_daily_prices.py --import-csv ... --dry-run --plan ...` now reports exact signal-date coverage, and MarketDataService fetches are blocked unless explicitly opted in with `--allow-market-fetch` or `SOVEREIGN_HALL_ALLOW_MARKET_BACKFILL=1`.
+- Integration decision: do not promote a return-seeking default or relax caps this round; use the retained policy only as a risk cap/warning until independently supplied local OHLC rows pass exact plan-date validation and a new cycle confirms coverage.
+
 ## What Changed
 - Ran the local-only heuristic cycle through the standard-library fallback because numpy/pandas import did not complete in the preflight window.
 - Preserved the existing interpretable policy family and retained promotion rules: diagnostic sparse/max3/min3/recent-failure trials are not default policies.
@@ -1438,6 +1445,7 @@ def write_readme(
 - Kept weak price coverage and failed ETF sleeve checks as real simulated-investment caps/warnings rather than return-seeking allocators.
 - Converted blocked `daily_prices` readiness into a simulated-buy cap, so missing independent local prices constrain entries instead of only appearing in reports.
 - Advanced the data-quality closure by measuring consecutive `blocked_no_daily_prices` cycles; repeated empty daily_prices now appears as a stalled backfill task and stricter simulated-buy cap, not a new leaderboard branch.
+- Tightened local CSV validation to exact missing signal dates from the plan/tape, and disabled MarketDataService fetches by default so this automation remains local-only unless explicitly opted in.
 - Wrote `project_context.json` with `evaluation_engine=stdlib_fallback` so user entry points can surface evaluator reliability.
 
 ## Best Metrics
@@ -1480,7 +1488,8 @@ def write_readme(
 - Priority backfill queue: {missing_queue or 'none'}
 - Machine-readable backfill plan: `{backfill_plan_path or 'not written'}`; plan tickers={plan_total}; top priority={top_plan or 'none'}
 - Local DB plan coverage check: `{backfill_status_command}`
-- Local CSV import validation: `{backfill_import_command}`
+- Local CSV exact signal-date validation: `{backfill_import_command}`
+- Market-data fetch guard: `scripts/backfill_daily_prices.py` blocks MarketDataService fetches unless `--allow-market-fetch` or `SOVEREIGN_HALL_ALLOW_MARKET_BACKFILL=1` is set.
 - Integration decision: do not synthesize `daily_prices` from prediction current_price; surface this as a local backfill checklist in user entries and keep exposure caps active.
 
 ## Persistent Data-Quality Stall
@@ -1509,14 +1518,14 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - User-visible change: latest heuristic status/research prompts include evaluation-engine reliability, weak price coverage, tape freshness, sleeve diagnostics, and current simulated-buy caps.
 - User-visible change: latest heuristic status/research prompts now include a daily_prices backfill readiness checklist and prioritized missing-price queue, not only the latest missing ticker.
 - User-visible change: this run writes `daily_price_backfill_plan.csv` and `daily_price_backfill_plan.json`; user entries surface the plan path so the next local backfill step is concrete.
-- User-visible change: priority queue entries now show explicit missing-date ranges, and CSV dry-run validation can compare local rows with the current plan before import.
+- User-visible change: priority queue entries now show explicit missing-date ranges, and CSV dry-run validation checks exact signal-date coverage before import.
 - User-visible change: `check_db` now prints a no-network DB coverage command, and `scripts/backfill_daily_prices.py --status` reports exact still-missing signal dates before any cap can be relaxed.
 - User-visible change: `python -m sovereign_hall.run_discussion --help` returns CLI help without requiring the single-instance lock; actual runs remain lock-protected.
 - User-visible change: latest heuristic status/research prompts now include consecutive empty-daily_prices cycles and the stalled-backfill next ticker; simulated buys receive an extra-small cap after repeated blockage.
 - Simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` continue to apply single-name, gross, weak-price, daily_prices-readiness, thin/zero-new-tape, ETF-sleeve, failure-memory, and observation-count caps through `services/heuristic_policy.py`.
 - Not integrated as an exposure-increasing default: price coverage remains weak and tape validation is not meaningful enough to widen exposure.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers, then rerun the cycle before relaxing weak-price caps.
-- This cycle's minimum local step: run `{backfill_status_command}`, then use `{backfill_import_command}` before adding any new return-seeking heuristic branch.
+- This cycle's minimum local step: run `{backfill_status_command}`, then use `{backfill_import_command}` to validate independently supplied OHLC rows against exact missing signal dates before adding any new return-seeking heuristic branch.
 
 ## Reproduce
 ```bash
