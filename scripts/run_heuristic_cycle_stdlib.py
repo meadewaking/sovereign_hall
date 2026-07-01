@@ -1419,7 +1419,13 @@ def write_readme(
     stall_blocked_runs = int(price_readiness_stall.get("consecutive_blocked_runs", 0) or 0)
     stall_min_runs = int(price_readiness_stall.get("minimum_blocked_runs", 3) or 3)
     best_cap = safe_float(next((trial.get("config", {}).get("max_position") for trial in trials if trial["trial_name"] == best_name), 0.0))
-    stall_cap = best_cap * 0.05 if price_readiness_stall.get("status") == "stalled_no_daily_prices" else None
+    stall_status = str(price_readiness_stall.get("status", "") or "")
+    stall_cap = best_cap * 0.05 if stall_status in {"stalled_no_daily_prices", "stalled_partial_daily_prices"} else None
+    stall_kind = str(price_readiness_stall.get("stall_kind", "") or "")
+    if stall_kind == "partial_daily_price_backfill_needed" or stall_status == "stalled_partial_daily_prices":
+        stall_decision_subject = "repeated partial daily_prices no-progress"
+    else:
+        stall_decision_subject = "repeated empty daily_prices"
     text = f"""# Heuristic Learning Cycle
 
 ## Run
@@ -1444,7 +1450,7 @@ def write_readme(
 - Advanced the prior fresh-tape direction by checking whether this run has meaningful new local predictions before treating the retained policy as validation for widening.
 - Kept weak price coverage and failed ETF sleeve checks as real simulated-investment caps/warnings rather than return-seeking allocators.
 - Converted blocked `daily_prices` readiness into a simulated-buy cap, so missing independent local prices constrain entries instead of only appearing in reports.
-- Advanced the data-quality closure by measuring consecutive `blocked_no_daily_prices` cycles; repeated empty daily_prices now appears as a stalled backfill task and stricter simulated-buy cap, not a new leaderboard branch.
+- Advanced the data-quality closure by measuring consecutive `blocked_no_daily_prices` and no-progress partial daily_prices cycles; repeated empty or unchanged partial coverage now appears as a stalled backfill task and stricter simulated-buy cap, not a new leaderboard branch.
 - Tightened local CSV validation to exact missing signal dates from the plan/tape, and disabled MarketDataService fetches by default so this automation remains local-only unless explicitly opted in.
 - Wrote `project_context.json` with `evaluation_engine=stdlib_fallback` so user entry points can surface evaluator reliability.
 
@@ -1497,7 +1503,7 @@ def write_readme(
 - Consecutive blocked runs: {stall_blocked_runs}/{stall_min_runs}; blocked run ids: {', '.join(price_readiness_stall.get('blocked_run_ids', [])[-6:]) or 'none'}
 - Next ticker: {price_readiness_stall.get('next_ticker', 'none') or 'none'}; same-next-ticker runs={price_readiness_stall.get('same_next_ticker_runs', 0)}
 - Rule: {price_readiness_stall.get('rule', 'Do not widen exposure while local daily_prices are repeatedly blocked.')}
-- Integration decision: repeated empty daily_prices is treated as a user-entry warning and {"a stricter simulated-buy cap of " + format(stall_cap, ".2%") if stall_cap is not None else "the existing no-expansion data-quality gate"}; do not add new leaderboard branches until local price validation moves.
+- Integration decision: {stall_decision_subject} is treated as a user-entry warning and {"a stricter simulated-buy cap of " + format(stall_cap, ".2%") if stall_cap is not None else "the existing no-expansion data-quality gate"}; do not add new leaderboard branches until local price validation moves.
 
 ## Tape Update Check
 - Status: {tape_update.get('validation_status', 'unknown')}
@@ -1522,6 +1528,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - User-visible change: `check_db` now prints a no-network DB coverage command, and `scripts/backfill_daily_prices.py --status` reports exact still-missing signal dates before any cap can be relaxed.
 - User-visible change: `python -m sovereign_hall.run_discussion --help` returns CLI help without requiring the single-instance lock; actual runs remain lock-protected.
 - User-visible change: latest heuristic status/research prompts now include consecutive empty-daily_prices cycles and the stalled-backfill next ticker; simulated buys receive an extra-small cap after repeated blockage.
+- User-visible change: unchanged partial daily_prices coverage is now surfaced as a stalled data task; simulated buys receive the same extra-small no-progress cap until exact local plan-date coverage moves.
 - Simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` continue to apply single-name, gross, weak-price, daily_prices-readiness, thin/zero-new-tape, ETF-sleeve, failure-memory, and observation-count caps through `services/heuristic_policy.py`.
 - Not integrated as an exposure-increasing default: price coverage remains weak and tape validation is not meaningful enough to widen exposure.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers, then rerun the cycle before relaxing weak-price caps.

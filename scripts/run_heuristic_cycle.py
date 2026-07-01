@@ -1619,7 +1619,13 @@ def write_readme(
     price_readiness_stall = price_readiness_stall or {}
     stall_blocked_runs = int(price_readiness_stall.get("consecutive_blocked_runs", 0) or 0)
     stall_min_runs = int(price_readiness_stall.get("minimum_blocked_runs", 3) or 3)
-    stall_cap = best_cap * 0.05 if price_readiness_stall.get("status") == "stalled_no_daily_prices" else None
+    stall_status = str(price_readiness_stall.get("status", "") or "")
+    stall_cap = best_cap * 0.05 if stall_status in {"stalled_no_daily_prices", "stalled_partial_daily_prices"} else None
+    stall_kind = str(price_readiness_stall.get("stall_kind", "") or "")
+    if stall_kind == "partial_daily_price_backfill_needed" or stall_status == "stalled_partial_daily_prices":
+        stall_decision_subject = "repeated partial daily_prices no-progress"
+    else:
+        stall_decision_subject = "repeated empty daily_prices"
     price_readiness_stall_text = (
         f"- Status: {price_readiness_stall.get('status', 'unknown')}\n"
         f"- Consecutive blocked runs: {stall_blocked_runs}/{stall_min_runs}; "
@@ -1627,7 +1633,7 @@ def write_readme(
         f"- Next ticker: {price_readiness_stall.get('next_ticker', 'none') or 'none'}; "
         f"same-next-ticker runs={price_readiness_stall.get('same_next_ticker_runs', 0)}\n"
         f"- Rule: {price_readiness_stall.get('rule', 'Do not widen exposure while local daily_prices are repeatedly blocked.')}\n"
-        f"- Integration decision: repeated empty daily_prices is treated as a user-entry warning and "
+        f"- Integration decision: {stall_decision_subject} is treated as a user-entry warning and "
         f"{'a stricter simulated-buy cap of ' + format(stall_cap, '.2%') if stall_cap is not None else 'the existing no-expansion data-quality gate'}; "
         "do not add new leaderboard branches until local price validation moves."
     )
@@ -1779,6 +1785,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved `run_discussion` operability: `python -m sovereign_hall.run_discussion --help` no longer fails behind the active single-instance lock, while real runs remain lock-protected.
 - Improved daily-price-readiness simulation closure: blocked independent `daily_prices` readiness now applies a simulated-buy cap through `services/heuristic_policy.py`, so missing local prices constrain entries rather than only appearing in reports.
 - Improved stalled-readiness closure: `check_db`, research prompt context, and simulated trade reasons now show consecutive empty-daily_prices cycles; after repeated blockage, simulated buys use an extra-small observation cap and the cycle explicitly avoids new leaderboard branches.
+- Improved partial-readiness stall closure: repeated `partial_daily_price_backfill_needed` cycles with unchanged coverage are now treated as a stalled data task, so simulated buys receive the same extra-small no-progress cap as an empty-price stall.
 - Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals by coverage quality; with zero independent daily_prices rows the user-entry cap is one-quarter of the latest policy cap rather than a fixed half-cap.
 - Improved fresh-tape closure: `check_db`, research prompt context, and simulated trade reasons now surface `tape_update.json`; when the current cycle only adds a thin local tape update, simulated long proposals are capped to observational sizing and the policy is not treated as validation for widening.
 - Improved zero-new-tape closure: when `tape_update.json` reports no new prediction rows since the previous run, `check_db`, research prompts, and simulated trade reasons show the stricter zero-new-tape cap instead of treating repeated samples as validation.

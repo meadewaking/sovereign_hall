@@ -1249,6 +1249,50 @@ def test_price_readiness_stall_report_counts_consecutive_blocked_runs(tmp_path):
     assert report["same_next_ticker_runs"] == 3
 
 
+def test_price_readiness_stall_report_counts_partial_no_progress(tmp_path):
+    readiness_payload = {
+        "status": "partial_daily_price_backfill_needed",
+        "total_signal_ticker_count": 307,
+        "priced_signal_ticker_count": 30,
+        "missing_signal_ticker_count": 277,
+        "latest_missing_tickers": ["002221"],
+        "missing_tickers_top10": [{"ticker": "002221", "signal_days": 2}],
+    }
+    for run_id in ("20260628_123812", "20260629_123708", "20260630_123538"):
+        run_dir = tmp_path / run_id
+        run_dir.mkdir()
+        (run_dir / "README.md").write_text("# run\n", encoding="utf-8")
+        (run_dir / "price_readiness.json").write_text(
+            json.dumps(readiness_payload),
+            encoding="utf-8",
+        )
+
+    report = build_price_readiness_stall_report(tmp_path)
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap4_min2obs",
+        score=0.0,
+        max_position=0.04,
+        overfit_risk=False,
+        warning="partial daily_prices stalled",
+        failure_cases=[],
+        price_readiness_stall=report,
+    )
+
+    capped, reason = apply_heuristic_risk_cap("002221", 0.04, 0.8, context=context)
+    note = format_price_readiness_stall_note(context)
+
+    assert report["status"] == "stalled_partial_daily_prices"
+    assert report["stall_kind"] == "partial_daily_price_backfill_needed"
+    assert report["consecutive_blocked_runs"] == 3
+    assert report["priced_signal_ticker_count"] == 30
+    assert report["missing_signal_ticker_count"] == 277
+    assert report["next_ticker"] == "002221"
+    assert capped == pytest.approx(0.002)
+    assert "partial daily_prices覆盖无进展" in note
+    assert "数据补齐未推进仓位上限0.20%" in reason
+
+
 def test_heuristic_context_surfaces_price_readiness_stall(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,

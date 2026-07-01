@@ -134,6 +134,24 @@ def _is_blocked_no_daily_prices(readiness: dict[str, Any]) -> bool:
     )
 
 
+def _is_partial_daily_prices_stall_candidate(readiness: dict[str, Any]) -> bool:
+    if not isinstance(readiness, dict):
+        return False
+    return (
+        str(readiness.get("status", "")) == "partial_daily_price_backfill_needed"
+        and _safe_int(readiness.get("priced_signal_ticker_count")) > 0
+        and _safe_int(readiness.get("missing_signal_ticker_count")) > 0
+    )
+
+
+def _readiness_stall_kind(readiness: dict[str, Any]) -> str:
+    if _is_blocked_no_daily_prices(readiness):
+        return "blocked_no_daily_prices"
+    if _is_partial_daily_prices_stall_candidate(readiness):
+        return "partial_daily_price_backfill_needed"
+    return ""
+
+
 def _readiness_next_ticker(readiness: dict[str, Any]) -> str:
     latest_missing = readiness.get("latest_missing_tickers") if isinstance(readiness, dict) else None
     if isinstance(latest_missing, list) and latest_missing:
@@ -184,13 +202,22 @@ def build_price_readiness_stall_report(
             "next_action": "Run a heuristic cycle after local prediction and price artifacts exist.",
         }
 
+    latest_readiness = entries[-1]["readiness"]
+    latest_kind = _readiness_stall_kind(latest_readiness)
+    latest_priced = _safe_int(latest_readiness.get("priced_signal_ticker_count"))
+    latest_missing = _safe_int(latest_readiness.get("missing_signal_ticker_count"))
     blocked_streak: list[dict[str, Any]] = []
     for entry in reversed(entries):
-        if not _is_blocked_no_daily_prices(entry["readiness"]):
+        readiness = entry["readiness"]
+        if _readiness_stall_kind(readiness) != latest_kind or not latest_kind:
+            break
+        if latest_kind == "partial_daily_price_backfill_needed" and (
+            _safe_int(readiness.get("priced_signal_ticker_count")) != latest_priced
+            or _safe_int(readiness.get("missing_signal_ticker_count")) != latest_missing
+        ):
             break
         blocked_streak.append(entry)
 
-    latest_readiness = entries[-1]["readiness"]
     next_ticker = _readiness_next_ticker(latest_readiness)
     same_next_ticker_runs = 0
     if next_ticker:
@@ -202,10 +229,38 @@ def build_price_readiness_stall_report(
     blocked_count = len(blocked_streak)
     status = "not_stalled"
     if blocked_count:
-        status = "stalled_no_daily_prices" if blocked_count >= min_blocked_runs else "blocked_no_daily_prices"
+        if latest_kind == "blocked_no_daily_prices":
+            status = "stalled_no_daily_prices" if blocked_count >= min_blocked_runs else "blocked_no_daily_prices"
+        elif latest_kind == "partial_daily_price_backfill_needed":
+            status = (
+                "stalled_partial_daily_prices"
+                if blocked_count >= min_blocked_runs
+                else "partial_daily_price_backfill_needed"
+            )
     blocked_run_ids = [entry["run_id"] for entry in reversed(blocked_streak)]
+    if latest_kind == "partial_daily_price_backfill_needed":
+        rule = (
+            "If partial daily_prices coverage does not improve across repeated cycles, do not add "
+            "leaderboard branches or widen exposure; focus on exact plan-date local backfill."
+        )
+        next_action = (
+            f"Backfill exact local daily_prices plan dates for {next_ticker}, then rerun the cycle."
+            if next_ticker
+            else "Backfill exact local daily_prices plan dates for the priority queue, then rerun the cycle."
+        )
+    else:
+        rule = (
+            "If daily_prices remains empty for repeated cycles, do not add new leaderboard branches "
+            "or widen exposure; focus on validated local daily_prices backfill/tooling."
+        )
+        next_action = (
+            f"Backfill independently validated local daily_prices for {next_ticker}, then rerun the cycle."
+            if next_ticker
+            else "Backfill independently validated local daily_prices for the priority queue, then rerun the cycle."
+        )
     return {
         "status": status,
+        "stall_kind": latest_kind,
         "consecutive_blocked_runs": blocked_count,
         "minimum_blocked_runs": min_blocked_runs,
         "blocked_run_ids": blocked_run_ids,
@@ -214,15 +269,10 @@ def build_price_readiness_stall_report(
         "latest_blocked_run": blocked_run_ids[-1] if blocked_run_ids else "",
         "next_ticker": next_ticker,
         "same_next_ticker_runs": same_next_ticker_runs,
-        "rule": (
-            "If daily_prices remains empty for repeated cycles, do not add new leaderboard branches "
-            "or widen exposure; focus on validated local daily_prices backfill/tooling."
-        ),
-        "next_action": (
-            f"Backfill independently validated local daily_prices for {next_ticker}, then rerun the cycle."
-            if next_ticker
-            else "Backfill independently validated local daily_prices for the priority queue, then rerun the cycle."
-        ),
+        "priced_signal_ticker_count": latest_priced,
+        "missing_signal_ticker_count": latest_missing,
+        "rule": rule,
+        "next_action": next_action,
     }
 
 
@@ -459,7 +509,18 @@ def format_price_readiness_stall_note(context: HeuristicRiskContext) -> str:
     if blocked_runs <= 0:
         return ""
 
-    parts = [status, f"连续{blocked_runs}/{min_runs}轮daily_prices为0且补齐阻塞"]
+    stall_kind = str(stall.get("stall_kind", "") or "")
+    if stall_kind == "partial_daily_price_backfill_needed" or status == "stalled_partial_daily_prices":
+        priced = _safe_int(stall.get("priced_signal_ticker_count"))
+        missing = _safe_int(stall.get("missing_signal_ticker_count"))
+        parts = [
+            status,
+            f"连续{blocked_runs}/{min_runs}轮partial daily_prices覆盖无进展",
+        ]
+        if priced or missing:
+            parts.append(f"当前覆盖ticker={priced}, 仍缺={missing}")
+    else:
+        parts = [status, f"连续{blocked_runs}/{min_runs}轮daily_prices为0且补齐阻塞"]
     next_ticker = str(stall.get("next_ticker", "") or "")
     if next_ticker:
         same_next = _safe_int(stall.get("same_next_ticker_runs"))
@@ -480,7 +541,7 @@ def price_readiness_stall_position_cap(context: HeuristicRiskContext) -> float |
     stall = context.price_readiness_stall or {}
     if not isinstance(stall, dict):
         return None
-    if str(stall.get("status", "")) != "stalled_no_daily_prices":
+    if str(stall.get("status", "")) not in {"stalled_no_daily_prices", "stalled_partial_daily_prices"}:
         return None
     return context.max_position * PRICE_READINESS_STALLED_POSITION_SCALE
 
