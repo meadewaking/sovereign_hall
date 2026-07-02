@@ -607,9 +607,20 @@ class TokenCalculator:
             completion_tokens: completion token数
             pricing: 价格字典 {'input_per_1k': X, 'output_per_1k': Y}
         """
+        input_cost, output_cost = cls.calculate_cost_breakdown(prompt_tokens, completion_tokens, pricing)
+        return input_cost + output_cost
+
+    @classmethod
+    def calculate_cost_breakdown(
+        cls,
+        prompt_tokens: int,
+        completion_tokens: int,
+        pricing: Dict[str, float]
+    ) -> Tuple[float, float]:
+        """分别计算输入和输出 token 成本。"""
         input_cost = (prompt_tokens / 1000) * pricing.get('input_per_1k', 0)
         output_cost = (completion_tokens / 1000) * pricing.get('output_per_1k', 0)
-        return input_cost + output_cost
+        return input_cost, output_cost
 
 
 # ============================================================================
@@ -618,16 +629,54 @@ class TokenCalculator:
 
 def format_token(num: int) -> str:
     """格式化token显示（自动选择单位）"""
-    if num >= 1_000_000_000_000:
-        return f"{num / 1_000_000_000_000:.2f}T"
-    elif num >= 1_000_000_000:
-        return f"{num / 1_000_000_000:.2f}G"
-    elif num >= 1_000_000:
-        return f"{num / 1_000_000:.2f}M"
-    elif num >= 1_000:
-        return f"{num / 1_000:.2f}k"
-    else:
-        return str(num)
+    try:
+        value = float(num or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    units = (
+        (1_000_000_000_000, "t"),
+        (1_000_000_000, "g"),
+        (1_000_000, "m"),
+        (1_000, "k"),
+    )
+    for threshold, suffix in units:
+        if value >= threshold:
+            scaled = value / threshold
+            precision = 1 if scaled >= 10 else 2
+            return f"{sign}{scaled:.{precision}f}{suffix}"
+    return f"{sign}{int(value)}"
+
+
+def format_cost(amount: float) -> str:
+    """格式化成本，低金额保留更多小数避免显示成 $0.00。"""
+    try:
+        value = float(amount or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if abs(value) < 1:
+        return f"${value:.4f}"
+    return f"${value:.2f}"
+
+
+def format_token_breakdown(stats: Dict[str, Any]) -> str:
+    """格式化总 token、输入 token、输出 token。"""
+    total = stats.get("total_tokens", 0)
+    prompt = stats.get("prompt_tokens", 0)
+    completion = stats.get("completion_tokens", 0)
+    return f"{format_token(total)} (输入 {format_token(prompt)} / 输出 {format_token(completion)})"
+
+
+def format_cost_breakdown(stats: Dict[str, Any]) -> str:
+    """格式化总成本、输入成本、输出成本。"""
+    total = stats.get("total_cost", stats.get("total_cost_usd", 0))
+    if isinstance(total, str):
+        total = total.replace("$", "")
+    input_cost = stats.get("input_cost", stats.get("input_cost_usd", 0))
+    output_cost = stats.get("output_cost", stats.get("output_cost_usd", 0))
+    return f"{format_cost(total)} (输入 {format_cost(input_cost)} / 输出 {format_cost(output_cost)})"
 
 
 def extract_actual_response(text: str, max_length: int = 8000) -> str:

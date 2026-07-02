@@ -1,3 +1,4 @@
+import csv
 import sqlite3
 import json
 import inspect
@@ -38,6 +39,7 @@ from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
 from sovereign_hall.services.prediction_tracker import PredictionTracker
 from sovereign_hall.services.backtest_engine import get_backtest_engine
 from sovereign_hall.services.prediction_store import ensure_prediction_tables
+from sovereign_hall.utils import format_cost_breakdown, format_token, format_token_breakdown
 from sovereign_hall.run_discussion import (
     TOPIC_POOL,
     aggregate_committee_decision,
@@ -76,6 +78,27 @@ def test_entry_imports():
 def test_run_discussion_help_does_not_need_instance_lock():
     assert cli_args_can_run_without_instance_lock(["--help"]) is True
     assert cli_args_can_run_without_instance_lock(["--once"]) is False
+
+
+def test_token_format_uses_short_units():
+    assert format_token(999) == "999"
+    assert format_token(1_234) == "1.23k"
+    assert format_token(1_234_567) == "1.23m"
+    assert format_token(1_234_567_890) == "1.23g"
+
+
+def test_token_and_cost_breakdowns_include_input_output():
+    stats = {
+        "total_tokens": 1_234_567,
+        "prompt_tokens": 1_000_000,
+        "completion_tokens": 234_567,
+        "total_cost": 0.123456,
+        "input_cost_usd": 0.023456,
+        "output_cost_usd": 0.1,
+    }
+
+    assert format_token_breakdown(stats) == "1.23m (输入 1.00m / 输出 234.6k)"
+    assert format_cost_breakdown(stats) == "$0.1235 (输入 $0.0235 / 输出 $0.1000)"
 
 
 def test_check_db_safe_input_handles_closed_stdin(monkeypatch):
@@ -215,6 +238,7 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     assert "本地DB覆盖检查: python scripts/backfill_daily_prices.py --status --limit 5 --plan" in text
     assert "不联网计划查看: python scripts/backfill_daily_prices.py --dry-run --limit 5 --plan" in text
     assert "本地CSV精确日期校验: python scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv" in text
+    assert "本地CSV模板生成: python scripts/backfill_daily_prices.py --status --limit 5 --export-template data/local_daily_prices_template.csv" in text
     assert "MarketDataService fetch 默认关闭" in text
     assert f"--plan {plan_path}" in text
     assert "模拟买入上限维持 <= 0.5%" in text
@@ -393,6 +417,55 @@ def test_backfill_plan_status_uses_exact_signal_tape_dates(tmp_path):
     rendered = module.format_db_plan_coverage(summary, details)
     assert "signal_dates=2/3" in rendered
     assert "missing_dates=2026-06-26" in rendered
+
+
+def test_backfill_daily_prices_exports_missing_template_only(tmp_path):
+    module = load_script_module("backfill_daily_prices_template_test_module", "scripts/backfill_daily_prices.py")
+    plan_path = tmp_path / "daily_price_backfill_plan.csv"
+    plan_path.write_text(
+        "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
+        "total_signal_observations,latest_signal_date,missing_latest_signal_date,"
+        "minimum_rows_to_unblock_latest,plan_action\n"
+        "1,688256,3,2026-05-09,2026-06-26,6,2026-06-26,True,1,"
+        "backfill this ticker's latest local daily_prices row first\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "daily_signal_tape.csv").write_text(
+        "date,ticker,price,close_observations,price_source\n"
+        "2026-05-09,688256,1182.53,2,prediction_current_price\n"
+        "2026-05-10,688256,1182.53,3,prediction_current_price\n"
+        "2026-06-26,688256,1455.69,1,prediction_current_price\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "test.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE daily_prices (ticker TEXT, date TEXT, close REAL)")
+        conn.executemany(
+            "INSERT INTO daily_prices VALUES (?, ?, ?)",
+            [
+                ("688256", "2026-05-08", 1000.0),
+                ("688256", "2026-06-18", 1200.0),
+            ],
+        )
+
+    summary, details = module.summarize_db_plan_coverage(db_path, plan_path, limit=5, max_age_days=7)
+    template_path = tmp_path / "local_daily_prices_template.csv"
+    written = module.export_missing_price_template(template_path, summary, details)
+
+    assert written == 1
+    rows = list(csv.DictReader(template_path.open("r", encoding="utf-8")))
+    assert rows == [
+        {
+            "ticker": "688256",
+            "date": "2026-06-26",
+            "open": "",
+            "high": "",
+            "low": "",
+            "close": "",
+            "volume": "",
+            "source_note": "fill_from_independent_local_ohlc_before_import",
+        }
+    ]
 
 
 def test_price_readiness_uses_signal_date_price_source_not_ticker_level_history(tmp_path):
@@ -1941,7 +2014,8 @@ def test_core_discussion_prompts_are_evidence_rich_and_machine_readable():
     assert "max_tokens=8000" in stage2_source
     assert "build_structured_vote_prompt" in stage3_source
     assert "review_depth" in stage3_source
-    assert "max_tokens=3000" in stage3_source
+    assert "二次修正与反事实复盘" in stage3_source
+    assert "vote_max_tokens" in stage3_source
 
 
 def test_proposal_thesis_preserves_evidence_and_reject_conditions():

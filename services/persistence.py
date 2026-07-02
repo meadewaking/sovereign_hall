@@ -24,6 +24,8 @@ class TokenStats:
     """Token统计"""
     total_tokens: int = 0
     total_cost_usd: float = 0.0
+    input_cost_usd: float = 0.0
+    output_cost_usd: float = 0.0
     total_requests: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -99,6 +101,8 @@ class PersistenceManager:
                     'token_stats': {
                         'total_tokens': self._stats.token_stats.total_tokens,
                         'total_cost_usd': self._stats.token_stats.total_cost_usd,
+                        'input_cost_usd': self._stats.token_stats.input_cost_usd,
+                        'output_cost_usd': self._stats.token_stats.output_cost_usd,
                         'total_requests': self._stats.token_stats.total_requests,
                         'prompt_tokens': self._stats.token_stats.prompt_tokens,
                         'completion_tokens': self._stats.token_stats.completion_tokens,
@@ -117,6 +121,8 @@ class PersistenceManager:
         return {
             'total_tokens': stats.total_tokens,
             'total_cost_usd': stats.total_cost_usd,
+            'input_cost_usd': stats.input_cost_usd,
+            'output_cost_usd': stats.output_cost_usd,
             'total_requests': stats.total_requests,
             'prompt_tokens': stats.prompt_tokens,
             'completion_tokens': stats.completion_tokens,
@@ -146,6 +152,8 @@ class PersistenceManager:
         completion_tokens: int,
         total_cost_usd: float,
         total_requests: int,
+        input_cost_usd: float = 0.0,
+        output_cost_usd: float = 0.0,
         unattributed_tokens: int = None,
     ):
         """Overwrite persisted token totals from the live LLM counter."""
@@ -154,6 +162,8 @@ class PersistenceManager:
             self._stats.token_stats.prompt_tokens = int(prompt_tokens or 0)
             self._stats.token_stats.completion_tokens = int(completion_tokens or 0)
             self._stats.token_stats.total_cost_usd = float(total_cost_usd or 0)
+            self._stats.token_stats.input_cost_usd = float(input_cost_usd or 0)
+            self._stats.token_stats.output_cost_usd = float(output_cost_usd or 0)
             self._stats.token_stats.total_requests = int(total_requests or 0)
             if unattributed_tokens is None:
                 unattributed_tokens = max(

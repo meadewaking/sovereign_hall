@@ -25,7 +25,7 @@ from ..services.investment_committee import InvestmentCommittee
 from ..services.database import DatabaseService
 from ..agents.agent import Agent, AnalystTeam
 from ..agents import AgentRole
-from ..utils import ensure_dir, setup_logging
+from ..utils import ensure_dir, format_cost_breakdown, format_token_breakdown, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -234,8 +234,8 @@ class SovereignHall:
         llm_stats = self.llm.get_stats()
         spider_stats = self.spiders.get_stats()
 
-        print(f"\n  Token消耗: {llm_stats.get('total_tokens', 0):,}")
-        print(f"  预估成本: {llm_stats.get('total_cost_usd', '$0.0')}")
+        print(f"\n  Token消耗: {format_token_breakdown(llm_stats)}")
+        print(f"  预估成本: {format_cost_breakdown(llm_stats)}")
         print(f"\n  爬虫成功: {spider_stats['success']}")
         print(f"  爬虫失败: {spider_stats['fail']}")
         print(f"  成功率: {spider_stats.get('success_rate', 'N/A')}")
@@ -534,8 +534,8 @@ class SovereignHall:
 
         print(f"\n【本轮统计】")
         print(f"  LLM调用: {llm_stats['total_requests']} 次")
-        print(f"  Token消耗: {llm_stats['total_tokens']:,}")
-        print(f"  预估成本: {llm_stats['total_cost_usd']}")
+        print(f"  Token消耗: {format_token_breakdown(llm_stats)}")
+        print(f"  预估成本: {format_cost_breakdown(llm_stats)}")
         print(f"  缓存命中: {llm_stats['cache_size']}")
         print(f"  爬虫成功: {spider_stats['success']}")
         print(f"  爬虫失败: {spider_stats['fail']}")
@@ -545,7 +545,11 @@ class SovereignHall:
 
         # 更新Token统计
         self.system_stats.token_stats.total_tokens = int(llm_stats.get('total_tokens', 0))
-        self.system_stats.token_stats.total_cost_usd = float(llm_stats.get('total_cost_usd', '0.0').replace('$', ''))
+        self.system_stats.token_stats.prompt_tokens = int(llm_stats.get('prompt_tokens', 0))
+        self.system_stats.token_stats.completion_tokens = int(llm_stats.get('completion_tokens', 0))
+        self.system_stats.token_stats.total_cost = float(llm_stats.get('total_cost', 0.0))
+        self.system_stats.token_stats.input_cost = float(llm_stats.get('input_cost_usd', 0.0))
+        self.system_stats.token_stats.output_cost = float(llm_stats.get('output_cost_usd', 0.0))
 
     # =========================================================================
     # 持久化
@@ -592,6 +596,8 @@ class SovereignHall:
         spider_stats = self.spiders.get_stats()
 
         self.system_stats.token_stats.total_tokens = int(llm_stats.get('total_tokens', 0))
+        self.system_stats.token_stats.prompt_tokens = int(llm_stats.get('prompt_tokens', 0))
+        self.system_stats.token_stats.completion_tokens = int(llm_stats.get('completion_tokens', 0))
         self.system_stats.token_stats.total_requests = int(llm_stats.get('total_requests', 0))
         self.system_stats.token_stats.successful_requests = int(llm_stats.get('successful_requests', 0))
 

@@ -20,7 +20,7 @@ from ..core import (
 from ..services.llm_client import LLMClient
 from ..agents.agent import Agent
 from ..agents import AgentPersona, get_persona
-from ..utils import safe_parse_json, generate_id, truncate_text
+from ..utils import format_token_breakdown, safe_parse_json, generate_id, truncate_text
 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +318,7 @@ class InvestmentCommittee:
         )
 
         print(f"\n{'='*80}")
-        print(f"✅ 会议结束 | 耗时 {duration:.1f}秒 | 消耗Token {stats.get('total_tokens', 0):,}")
+        print(f"✅ 会议结束 | 耗时 {duration:.1f}秒 | 消耗Token {format_token_breakdown(stats)}")
         print(f"{'='*80}\n")
 
         return minutes

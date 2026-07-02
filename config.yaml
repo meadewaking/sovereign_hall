@@ -4,10 +4,10 @@
 # LLM配置 (使用本地API)
 llm:
   provider: "openai"  # openai/anthropic/local
-  base_url: "http://172.18.1.128:30300/v1"
-  model: "MiniMax-M2.7-INT8"
+  base_url: "http://172.18.5.19:8000/v1"
+  model: "GLM-5.2-FP8"
   api_key: "not_need"
-  model_uuid: ""  # 用于Host header；30300 为独立入口，不需要 Host 路由
+  model_uuid: ""  # 用于Host header；8000 为独立入口，不需要 Host 路由
   max_concurrent: 16
   temperature: 0.7
   max_tokens: 15000
@@ -18,7 +18,14 @@ llm:
   embedding_uuid: "ec85af59-12aa-4cba-9090-74cc48c39eda"
   embedding_dim: 1024
   embedding_base_url: "http://172.18.1.128:30977"
+  embedding_input_per_1k: 0.0
 
+# Token计费配置（当前为内网估算价，拿到真实费率后只改这里）
+pricing:
+  openai:
+    GLM-5.2-FP8:
+      input_per_1k: 0.0003
+      output_per_1k: 0.0012
 
 # 爬虫配置
 spider:
@@ -94,6 +101,24 @@ research:
   reflection_limit: 5
   rounds: 6
   conclusion_max_length: 20000
+  search_query_count: 30
+  search_results_per_query: 10
+  force_search_interval: 1
+  stage2_max_docs: 30
+  stage2_doc_chars: 1200
+  stage2_context_chars: 24000
+  agent_search_max_docs: 10
+  agent_search_doc_chars: 1200
+  committee_proposal_limit: 5
+  committee_min_review_depth: "full"
+  committee_full_discussion: true
+  committee_round1_max_tokens: 12000
+  committee_round2_max_tokens: 10000
+  committee_revision_max_tokens: 8000
+  committee_vote_max_tokens: 5000
+  committee_summary_chars: 1200
+  committee_vote_context_chars: 6000
+  conclusion_discussion_context_chars: 24000
 
 # 投委会配置
 investment_committee:

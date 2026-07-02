@@ -40,9 +40,9 @@ class Config:
             # LLM配置
             'llm': {
                 'provider': 'openai',
-                'model': 'MiniMax-M2.7-INT8',
+                'model': 'GLM-5.2-FP8',
                 'api_key_env': 'OPENAI_API_KEY',
-                'base_url': 'http://172.18.1.128:30300/v1',
+                'base_url': 'http://172.18.5.19:8000/v1',
                 'model_uuid': '',
                 'max_concurrent': 16,
                 'temperature': 0.7,
@@ -50,6 +50,7 @@ class Config:
                 'timeout': 120,
                 'embedding_model': 'text-embedding-3-small',
                 'embedding_dim': 1536,
+                'embedding_input_per_1k': 0.0,
             },
 
             # 爬虫配置
@@ -123,6 +124,32 @@ class Config:
                 'enable_circuit_breaker': True,
                 'circuit_breaker_failure_threshold': 5,
                 'circuit_breaker_timeout': 60,
+            },
+
+            # 研究讨论配置
+            'research': {
+                'max_tokens': 15000,
+                'reflection_limit': 5,
+                'rounds': 6,
+                'conclusion_max_length': 20000,
+                'search_query_count': 30,
+                'search_results_per_query': 10,
+                'force_search_interval': 1,
+                'stage2_max_docs': 30,
+                'stage2_doc_chars': 1200,
+                'stage2_context_chars': 24000,
+                'agent_search_max_docs': 10,
+                'agent_search_doc_chars': 1200,
+                'committee_proposal_limit': 5,
+                'committee_min_review_depth': 'full',
+                'committee_full_discussion': True,
+                'committee_round1_max_tokens': 12000,
+                'committee_round2_max_tokens': 10000,
+                'committee_revision_max_tokens': 8000,
+                'committee_vote_max_tokens': 5000,
+                'committee_summary_chars': 1200,
+                'committee_vote_context_chars': 6000,
+                'conclusion_discussion_context_chars': 24000,
             },
 
             # 投委会配置
@@ -230,7 +257,7 @@ class Config:
             },
 
             # Token计费配置（用于估算成本）
-            # MiniMax-M2.7-INT8 pricing should be adjusted here if the internal endpoint uses a different rate.
+            # Local OpenAI-compatible endpoints can override pricing here when a billing rate is known.
             'pricing': {
                 'anthropic': {
                     'input_per_1k': 0.0006,   # ¥1.20/百万 → ¥0.0006/千 (半价)
@@ -239,6 +266,7 @@ class Config:
                 'openai': {
                     'MiniMax/MiniMax-M2.5': {'input_per_1k': 0.0006, 'output_per_1k': 0.0042},
                     'MiniMax-M2.7-INT8': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
+                    'GLM-5.2-FP8': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
                     'gpt-4': {'input_per_1k': 0.03, 'output_per_1k': 0.06},
                     'gpt-4-turbo': {'input_per_1k': 0.01, 'output_per_1k': 0.03},
                     'gpt-3.5-turbo': {'input_per_1k': 0.0005, 'output_per_1k': 0.0015},

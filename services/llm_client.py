@@ -22,6 +22,8 @@ from ..core import TokenStats
 from ..utils import (
     safe_parse_json,
     TokenCalculator,
+    format_cost,
+    format_token,
     ThreadSafeCounter,
     RateLimiter,
     setup_logging,
@@ -250,15 +252,18 @@ class LLMClient:
                         completion_tokens = TokenCalculator.estimate(response, self.model)
 
                     # 更新统计
-                    cost = TokenCalculator.calculate_cost(
+                    input_cost, output_cost = TokenCalculator.calculate_cost_breakdown(
                         prompt_tokens, completion_tokens, self.pricing
                     )
+                    cost = input_cost + output_cost
                     with self._stats_lock:
                         self.token_stats.add_request(
                             prompt_len=prompt_tokens * 4,  # 还原为字符数
                             completion_len=completion_tokens * 4,
                             success=True,
-                            cost_usd=cost
+                            cost_usd=cost,
+                            input_cost_usd=input_cost,
+                            output_cost_usd=output_cost,
                         )
 
                     # 写入缓存
@@ -522,6 +527,7 @@ class LLMClient:
         dimension = embedding_config.get('embedding_dim', 1024)
         embedding_uuid = embedding_config.get('embedding_uuid', '')
         embedding_base_url = embedding_config.get('embedding_base_url', 'http://172.18.1.128:30977')
+        tracked_embedding_usage = False
 
         # 如果有API密钥，调用真实API
         if embedding_uuid and embedding_base_url:
@@ -547,6 +553,8 @@ class LLMClient:
                 if 'embedding' in data and data['embedding']:
                     embeddings = data['embedding']
                     if embeddings and len(embeddings) > 0:
+                        self._track_embedding_usage(text)
+                        tracked_embedding_usage = True
                         logger.debug(f"Embedding API success: dim={len(embeddings[0])}")
                         return embeddings[0]
             except Exception as e:
@@ -555,7 +563,30 @@ class LLMClient:
         # 返回模拟向量
         import random
         random.seed(hash(text) % (2**32))
+        if not tracked_embedding_usage:
+            self._track_embedding_usage(text)
         return [random.gauss(0, 1) for _ in range(dimension)]
+
+    def _track_embedding_usage(self, text: str):
+        """按输入 token 统计 embedding 调用。"""
+        try:
+            embedding_config = get_config().get_llm_config()
+            model_name = embedding_config.get('embedding_model', self.model)
+            billable_text = (text or "")[:8000]
+            prompt_tokens = TokenCalculator.estimate(billable_text, model_name)
+            input_per_1k = float(embedding_config.get('embedding_input_per_1k', 0.0) or 0.0)
+            input_cost = (prompt_tokens / 1000) * input_per_1k
+            with self._stats_lock:
+                self.token_stats.add_request(
+                    prompt_len=prompt_tokens * 4,
+                    completion_len=0,
+                    success=True,
+                    cost_usd=input_cost,
+                    input_cost_usd=input_cost,
+                    output_cost_usd=0.0,
+                )
+        except Exception as exc:
+            logger.debug("Failed to track embedding usage: %s", self._format_exception(exc))
 
     # =========================================================================
     # 缓存管理
@@ -611,8 +642,16 @@ class LLMClient:
             'prompt_tokens': stats['prompt_tokens'],
             'completion_tokens': stats['completion_tokens'],
             'unattributed_tokens': stats.get('unattributed_tokens', 0),
-            'total_cost_usd': f"${stats['total_cost']:.2f}",
+            'total_tokens_display': format_token(stats['total_tokens']),
+            'prompt_tokens_display': format_token(stats['prompt_tokens']),
+            'completion_tokens_display': format_token(stats['completion_tokens']),
+            'unattributed_tokens_display': format_token(stats.get('unattributed_tokens', 0)),
+            'total_cost_usd': format_cost(stats['total_cost']),
             'total_cost': stats['total_cost'],  # 数值
+            'input_cost_usd': stats.get('input_cost', 0.0),
+            'output_cost_usd': stats.get('output_cost', 0.0),
+            'input_cost_display': format_cost(stats.get('input_cost', 0.0)),
+            'output_cost_display': format_cost(stats.get('output_cost', 0.0)),
             'cache_size': len(self.cache),
             'peak_token_rate': stats.get('peak_token_rate', '0/s'),
             'avg_token_rate': stats.get('avg_token_rate', '0/s'),

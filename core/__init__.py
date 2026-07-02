@@ -405,6 +405,26 @@ class SystemStats:
         return data
 
 
+def _format_token_count(num: int) -> str:
+    try:
+        value = float(num or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    for threshold, suffix in (
+        (1_000_000_000_000, "t"),
+        (1_000_000_000, "g"),
+        (1_000_000, "m"),
+        (1_000, "k"),
+    ):
+        if value >= threshold:
+            scaled = value / threshold
+            precision = 1 if scaled >= 10 else 2
+            return f"{sign}{scaled:.{precision}f}{suffix}"
+    return f"{sign}{int(value)}"
+
+
 @dataclass
 class TokenStats:
     """Token使用统计"""
@@ -412,6 +432,8 @@ class TokenStats:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_cost: float = 0.0
+    input_cost: float = 0.0
+    output_cost: float = 0.0
     request_count: int = 0
     total_requests: int = 0  # request_count 的别名
     successful_requests: int = 0
@@ -441,15 +463,25 @@ class TokenStats:
                 self.prompt_tokens = prev_stats.get('prompt_tokens', 0)
                 self.completion_tokens = prev_stats.get('completion_tokens', 0)
                 self.total_cost = prev_stats.get('total_cost_usd', 0.0)
+                self.input_cost = prev_stats.get('input_cost_usd', 0.0)
+                self.output_cost = prev_stats.get('output_cost_usd', 0.0)
                 self.request_count = prev_stats.get('total_requests', 0)
                 self.total_requests = self.request_count
                 self._loaded_total_tokens = self.total_tokens
                 self._persistence_loaded = True
-                logger.info(f"已加载历史Token统计: {self.total_tokens:,} tokens, ${self.total_cost:.2f}")
+                logger.info(f"已加载历史Token统计: {_format_token_count(self.total_tokens)} tokens, ${self.total_cost:.2f}")
         except Exception as e:
             logger.debug(f"加载历史统计失败: {e}")
 
-    def add_usage(self, prompt_tokens: int, completion_tokens: int, cost: float = 0.0, success: bool = True):
+    def add_usage(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cost: float = 0.0,
+        success: bool = True,
+        input_cost: float = 0.0,
+        output_cost: float = 0.0,
+    ):
         import time
         current_time = time.time()
         tokens_this_request = prompt_tokens + completion_tokens
@@ -459,6 +491,8 @@ class TokenStats:
             self.completion_tokens += completion_tokens
             self.total_tokens += tokens_this_request
             self.total_cost += cost
+            self.input_cost += input_cost
+            self.output_cost += output_cost
             self.request_count += 1
             self.total_requests = self.request_count
             if success:
@@ -495,18 +529,35 @@ class TokenStats:
                 prompt_tokens=self.prompt_tokens,
                 completion_tokens=self.completion_tokens,
                 total_cost_usd=self.total_cost,
+                input_cost_usd=self.input_cost,
+                output_cost_usd=self.output_cost,
                 total_requests=self.request_count,
                 unattributed_tokens=max(0, self.total_tokens - self.prompt_tokens - self.completion_tokens),
             )
         except Exception as e:
             logger.debug(f"保存Token统计失败: {e}")
 
-    def add_request(self, prompt_len: int, completion_len: int, success: bool = True, cost_usd: float = 0.0):
+    def add_request(
+        self,
+        prompt_len: int,
+        completion_len: int,
+        success: bool = True,
+        cost_usd: float = 0.0,
+        input_cost_usd: float = 0.0,
+        output_cost_usd: float = 0.0,
+    ):
         """兼容旧代码的 add_request 方法（参数是字符数）"""
         # 转换为 token 估算（约 4 字符 = 1 token）
         prompt_tokens = prompt_len // 4
         completion_tokens = completion_len // 4
-        self.add_usage(prompt_tokens, completion_tokens, cost_usd, success)
+        self.add_usage(
+            prompt_tokens,
+            completion_tokens,
+            cost_usd,
+            success,
+            input_cost=input_cost_usd,
+            output_cost=output_cost_usd,
+        )
 
     def get_stats(self) -> Dict[str, Any]:
         import time
@@ -526,6 +577,8 @@ class TokenStats:
                 "completion_tokens": self.completion_tokens,
                 "unattributed_tokens": max(0, self.total_tokens - self.prompt_tokens - self.completion_tokens),
                 "total_cost": self.total_cost,
+                "input_cost": self.input_cost,
+                "output_cost": self.output_cost,
                 "request_count": self.request_count,
                 "total_requests": self.total_requests,
                 "successful_requests": self.successful_requests,

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..core import AgentRole, Document, InvestmentProposal, DATA_DIR
+from ..core.config import get_config
 from ..services.llm_client import LLMClient
 from . import AgentPersona, get_persona
 from ..utils import (
@@ -325,13 +326,16 @@ class Agent:
                     unique_docs.append(doc)
 
             # 提取内容
+            research_config = get_config().get("research", {})
+            max_search_docs = int(research_config.get("agent_search_max_docs", 10) or 10)
+            search_doc_chars = int(research_config.get("agent_search_doc_chars", 1200) or 1200)
             content_parts = []
-            for doc in unique_docs[:6]:  # 最多用6个文档
+            for doc in unique_docs[:max_search_docs]:
                 title = getattr(doc, 'title', '') or ''
                 content = getattr(doc, 'content', '') or ''
                 source = getattr(doc, 'source', '') or ''
                 if len(content) > 100:
-                    content_parts.append(f"【来源:{source}】{title}\n{content[:800]}")
+                    content_parts.append(f"【来源:{source}】{title}\n{content[:search_doc_chars]}")
 
             if not content_parts:
                 # 无搜索结果，降级为普通思考

@@ -441,6 +441,17 @@ def daily_price_backfill_progress(
     ]
     if plan_path:
         local_import_parts.extend(["--plan", plan_path])
+    template_parts = [
+        "python",
+        "scripts/backfill_daily_prices.py",
+        "--status",
+        "--limit",
+        str(limit),
+        "--export-template",
+        "data/local_daily_prices_template.csv",
+    ]
+    if plan_path:
+        template_parts.extend(["--plan", plan_path])
     return {
         "status": readiness.get("status", "unknown"),
         "queue": queue,
@@ -463,6 +474,7 @@ def daily_price_backfill_progress(
         "status_command": " ".join(status_parts),
         "dry_run_command": " ".join(dry_run_parts),
         "local_import_command": " ".join(local_import_parts),
+        "template_command": " ".join(template_parts),
         "market_fetch_note": "MarketDataService fetch 默认关闭；本入口只建议 status 与本地CSV精确日期校验",
     }
 
@@ -518,6 +530,8 @@ def format_daily_price_backfill_progress(
         lines.append(f"   不联网计划查看: {progress['dry_run_command']}")
     if progress.get("local_import_command"):
         lines.append(f"   本地CSV精确日期校验: {progress['local_import_command']}")
+    if progress.get("template_command"):
+        lines.append(f"   本地CSV模板生成: {progress['template_command']}")
     if progress.get("market_fetch_note"):
         lines.append(f"   数据安全门: {progress['market_fetch_note']}")
     if progress.get("stall_note"):

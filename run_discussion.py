@@ -48,6 +48,11 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger("sovereign_hall")
+from sovereign_hall.utils import (
+    format_cost_breakdown,
+    format_token,
+    format_token_breakdown,
+)
 from sovereign_hall.services.heuristic_policy import (
     apply_heuristic_risk_cap,
     format_heuristic_prompt_context,
@@ -74,6 +79,32 @@ def _safe_parse_json(text: str, default=None):
     from sovereign_hall.utils import safe_parse_json
 
     return safe_parse_json(text, default)
+
+
+def _numeric_stat(stats: Dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        if key in stats:
+            value = stats.get(key, 0)
+            if isinstance(value, str):
+                value = value.replace("$", "").replace(",", "")
+            try:
+                return float(value or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _llm_stats_delta(current: Dict[str, Any], previous: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "total_tokens": max(0, int(_numeric_stat(current, "total_tokens") - _numeric_stat(previous, "total_tokens"))),
+        "prompt_tokens": max(0, int(_numeric_stat(current, "prompt_tokens") - _numeric_stat(previous, "prompt_tokens"))),
+        "completion_tokens": max(0, int(_numeric_stat(current, "completion_tokens") - _numeric_stat(previous, "completion_tokens"))),
+        "unattributed_tokens": max(0, int(_numeric_stat(current, "unattributed_tokens") - _numeric_stat(previous, "unattributed_tokens"))),
+        "total_requests": max(0, int(_numeric_stat(current, "total_requests") - _numeric_stat(previous, "total_requests"))),
+        "total_cost": max(0.0, _numeric_stat(current, "total_cost", "total_cost_usd") - _numeric_stat(previous, "total_cost", "total_cost_usd")),
+        "input_cost_usd": max(0.0, _numeric_stat(current, "input_cost_usd", "input_cost") - _numeric_stat(previous, "input_cost_usd", "input_cost")),
+        "output_cost_usd": max(0.0, _numeric_stat(current, "output_cost_usd", "output_cost") - _numeric_stat(previous, "output_cost_usd", "output_cost")),
+    }
 
 
 def build_proposal_thesis(raw: Dict) -> str:
@@ -538,6 +569,11 @@ def build_lessons_with_heuristic_context(lessons_prompt: str = "") -> str:
 # ============================================================================
 async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) -> list:
     """阶段1：海量信息搜索"""
+    from sovereign_hall.core.config import get_config
+
+    research_config = get_config().get("research", {})
+    max_results_per_query = int(research_config.get("search_results_per_query", 10) or 10)
+
     logger.info(f"========== 阶段1：海量信息搜索 - 议题: {topic} ==========")
     print("\n" + "="*60)
     print(f"📡 阶段1：海量信息搜索 - 议题: {topic}")
@@ -574,10 +610,9 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
     # 合并额外查询词并去重
     all_queries = list(set(queries + extra_queries))[:query_count]
 
-    # 降低搜索量以减少被封风险 - 减少查询数和结果数
     raw_docs = await spiders.aggressive_search(
         all_queries,
-        max_results_per_query=5,  # 从10降到5
+        max_results_per_query=max_results_per_query,
     )
 
     print(f"\n抓取 {len(raw_docs)} 篇文档")
@@ -589,6 +624,13 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
 # ============================================================================
 async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, lessons_prompt: str = "") -> list:
     """阶段2：从文档中提取投资提案"""
+    from sovereign_hall.core.config import get_config
+
+    research_config = get_config().get("research", {})
+    stage2_max_docs = int(research_config.get("stage2_max_docs", 30) or 30)
+    stage2_doc_chars = int(research_config.get("stage2_doc_chars", 1200) or 1200)
+    stage2_context_chars = int(research_config.get("stage2_context_chars", 24000) or 24000)
+
     if not docs:
         print("\n⚠️ 没有文档，跳过深度研究")
         logger.warning("阶段2：没有文档，跳过深度研究")
@@ -636,12 +678,12 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 
     # 构建文档摘要
     doc_contents = []
-    for doc in valid_docs[:15]:
+    for doc in valid_docs[:stage2_max_docs]:
         content = getattr(doc, 'content', '') or ''
         title = getattr(doc, 'title', '') or ''
         url = getattr(doc, 'url', '') or ''
         if len(content) > 200:
-            doc_contents.append(f"【{title}】\n{content[:800]}\n来源: {url}")
+            doc_contents.append(f"【{title}】\n{content[:stage2_doc_chars]}\n来源: {url}")
 
     content_text = "\n\n".join(doc_contents)
 
@@ -654,7 +696,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 {lessons_prompt}
 
 资料：
-{content_text[:8000]}
+{content_text[:stage2_context_chars]}
 
 筛选规则：
 1. 只推荐资料中有明确新增证据支持的标的；证据不足时宁可少输出
@@ -946,7 +988,19 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
         return "", []
 
     from sovereign_hall.core import AgentRole
+    from sovereign_hall.core.config import get_config
     from sovereign_hall.services.decision_tracker import DecisionRecorder
+
+    research_config = get_config().get("research", {})
+    committee_proposal_limit = int(research_config.get("committee_proposal_limit", 5) or 5)
+    committee_full_discussion = bool(research_config.get("committee_full_discussion", True))
+    committee_min_review_depth = str(research_config.get("committee_min_review_depth", "full") or "full")
+    round1_max_tokens = int(research_config.get("committee_round1_max_tokens", 12000) or 12000)
+    round2_max_tokens = int(research_config.get("committee_round2_max_tokens", 10000) or 10000)
+    revision_max_tokens = int(research_config.get("committee_revision_max_tokens", 8000) or 8000)
+    vote_max_tokens = int(research_config.get("committee_vote_max_tokens", 5000) or 5000)
+    summary_chars = int(research_config.get("committee_summary_chars", 1200) or 1200)
+    vote_context_chars = int(research_config.get("committee_vote_context_chars", 6000) or 6000)
 
     logger.info("========== 阶段3：投委会审议 ==========")
     print("\n" + "="*60)
@@ -967,19 +1021,25 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
     all_discussions = []
     final_decisions = []
 
-    # 每轮优先讨论最高价值提案；弱提案走轻量裁决，避免低信号内容稀释学习样本。
-    committee_proposals = select_committee_proposals(proposals, limit=3)
+    # 每轮优先讨论最高价值提案，但默认扩大审议面并保持深度辩论。
+    committee_proposals = select_committee_proposals(proposals, limit=committee_proposal_limit)
     for i, proposal in enumerate(committee_proposals):
         ticker = proposal.get('ticker', '')
         thesis = proposal.get('thesis', '')
         sector = proposal.get('sector', '')
         review_depth = choose_review_depth(proposal)
+        if committee_min_review_depth == "full":
+            review_depth = "full"
+        elif committee_min_review_depth == "focused" and review_depth == "light":
+            review_depth = "focused"
         priority_score = proposal_priority_score(proposal)
         learned_context = f"\n\n{lessons_prompt}" if lessons_prompt else ""
         analysis_format = (
             "\n\n输出要求：只讲新增判断，不复述提案；"
             "按【证据】【风险/机会】【反证/压力测试】【结论】输出；"
-            "不限制必要展开，但每条都必须承担不同验证角度；结论必须含买入/卖出/观望、置信度和否决条件。"
+            "不限制必要展开，但每条都必须承担不同验证角度；"
+            "必须给出正反两面推理、至少两个可证伪条件、仓位纪律、观察指标；"
+            "结论必须含买入/卖出/观望、置信度和否决条件。"
         )
 
         print(f"\n### 提案 {i+1}: {ticker} ({proposal.get('direction')}) | 置信度: {proposal.get('confidence', 0):.0%} | 深度: {review_depth} | score={priority_score:.2f}")
@@ -992,23 +1052,30 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
         round1_tasks = [
             (agents[AgentRole.RISK_OFFICER], "风控-财务风险", f"作为风控官，分析{ticker}的财务造假风险。核心观点：{thesis}。请找出潜在风险。{learned_context}{analysis_format}", [f"{ticker} 财务", f"{ticker} 风险"]),
             (agents[AgentRole.RISK_OFFICER], "风控-最坏情况", f"作为风控官，分析{ticker}最坏情况可能跌多少。{learned_context}{analysis_format}", [f"{ticker} 历史跌幅"]),
+            (agents[AgentRole.RISK_OFFICER], "风控-仓位纪律", f"作为风控官，给出{ticker}仓位上限、止损纪律、风险预算和触发减仓的量化条件。{learned_context}{analysis_format}", [f"{ticker} 风险预算", f"{ticker} 止损"]),
             (agents[AgentRole.QUANT_RESEARCHER], "量化-技术面", f"作为量化分析师，分析{ticker}的技术走势。{learned_context}{analysis_format}", [f"{ticker} K线", f"{ticker} 技术分析"]),
             (agents[AgentRole.QUANT_RESEARCHER], "量化-估值", f"作为量化分析师，分析{ticker}的估值水平PE/PB。{learned_context}{analysis_format}", [f"{ticker} 估值", f"{ticker} PE"]),
+            (agents[AgentRole.QUANT_RESEARCHER], "量化-胜率赔率", f"作为量化分析师，拆解{ticker}胜率、赔率、回撤、拥挤度和交易信号有效性。{learned_context}{analysis_format}", [f"{ticker} 胜率", f"{ticker} 拥挤度"]),
             (agents[AgentRole.MACRO_STRATEGIST], "宏观-政策风险", f"作为宏观策略师，分析{ticker}面临的政策风险。{learned_context}{analysis_format}", [f"{ticker} 政策", f"{sector} 政策"]),
             (agents[AgentRole.MACRO_STRATEGIST], "宏观-时机", f"作为宏观策略师，分析当前是否是买入{ticker}的时机。{learned_context}{analysis_format}", ["A股 买入时机", "2025 投资"]),
+            (agents[AgentRole.MACRO_STRATEGIST], "宏观-流动性", f"作为宏观策略师，分析流动性、利率、汇率和风险偏好对{ticker}的影响路径。{learned_context}{analysis_format}", ["A股 流动性", "利率 汇率 风险偏好"]),
             (agents[AgentRole.TMT_ANALYST], "TMT-行业", f"作为TMT分析师，从行业角度点评{ticker}。{learned_context}{analysis_format}", [f"{sector} 行业", f"{ticker} 动态"]),
             (agents[AgentRole.CONSUMER_ANALYST], "消费-行业", f"作为消费分析师，从行业角度点评{ticker}。{learned_context}{analysis_format}", [f"{sector} 消费", f"{ticker} 消费"]),
             (agents[AgentRole.CYCLE_ANALYST], "周期-行业", f"作为周期分析师，从行业周期角度点评{ticker}。{learned_context}{analysis_format}", [f"{sector} 周期"]),
             (agents[AgentRole.CIO], "CIO-综合", f"作为CIO，综合分析{ticker}的投资价值。{learned_context}{analysis_format}", [f"{ticker} 机构观点", f"{ticker} 评级"]),
+            (agents[AgentRole.CIO], "CIO-组合适配", f"作为CIO，分析{ticker}在组合中的角色、与现有持仓相关性、替代标的和执行优先级。{learned_context}{analysis_format}", [f"{ticker} 组合配置", f"{ticker} 替代标的"]),
             (agents[AgentRole.TMT_ANALYST], "TMT-机会", f"作为TMT分析师，分析{ticker}的增长机会。{learned_context}{analysis_format}", [f"{ticker} 增长", f"{ticker} 前景"]),
+            (agents[AgentRole.TMT_ANALYST], "TMT-竞争格局", f"作为TMT分析师，分析{ticker}的竞争格局、技术替代和产业链议价能力。{learned_context}{analysis_format}", [f"{ticker} 竞争格局", f"{sector} 产业链"]),
             (agents[AgentRole.CONSUMER_ANALYST], "消费-机会", f"作为消费分析师，分析{ticker}的增长机会。{learned_context}{analysis_format}", [f"{ticker} 业绩", f"{ticker} 增长"]),
+            (agents[AgentRole.CONSUMER_ANALYST], "消费-需求验证", f"作为消费分析师，分析{ticker}需求端恢复是否真实、库存和渠道反馈是否支持提案。{learned_context}{analysis_format}", [f"{ticker} 需求", f"{ticker} 库存"]),
             (agents[AgentRole.CYCLE_ANALYST], "周期-机会", f"作为周期分析师，分析{ticker}的周期位置。{learned_context}{analysis_format}", [f"{sector} 供需"]),
+            (agents[AgentRole.CYCLE_ANALYST], "周期-价格传导", f"作为周期分析师，分析{ticker}上游成本、产品价格、库存周期和利润传导。{learned_context}{analysis_format}", [f"{ticker} 价格", f"{sector} 库存"]),
             (agents[AgentRole.QUANT_RESEARCHER], "量化-资金", f"作为量化分析师，分析{ticker}的资金流向。{learned_context}{analysis_format}", [f"{ticker} 主力资金"]),
         ]
-        if review_depth == "focused":
+        if not committee_full_discussion and review_depth == "focused":
             focused_names = {"风控-财务风险", "风控-最坏情况", "量化-技术面", "量化-估值", "宏观-时机", "CIO-综合", "TMT-机会", "消费-机会", "周期-机会"}
             round1_tasks = [task for task in round1_tasks if task[1] in focused_names]
-        elif review_depth == "light":
+        elif not committee_full_discussion and review_depth == "light":
             light_names = {"风控-最坏情况", "量化-技术面", "宏观-时机", "CIO-综合"}
             round1_tasks = [task for task in round1_tasks if task[1] in light_names]
 
@@ -1020,35 +1087,35 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                         search_queries=queries,
                         context=thesis,
                         temperature=0.8,
-                        max_tokens=8000
+                        max_tokens=round1_max_tokens
                     )
                     for agent, name, task, queries in round1_tasks
                 ]),
-                timeout=900
+                timeout=1200
             )
 
             task_names = [name for _, name, _, _ in round1_tasks]
             all_discussions.append(f"\n{'='*50}\n【{ticker}】第一轮分析\n{'='*50}")
             for name, result in zip(task_names, round1_results):
-                all_discussions.append(f"\n[{name}]\n{result[:500]}")
+                all_discussions.append(f"\n[{name}]\n{result[:summary_chars]}")
 
             print(f"      ✅ 第一轮完成")
 
-            round1_summary = "\n".join([f"{name}: {r[:300]}" for name, r in zip(task_names, round1_results)])
+            round1_summary = "\n".join([f"{name}: {r[:summary_chars]}" for name, r in zip(task_names, round1_results)])
 
             debate_tasks = [
-                (agents[AgentRole.RISK_OFFICER], "质疑", f"基于以下分析提出最尖锐的质疑：\n{round1_summary[:500]}{analysis_format}", [f"{ticker} 风险", f"{ticker} 问题"]),
-                (agents[AgentRole.QUANT_RESEARCHER], "数据质疑", f"基于以下分析指出数据问题：\n{round1_summary[:500]}{analysis_format}", [f"{ticker} 数据"]),
-                (agents[AgentRole.MACRO_STRATEGIST], "宏观质疑", f"基于以下分析指出宏观风险：\n{round1_summary[:500]}{analysis_format}", ["宏观经济 风险"]),
-                (agents[AgentRole.TMT_ANALYST], "行业反驳", f"从行业角度反驳其他观点：\n{round1_summary[:500]}{analysis_format}", [f"{sector} 趋势"]),
-                (agents[AgentRole.CONSUMER_ANALYST], "消费反驳", f"从消费角度反驳其他观点：\n{round1_summary[:500]}{analysis_format}", [f"{sector} 消费"]),
-                (agents[AgentRole.CYCLE_ANALYST], "周期反驳", f"从周期角度反驳其他观点：\n{round1_summary[:500]}{analysis_format}", [f"{sector} 周期"]),
-                (agents[AgentRole.CIO], "CIO回应", f"回应各方质疑，给出最终立场：\n{round1_summary[:500]}{analysis_format}", [f"{ticker} 机构"]),
+                (agents[AgentRole.RISK_OFFICER], "质疑", f"基于以下分析提出最尖锐的质疑，并指出哪些论证最可能错：\n{round1_summary[:vote_context_chars]}{analysis_format}", [f"{ticker} 风险", f"{ticker} 问题"]),
+                (agents[AgentRole.QUANT_RESEARCHER], "数据质疑", f"基于以下分析指出数据问题、样本偏差、估值错配和交易拥挤风险：\n{round1_summary[:vote_context_chars]}{analysis_format}", [f"{ticker} 数据", f"{ticker} 估值"]),
+                (agents[AgentRole.MACRO_STRATEGIST], "宏观质疑", f"基于以下分析指出宏观风险、政策反身性和市场风格切换风险：\n{round1_summary[:vote_context_chars]}{analysis_format}", ["宏观经济 风险", "市场风格 切换"]),
+                (agents[AgentRole.TMT_ANALYST], "行业反驳", f"从行业角度反驳其他观点，尤其要找出被低估的产业催化和被高估的叙事：\n{round1_summary[:vote_context_chars]}{analysis_format}", [f"{sector} 趋势", f"{ticker} 催化"]),
+                (agents[AgentRole.CONSUMER_ANALYST], "消费反驳", f"从消费/需求角度反驳其他观点，并检验终端需求与价格弹性：\n{round1_summary[:vote_context_chars]}{analysis_format}", [f"{sector} 消费", f"{ticker} 需求"]),
+                (agents[AgentRole.CYCLE_ANALYST], "周期反驳", f"从周期角度反驳其他观点，并检验库存、价格、产能和利润传导：\n{round1_summary[:vote_context_chars]}{analysis_format}", [f"{sector} 周期", f"{sector} 价格"]),
+                (agents[AgentRole.CIO], "CIO回应", f"回应各方质疑，给出组合层面的最终倾向、仓位和执行节奏：\n{round1_summary[:vote_context_chars]}{analysis_format}", [f"{ticker} 机构", f"{ticker} 评级"]),
             ]
-            if review_depth == "focused":
+            if not committee_full_discussion and review_depth == "focused":
                 focused_debate_names = {"质疑", "数据质疑", "宏观质疑", "CIO回应"}
                 debate_tasks = [task for task in debate_tasks if task[1] in focused_debate_names]
-            elif review_depth == "light":
+            elif not committee_full_discussion and review_depth == "light":
                 debate_tasks = []
 
             # ============================================================
@@ -1063,30 +1130,69 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                         agent.think_with_search(
                             task=task,
                             search_queries=queries,
-                            context=round1_summary[:300],
+                            context=round1_summary[:vote_context_chars],
                             temperature=0.7,
-                            max_tokens=6000
+                            max_tokens=round2_max_tokens
                         )
                         for agent, name, task, queries in debate_tasks
                     ]),
-                    timeout=600
+                    timeout=900
                 )
 
                 debate_names = [name for _, name, _, _ in debate_tasks]
                 all_discussions.append(f"\n{'='*50}\n【{ticker}】第二轮辩论\n{'='*50}")
                 for name, result in zip(debate_names, round2_results):
-                    all_discussions.append(f"\n[{name}]\n{result[:500]}")
+                    all_discussions.append(f"\n[{name}]\n{result[:summary_chars]}")
 
                 print(f"      ✅ 第二轮完成")
             else:
                 print("   📝 第二轮：轻量提案，跳过深度辩论")
 
             # ============================================================
-            # 第三轮：投票裁决
+            # 第三轮：二次修正与反事实复盘
             # ============================================================
-            print("   📊 第三轮：投票...")
+            print("   🧠 第三轮：二次修正与反事实复盘...")
+            revision_context = (
+                f"【第一轮分析】\n{round1_summary[:vote_context_chars]}\n\n"
+                f"【第二轮辩论】\n"
+                + "\n".join([f"{n}: {r[:summary_chars]}" for n, r in zip(debate_names, round2_results)])
+            )
+            revision_tasks = [
+                (agents[AgentRole.CIO], "CIO-最终修正", "整合全部争议，重写最终投资备忘录，必须说明是否推翻原提案、仓位如何调整、最重要的三条跟踪指标。"),
+                (agents[AgentRole.RISK_OFFICER], "风控-否决清单", "列出可以一票否决该提案的证据、价格行为、财务信号和宏观触发条件，并给出监控频率。"),
+                (agents[AgentRole.QUANT_RESEARCHER], "量化-执行计划", "给出入场、加仓、止损、止盈、回撤控制和失败样本复盘框架。"),
+                (agents[AgentRole.MACRO_STRATEGIST], "宏观-情景矩阵", "构造乐观/基准/悲观三种宏观情景，分别判断该提案的胜率、赔率和仓位。"),
+                (agents[AgentRole.TMT_ANALYST], "行业-催化复核", "复核行业催化、技术路线、竞争格局与供应链证据，指出最可能误判的地方。"),
+                (agents[AgentRole.CONSUMER_ANALYST], "需求-验证框架", "复核需求侧证据、渠道库存、价格敏感性和消费场景变化，给出验证路径。"),
+                (agents[AgentRole.CYCLE_ANALYST], "周期-拐点复核", "复核周期拐点、库存、产能、价格传导和盈利弹性，给出反转/失败条件。"),
+            ]
+            round3_results = await asyncio.wait_for(
+                asyncio.gather(*[
+                    agent.think(
+                        task=f"{task}\n\n提案：{ticker}\n核心观点：{thesis}\n\n讨论材料：\n{revision_context[:vote_context_chars]}{analysis_format}",
+                        temperature=0.6,
+                        max_tokens=revision_max_tokens,
+                    )
+                    for agent, name, task in revision_tasks
+                ]),
+                timeout=900,
+            )
+            revision_names = [name for _, name, _ in revision_tasks]
+            all_discussions.append(f"\n{'='*50}\n【{ticker}】第三轮修正复盘\n{'='*50}")
+            for name, result in zip(revision_names, round3_results):
+                all_discussions.append(f"\n[{name}]\n{result[:summary_chars]}")
+            print("      ✅ 第三轮完成")
 
-            full_context = f"【第一轮】{round1_summary[:800]}\n\n【第二轮】" + "\n".join([f"{n}: {r[:200]}" for n, r in zip(debate_names, round2_results)])
+            # ============================================================
+            # 第四轮：投票裁决
+            # ============================================================
+            print("   📊 第四轮：投票...")
+
+            full_context = (
+                f"【第一轮】{round1_summary[:vote_context_chars]}\n\n"
+                f"【第二轮】" + "\n".join([f"{n}: {r[:summary_chars]}" for n, r in zip(debate_names, round2_results)]) +
+                "\n\n【第三轮修正】" + "\n".join([f"{n}: {r[:summary_chars]}" for n, r in zip(revision_names, round3_results)])
+            )
 
             vote_tasks = [
                 (agents[AgentRole.CIO], "CIO综合视角", 2.0),
@@ -1097,37 +1203,37 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                 (agents[AgentRole.RISK_OFFICER], "风控视角", 1.5),
                 (agents[AgentRole.QUANT_RESEARCHER], "量化视角", 1.0),
             ]
-            if review_depth == "focused":
+            if not committee_full_discussion and review_depth == "focused":
                 vote_tasks = [task for task in vote_tasks if task[1] in {"CIO综合视角", "宏观策略视角", "风控视角", "量化视角"}]
-            elif review_depth == "light":
+            elif not committee_full_discussion and review_depth == "light":
                 vote_tasks = [task for task in vote_tasks if task[1] in {"CIO综合视角", "风控视角", "量化视角"}]
 
             vote_prompts = [
-                build_structured_vote_prompt(ticker, role_view, full_context[:1200], learned_context)
+                build_structured_vote_prompt(ticker, role_view, full_context[:vote_context_chars], learned_context)
                 for _, role_view, _ in vote_tasks
             ]
 
-            # 第三轮投票 - 增加错误处理和日志
+            # 第四轮投票 - 增加错误处理和日志
             print("      🔄 等待投票结果...")
             try:
                 round3_results = await asyncio.wait_for(
                     asyncio.gather(*[
-                        agent.think(task=prompt, temperature=0.4, max_tokens=3000)
+                        agent.think(task=prompt, temperature=0.4, max_tokens=vote_max_tokens)
                         for agent, prompt in zip([a for a, _, _ in vote_tasks], vote_prompts)
                     ]),
-                    timeout=300
+                    timeout=600
                 )
             except Exception as e:
-                logger.error(f"第三轮投票失败: {e}")
+                logger.error(f"第四轮投票失败: {e}")
                 print(f"      ⚠️ 投票出错: {e}")
                 # 返回空结果继续
                 round3_results = [f"投票失败: {str(e)[:100]}" for _ in vote_tasks]
 
             vote_names = [name for _, name, _ in vote_tasks]
             vote_weights = [weight for _, _, weight in vote_tasks]
-            all_discussions.append(f"\n{'='*50}\n【{ticker}】第三轮投票\n{'='*50}")
+            all_discussions.append(f"\n{'='*50}\n【{ticker}】第四轮投票\n{'='*50}")
             for name, result in zip(vote_names, round3_results):
-                all_discussions.append(f"\n[{name}]\n{result[:300]}")
+                all_discussions.append(f"\n[{name}]\n{result[:summary_chars]}")
 
             committee_decision = aggregate_committee_decision(proposal, round3_results, vote_weights=vote_weights)
             expected_days = normalize_proposal_holding_period(proposal, topic)
@@ -1197,6 +1303,11 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
 # ============================================================================
 async def stage4_final_conclusion(llm, discussions: str, decisions: List[Dict], topic: str) -> Dict:
     """阶段4：生成综合结论并结构化"""
+    from sovereign_hall.core.config import get_config
+
+    research_config = get_config().get("research", {})
+    conclusion_context_chars = int(research_config.get("conclusion_discussion_context_chars", 24000) or 24000)
+
     logger.info("========== 阶段4：综合结论 ==========")
     print("\n" + "="*60)
     print("⚖️ 阶段4：综合结论")
@@ -1227,7 +1338,7 @@ async def stage4_final_conclusion(llm, discussions: str, decisions: List[Dict], 
 研究议题：{topic}
 
 讨论内容：
-{discussions[:6000]}
+{discussions[:conclusion_context_chars]}
 
 请输出简洁的结构化结论。不要复述讨论过程，只写最终可执行判断：
 ## 核心判断
@@ -1459,8 +1570,8 @@ async def main():
     prev_stats = persistence.load_previous_stats()
     if prev_stats and prev_stats.get('total_tokens', 0) > 0:
         print(f"📊 历史累计统计:")
-        print(f"   - 累计Token: {prev_stats.get('total_tokens', 0):,}")
-        print(f"   - 累计成本: ${prev_stats.get('total_cost_usd', 0):.2f}")
+        print(f"   - 累计Token: {format_token_breakdown(prev_stats)}")
+        print(f"   - 累计成本: {format_cost_breakdown(prev_stats)}")
         print(f"   - 请求次数: {prev_stats.get('total_requests', 0):,}")
         print(f"   - 已讨论话题: {len(prev_stats.get('topics_discussed', []))}个")
         print(f"   - 已完成轮次: {prev_stats.get('total_rounds', 0)}轮")
@@ -1506,6 +1617,7 @@ async def main():
     config = get_config()
     llm_config = config.get_llm_config()
     system_config = config.get("system", {})
+    research_config = config.get("research", {})
     daily_budget = DailyTokenBudget(
         TOKEN_BUDGET_FILE,
         budget=system_config.get("daily_token_budget"),
@@ -1513,6 +1625,8 @@ async def main():
     daily_budget_pause = int(system_config.get("daily_budget_pause_seconds", 3600) or 3600)
     validation_batch_size = int(system_config.get("validation_batch_size", 100) or 100)
     topic_cooldown_hours = int(system_config.get("topic_cooldown_hours", DEFAULT_TOPIC_COOLDOWN_HOURS) or 0)
+    search_query_count = int(research_config.get("search_query_count", 30) or 30)
+    force_search_interval = int(research_config.get("force_search_interval", 1) or 0)
 
     llm = LLMClient(
         max_concurrent=16,  # 高并发
@@ -1579,7 +1693,7 @@ async def main():
             if daily_budget.exceeded(current_tokens):
                 used = daily_budget.used_today(current_tokens)
                 logger.warning(
-                    f"今日Token预算已用尽: {used:,}/{daily_budget.budget:,}，暂停{daily_budget_pause}秒"
+                    f"今日Token预算已用尽: {format_token(used)}/{format_token(daily_budget.budget)}，暂停{daily_budget_pause}秒"
                 )
                 await asyncio.sleep(daily_budget_pause)
                 continue
@@ -1601,6 +1715,7 @@ async def main():
 
             iteration += 1
             round_start = datetime.now()
+            round_start_stats = llm.get_stats()
             logger.info(f"🔥 第 {iteration} 轮开始 | 议题: {topic}")
             print(f"\n{'='*60}")
             print(f"🔥 第 {iteration} 轮 | 议题: {topic}")
@@ -1639,24 +1754,24 @@ async def main():
                 except Exception as e:
                     logger.warning(f"向量检索失败: {e}")
 
-                # 强制定期搜索新数据（每5轮或议题变化时）
+                # 强制定期搜索新数据（默认每轮刷新，避免本地缓存让每轮 token 过低）
                 # 避免一直用旧缓存导致空转
+                force_search_due = bool(force_search_interval and iteration % force_search_interval == 0)
                 should_force_search = (
                     not existing_docs or
                     len(existing_docs) < 10 or
-                    iteration % 5 == 0  # 每5轮强制搜索一次
+                    force_search_due
                 )
 
                 if should_force_search and not existing_docs:
                     print(f"\n📚 阶段1：本地数据不足，进行搜索补充...")
-                    docs = await stage1_mass_search(llm, spiders, topic, query_count=6)
-                elif existing_docs and len(existing_docs) >= 10 and iteration % 5 != 0:
+                    docs = await stage1_mass_search(llm, spiders, topic, query_count=search_query_count)
+                elif existing_docs and len(existing_docs) >= 10 and not force_search_due:
                     print(f"\n📚 阶段1：使用本地数据 ({len(existing_docs)} 条相关文档)")
                     docs = existing_docs
                 else:
-                    # 每5轮强制搜索更新数据
-                    print(f"\n📚 阶段1：定期更新数据 (每5轮强制搜索)")
-                    docs = await stage1_mass_search(llm, spiders, topic, query_count=6)
+                    print(f"\n📚 阶段1：定期更新数据 (每 {force_search_interval or 'N'} 轮强制搜索)")
+                    docs = await stage1_mass_search(llm, spiders, topic, query_count=search_query_count)
 
                 # 保存文档
                 if docs:
@@ -1738,6 +1853,7 @@ async def main():
             round_time = (datetime.now() - round_start).total_seconds()
             total_time = (datetime.now() - start_time).total_seconds()
             llm_stats = llm.get_stats()
+            round_llm_stats = _llm_stats_delta(llm_stats, round_start_stats)
 
             # 检查本轮是否有有效结果
             has_valid_result = bool(docs and proposals)
@@ -1756,7 +1872,13 @@ async def main():
             persistence.add_time(round_time)
             persistence.increment_proposals(len(proposals))
 
-            stats_msg = f"⏱️  本轮用时: {round_time:.1f}秒 | 累计Token: {llm_stats.get('total_tokens', 0):,} | 成本: {llm_stats.get('total_cost_usd', '$0')}"
+            stats_msg = (
+                f"⏱️  本轮用时: {round_time:.1f}秒 | "
+                f"本轮Token: {format_token_breakdown(round_llm_stats)} | "
+                f"累计Token: {format_token_breakdown(llm_stats)} | "
+                f"本轮成本: {format_cost_breakdown(round_llm_stats)} | "
+                f"累计成本: {format_cost_breakdown(llm_stats)}"
+            )
             logger.info(stats_msg)
             db_fd_count = count_open_file_handles(db_path)
             if db_fd_count > 5:
@@ -1764,13 +1886,15 @@ async def main():
             elif db_fd_count >= 0:
                 logger.debug("SQLite fd count: %s", db_fd_count)
             print(f"\n⏱️  本轮用时: {round_time:.1f}秒")
-            print(f"🔥  累计Token: {llm_stats.get('total_tokens', 0):,}")
+            print(f"🔥  本轮Token: {format_token_breakdown(round_llm_stats)}")
+            print(f"🔥  累计Token: {format_token_breakdown(llm_stats)}")
             print(f"🚀  峰值Token速率: {llm_stats.get('peak_token_rate', '0/s')}")
             print(f"📊  平均Token速率: {llm_stats.get('avg_token_rate', '0/s')}")
-            print(f"💰  累计成本: {llm_stats.get('total_cost_usd', '$0')}")
+            print(f"💰  本轮成本: {format_cost_breakdown(round_llm_stats)}")
+            print(f"💰  累计成本: {format_cost_breakdown(llm_stats)}")
             if daily_budget.budget:
                 used_today = daily_budget.used_today(llm_stats.get('total_tokens', 0))
-                print(f"🧯 今日Token预算: {used_today:,}/{daily_budget.budget:,}")
+                print(f"🧯 今日Token预算: {format_token(used_today)}/{format_token(daily_budget.budget)}")
 
             # 根据是否有结果决定休息时间
             if args.once:
@@ -1793,10 +1917,10 @@ async def main():
         # 打印最终统计
         llm_stats = llm.get_stats()
         print(f"\n📊 最终统计:")
-        print(f"   累计Token: {llm_stats.get('total_tokens', 0):,}")
+        print(f"   累计Token: {format_token_breakdown(llm_stats)}")
         print(f"   峰值Token速率: {llm_stats.get('peak_token_rate', '0/s')}")
         print(f"   平均Token速率: {llm_stats.get('avg_token_rate', '0/s')}")
-        print(f"   累计成本: {llm_stats.get('total_cost_usd', '$0')}")
+        print(f"   累计成本: {format_cost_breakdown(llm_stats)}")
 
     finally:
         await spiders.close()
