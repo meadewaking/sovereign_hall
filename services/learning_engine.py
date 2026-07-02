@@ -239,11 +239,15 @@ class LearningEngine:
             lesson = f"高置信度决策但实际错误，需更谨慎评估" if result == 'wrong' else f"部分正确但未达到目标，需要更好的入场时机"
 
             async with aiosqlite.connect(self.db_path) as db:
-                async with db.execute("SELECT id FROM playbook WHERE ticker = ?", (ticker,)) as cursor:
-                    existing = await cursor.fetchone() if "id" in playbook_columns else None
-                if not existing and "entry_id" in playbook_columns:
+                existing = None
+                if "id" in playbook_columns:
+                    async with db.execute("SELECT id FROM playbook WHERE ticker = ?", (ticker,)) as cursor:
+                        existing = await cursor.fetchone()
+                elif "entry_id" in playbook_columns:
                     async with db.execute("SELECT entry_id FROM playbook WHERE ticker = ?", (ticker,)) as cursor:
                         existing = await cursor.fetchone()
+                else:
+                    continue
 
                 if not existing:
                     if {"id", "ticker", "situation", "lesson", "outcome", "success", "created_at"}.issubset(playbook_columns):

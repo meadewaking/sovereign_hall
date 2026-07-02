@@ -848,23 +848,38 @@ class WikiSearchIndex:
         return scored
 
     async def _vector_search(self, query: str, pages: List[WikiPage]) -> List[Tuple[str, float]]:
+        t0 = datetime.now()
         try:
-            query_vec = await self.llm_client.get_embedding(query)
+            query_vec = await asyncio.wait_for(self.llm_client.get_embedding(query), timeout=30)
+        except asyncio.TimeoutError:
+            logger.warning("wiki embedding query timeout (30s)")
+            return []
         except Exception as exc:
             logger.warning("wiki embedding query failed: %s", exc)
             return []
 
-        results: List[Tuple[str, float]] = []
-        for page in pages:
+        # 并发获取所有页面 embedding，单页 30s 超时
+        async def _safe_page_vec(page: WikiPage) -> Optional[List[float]]:
             try:
-                page_vec = await self._page_embedding(page)
+                return await asyncio.wait_for(self._page_embedding(page), timeout=30)
+            except asyncio.TimeoutError:
+                logger.debug("wiki page embedding timeout: %s", page.rel_path)
+                return None
             except Exception as exc:
                 logger.debug("wiki page embedding failed for %s: %s", page.rel_path, exc)
+                return None
+
+        page_vecs = await asyncio.gather(*[_safe_page_vec(p) for p in pages])
+
+        results: List[Tuple[str, float]] = []
+        for page, page_vec in zip(pages, page_vecs):
+            if page_vec is None:
                 continue
             score = cosine_similarity(query_vec, page_vec)
             if score > 0:
                 results.append((page.rel_path, score))
         results.sort(key=lambda item: item[1], reverse=True)
+        logger.debug(f"wiki vector_search done in {(datetime.now()-t0).total_seconds():.1f}s, {len(results)} hits")
         return results
 
     async def _page_embedding(self, page: WikiPage) -> List[float]:

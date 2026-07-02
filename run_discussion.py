@@ -252,32 +252,37 @@ async def run_startup_preflight(llm, spiders) -> bool:
 
     async def _check_search():
         docs = await asyncio.wait_for(
-            spiders.aggressive_search(["A股 最新消息"], max_results_per_query=1, sources=["ddg"]),
+            spiders.aggressive_search(["A股 最新消息"], max_results_per_query=1),
             timeout=90,
         )
         if not docs:
             raise RuntimeError("搜索返回空结果")
 
-    for name, check in [
-        ("LLM", _check_llm),
-        ("Embedding", _check_embedding),
-        ("搜索", _check_search),
+    for name, check, required in [
+        ("LLM", _check_llm, True),
+        ("Embedding", _check_embedding, True),
+        ("搜索", _check_search, False),
     ]:
         try:
             await check()
-            checks.append((name, True, "OK"))
+            checks.append((name, True, "OK", required))
             print(f"   ✅ {name}: OK")
         except Exception as exc:
             detail = str(exc)[:300] or exc.__class__.__name__
-            checks.append((name, False, detail))
-            print(f"   ❌ {name}: {detail}")
+            checks.append((name, False, detail, required))
+            status = "❌" if required else "⚠️"
+            print(f"   {status} {name}: {detail}")
 
-    failed = [item for item in checks if not item[1]]
+    failed = [item for item in checks if not item[1] and item[3]]
     if failed:
         print("\n❌ 联通性检查未通过，本次不启动 run_discussion。")
-        for name, _, detail in failed:
+        for name, _, detail, _ in failed:
             print(f"   - {name}: {detail}")
         return False
+
+    optional_failed = [item for item in checks if not item[1] and not item[3]]
+    if optional_failed:
+        print("\n⚠️ 搜索联通性暂时不可用，将依赖本地知识库并在后续轮次继续重试。")
 
     print("✅ 联通性检查通过\n")
     return True
@@ -602,13 +607,20 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
     from sovereign_hall.services.spider_service import SearchQueryGenerator
 
     query_gen = SearchQueryGenerator(llm)
-    queries = await query_gen.generate_queries(count=query_count, seeds=seeds)
+    queries = await query_gen.generate_queries(count=query_count, seeds=seeds, topic=topic)
 
     print(f"\n生成 {len(queries)} 个搜索词")
     print(f"示例: {queries[:5]}")
 
-    # 合并额外查询词并去重
-    all_queries = list(set(queries + extra_queries))[:query_count]
+    # 合并额外查询词并去重（保序）
+    seen = set()
+    all_queries = []
+    for q in queries + extra_queries:
+        key = str(q).strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            all_queries.append(q)
+    all_queries = all_queries[:query_count]
 
     raw_docs = await spiders.aggressive_search(
         all_queries,
@@ -668,10 +680,14 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         if len(content) > 50 and content and content != 'None':
             valid_docs.append(doc)
 
-    print(f"有效文档: {len(valid_docs)} / {len(docs)}")
-
-    if len(valid_docs) < 3:
-        print("⚠️ 有效文档不足")
+    logger.info(f"[diag] stage2 valid_docs={len(valid_docs)}/{len(docs)}")
+    if not valid_docs:
+        # 打印第一个 doc 的属性，帮助诊断
+        sample = docs[0] if docs else None
+        if sample is not None:
+            attrs = {k: type(getattr(sample, k, None)).__name__ for k in ('content', 'title', 'url', 'doc_id')}
+            logger.warning(f"[diag] stage2 docs have no content. sample attrs={attrs}")
+            logger.warning(f"[diag] sample doc repr: {repr(sample)[:300]}")
         return []
 
     AgentCls = _get_agent()
@@ -686,6 +702,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
             doc_contents.append(f"【{title}】\n{content[:stage2_doc_chars]}\n来源: {url}")
 
     content_text = "\n\n".join(doc_contents)
+    logger.info(f"[diag] stage2 content_text len={len(content_text)}, doc_contents={len(doc_contents)}")
 
     # 一次性生成多个提案
     prompt = f"""
@@ -730,7 +747,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 """
 
     try:
-        print(f"   🔄 调用LLM批量生成提案...")
+        logger.info(f"[diag] stage2 LLM call begin")
         response = await asyncio.wait_for(
             llm.chat(
                 system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；证据不足时输出空数组。",
@@ -740,11 +757,11 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
             ),
             timeout=600
         )
-
-        print(f"   📥 LLM响应: {response[:200]}...")
+        logger.info(f"[diag] stage2 LLM response len={len(response or '')}, first 300: {(response or '')[:300]}")
 
         # 解析JSON
         proposals = _safe_parse_json(response, [])
+        logger.info(f"[diag] stage2 parsed type={type(proposals).__name__}, len={len(proposals) if hasattr(proposals, '__len__') else 'N/A'}")
         if not isinstance(proposals, list):
             proposals = [proposals]
 
@@ -771,7 +788,9 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
                 cleaned_proposal['holding_period'] = normalize_proposal_holding_period(cleaned_proposal | {'holding_period': p.get('holding_period')}, topic)
                 cleaned.append(cleaned_proposal)
 
-        print(f"\n   ✅ 生成 {len(cleaned)} 个提案（过滤黑名单后）")
+        logger.info(f"[diag] stage2 cleaned={len(cleaned)} (after blacklist filter)")
+        if not cleaned:
+            logger.warning(f"[diag] stage2 produced 0 proposals. Raw response (first 500): {(response or '')[:500]}")
         for p in cleaned:
             print(f"      {p['ticker']} | {p['direction']} | {p['holding_period']}天 | 置信度: {p['confidence']:.0%} | {p['thesis'][:30]}")
 
@@ -1723,25 +1742,47 @@ async def main():
 
             # 加载历史教训并显示
             try:
+                t0 = datetime.now()
                 learning_engine = LearningEngine(str(db_path))
-                lessons_prompt = await learning_engine.generate_lessons_prompt()
-                stats = await learning_engine.get_accuracy_stats()
+                logger.info("[diag] generate_lessons_prompt begin")
+                lessons_prompt = await asyncio.wait_for(
+                    learning_engine.generate_lessons_prompt(), timeout=120
+                )
+                logger.info(f"[diag] generate_lessons_prompt done in {(datetime.now()-t0).total_seconds():.1f}s")
+
+                t0 = datetime.now()
+                logger.info("[diag] get_accuracy_stats begin")
+                stats = await asyncio.wait_for(
+                    learning_engine.get_accuracy_stats(), timeout=60
+                )
+                logger.info(f"[diag] get_accuracy_stats done in {(datetime.now()-t0).total_seconds():.1f}s")
                 if stats['total'] > 0:
                     print(f"\n📈 历史预测胜率: {stats['accuracy']:.1%} ({stats['correct']}/{stats['total']})")
                 if lessons_prompt:
                     print(f"📜 加载了 {lessons_prompt.count('教训') - 1} 条历史教训")
 
                 # 验证待验证决策
+                t0 = datetime.now()
+                logger.info("[diag] validate_pending begin")
                 recorder = DecisionRecorder(str(db_path))
-                validation_result = await recorder.validate_pending(max_count=validation_batch_size)
+                validation_result = await asyncio.wait_for(
+                    recorder.validate_pending(max_count=validation_batch_size), timeout=180
+                )
+                logger.info(f"[diag] validate_pending done in {(datetime.now()-t0).total_seconds():.1f}s")
                 if validation_result.get('validated', 0) > 0:
                     print(f"🔄 本轮验证了 {validation_result['validated']} 条决策")
 
                 # 更新playbook
-                await learning_engine.update_playbook()
+                t0 = datetime.now()
+                logger.info("[diag] update_playbook begin")
+                await asyncio.wait_for(learning_engine.update_playbook(), timeout=180)
+                logger.info(f"[diag] update_playbook done in {(datetime.now()-t0).total_seconds():.1f}s")
 
+            except asyncio.TimeoutError as e:
+                logger.error(f"加载历史教训/验证超时: {e}")
+                lessons_prompt = ""
             except Exception as e:
-                logger.debug(f"加载历史教训/验证失败: {e}")
+                logger.exception(f"加载历史教训/验证失败: {e}")
                 lessons_prompt = ""
 
             try:
@@ -1749,10 +1790,21 @@ async def main():
                 # 检查 VectorDB 中是否有相关数据
                 existing_docs = []
                 try:
-                    # 简单搜索已有数据
-                    existing_docs = await vector_db.search(topic, top_k=20, llm_client=llm)
+                    t0 = datetime.now()
+                    logger.info(f"[diag] vector_db.search begin topic={topic!r}")
+                    existing_docs = await asyncio.wait_for(
+                        vector_db.search(topic, top_k=20, llm_client=llm), timeout=120
+                    )
+                    logger.info(
+                        f"[diag] vector_db.search done in {(datetime.now()-t0).total_seconds():.1f}s, "
+                        f"got {len(existing_docs)} docs"
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"向量检索超时 (120s): topic={topic!r}")
+                    existing_docs = []
                 except Exception as e:
                     logger.warning(f"向量检索失败: {e}")
+                    existing_docs = []
 
                 # 强制定期搜索新数据（默认每轮刷新，避免本地缓存让每轮 token 过低）
                 # 避免一直用旧缓存导致空转
@@ -1772,6 +1824,29 @@ async def main():
                 else:
                     print(f"\n📚 阶段1：定期更新数据 (每 {force_search_interval or 'N'} 轮强制搜索)")
                     docs = await stage1_mass_search(llm, spiders, topic, query_count=search_query_count)
+                    if not docs and existing_docs:
+                        logger.warning(
+                            "阶段1：外部搜索返回0篇，回退使用本地数据 %s 条，避免后续阶段空转",
+                            len(existing_docs),
+                        )
+                        print(f"⚠️ 外部搜索返回0篇，回退使用本地数据 ({len(existing_docs)} 条)")
+                        docs = existing_docs
+                    elif docs and existing_docs:
+                        seen_doc_keys = {
+                            (getattr(doc, "url", "") or getattr(doc, "id", "") or getattr(doc, "doc_id", ""))
+                            for doc in docs
+                        }
+                        added_local_docs = 0
+                        for doc in existing_docs:
+                            doc_key = getattr(doc, "url", "") or getattr(doc, "id", "") or getattr(doc, "doc_id", "")
+                            if doc_key and doc_key not in seen_doc_keys:
+                                docs.append(doc)
+                                seen_doc_keys.add(doc_key)
+                                added_local_docs += 1
+                            if len(docs) >= max(10, search_query_count):
+                                break
+                        if added_local_docs:
+                            logger.info("阶段1：搜索结果较少时追加本地数据 %s 条", added_local_docs)
 
                 # 保存文档
                 if docs:
@@ -1781,18 +1856,35 @@ async def main():
                         and not str(getattr(doc, "id", "") or getattr(doc, "doc_id", "")).startswith("wiki:")
                     ]
                     skipped_docs = len(docs) - len(external_docs)
-                    print(f"\n💾 保存 {len(external_docs)} 篇新外部文档...")
+                    t0 = datetime.now()
+                    logger.info(f"[diag] save_docs begin: external={len(external_docs)} skipped={skipped_docs}")
+                    sys.stdout.flush()
                     saved_docs = 0
                     # 先保存到数据库
-                    for doc in external_docs:
+                    for i, doc in enumerate(external_docs):
                         try:
-                            if await db_service.add_document(doc):
+                            if await asyncio.wait_for(db_service.add_document(doc), timeout=30):
                                 saved_docs += 1
+                        except asyncio.TimeoutError:
+                            logger.warning(f"保存文档超时 (30s): doc #{i} {getattr(doc, 'title', '')[:50]}")
                         except Exception as e:
                             logger.warning(f"保存文档失败: {e}")
 
                     # 批量添加到 VectorDB（带 embedding）
-                    vector_saved = await vector_db.add_documents_batch(external_docs, llm_client=llm)
+                    logger.info(f"[diag] add_documents_batch begin: count={len(external_docs)}")
+                    try:
+                        vector_saved = await asyncio.wait_for(
+                            vector_db.add_documents_batch(external_docs, llm_client=llm),
+                            timeout=600,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"[diag] add_documents_batch timeout (600s), vector_saved=0")
+                        vector_saved = 0
+                    except Exception as e:
+                        logger.error(f"[diag] add_documents_batch failed: {e}")
+                        vector_saved = 0
+                    logger.info(f"[diag] save_docs done in {(datetime.now()-t0).total_seconds():.1f}s, "
+                                f"DB={saved_docs}, Wiki={vector_saved}")
 
                     print(f"   ✅ 文档已保存 (DB: {saved_docs}, Wiki: {vector_saved}, 跳过本地派生: {skipped_docs})")
 

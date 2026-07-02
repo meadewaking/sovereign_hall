@@ -541,12 +541,13 @@ class LLMClient:
                     "Host": embedding_uuid,
                     "Content-Type": "application/json"
                 }
-                # 使用内网客户端（不走代理）
-                resp = await self._embedding_client.post(
-                    url,
-                    json=payload,
-                    headers=headers
+                # 使用内网客户端（不走代理），30s 超时（实测 1s 即可）
+                t0 = datetime.now()
+                resp = await asyncio.wait_for(
+                    self._embedding_client.post(url, json=payload, headers=headers),
+                    timeout=30,
                 )
+                elapsed = (datetime.now() - t0).total_seconds()
                 resp.raise_for_status()
                 data = resp.json()
                 # 检查返回格式
@@ -555,8 +556,10 @@ class LLMClient:
                     if embeddings and len(embeddings) > 0:
                         self._track_embedding_usage(text)
                         tracked_embedding_usage = True
-                        logger.debug(f"Embedding API success: dim={len(embeddings[0])}")
+                        logger.debug(f"Embedding API success: dim={len(embeddings[0])} in {elapsed:.1f}s")
                         return embeddings[0]
+            except asyncio.TimeoutError:
+                logger.warning(f"Embedding API timeout (30s), using mock")
             except Exception as e:
                 logger.warning(f"Embedding API failed: {e}, using mock")
 

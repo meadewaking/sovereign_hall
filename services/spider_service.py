@@ -126,6 +126,11 @@ class SpiderSwarm:
         self.user_agent = user_agent or spider_config.get('user_agent', 'SovereignHall/1.0 (Research Bot)')
         self.retry_times = int(retry_times if retry_times is not None else spider_config.get('retry_times', 3))
         self.search_interval = spider_config.get('search_interval', 0.5)  # 搜索间隔
+        self.default_sources = spider_config.get('search_sources') or ['ddg', 'bing', 'sogou']
+        if isinstance(self.default_sources, str):
+            self.default_sources = [s.strip() for s in self.default_sources.split(',') if s.strip()]
+        default_source_timeout = max(5, min(10, self.timeout // 3 or 5))
+        self.source_timeout = int(spider_config.get('source_timeout', default_source_timeout))
 
         # 搜索结果缓存（类级别共享，同一轮次内有效）
         self._search_cache: Dict[str, Tuple[List[Doc], float]] = {}  # query -> (docs, timestamp)
@@ -296,11 +301,17 @@ class SpiderSwarm:
         async with self.semaphore:
             logger.debug(f"Searching: {query}")
 
+            search_sources = sources or self.default_sources
+            query_timeout = max(
+                self.timeout,
+                self.source_timeout * max(1, len(search_sources)) + 3,
+            )
+
             # 定义搜索操作（用于重试）
             async def _do_search_with_timeout():
                 return await asyncio.wait_for(
                     self._do_search(query, max_results, sources),
-                    timeout=self.timeout
+                    timeout=query_timeout
                 )
 
             # 带重试的执行
@@ -310,7 +321,7 @@ class SpiderSwarm:
                     results = await _do_search_with_timeout()
                     return results
                 except asyncio.TimeoutError:
-                    last_error = f"Timeout after {self.timeout}s"
+                    last_error = f"Timeout after {query_timeout}s"
                     logger.warning(f"Search timeout for '{query}' (attempt {attempt + 1}/{self.retry_times})")
                 except Exception as e:
                     last_error = str(e)
@@ -350,7 +361,7 @@ class SpiderSwarm:
         """
         import time
         docs = []
-        sources = sources or ['ddg']  # 百度被封禁频繁，默认只用DDG
+        sources = sources or self.default_sources
 
         # 检查是否处于告警模式，如果是，检查是否超时需要恢复
         if SpiderSwarm._alarm_mode:
@@ -361,41 +372,65 @@ class SpiderSwarm:
                 SpiderSwarm._consecutive_failures = 0
                 logger.info(f"Spider alarm mode auto-recovered after {elapsed:.1f}s")
             else:
-                logger.warning(f"Spider in alarm mode - search skipped for '{query}'")
+                fallback_sources = [source for source in sources if source != 'ddg']
+                if fallback_sources:
+                    logger.warning(
+                        f"Spider in alarm mode - trying fallback sources for '{query}': {fallback_sources}"
+                    )
+                    sources = fallback_sources
+                else:
+                    logger.warning(f"Spider in alarm mode - retrying configured sources for '{query}'")
+
+        async def _run_source(source_name: str, search_coro):
+            try:
+                return await asyncio.wait_for(search_coro, timeout=self.source_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"{source_name} search timeout for '{query}' after {self.source_timeout}s")
+                return []
+            except Exception as exc:
+                logger.warning(f"{source_name} search failed: {exc}")
                 return []
 
         # 1. 尝试 DuckDuckGO 搜索（带代理）
         if 'ddg' in sources:
-            try:
-                ddg_results = await self._ddg_search(query, max_results)
-                if ddg_results:
-                    docs.extend(ddg_results)
-                    logger.info(f"DDG search for '{query}': found {len(ddg_results)} results")
-            except Exception as e:
-                logger.warning(f"DDG search failed: {e}")
+            ddg_results = await _run_source("DDG", self._ddg_search(query, max_results))
+            if ddg_results:
+                docs.extend(ddg_results)
+                logger.info(f"DDG search for '{query}': found {len(ddg_results)} results")
 
-        # 2. 尝试百度搜索
-        if 'baidu' in sources:
+        # 2. 如果结果不足，尝试 Bing。Bing snippet 质量通常比被验证码拦截的中文搜索源稳定。
+        if 'bing' in sources and len(docs) < max_results:
+            remaining = max_results - len(docs)
+            bing_results = await _run_source("Bing", self._bing_search(query, remaining))
+            if bing_results:
+                docs.extend(bing_results)
+                logger.info(f"Bing search for '{query}': found {len(bing_results)} results")
+
+        # 3. 按配置尝试百度搜索
+        if 'baidu' in sources and len(docs) < max_results:
+            remaining = max_results - len(docs)
             try:
-                baidu_results = await self._baidu_search(query, max_results)
+                baidu_results = await asyncio.wait_for(
+                    self._baidu_search(query, remaining),
+                    timeout=self.source_timeout,
+                )
                 if baidu_results:
                     docs.extend(baidu_results)
                     logger.info(f"Baidu search for '{query}': found {len(baidu_results)} results")
+            except asyncio.TimeoutError:
+                logger.warning(f"Baidu search timeout for '{query}' after {self.source_timeout}s")
             except ConnectionError as e:
                 logger.warning(f"Baidu blocked/captcha: {e}")
             except Exception as e:
                 logger.warning(f"Baidu search failed: {e}")
 
-        # 2. 如果结果不足，尝试搜狗
+        # 4. 如果结果不足，尝试搜狗
         if 'sogou' in sources and len(docs) < max_results:
             remaining = max_results - len(docs)
-            try:
-                sogou_results = await self._sogou_search(query, remaining)
-                if sogou_results:
-                    docs.extend(sogou_results)
-                    logger.info(f"Sogou search for '{query}': found {len(sogou_results)} results")
-            except Exception as e:
-                logger.warning(f"Sogou search failed: {e}")
+            sogou_results = await _run_source("Sogou", self._sogou_search(query, remaining))
+            if sogou_results:
+                docs.extend(sogou_results)
+                logger.info(f"Sogou search for '{query}': found {len(sogou_results)} results")
 
         # 3. 记录失败并更新告警状态
         if not docs:
@@ -406,7 +441,7 @@ class SpiderSwarm:
                 SpiderSwarm._alarm_mode = True
                 SpiderSwarm._alarm_start_time = time.time()
                 logger.warning("⚠️ Search engine failure threshold reached - entering alarm mode")
-                logger.warning("⚠️ Will return empty results for 60s until search succeeds")
+                logger.warning(f"⚠️ Will prefer fallback sources for {SpiderSwarm._alarm_timeout}s until search succeeds")
         else:
             # 搜索成功，重置失败计数
             if SpiderSwarm._consecutive_failures > 0 or SpiderSwarm._alarm_mode:
@@ -709,10 +744,13 @@ class SpiderSwarm:
             try:
                 from ddgs import DDGS
 
-                # 使用代理
-                proxy = get_config().get_spider_config().get("proxy")
-                ddgs = DDGS(proxy=proxy, timeout=min(15, self.timeout))
-                results = ddgs.text(query, max_results=max_results)
+                def _run_ddgs_text():
+                    # 使用代理；ddgs 是同步库，放到线程里避免阻塞整个 async 搜索调度。
+                    proxy = get_config().get_spider_config().get("proxy")
+                    ddgs = DDGS(proxy=proxy, timeout=min(8, self.source_timeout))
+                    return ddgs.text(query, max_results=max_results)
+
+                results = await asyncio.to_thread(_run_ddgs_text)
             finally:
                 # 恢复日志级别
                 ddgs_logger.setLevel(original_ddgs_level)
@@ -757,7 +795,8 @@ class SpiderSwarm:
                 return []
 
             # 并发抓取URL内容（带超时，避免长时间等待）
-            DEEP_FETCH_TIMEOUT = 10  # 深度抓取超时10秒
+            DEEP_FETCH_TIMEOUT = max(3, min(6, self.source_timeout // 2))
+            DEEP_FETCH_LIMIT = max(1, min(max_results, 5))
 
             async def fetch_and_parse(title: str, url: str, fallback_body: str):
                 try:
@@ -799,7 +838,7 @@ class SpiderSwarm:
                 async with semaphore:
                     return await fetch_and_parse(title, url, body)
 
-            tasks = [limited_fetch(t, u, b) for t, u, b in search_results[:max_results]]
+            tasks = [limited_fetch(t, u, b) for t, u, b in search_results[:DEEP_FETCH_LIMIT]]
             docs = await asyncio.gather(*tasks, return_exceptions=True)
 
             # 过滤异常结果
@@ -1034,6 +1073,7 @@ class SearchQueryGenerator:
         count: int = 50,
         seeds: Dict[str, List[str]] = None,
         _retry_count: int = 0,
+        topic: str = None,
     ) -> List[str]:
         """生成搜索查询词
 
@@ -1041,35 +1081,36 @@ class SearchQueryGenerator:
             count: 要生成的查询词数量
             seeds: 种子词字典
             _retry_count: 内部重试计数器，防止无限递归
+            topic: 当前研究议题，用于生成议题相关的查询词
         """
         MAX_RETRIES = 3  # 最大重试次数
         seeds = seeds or self.DEFAULT_SEEDS
 
+        topic_str = topic or "当前A股投资机会"
         prompt = f"""
-基于以下种子词，生成{count}个具体的搜索引擎查询词，用于发现当前的投资机会。
+针对议题「{topic_str}」，生成{count}个具体的搜索引擎查询词，用于发现相关投资机会。
 
-【种子词】
+【种子词参考】
 宏观：{', '.join(seeds.get('macro', []))}
 行业：{', '.join(seeds.get('sector', []))}
 个股：{', '.join(seeds.get('stocks', []))}
 
 【要求】
-1. 覆盖宏观、行业、个股三个层面
-2. 包含异动、政策、技术突破、财务业绩等关键词
-3. 中英文混合
-4. 每个词3-8个字或单词
-5. 精确描述，便于搜索
-6. 避免泛词和重复词；每个查询词必须有明确可检索事件或主题
-7. 优先生成能验证投资假设的查询词，而不是宽泛新闻词
+1. 每个查询词必须与议题「{topic_str}」直接相关，禁止生成通用词
+2. 覆盖：政策/异动/财报/技术突破/产业链/龙头个股/估值/资金流向
+3. 中英文混合，优先中文
+4. 每个5-15字，精确描述可检索事件
+5. 不重复；不用"查询词1"这类占位符
+6. 个股查询词必须带具体股票代码或名称
 
 【输出格式】
-仅返回JSON数组：
-["查询词1", "查询词2", ...]
+仅返回JSON数组，不要其他文字。示例：
+["银行 股息率 2025", "江苏银行 业绩 财报", "降准 对银行影响", "银行PB 估值"]
 """
 
         try:
             response = await self.llm.chat(
-                system="你是投资研究搜索词生成器。只输出JSON数组；避免泛词、重复词和无法检索的概念词。",
+                system="你是投资研究搜索词生成器。只输出JSON数组；避免泛词、重复词、占位符和无法检索的概念词。",
                 user=prompt,
                 temperature=0.8,
                 max_tokens=2000,
@@ -1090,7 +1131,8 @@ class SearchQueryGenerator:
                     return await self.generate_queries(
                         count=max(5, count // 2),
                         seeds=seeds,
-                        _retry_count=_retry_count + 1
+                        _retry_count=_retry_count + 1,
+                        topic=topic,
                     )
                 else:
                     logger.warning(f"Max retries reached for query generation, using fallback")
@@ -1119,6 +1161,18 @@ class SearchQueryGenerator:
                 if matches:
                     queries = matches[:30]
 
+            # 后处理：过滤占位符/泛词
+            queries = [q for q in queries if self._is_valid_query(str(q), topic=topic_str)]
+            # 去重（保序）
+            seen = set()
+            deduped = []
+            for q in queries:
+                key = q.strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    deduped.append(q)
+            queries = deduped
+
             # 调试：记录原始响应
             if not queries:
                 logger.warning(f"Failed to parse queries. Raw response (first 200 chars): {response[:200]}")
@@ -1133,16 +1187,54 @@ class SearchQueryGenerator:
         except Exception as e:
             logger.error(f"Failed to generate queries: {e}")
 
-        # 降级：返回种子词的变体，确保不为空
-        try:
-            all_seeds = []
-            for category in seeds.values():
-                if category:
-                    all_seeds.extend(category)
-            return all_seeds[:count] if all_seeds else ["投资机会", "A股市场", "股票推荐"]
-        except Exception as exc:
-            logger.warning("加载默认搜索种子失败，使用兜底种子: %s", exc)
-            return ["投资机会", "A股市场", "股票推荐"]
+        # 降级：基于议题生成简单查询词
+        fallback = []
+        if topic:
+            fallback = [
+                f"{topic} 最新消息",
+                f"{topic} 政策",
+                f"{topic} 龙头",
+                f"{topic} 行情",
+                f"{topic} 研报",
+            ]
+        if not fallback:
+            try:
+                all_seeds = []
+                for category in seeds.values():
+                    if category:
+                        all_seeds.extend(category)
+                fallback = all_seeds[:count] if all_seeds else ["投资机会", "A股市场", "股票推荐"]
+            except Exception as exc:
+                logger.warning("加载默认搜索种子失败，使用兜底种子: %s", exc)
+                fallback = ["投资机会", "A股市场", "股票推荐"]
+        return fallback[:count]
+
+    # 占位符/泛词黑名单（小写匹配）
+    _PLACEHOLDER_PATTERNS = [
+        "查询词", "示例", "占位", "xxx", "test",
+        "投资机会", "股票推荐", "a股市场",  # 兜底词，不应出现在真实结果中
+    ]
+    # 通用泛词黑名单（独立词时过滤）
+    _GENERIC_WORDS = {
+        "最新", "最新消息", "新闻", "行情", "大盘", "a股", "股市",
+        "政策", "财报", "业绩", "研报", "机构", "评级",
+        "龙头", "产业链", "供需", "库存", "价格",
+    }
+
+    def _is_valid_query(self, query: str, topic: str = None) -> bool:
+        """校验查询词是否有效：非空、非占位符、非纯泛词。"""
+        q = (query or "").strip()
+        if not q or len(q) < 2:
+            return False
+        low = q.lower()
+        # 占位符直接过滤
+        for pat in self._PLACEHOLDER_PATTERNS:
+            if pat in low:
+                return False
+        # 纯泛词过滤（除非带了议题关键词）
+        if q in self._GENERIC_WORDS and topic and topic not in q:
+            return False
+        return True
 
     def get_default_seeds(self) -> Dict[str, List[str]]:
         """获取默认种子词"""
