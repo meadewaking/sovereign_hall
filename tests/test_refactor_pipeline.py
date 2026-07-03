@@ -112,6 +112,23 @@ def test_check_db_safe_input_handles_closed_stdin(monkeypatch):
     assert check_db.safe_input("choice: ") is None
 
 
+def test_check_db_blank_choice_exits_safely(tmp_path, monkeypatch, capsys):
+    import sovereign_hall.check_db as check_db
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "sovereign_hall.db").write_bytes(b"")
+    monkeypatch.setattr(check_db, "project_root", tmp_path)
+    monkeypatch.setattr(check_db, "show_stats", lambda _db_path: [])
+    monkeypatch.setattr(check_db, "safe_input", lambda _prompt: "")
+
+    check_db.main()
+    output = capsys.readouterr().out
+
+    assert "空输入，安全退出" in output
+    assert "无效选择" not in output
+
+
 def test_research_interactive_safe_input_handles_closed_stdin(monkeypatch):
     import sovereign_hall.research_interactive as research_interactive
 
@@ -318,6 +335,54 @@ def test_backfill_daily_prices_validates_exact_plan_dates(tmp_path):
     assert "csv_exact_ticker_coverage=0/1" in summary
     assert "signal_dates=1/2" in summary
     assert "missing_top=600519" in summary
+
+
+def test_backfill_daily_prices_import_csv_defaults_to_latest_plan(tmp_path, capsys):
+    module = load_script_module("backfill_daily_prices_latest_plan_module", "scripts/backfill_daily_prices.py")
+    runs_root = tmp_path / "runs" / "heuristic_cycle"
+    run_dir = runs_root / "20260703_000000"
+    run_dir.mkdir(parents=True)
+    plan_path = run_dir / "daily_price_backfill_plan.csv"
+    plan_path.write_text(
+        "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
+        "total_signal_observations,latest_signal_date,missing_latest_signal_date,"
+        "minimum_rows_to_unblock_latest,plan_action\n"
+        "1,600519,2,2026-06-05,2026-06-20,2,2026-06-20,True,1,backfill latest\n",
+        encoding="utf-8",
+    )
+    (run_dir / "daily_signal_tape.csv").write_text(
+        "date,ticker,price_source\n"
+        "2026-06-05,600519,prediction_current_price\n"
+        "2026-06-20,600519,prediction_current_price\n",
+        encoding="utf-8",
+    )
+    csv_path = tmp_path / "daily_prices.csv"
+    csv_path.write_text(
+        "ticker,date,close\n"
+        "600519,2026-06-20,10.5\n",
+        encoding="utf-8",
+    )
+    args = module.build_parser().parse_args(
+        [
+            "--db",
+            str(tmp_path / "test.db"),
+            "--runs-root",
+            str(runs_root),
+            "--import-csv",
+            str(csv_path),
+            "--source",
+            "local_csv",
+            "--dry-run",
+        ]
+    )
+
+    result = __import__("asyncio").run(module.run(args))
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert f"Plan: {plan_path.resolve()}" in output
+    assert "Plan coverage: plan_requests=1" in output
+    assert "signal_dates=1/2" in output
 
 
 def test_backfill_daily_prices_blocks_market_fetch_by_default(tmp_path, capsys):

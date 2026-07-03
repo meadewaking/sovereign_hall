@@ -430,6 +430,16 @@ def daily_price_backfill_progress(
     status_parts = ["python", "scripts/backfill_daily_prices.py", "--status", "--limit", str(limit)]
     if plan_path:
         status_parts.extend(["--plan", plan_path])
+    latest_status_parts = ["python", "scripts/backfill_daily_prices.py", "--status", "--limit", str(limit)]
+    latest_import_parts = [
+        "python",
+        "scripts/backfill_daily_prices.py",
+        "--import-csv",
+        "data/local_daily_prices.csv",
+        "--source",
+        "local_csv",
+        "--dry-run",
+    ]
     local_import_parts = [
         "python",
         "scripts/backfill_daily_prices.py",
@@ -472,7 +482,9 @@ def daily_price_backfill_progress(
         "active_cap": min(active_caps) if active_caps else None,
         "stall_note": format_price_readiness_stall_note(ctx),
         "status_command": " ".join(status_parts),
+        "latest_status_command": " ".join(latest_status_parts),
         "dry_run_command": " ".join(dry_run_parts),
+        "latest_import_command": " ".join(latest_import_parts),
         "local_import_command": " ".join(local_import_parts),
         "template_command": " ".join(template_parts),
         "market_fetch_note": "MarketDataService fetch 默认关闭；本入口只建议 status 与本地CSV精确日期校验",
@@ -526,10 +538,14 @@ def format_daily_price_backfill_progress(
         lines.append(f"   计划优先级Top: {', '.join(progress['backfill_plan_top'][:5])}")
     if progress.get("status_command"):
         lines.append(f"   本地DB覆盖检查: {progress['status_command']}")
+    if progress.get("latest_status_command"):
+        lines.append(f"   本地DB覆盖检查(最新计划短命令): {progress['latest_status_command']}")
     if progress.get("dry_run_command"):
         lines.append(f"   不联网计划查看: {progress['dry_run_command']}")
     if progress.get("local_import_command"):
         lines.append(f"   本地CSV精确日期校验: {progress['local_import_command']}")
+    if progress.get("latest_import_command"):
+        lines.append(f"   本地CSV精确日期校验(最新计划短命令): {progress['latest_import_command']}")
     if progress.get("template_command"):
         lines.append(f"   本地CSV模板生成: {progress['template_command']}")
     if progress.get("market_fetch_note"):
@@ -1050,6 +1066,9 @@ def main():
             break
         choice = choice_raw.strip().lower()
 
+        if not choice:
+            print("👋 空输入，安全退出")
+            break
         if choice == '1':
             show_stats(db_path)
         elif choice == '2':
