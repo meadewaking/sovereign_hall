@@ -1596,6 +1596,13 @@ def write_readme(
     )
     if backfill_plan_path:
         backfill_import_command += f" --plan {backfill_plan_path}"
+    backfill_strict_import_command = (
+        "python scripts/backfill_daily_prices.py --import-csv "
+        "data/local_daily_prices.csv --source local_csv --dry-run "
+        "--coverage-limit 5 --require-plan-coverage"
+    )
+    if backfill_plan_path:
+        backfill_strict_import_command += f" --plan {backfill_plan_path}"
     price_readiness_text = (
         f"- Status: {price_readiness.get('status', 'unknown')}\n"
         f"- Signal tickers fully covered by local daily_prices: {price_readiness.get('priced_signal_ticker_count', 0)}/"
@@ -1610,6 +1617,7 @@ def write_readme(
         f"- Local DB plan coverage check: `{backfill_status_command}`\n"
         f"- Local request preview, no network: `{backfill_dry_run_command}`\n"
         f"- Local CSV exact signal-date validation: `{backfill_import_command}`\n"
+        f"- Local CSV strict top-plan validation: `{backfill_strict_import_command}`\n"
         "- Market-data fetch guard: `scripts/backfill_daily_prices.py` blocks MarketDataService fetches "
         "unless `--allow-market-fetch` or `SOVEREIGN_HALL_ALLOW_MARKET_BACKFILL=1` is set.\n"
         "- Integration decision: do not synthesize `daily_prices` from prediction current_price; "
@@ -1779,6 +1787,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved daily-price-readiness closure: `check_db`, research prompt context, and manual research reports now surface `price_readiness.json`, including the prioritized missing-price queue.
 - Improved live daily-price-readiness closure: `check_db` now validates that priority queue against the current SQLite `daily_prices` table and prints covered/missing queue tickers, the next local backfill target, and the active no-expansion cap before the user starts simulation.
 - Improved local backfill repair path: `check_db` now prints a no-network plan preview and a local CSV exact signal-date validation command; `scripts/backfill_daily_prices.py --import-csv ... --dry-run` validates OHLC rows without network access.
+- Improved strict import gate: `scripts/backfill_daily_prices.py --require-plan-coverage --coverage-limit 5` now fails nonzero unless the selected top-priority plan signal dates are covered, so a parseable CSV cannot be mistaken for a blocker-clearing import.
 - Improved backfill-readiness closure: user entries and reports now label priority queue dates as missing ranges, and local CSV validation can compare supplied rows with the current plan before import.
 - Improved backfill verification path: `check_db` now prints a no-network DB coverage command, and `scripts/backfill_daily_prices.py --status` reports exact still-missing signal dates before any exposure cap can be relaxed.
 - Improved daily-price backfill closure: this run writes `daily_price_backfill_plan.csv` and `daily_price_backfill_plan.json`; user entries surface the plan path and top priority ticker so repeated empty `daily_prices` runs have a concrete local next step.
@@ -1801,7 +1810,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
 - Still not integrated as validation for exposure widening: `tape_update.json` does not meet the minimum fresh-row/latest-day observation thresholds when marked as thin or stale.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers shown by `check_db`, then validate whether the evidence-gated cap, observation-count cap, and ETF-sleeve caps reduce churn/drawdown over another tape update before widening exposure.
-- This cycle's minimum local step: run `{backfill_status_command}` to verify current DB coverage, then use `{backfill_import_command}` to validate independently supplied OHLC rows against exact missing signal dates before adding any new return-seeking heuristic branch.
+- This cycle's minimum local step: run `{backfill_status_command}` to verify current DB coverage, then use `{backfill_strict_import_command}` to validate independently supplied OHLC rows against exact missing signal dates before adding any new return-seeking heuristic branch.
 
 ## Reproduce
 ```bash

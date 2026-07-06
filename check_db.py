@@ -16,6 +16,8 @@ from typing import Any
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root.parent))
 
+LOCAL_DAILY_PRICE_TEMPLATE = project_root / "data" / "local_daily_prices_template.csv"
+
 
 def format_size(size_bytes: int) -> str:
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -274,6 +276,115 @@ def _format_next_backfill_item(item: dict[str, Any]) -> str:
     return text
 
 
+def _template_dates_for_missing_item(item: dict[str, Any]) -> list[str]:
+    dates: list[str] = []
+    raw_dates = item.get("missing_signal_dates") or []
+    if isinstance(raw_dates, list):
+        for raw in raw_dates:
+            day = str(raw or "").strip()[:10]
+            if day:
+                dates.append(day)
+    if not dates:
+        fallback = str(item.get("last_missing_signal_date", "") or "").strip()[:10]
+        if fallback:
+            dates.append(fallback)
+    return sorted(set(dates))
+
+
+def export_daily_price_template_from_progress(
+    progress: dict[str, Any],
+    output_path: Path | None = None,
+) -> int:
+    """Write a stable local OHLC template for the live missing plan dates."""
+    if not progress:
+        return 0
+    rows: list[dict[str, str]] = []
+    for item in progress.get("missing_details", []) or []:
+        if not isinstance(item, dict):
+            continue
+        ticker = normalize_ticker(str(item.get("ticker", "")))
+        if not ticker:
+            continue
+        for day in _template_dates_for_missing_item(item):
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "date": day,
+                    "open": "",
+                    "high": "",
+                    "low": "",
+                    "close": "",
+                    "volume": "",
+                    "source_note": "fill_from_independent_local_ohlc_before_import",
+                }
+            )
+
+    if not rows:
+        return 0
+
+    output_path = output_path or Path(
+        str(progress.get("stable_template_path") or LOCAL_DAILY_PRICE_TEMPLATE)
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "ticker",
+                "date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "source_note",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
+def inspect_local_daily_price_csv(csv_path: Path | str) -> dict[str, Any]:
+    """Inspect a local OHLC CSV candidate without importing or fetching prices."""
+    path = Path(csv_path).expanduser()
+    status: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "rows": 0,
+        "valid_ohlc_rows": 0,
+        "blank_rows": 0,
+        "invalid_rows": 0,
+    }
+    if not path.exists():
+        return status
+
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                status["rows"] += 1
+                ticker = normalize_ticker(str(row.get("ticker") or row.get("code") or row.get("symbol") or ""))
+                day = str(row.get("date") or row.get("trade_date") or "").strip()[:10]
+                close_text = str(row.get("close") or row.get("close_price") or "").strip()
+                open_text = str(row.get("open") or row.get("open_price") or close_text).strip()
+                high_text = str(row.get("high") or row.get("high_price") or close_text).strip()
+                low_text = str(row.get("low") or row.get("low_price") or close_text).strip()
+                if not any([close_text, open_text, high_text, low_text]):
+                    status["blank_rows"] += 1
+                    continue
+                try:
+                    values = [float(value) for value in (close_text, open_text, high_text, low_text)]
+                    if not ticker or not day or any(value <= 0 for value in values):
+                        raise ValueError("missing ticker/date or non-positive OHLC")
+                except Exception:
+                    status["invalid_rows"] += 1
+                    continue
+                status["valid_ohlc_rows"] += 1
+    except Exception as exc:
+        status["read_error"] = str(exc)
+    return status
+
+
 def daily_price_backfill_progress(
     conn: sqlite3.Connection,
     context: Any = None,
@@ -451,6 +562,63 @@ def daily_price_backfill_progress(
     ]
     if plan_path:
         local_import_parts.extend(["--plan", plan_path])
+    local_strict_import_parts = [
+        "python",
+        "scripts/backfill_daily_prices.py",
+        "--import-csv",
+        "data/local_daily_prices.csv",
+        "--source",
+        "local_csv",
+        "--dry-run",
+        "--coverage-limit",
+        str(limit),
+        "--require-plan-coverage",
+    ]
+    if plan_path:
+        local_strict_import_parts.extend(["--plan", plan_path])
+    stable_template_path = (
+        str(Path(plan_path).expanduser().with_name("local_daily_prices_template.csv"))
+        if plan_path
+        else str(LOCAL_DAILY_PRICE_TEMPLATE)
+    )
+    stable_template_import_parts = [
+        "python",
+        "scripts/backfill_daily_prices.py",
+        "--import-csv",
+        stable_template_path,
+        "--source",
+        "local_csv",
+        "--dry-run",
+    ]
+    if plan_path:
+        stable_template_import_parts.extend(["--plan", plan_path])
+    stable_template_strict_import_parts = [
+        "python",
+        "scripts/backfill_daily_prices.py",
+        "--import-csv",
+        stable_template_path,
+        "--source",
+        "local_csv",
+        "--dry-run",
+        "--coverage-limit",
+        str(limit),
+        "--require-plan-coverage",
+    ]
+    if plan_path:
+        stable_template_strict_import_parts.extend(["--plan", plan_path])
+    stable_template_commit_parts = [
+        "python",
+        "scripts/backfill_daily_prices.py",
+        "--import-csv",
+        stable_template_path,
+        "--source",
+        "local_csv",
+        "--coverage-limit",
+        str(limit),
+        "--require-plan-coverage",
+    ]
+    if plan_path:
+        stable_template_commit_parts.extend(["--plan", plan_path])
     template_parts = [
         "python",
         "scripts/backfill_daily_prices.py",
@@ -458,7 +626,7 @@ def daily_price_backfill_progress(
         "--limit",
         str(limit),
         "--export-template",
-        "data/local_daily_prices_template.csv",
+        stable_template_path,
     ]
     if plan_path:
         template_parts.extend(["--plan", plan_path])
@@ -486,7 +654,12 @@ def daily_price_backfill_progress(
         "dry_run_command": " ".join(dry_run_parts),
         "latest_import_command": " ".join(latest_import_parts),
         "local_import_command": " ".join(local_import_parts),
+        "local_strict_import_command": " ".join(local_strict_import_parts),
         "template_command": " ".join(template_parts),
+        "stable_template_path": stable_template_path,
+        "stable_template_import_command": " ".join(stable_template_import_parts),
+        "stable_template_strict_import_command": " ".join(stable_template_strict_import_parts),
+        "stable_template_commit_command": " ".join(stable_template_commit_parts),
         "market_fetch_note": "MarketDataService fetch 默认关闭；本入口只建议 status 与本地CSV精确日期校验",
     }
 
@@ -495,9 +668,10 @@ def format_daily_price_backfill_progress(
     conn: sqlite3.Connection,
     context: Any = None,
     limit: int = 5,
+    progress: dict[str, Any] | None = None,
 ) -> str:
     """Format live local daily_prices progress for check_db."""
-    progress = daily_price_backfill_progress(conn, context=context, limit=limit)
+    progress = progress or daily_price_backfill_progress(conn, context=context, limit=limit)
     if not progress:
         return ""
 
@@ -544,10 +718,44 @@ def format_daily_price_backfill_progress(
         lines.append(f"   不联网计划查看: {progress['dry_run_command']}")
     if progress.get("local_import_command"):
         lines.append(f"   本地CSV精确日期校验: {progress['local_import_command']}")
+    if progress.get("local_strict_import_command"):
+        lines.append(f"   本地CSV严格覆盖校验(Top计划): {progress['local_strict_import_command']}")
     if progress.get("latest_import_command"):
         lines.append(f"   本地CSV精确日期校验(最新计划短命令): {progress['latest_import_command']}")
     if progress.get("template_command"):
         lines.append(f"   本地CSV模板生成: {progress['template_command']}")
+    template_status = progress.get("template_csv_status")
+    if isinstance(template_status, dict) and template_status.get("exists"):
+        lines.append(
+            "   模板当前状态: "
+            f"rows={_safe_int(template_status.get('rows'))}, "
+            f"valid_ohlc={_safe_int(template_status.get('valid_ohlc_rows'))}, "
+            f"blank={_safe_int(template_status.get('blank_rows'))}, "
+            f"invalid={_safe_int(template_status.get('invalid_rows'))}"
+        )
+        if _safe_int(template_status.get("valid_ohlc_rows")) <= 0:
+            lines.append("   模板尚未填入独立OHLC；严格覆盖校验会失败，不能导入或解除数据阻塞")
+    elif isinstance(template_status, dict):
+        lines.append(f"   模板当前状态: 未找到 {template_status.get('path')}")
+    if progress.get("template_written_rows") is not None:
+        rows = _safe_int(progress.get("template_written_rows"))
+        if rows:
+            lines.append(
+                f"   入口已生成待填写模板: {progress.get('stable_template_path')} ({rows} rows)"
+            )
+            lines.append(
+                f"   模板填完后校验: {progress.get('stable_template_import_command')}"
+            )
+            lines.append(
+                f"   模板填完后严格校验: {progress.get('stable_template_strict_import_command')}"
+            )
+            lines.append(
+                f"   严格校验通过后导入: {progress.get('stable_template_commit_command')}"
+            )
+        else:
+            lines.append("   入口模板生成: 当前优先队列没有可写入的缺口日期")
+    if progress.get("template_write_error"):
+        lines.append(f"   入口模板生成失败: {progress['template_write_error']}")
     if progress.get("market_fetch_note"):
         lines.append(f"   数据安全门: {progress['market_fetch_note']}")
     if progress.get("stall_note"):
@@ -692,7 +900,16 @@ def show_stats(db_path):
 
         with sqlite3.connect(str(db_path)) as conn:
             sync_simulation_risk_memory_sqlite(conn)
-            backfill_progress = format_daily_price_backfill_progress(conn)
+            progress = daily_price_backfill_progress(conn)
+            if progress and _safe_int(progress.get("missing_signal_dates")) > 0:
+                try:
+                    progress["template_written_rows"] = export_daily_price_template_from_progress(progress)
+                    progress["template_csv_status"] = inspect_local_daily_price_csv(
+                        progress.get("stable_template_path") or LOCAL_DAILY_PRICE_TEMPLATE
+                    )
+                except Exception as template_exc:
+                    progress["template_write_error"] = str(template_exc)
+            backfill_progress = format_daily_price_backfill_progress(conn, progress=progress)
         print(format_heuristic_status())
         if backfill_progress:
             print(backfill_progress)

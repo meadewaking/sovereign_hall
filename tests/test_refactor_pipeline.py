@@ -255,11 +255,88 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     assert "本地DB覆盖检查: python scripts/backfill_daily_prices.py --status --limit 5 --plan" in text
     assert "不联网计划查看: python scripts/backfill_daily_prices.py --dry-run --limit 5 --plan" in text
     assert "本地CSV精确日期校验: python scripts/backfill_daily_prices.py --import-csv data/local_daily_prices.csv" in text
-    assert "本地CSV模板生成: python scripts/backfill_daily_prices.py --status --limit 5 --export-template data/local_daily_prices_template.csv" in text
+    assert "本地CSV模板生成: python scripts/backfill_daily_prices.py --status --limit 5 --export-template" in text
+    assert "local_daily_prices_template.csv" in text
     assert "MarketDataService fetch 默认关闭" in text
     assert f"--plan {plan_path}" in text
     assert "模拟买入上限维持 <= 0.5%" in text
     assert "不得扩仓" in text
+
+
+def test_check_db_exports_stable_local_daily_price_template(tmp_path):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE daily_prices (ticker TEXT, date TEXT, close REAL)")
+    conn.execute("INSERT INTO daily_prices VALUES ('600519', '2026-06-18', 10.5)")
+    conn.commit()
+    plan_path = tmp_path / "daily_price_backfill_plan.csv"
+    plan_path.write_text(
+        "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
+        "total_signal_observations,latest_signal_date,missing_latest_signal_date,"
+        "minimum_rows_to_unblock_latest,plan_action\n"
+        "1,600519,45,2026-05-01,2026-06-20,1585,2026-06-20,True,1,"
+        "backfill this ticker's latest local daily_prices row first\n"
+        "2,512880,44,2026-05-02,2026-06-10,1197,2026-06-20,False,0,"
+        "backfill historical local daily_prices before using scores to widen exposure\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "daily_signal_tape.csv").write_text(
+        "date,ticker,price_source\n"
+        "2026-06-19,600519,prediction_current_price\n"
+        "2026-06-20,600519,prediction_current_price\n"
+        "2026-06-10,512880,prediction_current_price\n",
+        encoding="utf-8",
+    )
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
+        score=0.061,
+        max_position=0.05,
+        overfit_risk=False,
+        warning="daily_prices缺失",
+        failure_cases=[],
+        price_readiness={
+            "status": "blocked_no_daily_prices",
+            "missing_tickers_top10": [
+                {"ticker": "600519", "signal_days": 45, "last_signal_date": "2026-06-20"},
+                {"ticker": "512880", "signal_days": 44, "last_signal_date": "2026-06-10"},
+            ],
+            "backfill_plan_path": str(plan_path),
+            "backfill_plan": {
+                "total_missing_tickers": 2,
+                "minimum_next_rows": 1,
+                "top_priority_tickers": ["600519", "512880"],
+            },
+        },
+    )
+
+    progress = check_db.daily_price_backfill_progress(conn, context=context)
+    output_path = tmp_path / "data" / "local_daily_prices_template.csv"
+    written = check_db.export_daily_price_template_from_progress(progress, output_path)
+    progress["template_written_rows"] = written
+    progress["stable_template_path"] = str(output_path)
+    text = check_db.format_daily_price_backfill_progress(conn, progress=progress)
+    conn.close()
+
+    rows = list(csv.DictReader(output_path.open("r", encoding="utf-8")))
+    assert written == 1
+    assert rows[0]["ticker"] == "512880"
+    assert rows[0]["date"] == "2026-06-10"
+    assert rows[0]["close"] == ""
+    assert "入口已生成待填写模板" in text
+    assert f"{output_path} (1 rows)" in text
+    assert "模板填完后校验" in text
+    assert "模板填完后严格校验" in text
+    assert "严格校验通过后导入" in text
+    assert "--require-plan-coverage" in text
+    assert "--coverage-limit 5" in text
+
+    progress["template_csv_status"] = check_db.inspect_local_daily_price_csv(output_path)
+    text_with_status = check_db.format_daily_price_backfill_progress(conn, progress=progress)
+    assert "模板当前状态: rows=1, valid_ohlc=0, blank=1, invalid=0" in text_with_status
+    assert "模板尚未填入独立OHLC" in text_with_status
 
 
 def test_backfill_daily_prices_imports_local_csv_without_network(tmp_path):
@@ -383,6 +460,84 @@ def test_backfill_daily_prices_import_csv_defaults_to_latest_plan(tmp_path, caps
     assert f"Plan: {plan_path.resolve()}" in output
     assert "Plan coverage: plan_requests=1" in output
     assert "signal_dates=1/2" in output
+
+
+def test_backfill_daily_prices_strict_plan_coverage_gate(tmp_path, capsys):
+    module = load_script_module("backfill_daily_prices_strict_plan_module", "scripts/backfill_daily_prices.py")
+    plan_path = tmp_path / "daily_price_backfill_plan.csv"
+    plan_path.write_text(
+        "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
+        "total_signal_observations,latest_signal_date,missing_latest_signal_date,"
+        "minimum_rows_to_unblock_latest,plan_action\n"
+        "1,600519,2,2026-06-05,2026-06-20,2,2026-06-20,True,1,backfill latest\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "daily_signal_tape.csv").write_text(
+        "date,ticker,price_source\n"
+        "2026-06-05,600519,prediction_current_price\n"
+        "2026-06-20,600519,prediction_current_price\n",
+        encoding="utf-8",
+    )
+    partial_csv = tmp_path / "partial_daily_prices.csv"
+    partial_csv.write_text(
+        "ticker,date,close\n"
+        "600519,2026-06-20,10.5\n",
+        encoding="utf-8",
+    )
+    args = module.build_parser().parse_args(
+        [
+            "--db",
+            str(tmp_path / "test.db"),
+            "--plan",
+            str(plan_path),
+            "--import-csv",
+            str(partial_csv),
+            "--source",
+            "local_csv",
+            "--dry-run",
+            "--coverage-limit",
+            "1",
+            "--require-plan-coverage",
+        ]
+    )
+
+    result = __import__("asyncio").run(module.run(args))
+    output = capsys.readouterr().out
+
+    assert result == 4
+    assert "STRICT plan coverage failed" in output
+    assert "signal_dates=1/2" in output
+
+    full_csv = tmp_path / "full_daily_prices.csv"
+    full_csv.write_text(
+        "ticker,date,close\n"
+        "600519,2026-06-05,10.1\n"
+        "600519,2026-06-20,10.5\n",
+        encoding="utf-8",
+    )
+    args = module.build_parser().parse_args(
+        [
+            "--db",
+            str(tmp_path / "test.db"),
+            "--plan",
+            str(plan_path),
+            "--import-csv",
+            str(full_csv),
+            "--source",
+            "local_csv",
+            "--dry-run",
+            "--coverage-limit",
+            "1",
+            "--require-plan-coverage",
+        ]
+    )
+
+    result = __import__("asyncio").run(module.run(args))
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "STRICT plan coverage passed" in output
+    assert "signal_dates=2/2" in output
 
 
 def test_backfill_daily_prices_blocks_market_fetch_by_default(tmp_path, capsys):

@@ -1413,6 +1413,13 @@ def write_readme(
     )
     if backfill_plan_path:
         backfill_import_command += f" --plan {backfill_plan_path}"
+    backfill_strict_import_command = (
+        "python scripts/backfill_daily_prices.py --import-csv "
+        "data/local_daily_prices.csv --source local_csv --dry-run "
+        "--coverage-limit 5 --require-plan-coverage"
+    )
+    if backfill_plan_path:
+        backfill_strict_import_command += f" --plan {backfill_plan_path}"
     backfill_status_command = "python scripts/backfill_daily_prices.py --status --limit 5"
     if backfill_plan_path:
         backfill_status_command += f" --plan {backfill_plan_path}"
@@ -1495,6 +1502,7 @@ def write_readme(
 - Machine-readable backfill plan: `{backfill_plan_path or 'not written'}`; plan tickers={plan_total}; top priority={top_plan or 'none'}
 - Local DB plan coverage check: `{backfill_status_command}`
 - Local CSV exact signal-date validation: `{backfill_import_command}`
+- Local CSV strict top-plan validation: `{backfill_strict_import_command}`
 - Market-data fetch guard: `scripts/backfill_daily_prices.py` blocks MarketDataService fetches unless `--allow-market-fetch` or `SOVEREIGN_HALL_ALLOW_MARKET_BACKFILL=1` is set.
 - Integration decision: do not synthesize `daily_prices` from prediction current_price; surface this as a local backfill checklist in user entries and keep exposure caps active.
 
@@ -1526,13 +1534,14 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - User-visible change: this run writes `daily_price_backfill_plan.csv` and `daily_price_backfill_plan.json`; user entries surface the plan path so the next local backfill step is concrete.
 - User-visible change: priority queue entries now show explicit missing-date ranges, and CSV dry-run validation checks exact signal-date coverage before import.
 - User-visible change: `check_db` now prints a no-network DB coverage command, and `scripts/backfill_daily_prices.py --status` reports exact still-missing signal dates before any cap can be relaxed.
+- User-visible change: `scripts/backfill_daily_prices.py --require-plan-coverage --coverage-limit 5` now returns nonzero unless selected top-priority plan dates are covered, preventing a parseable but incomplete CSV from clearing the blocker.
 - User-visible change: `python -m sovereign_hall.run_discussion --help` returns CLI help without requiring the single-instance lock; actual runs remain lock-protected.
 - User-visible change: latest heuristic status/research prompts now include consecutive empty-daily_prices cycles and the stalled-backfill next ticker; simulated buys receive an extra-small cap after repeated blockage.
 - User-visible change: unchanged partial daily_prices coverage is now surfaced as a stalled data task; simulated buys receive the same extra-small no-progress cap until exact local plan-date coverage moves.
 - Simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` continue to apply single-name, gross, weak-price, daily_prices-readiness, thin/zero-new-tape, ETF-sleeve, failure-memory, and observation-count caps through `services/heuristic_policy.py`.
 - Not integrated as an exposure-increasing default: price coverage remains weak and tape validation is not meaningful enough to widen exposure.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers, then rerun the cycle before relaxing weak-price caps.
-- This cycle's minimum local step: run `{backfill_status_command}`, then use `{backfill_import_command}` to validate independently supplied OHLC rows against exact missing signal dates before adding any new return-seeking heuristic branch.
+- This cycle's minimum local step: run `{backfill_status_command}`, then use `{backfill_strict_import_command}` to validate independently supplied OHLC rows against exact missing signal dates before adding any new return-seeking heuristic branch.
 
 ## Reproduce
 ```bash

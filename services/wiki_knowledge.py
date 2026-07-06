@@ -676,7 +676,6 @@ class WikiIngestor:
             "files": written,
         }
         self.store.save_cache(cache)
-        self.store.rebuild_index()
         self.store.append_log(
             "ingest",
             f"- source: {source_link}\n- topic: {topic_link}\n- entities: {', '.join(entity_links) if entity_links else 'none'}",
@@ -1009,13 +1008,23 @@ class WikiKnowledgeBase:
             return False
         self.ingestor.ingest_document(doc)
         self.documents[doc.id] = doc
+        self.store.rebuild_index()
         return True
 
     async def add_documents_batch(self, docs: List[Document | Dict[str, Any]], llm_client: Any = None) -> int:
+        await self._ensure_initialized(llm_client)
         added = 0
         for doc in docs or []:
-            if await self.add_document(doc, llm_client=llm_client):
-                added += 1
+            if isinstance(doc, dict):
+                doc = Document.from_dict(doc)
+            if not is_ingestable_source_document(doc):
+                logger.debug("Skipped wiki ingest for generated or low-quality document: %s", doc.title or doc.id)
+                continue
+            self.ingestor.ingest_document(doc)
+            self.documents[doc.id] = doc
+            added += 1
+        if added:
+            self.store.rebuild_index()
         return added
 
     async def has_document(self, doc_id: str = None, url: str = None) -> bool:
