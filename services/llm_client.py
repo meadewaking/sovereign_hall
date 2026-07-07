@@ -140,16 +140,34 @@ class LLMClient:
         )
         # 创建复用的异步HTTP客户端（内网，不走代理）
         self._http_client = httpx.AsyncClient(
-            timeout=self.timeout,
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+            timeout=httpx.Timeout(
+                connect=10.0,
+                read=self.timeout,
+                write=10.0,
+                pool=30.0,
+            ),
+            limits=httpx.Limits(
+                max_keepalive_connections=50,
+                max_connections=200,
+                keepalive_expiry=5.0,
+            ),
             proxy=None,  # 内网直连，不走代理
             trust_env=False,
         )
         # 用于 embedding 的内网客户端（使用 AsyncHTTPTransport，不走代理）
         transport = httpx.AsyncHTTPTransport(retries=3)
         self._embedding_client = httpx.AsyncClient(
-            timeout=self.timeout,
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=50),
+            timeout=httpx.Timeout(
+                connect=10.0,
+                read=self.timeout,
+                write=10.0,
+                pool=30.0,
+            ),
+            limits=httpx.Limits(
+                max_keepalive_connections=20,
+                max_connections=100,
+                keepalive_expiry=5.0,
+            ),
             transport=transport,  # 不走代理
             trust_env=False,
         )

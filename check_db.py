@@ -822,7 +822,7 @@ def show_investment_status(db_path):
     prediction_prices = get_latest_prediction_prices(conn, tickers)
     conn.close()
 
-    # 投资状态按可用价格估值：实时行情 > 本地收盘价 > 本地最近预测入场价 > 成本价。
+    # 投资状态默认本地估值；实时行情必须显式 opt in。
     use_realtime_quotes = realtime_quotes_enabled()
     realtime_prices = get_realtime_prices(tickers) if tickers and use_realtime_quotes else {}
 

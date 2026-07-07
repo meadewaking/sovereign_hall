@@ -1465,9 +1465,9 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             direction = decision.get('direction', 'hold')
             confidence = float(decision.get('confidence', 0.5))
             target_position = float(decision.get('target_position', 0.0))
-            current_price = await market_data.get_current_price(ticker)
+            current_price, price_source = await simulation.resolve_trade_price(ticker)
             if current_price is None:
-                print(f"   ⏭️ {ticker}: 无法获取真实价格，跳过交易")
+                print(f"   ⏭️ {ticker}: 无法获取本地价格，跳过交易")
                 continue
 
             has_position = ticker in current_tickers
@@ -1486,6 +1486,8 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             else:
                 trade_position = target_position
                 trade_reason = f"投委会置信度{confidence:.0%}，按裁决执行"
+            if price_source:
+                trade_reason = f"{trade_reason}；价格来源={price_source}"
 
             signal_count = recent_prediction_observation_count(ticker)
             position_values, total_assets_for_cap = simulation._estimate_trade_assets(ticker, current_price)
