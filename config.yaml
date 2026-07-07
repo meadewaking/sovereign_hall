@@ -8,9 +8,9 @@ llm:
   model: "GLM-5.2-FP8"
   api_key: "not_need"
   model_uuid: ""  # 用于Host header；8000 为独立入口，不需要 Host 路由
-  max_concurrent: 16
+  max_concurrent: 12
   temperature: 0.7
-  max_tokens: 15000
+  max_tokens: 22500
   timeout: 180
 
   # Embedding 配置
@@ -97,7 +97,7 @@ system:
 
 # 研究讨论配置
 research:
-  max_tokens: 15000
+  max_tokens: 22500
   reflection_limit: 5
   rounds: 6
   conclusion_max_length: 20000
@@ -112,10 +112,10 @@ research:
   committee_proposal_limit: 5
   committee_min_review_depth: "full"
   committee_full_discussion: true
-  committee_round1_max_tokens: 12000
-  committee_round2_max_tokens: 10000
-  committee_revision_max_tokens: 8000
-  committee_vote_max_tokens: 5000
+  committee_round1_max_tokens: 18000
+  committee_round2_max_tokens: 15000
+  committee_revision_max_tokens: 12000
+  committee_vote_max_tokens: 7500
   committee_summary_chars: 1200
   committee_vote_context_chars: 6000
   conclusion_discussion_context_chars: 24000

@@ -1650,7 +1650,7 @@ async def main():
     force_search_interval = int(research_config.get("force_search_interval", 1) or 0)
 
     llm = LLMClient(
-        max_concurrent=16,  # 高并发
+        max_concurrent=int(llm_config.get('max_concurrent', 12)),
         model=llm_config.get('model'),
         provider=llm_config.get('provider'),
     )
