@@ -1011,7 +1011,7 @@ def build_price_readiness_report(
         status = "ready_validated_daily_prices"
 
     next_action = (
-        "Backfill latest local daily_prices for latest_missing_tickers first, then rerun the cycle and require validated coverage before relaxing caps."
+        "Backfill latest local daily_prices for the full latest_missing_tickers batch first, then rerun the cycle and require validated coverage before relaxing caps."
         if latest_missing
         else "Latest signal-date prices are covered; continue historical priority backfill before relaxing weak-coverage caps."
     )
@@ -1023,6 +1023,7 @@ def build_price_readiness_report(
         "missing_signal_ticker_count": len(missing),
         "latest_signal_date": latest_date,
         "latest_missing_tickers": latest_missing,
+        "unblock_tickers": latest_missing,
         "minimum_next_rows": len(latest_missing),
         "missing_tickers_top10": stats[:10],
         "rule": "Populate local daily_prices with independently validated OHLC rows before treating heuristic score as exposure-widening evidence.",
@@ -1399,6 +1400,10 @@ def write_readme(
         )
     zero_new = safe_float(tape_update.get("new_prediction_rows_since_previous"), 0.0) <= 0
     missing_queue = format_missing_price_queue(price_readiness)
+    latest_missing = price_readiness.get("latest_missing_tickers", [])
+    latest_missing_text = ", ".join(str(ticker) for ticker in latest_missing[:8]) if isinstance(latest_missing, list) else ""
+    unblock_tickers = price_readiness.get("unblock_tickers", latest_missing)
+    unblock_text = ", ".join(str(ticker) for ticker in unblock_tickers[:8]) if isinstance(unblock_tickers, list) else ""
     backfill_plan = price_readiness.get("backfill_plan", {}) if isinstance(price_readiness, dict) else {}
     backfill_plan_path = str(price_readiness.get("backfill_plan_path", "") or "") if isinstance(price_readiness, dict) else ""
     if isinstance(backfill_plan, dict):
@@ -1429,6 +1434,8 @@ def write_readme(
     stall_status = str(price_readiness_stall.get("status", "") or "")
     stall_cap = best_cap * 0.05 if stall_status in {"stalled_no_daily_prices", "stalled_partial_daily_prices"} else None
     stall_kind = str(price_readiness_stall.get("stall_kind", "") or "")
+    stall_unblock = price_readiness_stall.get("unblock_tickers", [])
+    stall_unblock_text = ", ".join(str(ticker) for ticker in stall_unblock[:8]) if isinstance(stall_unblock, list) else ""
     if stall_kind == "partial_daily_price_backfill_needed" or stall_status == "stalled_partial_daily_prices":
         stall_decision_subject = "repeated partial daily_prices no-progress"
     else:
@@ -1497,7 +1504,8 @@ def write_readme(
 ## Daily Price Readiness
 - Status: {price_readiness.get('status', 'unknown')}
 - Signal tickers fully covered by local daily_prices: {price_readiness.get('priced_signal_ticker_count', 0)}/{price_readiness.get('total_signal_ticker_count', 0)}; missing={price_readiness.get('missing_signal_ticker_count', 0)}
-- Latest signal date: {price_readiness.get('latest_signal_date', 'unknown')}; latest missing tickers: {', '.join(price_readiness.get('latest_missing_tickers', [])[:8]) or 'none'}; minimum next rows={price_readiness.get('minimum_next_rows', 0)}
+- Latest signal date: {price_readiness.get('latest_signal_date', 'unknown')}; latest missing tickers: {latest_missing_text or 'none'}; minimum next rows={price_readiness.get('minimum_next_rows', 0)}
+- Minimum unlock batch: {unblock_text or 'none'}
 - Priority backfill queue: {missing_queue or 'none'}
 - Machine-readable backfill plan: `{backfill_plan_path or 'not written'}`; plan tickers={plan_total}; top priority={top_plan or 'none'}
 - Local DB plan coverage check: `{backfill_status_command}`
@@ -1510,6 +1518,7 @@ def write_readme(
 - Status: {price_readiness_stall.get('status', 'unknown')}
 - Consecutive blocked runs: {stall_blocked_runs}/{stall_min_runs}; blocked run ids: {', '.join(price_readiness_stall.get('blocked_run_ids', [])[-6:]) or 'none'}
 - Next ticker: {price_readiness_stall.get('next_ticker', 'none') or 'none'}; same-next-ticker runs={price_readiness_stall.get('same_next_ticker_runs', 0)}
+- Minimum unlock batch: {stall_unblock_text or 'none'}; same-batch runs={price_readiness_stall.get('same_unblock_batch_runs', 0)}
 - Rule: {price_readiness_stall.get('rule', 'Do not widen exposure while local daily_prices are repeatedly blocked.')}
 - Integration decision: {stall_decision_subject} is treated as a user-entry warning and {"a stricter simulated-buy cap of " + format(stall_cap, ".2%") if stall_cap is not None else "the existing no-expansion data-quality gate"}; do not add new leaderboard branches until local price validation moves.
 
@@ -1533,10 +1542,12 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - User-visible change: latest heuristic status/research prompts now include a daily_prices backfill readiness checklist and prioritized missing-price queue, not only the latest missing ticker.
 - User-visible change: this run writes `daily_price_backfill_plan.csv` and `daily_price_backfill_plan.json`; user entries surface the plan path so the next local backfill step is concrete.
 - User-visible change: priority queue entries now show explicit missing-date ranges, and CSV dry-run validation checks exact signal-date coverage before import.
+- User-visible change: user entries and reports now show the minimum latest-date unlock batch separately from the longer historical priority queue, so users can fill `{unblock_text or 'none'}` first instead of confusing it with older gaps.
 - User-visible change: `check_db` now prints a no-network DB coverage command, and `scripts/backfill_daily_prices.py --status` reports exact still-missing signal dates before any cap can be relaxed.
 - User-visible change: `scripts/backfill_daily_prices.py --require-plan-coverage --coverage-limit 5` now returns nonzero unless selected top-priority plan dates are covered, preventing a parseable but incomplete CSV from clearing the blocker.
 - User-visible change: `python -m sovereign_hall.run_discussion --help` returns CLI help without requiring the single-instance lock; actual runs remain lock-protected.
 - User-visible change: latest heuristic status/research prompts now include consecutive empty-daily_prices cycles and the stalled-backfill next ticker; simulated buys receive an extra-small cap after repeated blockage.
+- User-visible change: same-day manual reruns are deduped before counting consecutive blocked cycles, so a debugging rerun cannot prematurely tighten simulated-buy caps.
 - User-visible change: unchanged partial daily_prices coverage is now surfaced as a stalled data task; simulated buys receive the same extra-small no-progress cap until exact local plan-date coverage moves.
 - Simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` continue to apply single-name, gross, weak-price, daily_prices-readiness, thin/zero-new-tape, ETF-sleeve, failure-memory, and observation-count caps through `services/heuristic_policy.py`.
 - Not integrated as an exposure-increasing default: price coverage remains weak and tape validation is not meaningful enough to widen exposure.

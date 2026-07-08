@@ -409,47 +409,66 @@ class LLMClient:
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "stream": True,
+                "stream_options": {"include_usage": True},
             }
 
-            # 复用HTTP客户端
-            resp = await self._http_client.post(
+            # 流式调用：read 超时作用于 chunk 间隔，而非整体响应
+            content_parts: List[str] = []
+            reasoning_parts: List[str] = []
+            usage: Dict = {}
+            finish_reason = ""
+            async with self._http_client.stream(
+                "POST",
                 url,
                 json=payload,
-                headers=headers
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            message = data["choices"][0]["message"]
+                headers=headers,
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {resp.status_code}: {body[:500]!r}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    if not data_str or data_str == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if "usage" in chunk and chunk["usage"]:
+                        usage = {
+                            'prompt_tokens': chunk["usage"].get("prompt_tokens", 0),
+                            'completion_tokens': chunk["usage"].get("completion_tokens", 0),
+                            'total_tokens': chunk["usage"].get("total_tokens", 0),
+                        }
+                    if not chunk.get("choices"):
+                        continue
+                    delta = chunk["choices"][0].get("delta", {})
+                    if delta.get("content"):
+                        content_parts.append(delta["content"])
+                    if delta.get("reasoning") or delta.get("reasoning_content"):
+                        reasoning_parts.append(delta.get("reasoning") or delta.get("reasoning_content"))
+                    fr = chunk["choices"][0].get("finish_reason")
+                    if fr:
+                        finish_reason = fr
 
-            # 优先使用 content，如果为空则尝试使用 reasoning_content（MiniMax 等模型）
-            content = message.get("content")
+            content = "".join(content_parts).strip()
             if not content:
-                # MiniMax 等模型可能将内容放在 reasoning 字段
-                reasoning = message.get("reasoning") or message.get("reasoning_content")
+                # 与旧逻辑保持一致：content 为空时回退到 reasoning
+                reasoning = "".join(reasoning_parts).strip()
                 if reasoning:
-                    logger.info("Using reasoning content as fallback")
                     content = reasoning
                 else:
-                    content = None
-
-            if not content:
-                # 记录详细错误信息
-                logger.warning(f"LLM returned empty content. Response data: {data}")
-                # 尝试返回 reason 如果有的话
-                if "choices" in data and len(data["choices"]) > 0:
-                    finish_reason = data["choices"][0].get("finish_reason", "")
+                    logger.warning("LLM returned empty content (stream). finish_reason=%s", finish_reason)
                     if finish_reason == "length":
-                        return "输出被截断，请缩短输入。", {}
-                raise ValueError("LLM returned empty content")
-
-            # 提取 usage 信息
-            usage = {}
-            if 'usage' in data:
-                usage = {
-                    'prompt_tokens': data['usage'].get('prompt_tokens', 0),
-                    'completion_tokens': data['usage'].get('completion_tokens', 0),
-                    'total_tokens': data['usage'].get('total_tokens', 0),
-                }
+                        return "输出被截断，请缩短输入。", usage
+                    raise ValueError("LLM returned empty content")
 
             return content, usage
 

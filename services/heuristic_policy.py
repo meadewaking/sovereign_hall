@@ -164,6 +164,43 @@ def _readiness_next_ticker(readiness: dict[str, Any]) -> str:
     return ""
 
 
+def _readiness_run_bucket(run_id: str) -> str:
+    """Group multiple manual reruns from the same calendar date as one cycle."""
+    text = str(run_id or "")
+    return text[:8] if re.match(r"^\d{8}_", text) else text
+
+
+def _readiness_unblock_tickers(readiness: dict[str, Any], limit: int = 8) -> list[str]:
+    """Return the exact latest signal-date ticker batch needed to unblock readiness."""
+    if not isinstance(readiness, dict):
+        return []
+
+    tickers: list[str] = []
+    latest_missing = readiness.get("latest_missing_tickers")
+    if isinstance(latest_missing, list):
+        for ticker in latest_missing:
+            code = normalize_ticker(str(ticker))
+            if code and code not in tickers:
+                tickers.append(code)
+                if len(tickers) >= limit:
+                    return tickers
+        if tickers:
+            return tickers
+
+    minimum_rows = _safe_int(readiness.get("minimum_next_rows"))
+    top_missing = readiness.get("missing_tickers_top10")
+    if minimum_rows > 0 and isinstance(top_missing, list):
+        for row in top_missing:
+            if not isinstance(row, dict) or not row.get("ticker"):
+                continue
+            code = normalize_ticker(str(row["ticker"]))
+            if code and code not in tickers:
+                tickers.append(code)
+                if len(tickers) >= min(limit, minimum_rows):
+                    break
+    return tickers[:limit]
+
+
 def build_price_readiness_stall_report(
     runs_root: Path = RUNS_ROOT,
     pending_run_dir: Path | None = None,
@@ -188,6 +225,13 @@ def build_price_readiness_stall_report(
             }
         )
 
+    raw_entry_count = len(entries)
+    if entries:
+        latest_per_bucket: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            latest_per_bucket[_readiness_run_bucket(str(entry.get("run_id", "")))] = entry
+        entries = sorted(latest_per_bucket.values(), key=lambda entry: str(entry.get("run_id", "")))
+
     if not entries:
         return {
             "status": "no_price_readiness_history",
@@ -195,6 +239,9 @@ def build_price_readiness_stall_report(
             "minimum_blocked_runs": min_blocked_runs,
             "blocked_run_ids": [],
             "next_ticker": "",
+            "unblock_tickers": [],
+            "minimum_next_rows": 0,
+            "same_unblock_batch_runs": 0,
             "rule": (
                 "After repeated blocked_no_daily_prices cycles, stop adding leaderboard branches "
                 "and prioritize local validated daily_prices backfill or tooling."
@@ -219,12 +266,20 @@ def build_price_readiness_stall_report(
         blocked_streak.append(entry)
 
     next_ticker = _readiness_next_ticker(latest_readiness)
+    unblock_tickers = _readiness_unblock_tickers(latest_readiness)
+    unblock_key = tuple(unblock_tickers)
     same_next_ticker_runs = 0
     if next_ticker:
         for entry in blocked_streak:
             if _readiness_next_ticker(entry["readiness"]) != next_ticker:
                 break
             same_next_ticker_runs += 1
+    same_unblock_batch_runs = 0
+    if unblock_key:
+        for entry in blocked_streak:
+            if tuple(_readiness_unblock_tickers(entry["readiness"])) != unblock_key:
+                break
+            same_unblock_batch_runs += 1
 
     blocked_count = len(blocked_streak)
     status = "not_stalled"
@@ -238,14 +293,15 @@ def build_price_readiness_stall_report(
                 else "partial_daily_price_backfill_needed"
             )
     blocked_run_ids = [entry["run_id"] for entry in reversed(blocked_streak)]
+    unblock_text = ", ".join(unblock_tickers)
     if latest_kind == "partial_daily_price_backfill_needed":
         rule = (
             "If partial daily_prices coverage does not improve across repeated cycles, do not add "
             "leaderboard branches or widen exposure; focus on exact plan-date local backfill."
         )
         next_action = (
-            f"Backfill exact local daily_prices plan dates for {next_ticker}, then rerun the cycle."
-            if next_ticker
+            f"Backfill exact local daily_prices plan dates for {unblock_text}, then rerun the cycle."
+            if unblock_text
             else "Backfill exact local daily_prices plan dates for the priority queue, then rerun the cycle."
         )
     else:
@@ -254,8 +310,8 @@ def build_price_readiness_stall_report(
             "or widen exposure; focus on validated local daily_prices backfill/tooling."
         )
         next_action = (
-            f"Backfill independently validated local daily_prices for {next_ticker}, then rerun the cycle."
-            if next_ticker
+            f"Backfill independently validated local daily_prices for {unblock_text}, then rerun the cycle."
+            if unblock_text
             else "Backfill independently validated local daily_prices for the priority queue, then rerun the cycle."
         )
     return {
@@ -265,10 +321,15 @@ def build_price_readiness_stall_report(
         "minimum_blocked_runs": min_blocked_runs,
         "blocked_run_ids": blocked_run_ids,
         "lookback_runs": len(entries),
+        "raw_lookback_runs": raw_entry_count,
+        "deduped_by_run_date": True,
         "first_blocked_run": blocked_run_ids[0] if blocked_run_ids else "",
         "latest_blocked_run": blocked_run_ids[-1] if blocked_run_ids else "",
         "next_ticker": next_ticker,
+        "unblock_tickers": unblock_tickers,
+        "minimum_next_rows": _safe_int(latest_readiness.get("minimum_next_rows"), len(unblock_tickers)),
         "same_next_ticker_runs": same_next_ticker_runs,
+        "same_unblock_batch_runs": same_unblock_batch_runs,
         "priced_signal_ticker_count": latest_priced,
         "missing_signal_ticker_count": latest_missing,
         "rule": rule,
@@ -526,6 +587,13 @@ def format_price_readiness_stall_note(context: HeuristicRiskContext) -> str:
         same_next = _safe_int(stall.get("same_next_ticker_runs"))
         repeat_text = f"，同一下一步ticker连续{same_next}轮" if same_next > 1 else ""
         parts.append(f"下一步ticker={next_ticker}{repeat_text}")
+    unblock_tickers = stall.get("unblock_tickers")
+    if isinstance(unblock_tickers, list) and unblock_tickers:
+        tickers_text = ", ".join(normalize_ticker(str(ticker)) for ticker in unblock_tickers[:8])
+        same_batch = _safe_int(stall.get("same_unblock_batch_runs"))
+        min_rows = _safe_int(stall.get("minimum_next_rows"), len(unblock_tickers))
+        repeat_text = f"，同一解锁批次连续{same_batch}轮" if same_batch > 1 else ""
+        parts.append(f"最小解锁批次={tickers_text}({min_rows}行){repeat_text}")
     first_run = str(stall.get("first_blocked_run", "") or "")
     latest_run = str(stall.get("latest_blocked_run", "") or "")
     if first_run and latest_run:

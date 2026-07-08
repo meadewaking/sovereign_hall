@@ -426,6 +426,14 @@ def daily_price_backfill_progress(
     queue = [ticker for ticker in queue if ticker]
     if not queue:
         return {}
+    raw_unblock = readiness.get("unblock_tickers") or readiness.get("latest_missing_tickers") or []
+    unblock_tickers = []
+    if isinstance(raw_unblock, list):
+        for ticker in raw_unblock:
+            code = normalize_ticker(str(ticker))
+            if code and code not in unblock_tickers:
+                unblock_tickers.append(code)
+    minimum_next_rows = _safe_int(readiness.get("minimum_next_rows"), len(unblock_tickers))
 
     plan = readiness.get("backfill_plan") if isinstance(readiness, dict) else {}
     plan_path = str(readiness.get("backfill_plan_path", "") or "") if isinstance(readiness, dict) else ""
@@ -644,6 +652,8 @@ def daily_price_backfill_progress(
         "priced": priced,
         "next_ticker": needs_plan_backfill[0]["ticker"] if needs_plan_backfill else None,
         "next_detail": needs_plan_backfill[0] if needs_plan_backfill else None,
+        "unblock_tickers": unblock_tickers,
+        "minimum_next_rows": minimum_next_rows,
         "daily_prices_rows": total_rows,
         "backfill_plan_path": plan_path,
         "backfill_plan_top": top_plan,
@@ -706,6 +716,12 @@ def format_daily_price_backfill_progress(
         lines.append(f"   下一步本地补齐: {_format_next_backfill_item(next_detail)}")
     else:
         lines.append("   下一步本地补齐: 优先队列已覆盖，需重新运行 heuristic cycle 验证")
+    if progress.get("unblock_tickers"):
+        lines.append(
+            "   最小解锁批次: "
+            f"{', '.join(progress['unblock_tickers'][:8])} "
+            f"({progress.get('minimum_next_rows', len(progress['unblock_tickers']))} signal rows)"
+        )
     if progress.get("backfill_plan_path"):
         lines.append(f"   机器可读补齐计划: {progress['backfill_plan_path']}")
     if progress.get("backfill_plan_top"):

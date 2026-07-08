@@ -229,6 +229,9 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
         failure_cases=[],
         price_readiness={
             "status": "blocked_no_daily_prices",
+            "latest_missing_tickers": ["600519", "688256"],
+            "unblock_tickers": ["600519", "688256"],
+            "minimum_next_rows": 2,
             "missing_tickers_top10": [
                 {"ticker": "600519", "signal_days": 45, "last_signal_date": "2026-06-20"},
                 {"ticker": "512880", "signal_days": 44, "last_signal_date": "2026-06-10"},
@@ -250,6 +253,7 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     assert "600519(missing 2026-05-01..2026-06-20, 45d, 1585obs, plan_covered=2/2" in text
     assert "512880(missing 2026-05-02..2026-06-10, 44d, 1197obs, plan_covered=0/1)" in text
     assert "下一步本地补齐: 512880 2026-05-02..2026-06-10 (44 signal days)" in text
+    assert "最小解锁批次: 600519, 688256 (2 signal rows)" in text
     assert f"机器可读补齐计划: {tmp_path / 'daily_price_backfill_plan.csv'}" in text
     assert "计划优先级Top: 600519, 512880" in text
     assert "本地DB覆盖检查: python scripts/backfill_daily_prices.py --status --limit 5 --plan" in text
@@ -1548,8 +1552,12 @@ def test_price_readiness_stall_report_counts_partial_no_progress(tmp_path):
         "total_signal_ticker_count": 307,
         "priced_signal_ticker_count": 30,
         "missing_signal_ticker_count": 277,
-        "latest_missing_tickers": ["002221"],
-        "missing_tickers_top10": [{"ticker": "002221", "signal_days": 2}],
+        "latest_missing_tickers": ["002221", "600030"],
+        "minimum_next_rows": 2,
+        "missing_tickers_top10": [
+            {"ticker": "002221", "signal_days": 2},
+            {"ticker": "159990", "signal_days": 43},
+        ],
     }
     for run_id in ("20260628_123812", "20260629_123708", "20260630_123538"):
         run_dir = tmp_path / run_id
@@ -1581,9 +1589,41 @@ def test_price_readiness_stall_report_counts_partial_no_progress(tmp_path):
     assert report["priced_signal_ticker_count"] == 30
     assert report["missing_signal_ticker_count"] == 277
     assert report["next_ticker"] == "002221"
+    assert report["unblock_tickers"] == ["002221", "600030"]
+    assert report["same_unblock_batch_runs"] == 3
     assert capped == pytest.approx(0.002)
     assert "partial daily_prices覆盖无进展" in note
+    assert "最小解锁批次=002221, 600030(2行)，同一解锁批次连续3轮" in note
     assert "数据补齐未推进仓位上限0.20%" in reason
+
+
+def test_price_readiness_stall_report_dedupes_same_day_reruns(tmp_path):
+    readiness_payload = {
+        "status": "partial_daily_price_backfill_needed",
+        "total_signal_ticker_count": 307,
+        "priced_signal_ticker_count": 28,
+        "missing_signal_ticker_count": 279,
+        "latest_missing_tickers": ["159995", "600030"],
+        "minimum_next_rows": 2,
+        "missing_tickers_top10": [{"ticker": "159995", "signal_days": 1}],
+    }
+    for run_id in ("20260707_123540", "20260708_150542", "20260708_150718"):
+        run_dir = tmp_path / run_id
+        run_dir.mkdir()
+        (run_dir / "README.md").write_text("# run\n", encoding="utf-8")
+        (run_dir / "price_readiness.json").write_text(
+            json.dumps(readiness_payload),
+            encoding="utf-8",
+        )
+
+    report = build_price_readiness_stall_report(tmp_path)
+
+    assert report["status"] == "partial_daily_price_backfill_needed"
+    assert report["consecutive_blocked_runs"] == 2
+    assert report["blocked_run_ids"] == ["20260707_123540", "20260708_150718"]
+    assert report["raw_lookback_runs"] == 3
+    assert report["deduped_by_run_date"] is True
+    assert report["unblock_tickers"] == ["159995", "600030"]
 
 
 def test_heuristic_context_surfaces_price_readiness_stall(tmp_path):
