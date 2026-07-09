@@ -857,16 +857,19 @@ class WikiSearchIndex:
             logger.warning("wiki embedding query failed: %s", exc)
             return []
 
-        # 并发获取所有页面 embedding，单页 30s 超时
+        # 限制并发 embedding 请求数，避免连接池耗尽
+        sem = asyncio.Semaphore(16)
+
         async def _safe_page_vec(page: WikiPage) -> Optional[List[float]]:
-            try:
-                return await asyncio.wait_for(self._page_embedding(page), timeout=30)
-            except asyncio.TimeoutError:
-                logger.debug("wiki page embedding timeout: %s", page.rel_path)
-                return None
-            except Exception as exc:
-                logger.debug("wiki page embedding failed for %s: %s", page.rel_path, exc)
-                return None
+            async with sem:
+                try:
+                    return await asyncio.wait_for(self._page_embedding(page), timeout=30)
+                except asyncio.TimeoutError:
+                    logger.debug("wiki page embedding timeout: %s", page.rel_path)
+                    return None
+                except Exception as exc:
+                    logger.debug("wiki page embedding failed for %s: %s", page.rel_path, exc)
+                    return None
 
         page_vecs = await asyncio.gather(*[_safe_page_vec(p) for p in pages])
 
