@@ -11,7 +11,7 @@ llm:
   max_concurrent: 12
   temperature: 0.7
   max_tokens: 22500
-  timeout: 180
+  timeout: 600
 
   # Embedding 配置
   embedding_model: "bge-large-zh-v1.5"

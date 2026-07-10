@@ -414,6 +414,10 @@ class LLMClient:
             }
 
             # 流式调用：read 超时作用于 chunk 间隔，而非整体响应
+            # 首 chunk 超时：90s 内必须收到第一个 chunk，否则认为服务卡死
+            # chunk 间隔超时：120s 内必须收到下一个 chunk，否则认为流卡住
+            first_chunk_timeout = 90
+            chunk_interval_timeout = 120
             content_parts: List[str] = []
             reasoning_parts: List[str] = []
             usage: Dict = {}
@@ -431,7 +435,27 @@ class LLMClient:
                         request=resp.request,
                         response=resp,
                     )
-                async for line in resp.aiter_lines():
+                # 用 wait_for 包装 aiter_lines 实现 chunk 间隔超时
+                aiter = resp.aiter_lines()
+                first_chunk_received = False
+                while True:
+                    try:
+                        if not first_chunk_received:
+                            line = await asyncio.wait_for(aiter.__anext__(), timeout=first_chunk_timeout)
+                        else:
+                            line = await asyncio.wait_for(aiter.__anext__(), timeout=chunk_interval_timeout)
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        if not first_chunk_received:
+                            raise httpx.ReadTimeout(
+                                f"No first chunk within {first_chunk_timeout}s — service likely stuck",
+                                request=resp.request,
+                            )
+                        raise httpx.ReadTimeout(
+                            f"No chunk for {chunk_interval_timeout}s mid-stream — stream stalled",
+                            request=resp.request,
+                        )
                     if not line or not line.startswith("data:"):
                         continue
                     data_str = line[len("data:"):].strip()
@@ -441,6 +465,7 @@ class LLMClient:
                         chunk = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
+                    first_chunk_received = True
                     if "usage" in chunk and chunk["usage"]:
                         usage = {
                             'prompt_tokens': chunk["usage"].get("prompt_tokens", 0),
