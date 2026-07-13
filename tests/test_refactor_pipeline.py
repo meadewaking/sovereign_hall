@@ -17,6 +17,11 @@ from sovereign_hall.agents import get_persona
 from sovereign_hall.services.database import DatabaseService
 from sovereign_hall.services.decision_tracker import DecisionRecorder
 from sovereign_hall.services.investment_simulation import InvestmentSimulation
+from sovereign_hall.services.portfolio_policy import (
+    deployment_position_floor,
+    deployment_status,
+    review_position,
+)
 from sovereign_hall.services.heuristic_policy import (
     HeuristicRiskContext,
     apply_heuristic_risk_cap,
@@ -964,6 +969,150 @@ async def test_simulation_does_not_buy_for_short_without_position(monkeypatch):
     assert sim.positions == {}
 
 
+def test_portfolio_policy_targets_full_deployment_without_strategic_cash(tmp_path):
+    status = deployment_status(cash=7200.0, total_assets=10000.0, target_invested_ratio=1.0)
+
+    assert status["target_invested_ratio"] == 1.0
+    assert status["invested_ratio"] == pytest.approx(0.28)
+    assert status["deployment_gap"] == pytest.approx(7200.0)
+    assert deployment_position_floor(7200.0, 10000.0, 4) == pytest.approx(0.18)
+
+    evaluator = load_script_module("run_heuristic_cycle_full_deployment_module", "scripts/run_heuristic_cycle.py")
+    weights = evaluator.capped_proportional_allocation(
+        {"A": 9.0, "B": 1.0, "C": 1.0, "D": 1.0},
+        total_weight=1.0,
+        max_weight=0.25,
+    )
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert max(weights.values()) <= 0.25 + 1e-12
+
+    db_path = tmp_path / "simulation.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE system_stats (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO system_stats VALUES ('simulation_cash', '7200')")
+        conn.execute(
+            """
+            CREATE TABLE simulation_positions (
+                ticker TEXT, shares REAL, avg_cost REAL, opened_at TEXT,
+                last_mark_price REAL, last_mark_at TEXT, last_mark_source TEXT,
+                last_reviewed_at TEXT, review_status TEXT, review_reason TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO simulation_positions VALUES
+            ('600050', 100, 4.5, '2026-05-01', 4.5, '2026-05-02',
+             'stale local price', '2026-07-13', 'blocked_stale_price', 'stale')
+            """
+        )
+    report = evaluator.build_portfolio_lifecycle_report(db_path)
+    assert report["cash"] == pytest.approx(7200.0)
+    assert report["invested_ratio"] == pytest.approx(450.0 / 7650.0)
+    assert report["deployment_gap"] == pytest.approx(7200.0)
+
+
+def test_position_review_blocks_stale_price_instead_of_fabricating_exit():
+    review = review_position(
+        ticker="512660",
+        avg_cost=1.483,
+        opened_at="2026-05-12T06:02:08",
+        price=1.278,
+        price_at="2026-06-05",
+        price_source="stale local prediction current_price",
+        now=datetime.fromisoformat("2026-07-13T09:00:00"),
+        max_price_age_days=3,
+    )
+
+    assert review.action == "blocked_stale_price"
+    assert review.holding_days == 62
+    assert review.price_age_days == 38
+
+
+def test_position_review_exits_fresh_stop_or_max_holding_breach():
+    stopped = review_position(
+        ticker="512660",
+        avg_cost=1.483,
+        opened_at="2026-07-01T09:00:00",
+        price=1.30,
+        price_at="2026-07-13T09:00:00",
+        price_source="local daily_prices",
+        now=datetime.fromisoformat("2026-07-13T10:00:00"),
+        max_price_age_days=3,
+        stop_loss_pct=-0.08,
+    )
+    expired = review_position(
+        ticker="600050",
+        avg_cost=4.52,
+        opened_at="2026-05-11T09:00:00",
+        price=4.60,
+        price_at="2026-07-13T09:00:00",
+        price_source="local daily_prices",
+        now=datetime.fromisoformat("2026-07-13T10:00:00"),
+        max_holding_days=30,
+    )
+
+    assert stopped.action == "exit"
+    assert "止损" in stopped.reason
+    assert expired.action == "exit"
+    assert "最大持有期" in expired.reason
+
+
+@pytest.mark.asyncio
+async def test_simulation_reviews_every_position_and_only_executes_fresh_exit():
+    sim = InvestmentSimulation()
+    sim.positions = {
+        "512660": {"shares": 300, "avg_cost": 1.483, "opened_at": "2026-05-12T06:02:08"},
+        "600050": {"shares": 100, "avg_cost": 4.52, "opened_at": "2026-05-11T02:22:01"},
+    }
+    sim.resolve_trade_price_detail = AsyncMock(side_effect=[
+        {
+            "price": None,
+            "candidate_price": 1.278,
+            "source": "stale local prediction current_price",
+            "price_at": "2026-06-05",
+        },
+        {
+            "price": 4.10,
+            "source": "local daily_prices",
+            "price_at": datetime.now().isoformat(),
+        },
+    ])
+    sim.execute_trade = AsyncMock(return_value={"success": True, "action": "sell"})
+
+    reviews = await sim.review_open_positions()
+
+    assert [row["action"] for row in reviews] == ["blocked_stale_price", "exit"]
+    sim.execute_trade.assert_awaited_once()
+    assert sim.execute_trade.await_args.kwargs["ticker"] == "600050"
+
+
+@pytest.mark.asyncio
+async def test_simulation_position_schema_migrates_lifecycle_columns(tmp_path):
+    db = DatabaseService(str(tmp_path / "test.db"))
+    await db._init_db()
+    conn = db._connection
+    await conn.execute("DROP TABLE IF EXISTS simulation_positions")
+    await conn.execute(
+        "CREATE TABLE simulation_positions (ticker TEXT PRIMARY KEY, shares INTEGER, avg_cost REAL, updated_at TEXT)"
+    )
+    await conn.execute(
+        "INSERT INTO simulation_positions VALUES ('600050', 100, 4.52, '2026-05-11T02:22:01')"
+    )
+    await conn.commit()
+
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    async with conn.execute("PRAGMA table_info(simulation_positions)") as cursor:
+        columns = {row[1] for row in await cursor.fetchall()}
+    await db.close()
+
+    assert {
+        "opened_at", "peak_price", "last_mark_price", "last_mark_at",
+        "last_mark_source", "last_reviewed_at", "review_status", "review_reason",
+    } <= columns
+
+
 def test_heuristic_risk_cap_uses_latest_policy_as_constraint(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
@@ -982,7 +1131,7 @@ def test_heuristic_risk_cap_uses_latest_policy_as_constraint(tmp_path):
     assert "样本外风险" in reason
 
 
-def test_heuristic_risk_cap_enforces_portfolio_gross_limit(tmp_path):
+def test_heuristic_risk_cap_uses_full_investment_target_instead_of_cash_reserve(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
         policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
@@ -1002,9 +1151,11 @@ def test_heuristic_risk_cap_enforces_portfolio_gross_limit(tmp_path):
         current_gross_exposure=0.13,
         context=context,
     )
+    checklist = format_policy_checklist(context)
 
-    assert capped == pytest.approx(0.02)
-    assert "组合总模拟仓位上限15.0%" in reason
+    assert capped == pytest.approx(0.05)
+    assert reason is None
+    assert "组合目标投资比例=100%" in checklist
 
 
 def test_heuristic_risk_cap_tightens_recent_failure_ticker(tmp_path):
@@ -2131,7 +2282,8 @@ def test_heuristic_policy_checklist_surfaces_promoted_gates(tmp_path):
     assert "置信度>=66%" in checklist
     assert "风险收益比>=0.90" in checklist
     assert "最短持有>=6天" in checklist
-    assert "组合总模拟仓位<=20%" in checklist
+    assert "组合目标投资比例=100%" in checklist
+    assert "禁止战略现金" in prompt
     assert "Heuristic入场校验" in prompt
 
 
@@ -2259,7 +2411,7 @@ async def test_simulation_assets_use_latest_prediction_price_when_quote_missing(
             id, ticker, current_price, predicted_at, direction, confidence
         ) VALUES (?, ?, ?, ?, ?, ?)
         """,
-        ("p1", "600519.SH", 12.3, "2026-06-15T10:00:00", "long", 0.7),
+            ("p1", "600519.SH", 12.3, datetime.now().isoformat(), "long", 0.7),
     )
     await conn.commit()
 
@@ -2364,7 +2516,7 @@ async def test_simulation_trade_resolves_local_prediction_price_without_quote(tm
             id, ticker, current_price, predicted_at, direction, confidence
         ) VALUES (?, ?, ?, ?, ?, ?)
         """,
-        ("p1", "600519.SH", 12.3, "2026-06-15T10:00:00", "long", 0.7),
+        ("p1", "600519.SH", 12.3, datetime.now().isoformat(), "long", 0.7),
     )
     await conn.commit()
     fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)})()

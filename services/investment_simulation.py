@@ -22,6 +22,7 @@ from ..services.heuristic_policy import (
     derive_simulation_risk_memory,
     recent_prediction_observation_count,
 )
+from ..services.portfolio_policy import deployment_status, review_position
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,11 @@ class InvestmentSimulation:
         self.min_unit = self.config.get('min_unit', 100)  # 一手=100股
         self.trading_fee = self.config.get('trading_fee', 0.0003)  # 佣金万三
         self.stamp_duty = self.config.get('stamp_duty', 0.001)  # 印花税千一
+        self.target_invested_ratio = float(self.config.get('target_invested_ratio', 1.0))
+        self.max_trade_price_age_days = int(self.config.get('max_trade_price_age_days', 3))
+        self.stop_loss_pct = float(self.config.get('stop_loss_pct', -0.08))
+        self.take_profit_pct = float(self.config.get('take_profit_pct', 0.15))
+        self.max_holding_days = int(self.config.get('max_holding_days', 30))
 
         # 当前持仓
         self.positions: Dict[str, Dict] = {}  # {ticker: {shares, avg_cost}}
@@ -66,6 +72,7 @@ class InvestmentSimulation:
             return
 
         try:
+            await self.init_tables()
             conn = self.db_service._connection
 
             # 加载现金
@@ -78,12 +85,25 @@ class InvestmentSimulation:
 
             # 加载持仓
             async with conn.execute(
-                "SELECT ticker, shares, avg_cost FROM simulation_positions"
+                """
+                SELECT ticker, shares, avg_cost, opened_at, peak_price,
+                       last_mark_price, last_mark_at, last_mark_source,
+                       last_reviewed_at, review_status, review_reason
+                FROM simulation_positions
+                """
             ) as cursor:
                 async for row in cursor:
                     self.positions[row[0]] = {
                         'shares': row[1],
-                        'avg_cost': row[2]
+                        'avg_cost': row[2],
+                        'opened_at': row[3],
+                        'peak_price': row[4],
+                        'last_mark_price': row[5],
+                        'last_mark_at': row[6],
+                        'last_mark_source': row[7],
+                        'last_reviewed_at': row[8],
+                        'review_status': row[9],
+                        'review_reason': row[10],
                     }
 
             # 加载上次交易日期
@@ -173,9 +193,17 @@ class InvestmentSimulation:
             # 保存持仓
             for ticker, pos in self.positions.items():
                 await conn.execute("""
-                    INSERT OR REPLACE INTO simulation_positions (ticker, shares, avg_cost, updated_at)
-                    VALUES (?, ?, ?, ?)
-                """, (ticker, pos['shares'], pos['avg_cost'], datetime.now().isoformat()))
+                    INSERT OR REPLACE INTO simulation_positions (
+                        ticker, shares, avg_cost, updated_at, opened_at, peak_price,
+                        last_mark_price, last_mark_at, last_mark_source,
+                        last_reviewed_at, review_status, review_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    ticker, pos['shares'], pos['avg_cost'], datetime.now().isoformat(),
+                    pos.get('opened_at'), pos.get('peak_price'), pos.get('last_mark_price'),
+                    pos.get('last_mark_at'), pos.get('last_mark_source'),
+                    pos.get('last_reviewed_at'), pos.get('review_status'), pos.get('review_reason'),
+                ))
 
             # 删除不在当前持仓中的股票
             if self.positions:
@@ -315,24 +343,68 @@ class InvestmentSimulation:
                 break
         return latest
 
-    async def resolve_trade_price(self, ticker: str) -> tuple[Optional[float], str]:
-        """Resolve a simulated-trade price without fetching quotes by default."""
+    async def resolve_trade_price_detail(self, ticker: str) -> Dict[str, Any]:
+        """Resolve a fresh simulated fill price with reproducible source metadata."""
         code = self._normalize_ticker(ticker)
-        local_daily = await self._latest_local_daily_prices([code])
+        local_daily = await self._latest_local_daily_prices(
+            [code], max_age_days=self.max_trade_price_age_days
+        )
         if code in local_daily:
             item = local_daily[code]
-            return float(item["price"]), f"local daily_prices {item.get('date', '')}".strip()
+            return {
+                "price": float(item["price"]),
+                "source": "local daily_prices",
+                "price_at": str(item.get("date", ""))[:10],
+            }
 
         prediction_prices = await self._latest_prediction_price_details([code])
         if code in prediction_prices:
             item = prediction_prices[code]
-            return float(item["price"]), f"local prediction current_price {item.get('date', '')}".strip()
+            day = str(item.get("date", ""))[:10]
+            if self._local_price_is_fresh(day, max_age_days=self.max_trade_price_age_days):
+                return {
+                    "price": float(item["price"]),
+                    "source": "local prediction current_price",
+                    "price_at": day,
+                }
+
+        stale_daily = await self._latest_local_daily_prices([code], max_age_days=None)
+        stale_candidates: List[Dict[str, Any]] = []
+        if code in stale_daily:
+            item = stale_daily[code]
+            stale_candidates.append({
+                "candidate_price": float(item["price"]),
+                "source": "stale local daily_prices",
+                "price_at": str(item.get("date", ""))[:10],
+            })
+        if code in prediction_prices:
+            item = prediction_prices[code]
+            stale_candidates.append({
+                "candidate_price": float(item["price"]),
+                "source": "stale local prediction current_price",
+                "price_at": str(item.get("date", ""))[:10],
+            })
+        if stale_candidates:
+            latest_candidate = max(stale_candidates, key=lambda item: str(item.get("price_at", "")))
+            return {"price": None, **latest_candidate}
 
         if self.realtime_quotes_enabled():
             price = await self.get_current_price(code)
             if price is not None and price > 0:
-                return float(price), "opt-in realtime quote"
-        return None, "no local price"
+                return {
+                    "price": float(price),
+                    "source": "opt-in realtime quote",
+                    "price_at": datetime.now().isoformat(),
+                }
+        return {"price": None, "source": "no fresh local price", "price_at": ""}
+
+    async def resolve_trade_price(self, ticker: str) -> tuple[Optional[float], str]:
+        """Resolve a simulated-trade price without fetching quotes by default."""
+        detail = await self.resolve_trade_price_detail(ticker)
+        source = str(detail.get("source", ""))
+        price_at = str(detail.get("price_at", ""))
+        label = f"{source} {price_at}".strip()
+        return detail.get("price"), label
 
     async def execute_trade(
         self,
@@ -363,6 +435,7 @@ class InvestmentSimulation:
         from .market_data import get_market_data
 
         market_data = get_market_data()
+        direction_norm = (direction or "").lower()
 
         if not await market_data.is_trading_day():
             return {
@@ -373,7 +446,7 @@ class InvestmentSimulation:
             }
 
         # 检查冷却期
-        if self.is_in_cooldown(ticker):
+        if self.is_in_cooldown(ticker) and direction_norm not in ("short", "sell"):
             return {
                 'success': False,
                 'action': 'hold',
@@ -394,7 +467,6 @@ class InvestmentSimulation:
             }
 
         # 计算当前持仓
-        direction_norm = (direction or "").lower()
         current_shares = self.positions.get(ticker, {}).get('shares', 0)
         if direction_norm in ("hold", "neutral", "观望"):
             return {
@@ -473,14 +545,24 @@ class InvestmentSimulation:
                 old_cost = self.positions[ticker]['avg_cost'] * old_shares
                 new_shares = old_shares + shares_to_buy
                 new_cost = old_cost + cost
-                self.positions[ticker] = {
+                existing = self.positions[ticker]
+                existing.update({
                     'shares': new_shares,
-                    'avg_cost': new_cost / new_shares
-                }
+                    'avg_cost': new_cost / new_shares,
+                    'peak_price': max(float(existing.get('peak_price') or price), price),
+                })
             else:
                 self.positions[ticker] = {
                     'shares': shares_to_buy,
-                    'avg_cost': price
+                    'avg_cost': price,
+                    'opened_at': datetime.now().isoformat(),
+                    'peak_price': price,
+                    'last_mark_price': price,
+                    'last_mark_at': datetime.now().isoformat(),
+                    'last_mark_source': price_source,
+                    'last_reviewed_at': datetime.now().isoformat(),
+                    'review_status': 'opened',
+                    'review_reason': reason or '新建模拟持仓',
                 }
 
             self.last_trade_date = datetime.now()
@@ -663,6 +745,55 @@ class InvestmentSimulation:
             logger.warning(f"Failed to refresh simulation risk memory: {e}")
             return []
 
+    async def review_open_positions(self) -> List[Dict[str, Any]]:
+        """Review every open position before considering new simulated trades."""
+        reviews: List[Dict[str, Any]] = []
+        now = datetime.now()
+        for ticker in list(self.positions):
+            pos = self.positions.get(ticker)
+            if not pos:
+                continue
+            detail = await self.resolve_trade_price_detail(ticker)
+            executable_price = detail.get("price")
+            diagnostic_price = executable_price or detail.get("candidate_price")
+            review = review_position(
+                ticker=ticker,
+                avg_cost=float(pos.get("avg_cost", 0.0) or 0.0),
+                opened_at=pos.get("opened_at"),
+                price=float(diagnostic_price) if diagnostic_price else None,
+                price_at=detail.get("price_at"),
+                price_source=str(detail.get("source", "")),
+                now=now,
+                max_price_age_days=self.max_trade_price_age_days,
+                stop_loss_pct=self.stop_loss_pct,
+                take_profit_pct=self.take_profit_pct,
+                max_holding_days=self.max_holding_days,
+            )
+            pos["last_reviewed_at"] = now.isoformat()
+            pos["review_status"] = review.action
+            pos["review_reason"] = review.reason
+            pos["last_mark_price"] = diagnostic_price
+            pos["last_mark_at"] = str(detail.get("price_at", ""))
+            pos["last_mark_source"] = str(detail.get("source", ""))
+            if diagnostic_price:
+                pos["peak_price"] = max(float(pos.get("peak_price") or diagnostic_price), float(diagnostic_price))
+
+            result = review.as_dict()
+            if review.action == "exit" and executable_price:
+                execution = await self.execute_trade(
+                    ticker=ticker,
+                    direction="sell",
+                    target_position=0.0,
+                    current_price=float(executable_price),
+                    reason=f"逐仓强制复核: {review.reason}; price_source={detail.get('source')} {detail.get('price_at')}",
+                    risk_cap_already_applied=True,
+                )
+                result["execution"] = execution
+            reviews.append(result)
+
+        await self.save_state()
+        return reviews
+
     async def calculate_assets(self, prices: Dict[str, float] = None) -> Dict:
         """计算当前总资产"""
         total_value = self.cash
@@ -683,12 +814,16 @@ class InvestmentSimulation:
                 price = pos['avg_cost']
             total_value += pos['shares'] * price
 
+        deployment = deployment_status(self.cash, total_value, self.target_invested_ratio)
         return {
             'cash': self.cash,
             'positions_value': total_value - self.cash,
             'total_assets': total_value,
             'positions': self.positions.copy(),
-            'last_trade_date': self.last_trade_date.isoformat() if self.last_trade_date else None
+            'last_trade_date': self.last_trade_date.isoformat() if self.last_trade_date else None,
+            'target_invested_ratio': deployment['target_invested_ratio'],
+            'invested_ratio': deployment['invested_ratio'],
+            'deployment_gap': deployment['deployment_gap'],
         }
 
     async def daily_reflection(self, llm: LLMClient = None) -> str:
@@ -837,8 +972,49 @@ class InvestmentSimulation:
                 ticker TEXT PRIMARY KEY,
                 shares INTEGER NOT NULL,
                 avg_cost REAL NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                opened_at TEXT,
+                peak_price REAL,
+                last_mark_price REAL,
+                last_mark_at TEXT,
+                last_mark_source TEXT,
+                last_reviewed_at TEXT,
+                review_status TEXT,
+                review_reason TEXT
             )
+        """)
+
+        async with conn.execute("PRAGMA table_info(simulation_positions)") as cursor:
+            existing_position_columns = {row[1] for row in await cursor.fetchall()}
+        required_position_columns = {
+            "opened_at": "TEXT",
+            "peak_price": "REAL",
+            "last_mark_price": "REAL",
+            "last_mark_at": "TEXT",
+            "last_mark_source": "TEXT",
+            "last_reviewed_at": "TEXT",
+            "review_status": "TEXT",
+            "review_reason": "TEXT",
+        }
+        for column, column_type in required_position_columns.items():
+            if column not in existing_position_columns:
+                await conn.execute(
+                    f"ALTER TABLE simulation_positions ADD COLUMN {column} {column_type}"
+                )
+        await conn.execute("""
+            UPDATE simulation_positions
+            SET opened_at = COALESCE(
+                opened_at,
+                (SELECT MAX(t.traded_at)
+                 FROM simulation_trades t
+                 WHERE t.direction = 'buy'
+                   AND replace(replace(t.ticker, '.SH', ''), '.SZ', '') =
+                       replace(replace(simulation_positions.ticker, '.SH', ''), '.SZ', '')),
+                updated_at
+            ),
+                peak_price = COALESCE(peak_price, avg_cost),
+                review_status = COALESCE(review_status, 'pending_first_review'),
+                review_reason = COALESCE(review_reason, '等待逐仓生命周期复核')
         """)
 
         # 资产快照表（每日）

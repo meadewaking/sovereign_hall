@@ -137,6 +137,31 @@ def is_etf_ticker(ticker: Any) -> bool:
     return code.startswith(("15", "51", "56", "58"))
 
 
+def capped_proportional_allocation(
+    scores: dict[str, float],
+    total_weight: float,
+    max_weight: float,
+) -> dict[str, float]:
+    """Redistribute capped residual weight instead of silently leaving strategic cash."""
+    remaining = max(float(total_weight), 0.0)
+    active = {key: max(float(value), 0.0) for key, value in scores.items() if float(value) > 0}
+    allocated = {key: 0.0 for key in active}
+    while active and remaining > 1e-12:
+        score_sum = sum(active.values())
+        progressed = 0.0
+        for key, score in list(active.items()):
+            room = max(0.0, float(max_weight) - allocated[key])
+            proposed = remaining * score / score_sum if score_sum > 0 else remaining / len(active)
+            addition = min(room, proposed)
+            allocated[key] += addition
+            progressed += addition
+        remaining = max(0.0, remaining - progressed)
+        active = {key: score for key, score in active.items() if allocated[key] < max_weight - 1e-12}
+        if progressed <= 1e-12:
+            break
+    return {key: weight for key, weight in allocated.items() if weight > 1e-12}
+
+
 def score_metrics(metrics: dict[str, Any]) -> float:
     turnover_penalty = max(0.0, float(metrics.get("turnover", 0.0)) - 1.0)
     cost_penalty = float(metrics.get("cost_paid", 0.0))
@@ -437,8 +462,13 @@ def pick_targets(
     if raw_scores.sum() <= 0:
         return weights, reasons or ["non_positive_scores"]
 
+    allocated_weights = capped_proportional_allocation(
+        {str(row["ticker"]): float(row["signal_strength"]) for _, row in candidates.iterrows()},
+        allocatable,
+        policy.max_position,
+    )
     for _, row in candidates.iterrows():
-        raw_weight = allocatable * float(row["signal_strength"] / raw_scores.sum())
+        raw_weight = allocated_weights.get(str(row["ticker"]), 0.0)
         vol_scale = 1.0
         if policy.vol_lookback:
             vol = row.get(f"vol_{policy.vol_lookback}d")
@@ -537,6 +567,7 @@ def summarize_metrics(
             "turnover": 0.0,
             "trade_count": 0,
             "cost_paid": 0.0,
+            "average_invested_ratio": 0.0,
             "cost_assumption": cost_assumption,
         }
         base["score"] = score_metrics(base)
@@ -569,6 +600,7 @@ def summarize_metrics(
         "turnover": float(total_turnover),
         "trade_count": int(sum(1 for t in trades if t.get("exit_date"))),
         "cost_paid": float(total_cost),
+        "average_invested_ratio": float(curve["gross_exposure"].mean()) if "gross_exposure" in curve else 0.0,
         "cost_assumption": cost_assumption,
     }
     metrics["score"] = score_metrics(metrics)
@@ -1397,6 +1429,115 @@ def build_price_readiness_report(
     }
 
 
+def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
+    """Snapshot the real simulated account without creating trades or marks."""
+    generated_at = datetime.now().isoformat(timespec="seconds")
+    target_invested_ratio = 1.0
+    with sqlite3.connect(db_path) as conn:
+        table_names = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if "simulation_positions" not in table_names:
+            return {
+                "generated_at": generated_at,
+                "status": "simulation_positions_missing",
+                "target_invested_ratio": target_invested_ratio,
+                "positions": [],
+            }
+        position_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(simulation_positions)").fetchall()
+        }
+        lifecycle_columns = {
+            "opened_at",
+            "last_mark_price",
+            "last_mark_at",
+            "last_mark_source",
+            "last_reviewed_at",
+            "review_status",
+            "review_reason",
+        }
+        if not lifecycle_columns.issubset(position_columns):
+            return {
+                "generated_at": generated_at,
+                "status": "lifecycle_schema_missing",
+                "target_invested_ratio": target_invested_ratio,
+                "missing_columns": sorted(lifecycle_columns - position_columns),
+                "positions": [],
+            }
+        cash_row = None
+        if "system_stats" in table_names:
+            cash_row = conn.execute(
+                "SELECT value FROM system_stats WHERE key = 'simulation_cash'"
+            ).fetchone()
+        cash = float(cash_row[0]) if cash_row else 0.0
+        rows = conn.execute(
+            """
+            SELECT ticker, shares, avg_cost, opened_at, last_mark_price,
+                   last_mark_at, last_mark_source, last_reviewed_at,
+                   review_status, review_reason
+            FROM simulation_positions
+            WHERE shares > 0
+            ORDER BY ticker
+            """
+        ).fetchall()
+
+    now = datetime.now()
+    positions: list[dict[str, Any]] = []
+    market_value = 0.0
+    for row in rows:
+        mark_price = float(row[4]) if row[4] is not None else float(row[2])
+        value = float(row[1]) * mark_price
+        market_value += value
+        try:
+            held_days = max((now - datetime.fromisoformat(str(row[3]))).days, 0) if row[3] else None
+        except ValueError:
+            held_days = None
+        try:
+            quote_age_days = max((now - datetime.fromisoformat(str(row[5]))).days, 0) if row[5] else None
+        except ValueError:
+            quote_age_days = None
+        positions.append(
+            {
+                "ticker": str(row[0]),
+                "shares": float(row[1]),
+                "avg_cost": float(row[2]),
+                "mark_price": mark_price,
+                "market_value": value,
+                "opened_at": row[3],
+                "held_days": held_days,
+                "last_mark_at": row[5],
+                "quote_age_days": quote_age_days,
+                "last_mark_source": row[6],
+                "last_reviewed_at": row[7],
+                "review_status": row[8] or "pending_review",
+                "review_reason": row[9] or "not yet reviewed",
+            }
+        )
+
+    total_assets = cash + market_value
+    invested_ratio = market_value / total_assets if total_assets > 0 else 0.0
+    deployment_gap = max(target_invested_ratio * total_assets - market_value, 0.0)
+    blocked_count = sum(row["review_status"] == "blocked_stale_price" for row in positions)
+    return {
+        "generated_at": generated_at,
+        "status": "blocked_stale_prices" if blocked_count else "reviewed",
+        "target_invested_ratio": target_invested_ratio,
+        "cash": cash,
+        "market_value": market_value,
+        "total_assets": total_assets,
+        "invested_ratio": invested_ratio,
+        "deployment_gap": deployment_gap,
+        "position_count": len(positions),
+        "blocked_stale_price_count": blocked_count,
+        "rule": (
+            "Cash is an operational deployment gap, never a risk reserve. "
+            "Do not create simulated fills from stale prices."
+        ),
+        "positions": positions,
+    }
+
+
 def build_daily_price_backfill_plan(
     daily: pd.DataFrame,
     price_history: pd.DataFrame,
@@ -1583,6 +1724,7 @@ def write_readme(
     price_readiness: dict[str, Any] | None = None,
     price_readiness_stall: dict[str, Any] | None = None,
     tape_update: dict[str, Any] | None = None,
+    portfolio_lifecycle: dict[str, Any] | None = None,
 ) -> None:
     failed = [t for t in trials if t["trial_name"] != best_name]
     best_row = next((t for t in trials if t["trial_name"] == best_name), {})
@@ -1738,6 +1880,7 @@ def write_readme(
         "do not add new leaderboard branches until local price validation moves."
     )
     tape_update = tape_update or {}
+    portfolio_lifecycle = portfolio_lifecycle or {}
     new_rows = tape_update.get("new_prediction_rows_since_previous")
     new_rows_text = "unknown" if new_rows is None else str(new_rows)
     try:
@@ -1773,13 +1916,18 @@ def write_readme(
 ## Blocking & Repeated Warning Review
 - Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
-- Root cause advanced this cycle: user entries refreshed artifact age but not live SQLite row count/latest date, so predictions appended after the last cycle could remain invisible; a one-row refresh could also clear the stale-entry veto before breadth recovered.
-- System fix: `services/heuristic_policy.py` now overlays immutable tape artifacts with the current local `price_predictions` state. A stale tape enters `freshness_recovery_pending`; the veto clears only when age, new-row count, and latest-day breadth all pass.
+- Root cause advanced this cycle: entry risk gates prevented new exposure, but no mandatory lifecycle review covered legacy holdings; `simulation_positions` lacked stop/age/mark/review state, and low `max_gross` treated strategic cash as risk control.
+- System fix: the simulation now targets 100% invested capital, reviews every holding before new proposals, persists lifecycle/mark metadata, triggers stop/take-profit/max-hold exits only on fresh reproducible prices, and redistributes approved candidate weights instead of silently retaining strategic cash.
 - Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
 - Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
-- Integration decision: do not promote a return-seeking default or relax caps this round; use the retained policy only as a risk cap/warning until independently supplied local OHLC rows pass exact plan-date validation and a new cycle confirms coverage.
+- Integration decision: full deployment is now a portfolio invariant, while unavailable/stale prices remain an explicit operational blocker rather than a reason to fabricate fills; risk is expressed through rotation, diversification, and per-position exits instead of strategic cash.
 
 ## What Changed
+- Added `services/portfolio_policy.py` with deterministic stop-loss, take-profit, max-holding, fresh-price, deployment-gap, and candidate-allocation rules.
+- Migrated `simulation_positions` with opened/mark/review lifecycle fields and backfilled legacy opening times from local simulated buy history.
+- `run_discussion` now reviews every open position before considering new proposals; stale marks block fake exits, while fresh stop/expiry breaches generate real simulated sells.
+- Simulation capital now targets 100% investment. Approved new long candidates receive a deployment floor from the remaining gap; per-name/evidence rules redistribute exposure instead of reserving cash.
+- `check_db` now displays invested ratio, deployment gap, holding age, quote age, and the current mandatory action for every holding.
 - Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
 - Tested small interpretable changes: trend filtering, volatility scaling, anomaly veto, drawdown guard, losing-streak cooldown, minimum holding periods, no-new-risk pauses, and rebalance friction.
 - Advanced the prior no-lookahead direction by adding failure-memory replay trials that only penalize tickers after their own closed backtest loss is already known at that simulated date.
@@ -1820,7 +1968,7 @@ def write_readme(
 - Closed the veto-recovery boundary: fresh age alone is insufficient to clear the gate; the shared loader also requires the configured new-row and latest-day breadth thresholds, with a regression test at the exact age boundary.
 - Closed the live-artifact mismatch: all three user entries now see predictions appended after the latest cycle without mutating historical artifacts, while an isolated refresh remains vetoed until breadth recovers.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
-- Closed the portfolio-gross loop: simulated long proposals now enforce the retained policy `max_gross` as a real local cap instead of only showing it in the policy checklist.
+- Replaced the low-gross cash-reserve rule: simulated portfolios target 100% gross without leverage; risk constraints remain per-position and evidence-based.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
 - Wrote the retained policy snapshot to `policy_snapshot.py`.
 
@@ -1833,6 +1981,7 @@ def write_readme(
 - Win rate: {best_metrics['win_rate']:.2%}
 - Turnover: {best_metrics['turnover']:.3f}
 - Trade count: {best_metrics['trade_count']}
+- Average invested ratio: {best_metrics.get('average_invested_ratio', 0.0):.2%}
 - Cost assumption: {best_metrics['cost_assumption']}
 
 ## Failed Or Weaker Directions
@@ -1863,6 +2012,13 @@ def write_readme(
 ## Tape Update Check
 {tape_update_text}
 
+## Simulated Portfolio Lifecycle
+- Status: {portfolio_lifecycle.get('status', 'unknown')}
+- Current invested ratio: {float(portfolio_lifecycle.get('invested_ratio', 0.0)):.2%}; target: {float(portfolio_lifecycle.get('target_invested_ratio', 1.0)):.2%}
+- Operational deployment gap: {float(portfolio_lifecycle.get('deployment_gap', 0.0)):.2f}; cash is not a strategic risk reserve.
+- Open positions reviewed: {int(portfolio_lifecycle.get('position_count', 0))}; stale-price execution blockers: {int(portfolio_lifecycle.get('blocked_stale_price_count', 0))}
+- Machine-readable snapshot: `portfolio_lifecycle_review.json`. No trade is generated by this report.
+
 ## Overfitting Risk
 ```json
 {checks_text}
@@ -1871,6 +2027,10 @@ def write_readme(
 Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe split/cost-stress failure detected"}.
 
 ## User Entry Impact
+- Improved `check_db`: users now see whether capital is actually deployed, why any cash is operationally blocked, and each position's age/quote-age/exit status.
+- Improved `run_discussion`: every open position is reviewed before new proposals; absence of a new committee ticker no longer silently freezes legacy holdings.
+- Improved simulation lifecycle: stop-loss (-8%), take-profit (+15%), and maximum holding period (30 days) are explicit, persisted, and executable only with <=3-day local/reproducible prices.
+- Improved capital use: target invested ratio is 100%; cash is never labeled a risk reserve, and eligible approved candidates receive the undeployed allocation before per-name constraints.
 - Improved entry: `python -m sovereign_hall.check_db` now shows latest best policy, score, overfit warning, single-name cap, and recent failure cases.
 - Improved entry safety: `python -m sovereign_hall.check_db` now treats closed stdin as a safe non-interactive exit after printing status.
 - Local-only guard: `check_db` now uses local cost basis for position valuation by default; realtime quote lookup requires `SOVEREIGN_HALL_REALTIME_QUOTES=1`.
@@ -1904,12 +2064,12 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
 - Improved reduced-exposure closure: all three user entry paths inherit the retained single-stock cap and local evidence floor from `policy_snapshot.py` without adding a separate trading rule.
 - Improved evidence-gate closure: `run_discussion` and `InvestmentSimulation.execute_trade` now apply the retained `min_signal_count` requirement to actual simulated long proposals; proposals with fewer fresh same-day local prediction observations are limited to a small observation-size cap.
-- Improved portfolio-risk closure: `run_discussion` and `InvestmentSimulation.execute_trade` now pass current local gross exposure into `apply_heuristic_risk_cap`, so simulated buys cannot push the portfolio above the latest policy `max_gross`.
+- Improved portfolio-risk closure: `run_discussion` and `InvestmentSimulation.execute_trade` prevent leverage at 100% gross while using per-name, evidence, freshness, and lifecycle rules for risk control.
 - Still not fully integrated: durable simulation risk memory is intentionally a warning/cap layer only; it is not promoted into the offline default policy or an ETF/single-stock allocator because the replay trials only tied, not improved, current best.
 - Still not fully integrated: portfolio sleeve allocator is not promoted because both sleeves did not pass the required primary/OOS/cost-stress checks.
 - Still not integrated as a default: sparse high-score policies are recorded as diagnostic-only when they produce too few closed trades for a defensible rule.
 - Still not integrated as a default: the 3-name/15% gross-cap diagnostic needs another tape update because its score is driven by only two closed trades.
-- Still not integrated as an exposure-increasing default: the current best has zero closed trades in robustness slices, so its 0 score reflects risk avoidance rather than validated return robustness; local prices also remain only partially validated.
+- Still operationally blocked from immediate full deployment: the current local tape lacks enough fresh, validated prices; the system reports the gap and refuses fabricated buys/sells instead of treating cash as a chosen risk reserve.
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
 - Still not integrated as validation for exposure widening: `tape_update.json` does not meet the minimum fresh-row/latest-day observation thresholds when marked as thin or stale.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers shown by `check_db`, then validate whether the evidence-gated cap, observation-count cap, and ETF-sleeve caps reduce churn/drawdown over another tape update before widening exposure.
@@ -1921,9 +2081,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Validate the 6-day evidence-gated reduced-exposure single-stock policy only after a meaningful fresh tape update meets the now-tested age/new-row/latest-day thresholds; keep the boundary regression test aligned with any future threshold change.
-- Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
-- Replace prediction-current-price fallback with validated local daily prices by using the local CSV import path; if priority queue coverage is still incomplete next run, continue backfill tooling/status work and do not add return-seeking leaderboard branches.
+- Import fresh local marks for all seven legacy holdings, rerun mandatory lifecycle review, and verify that triggered exits use fresh reproducible fills rather than old prediction prices.
+- Evaluate 100%-gross diversified policies across time split and 3x-slippage stress, including average invested ratio and turnover; reduce risk through allocation/rotation, not strategic cash.
+- Close the redeployment loop after exits: verify proceeds are reassigned to fresh, committee-approved candidates subject to per-name and evidence constraints, with only fee/board-lot residual cash.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -2009,12 +2169,14 @@ def main() -> int:
         "scripts/run_heuristic_cycle_stdlib.py",
         "services/heuristic_policy.py",
         "services/investment_simulation.py",
+        "services/portfolio_policy.py",
         "services/research_discussion.py",
         "run_discussion.py",
         "research_interactive.py",
         "check_db.py",
         "scripts/backfill_daily_prices.py",
         "tests/test_refactor_pipeline.py",
+        "config.yaml",
     ]
     policies = [
         PolicyConfig(name="baseline_default_policy"),
@@ -2487,6 +2649,36 @@ def main() -> int:
             excluded_ticker_mode="veto",
         ),
         PolicyConfig(
+            name="full_deployment_diversified_hold10",
+            min_confidence=0.65,
+            max_names=10,
+            max_position=0.10,
+            max_gross=1.0,
+            min_risk_reward=0.8,
+            require_positive_trend=False,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=1.0,
+            loss_streak_threshold=0,
+            min_holding_days=10,
+            rebalance_threshold=0.05,
+        ),
+        PolicyConfig(
+            name="full_deployment_lower_churn_hold15",
+            min_confidence=0.65,
+            max_names=10,
+            max_position=0.10,
+            max_gross=1.0,
+            min_risk_reward=0.8,
+            require_positive_trend=False,
+            use_anomaly_veto=True,
+            anomaly_return_threshold=0.18,
+            drawdown_guard=1.0,
+            loss_streak_threshold=0,
+            min_holding_days=15,
+            rebalance_threshold=0.08,
+        ),
+        PolicyConfig(
             name="compact_cost_robust_hold4",
             min_confidence=0.66,
             max_names=4,
@@ -2528,6 +2720,7 @@ def main() -> int:
             "sharpe": metrics["sharpe"],
             "turnover": metrics["turnover"],
             "trade_count": metrics["trade_count"],
+            "average_invested_ratio": metrics.get("average_invested_ratio", 0.0),
             "cost_assumption": metrics["cost_assumption"],
             "score": metrics["score"],
             "notes": "local delayed daily signal simulation; no external market data",
@@ -2535,7 +2728,18 @@ def main() -> int:
         trial_rows.append(row)
         append_jsonl(trials_path, [row])
 
-    promotable_trials = [row for row in trial_rows if not row["trial_name"].endswith("_diagnostic")]
+    policies_by_name = {policy.name: policy for policy in policies}
+    promotable_trials = [
+        row for row in trial_rows
+        if not row["trial_name"].endswith("_diagnostic")
+        and policies_by_name[row["trial_name"]].max_gross >= 0.99
+        and (
+            policies_by_name[row["trial_name"]].max_names
+            * policies_by_name[row["trial_name"]].max_position
+        ) >= 0.99
+    ]
+    if not promotable_trials:
+        raise RuntimeError("No full-deployment heuristic policy is available for selection")
     best_trial = max(promotable_trials, key=lambda row: row["score"])
     best_policy = next(policy for policy in policies if policy.name == best_trial["trial_name"])
 
@@ -2564,6 +2768,7 @@ def main() -> int:
             "sharpe": simplified_metrics["sharpe"],
             "turnover": simplified_metrics["turnover"],
             "trade_count": simplified_metrics["trade_count"],
+            "average_invested_ratio": simplified_metrics.get("average_invested_ratio", 0.0),
             "cost_assumption": simplified_metrics["cost_assumption"],
             "score": simplified_metrics["score"],
             "notes": "simplification stage: removed volatility scaling and excess anomaly tuning",
@@ -2618,6 +2823,8 @@ def main() -> int:
     )
     write_json(run_dir / "price_readiness_stall.json", price_readiness_stall)
     write_json(run_dir / "tape_update.json", tape_update)
+    portfolio_lifecycle = build_portfolio_lifecycle_report(db_path)
+    write_json(run_dir / "portfolio_lifecycle_review.json", portfolio_lifecycle)
     write_policy_snapshot(run_dir / "policy_snapshot.py", best_policy, costs)
     make_plot(run_dir / "sample_efficiency.png", trial_rows)
 
@@ -2658,6 +2865,7 @@ def main() -> int:
         "price_readiness": price_readiness,
         "price_readiness_stall": price_readiness_stall,
         "daily_price_backfill_plan": backfill_plan_summary,
+        "portfolio_lifecycle": portfolio_lifecycle,
     }
     write_json(run_dir / "project_context.json", code_context)
     write_readme(
@@ -2678,6 +2886,7 @@ def main() -> int:
         price_readiness=price_readiness,
         price_readiness_stall=price_readiness_stall,
         tape_update=tape_update,
+        portfolio_lifecycle=portfolio_lifecycle,
     )
 
     latest = runs_root / "LATEST"

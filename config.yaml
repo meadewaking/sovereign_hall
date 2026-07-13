@@ -45,6 +45,11 @@ spider:
 simulation:
   enabled: true
   initial_capital: 10000  # 初始资金 10000 元
+  target_invested_ratio: 1.0  # 模拟资金全部属于投资组合，不因风险偏好保留战略现金
+  max_trade_price_age_days: 3  # 模拟成交必须使用足够新鲜且可复现的本地价格
+  stop_loss_pct: -0.08  # 逐仓强制复核默认止损
+  take_profit_pct: 0.15  # 逐仓强制复核默认止盈
+  max_holding_days: 30  # 超期持仓必须退出并重新配置，而不是无限冻结
   min_unit: 100  # 最小买卖单位：一手=100股
   trading_fee: 0.0003  # 佣金万三
   stamp_duty: 0.001  # 印花税千一（卖出时）

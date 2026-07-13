@@ -1412,6 +1412,9 @@ async def stage4_final_conclusion(llm, discussions: str, decisions: List[Dict], 
 
 async def run_committee_approved_simulation(simulation, market_data, llm, decisions: List[Dict]):
     """Run the daily simulated portfolio step after committee decisions exist."""
+    from sovereign_hall.services.portfolio_policy import (
+        deployment_position_floor as calculate_deployment_position_floor,
+    )
     should_trade = (
         not simulation.last_trade_date or
         (datetime.now() - simulation.last_trade_date).days >= 1
@@ -1440,8 +1443,37 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             f"单标的上限{heuristic_context.max_position:.0%} | {heuristic_context.warning}"
         )
 
+    print("   🔎 先执行全部现有持仓的强制生命周期复核...")
+    position_reviews = await simulation.review_open_positions()
+    for review in position_reviews:
+        action = review.get("action", "unknown")
+        ticker = review.get("ticker", "")
+        reason = review.get("reason", "")
+        if action == "exit":
+            execution = review.get("execution") or {}
+            if execution.get("action") == "sell":
+                print(f"   📉 风控退出 {ticker}: {reason}")
+            else:
+                print(f"   ⚠️ {ticker} 触发退出但未成交: {execution.get('reason', reason)}")
+        elif action == "blocked_stale_price":
+            print(f"   ⛔ {ticker} 复核阻塞: {reason}；不得用旧价伪造成交")
+        else:
+            pnl = review.get("pnl_pct")
+            pnl_text = "N/A" if pnl is None else f"{float(pnl):.1%}"
+            print(f"   ➖ {ticker} 复核持有: PnL={pnl_text}；{reason}")
+
+    assets = await simulation.calculate_assets()
+    print(
+        f"   资金部署: 已投资{assets.get('invested_ratio', 0.0):.1%} / "
+        f"目标{assets.get('target_invested_ratio', 1.0):.1%}，"
+        f"待部署{assets.get('deployment_gap', 0.0):.2f}元"
+    )
+    if assets.get('deployment_gap', 0.0) > 0:
+        print("   规则: 待部署现金不是风险储备；仅因缺少合格标的、新鲜价格、手续费或整手约束暂时未成交")
+
     current_positions = assets.get('positions', {})
     current_tickers = set(current_positions.keys())
+    current_ticker_codes = {simulation._normalize_ticker(ticker) for ticker in current_tickers}
     max_daily_trades = 5
     trade_count = 0
 
@@ -1449,10 +1481,23 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
         decision for decision in decisions
         if decision.get("direction") in ("long", "short")
     ]
+    deployable_new_longs = [
+        decision for decision in trade_candidates
+        if decision.get("direction") == "long"
+        and decision.get("ticker")
+        and simulation._normalize_ticker(decision.get("ticker")) not in current_ticker_codes
+    ]
+    deployment_position_floor = 0.0
+    if deployable_new_longs and assets.get('total_assets', 0.0) > 0:
+        deployment_position_floor = calculate_deployment_position_floor(
+            assets.get('deployment_gap', 0.0),
+            assets['total_assets'],
+            len(deployable_new_longs),
+        )
 
     if trade_candidates:
         for decision in trade_candidates[:5]:
-            ticker = decision.get('ticker')
+            ticker = simulation._normalize_ticker(decision.get('ticker'))
             if not ticker:
                 continue
             if trade_count >= max_daily_trades:
@@ -1470,7 +1515,13 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 print(f"   ⏭️ {ticker}: 无法获取本地价格，跳过交易")
                 continue
 
-            has_position = ticker in current_tickers
+            has_position = ticker in current_ticker_codes
+            if direction == "long" and not has_position and deployment_position_floor > target_position:
+                target_position = deployment_position_floor
+                print(
+                    f"   🎯 {ticker}: 为完成100%资金部署，将候选目标仓位提高到"
+                    f"{target_position:.1%}，随后仍接受单标的/证据风控约束"
+                )
             if "卖出" in history_reflection and has_position and direction == "long":
                 trade_position = target_position * 0.3
                 trade_reason = "反思建议谨慎，小幅建仓"

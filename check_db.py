@@ -9,9 +9,11 @@ import sys
 import os
 import csv
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+
+from sovereign_hall.services.portfolio_policy import deployment_status, review_position
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root.parent))
@@ -817,10 +819,32 @@ def show_investment_status(db_path):
 
     # 获取持仓
     try:
-        c.execute("SELECT ticker, shares, avg_cost FROM simulation_positions")
+        position_columns = {row[1] for row in c.execute("PRAGMA table_info(simulation_positions)")}
+        metadata_columns = [
+            column for column in (
+                "opened_at", "last_reviewed_at", "review_status", "review_reason"
+            ) if column in position_columns
+        ]
+        select_columns = "ticker, shares, avg_cost"
+        if metadata_columns:
+            select_columns += ", " + ", ".join(metadata_columns)
+        c.execute(f"SELECT {select_columns} FROM simulation_positions")
         positions = c.fetchall()
     except:
         positions = []
+        metadata_columns = []
+
+    last_buys = {}
+    try:
+        c.execute("""
+            SELECT replace(replace(ticker, '.SH', ''), '.SZ', ''), MAX(traded_at)
+            FROM simulation_trades
+            WHERE direction = 'buy'
+            GROUP BY replace(replace(ticker, '.SH', ''), '.SZ', '')
+        """)
+        last_buys = {row[0]: row[1] for row in c.fetchall()}
+    except Exception:
+        last_buys = {}
 
     # 获取最近交易
     try:
@@ -845,6 +869,7 @@ def show_investment_status(db_path):
     # 计算当前资产
     total_value = cash
     position_details = []
+    lifecycle_details = []
     for pos in positions:
         ticker = pos[0]
         shares = pos[1]
@@ -852,21 +877,50 @@ def show_investment_status(db_path):
         if ticker in realtime_prices:
             current_price = realtime_prices[ticker]
             price_label = "实时现价"
+            price_at = datetime.now().isoformat()
+            price_source = "opt-in realtime quote"
         elif ticker in local_prices:
             current_price = local_prices[ticker]["price"]
             price_label = f"本地收盘({local_prices[ticker]['date']})"
+            price_at = local_prices[ticker]["date"]
+            price_source = "local daily_prices"
         elif normalize_ticker(ticker) in prediction_prices:
             current_price = prediction_prices[normalize_ticker(ticker)]["price"]
             price_label = f"本地最近预测价({prediction_prices[normalize_ticker(ticker)]['date']})"
+            price_at = prediction_prices[normalize_ticker(ticker)]["date"]
+            price_source = "local prediction current_price"
         else:
             current_price = cost
             price_label = "成本价兜底"
+            price_at = ""
+            price_source = "cost fallback"
         position_value = shares * current_price
         total_value += position_value
         change = (current_price - cost) / cost * 100 if cost > 0 else 0
         sign = '+' if change >= 0 else ''
         position_details.append(
             f"  {ticker}: {shares}股 @ {price_label}{current_price:.3f} 成本{cost:.3f} ({sign}{change:.1f}%)"
+        )
+        opened_at = None
+        if "opened_at" in metadata_columns:
+            opened_at = pos["opened_at"]
+        opened_at = opened_at or last_buys.get(normalize_ticker(ticker))
+        lifecycle = review_position(
+            ticker=ticker,
+            avg_cost=float(cost),
+            opened_at=opened_at,
+            price=float(current_price) if price_source != "cost fallback" else None,
+            price_at=price_at,
+            price_source=price_source,
+            now=datetime.now(),
+            max_price_age_days=3,
+            stop_loss_pct=-0.08,
+            take_profit_pct=0.15,
+            max_holding_days=30,
+        )
+        lifecycle_details.append(
+            f"  {ticker}: action={lifecycle.action}, held={lifecycle.holding_days if lifecycle.holding_days is not None else 'unknown'}d, "
+            f"quote_age={lifecycle.price_age_days if lifecycle.price_age_days is not None else 'unknown'}d, {lifecycle.reason}"
         )
 
     profit = total_value - initial_capital
@@ -882,6 +936,13 @@ def show_investment_status(db_path):
     else:
         print(f"   📉 盈亏: {profit:.2f} 元 ({profit_pct:+.2f}%)")
     print(f"   现金: {cash:.2f} 元")
+    deployment = deployment_status(cash, total_value, 1.0)
+    print(
+        f"   资金部署: {deployment['invested_ratio']:.1%} / 目标100.0%；"
+        f"待部署 {deployment['deployment_gap']:.2f} 元"
+    )
+    if deployment['deployment_gap'] > 0:
+        print("   说明: 现金不是风险储备；只允许因缺少合格标的、新鲜价格、手续费或整手约束暂时留存")
 
     print(f"\n   📦 当前持仓:")
     if position_details:
@@ -891,6 +952,13 @@ def show_investment_status(db_path):
             print("   提示: 当前为本地估值；实时估值请设置 SOVEREIGN_HALL_REALTIME_QUOTES=1")
     else:
         print("   (空仓)")
+
+    print("\n   🩺 强制持仓复核:")
+    if lifecycle_details:
+        for detail in lifecycle_details:
+            print(detail)
+    else:
+        print("   (无持仓需要复核)")
 
     print(f"\n   📜 最近交易:")
     if trades:

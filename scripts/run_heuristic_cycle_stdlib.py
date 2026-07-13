@@ -75,6 +75,27 @@ def is_etf_ticker(ticker: Any) -> bool:
     return normalize_ticker(ticker).startswith(("15", "51", "56", "58"))
 
 
+def capped_proportional_allocation(scores: dict[str, float], total_weight: float, max_weight: float) -> dict[str, float]:
+    """Redistribute capped residual weight instead of silently leaving strategic cash."""
+    remaining = max(float(total_weight), 0.0)
+    active = {key: max(float(value), 0.0) for key, value in scores.items() if float(value) > 0}
+    allocated = {key: 0.0 for key in active}
+    while active and remaining > 1e-12:
+        score_sum = sum(active.values())
+        progressed = 0.0
+        for key, score in list(active.items()):
+            room = max(0.0, float(max_weight) - allocated[key])
+            proposed = remaining * score / score_sum if score_sum > 0 else remaining / len(active)
+            addition = min(room, proposed)
+            allocated[key] += addition
+            progressed += addition
+        remaining = max(0.0, remaining - progressed)
+        active = {key: score for key, score in active.items() if allocated[key] < max_weight - 1e-12}
+        if progressed <= 1e-12:
+            break
+    return {key: weight for key, weight in allocated.items() if weight > 1e-12}
+
+
 def parse_dt(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
@@ -421,8 +442,13 @@ def pick_targets(
     raw_sum = sum(max(0.0, row["signal_strength"]) for row in candidates)
     if remaining_slots <= 0 or allocatable <= 1e-9 or raw_sum <= 0:
         return weights, reasons or ["no_allocatable_signal"]
+    allocated_weights = capped_proportional_allocation(
+        {str(row["ticker"]): max(0.0, row["signal_strength"]) for row in candidates},
+        allocatable,
+        policy.max_position,
+    )
     for row in candidates:
-        raw_weight = allocatable * max(0.0, row["signal_strength"]) / raw_sum
+        raw_weight = allocated_weights.get(str(row["ticker"]), 0.0)
         vol_scale = 1.0
         if policy.vol_lookback:
             vol = row.get(f"vol_{policy.vol_lookback}d")
@@ -502,6 +528,7 @@ def summarize_metrics(
             "turnover": 0.0,
             "trade_count": 0,
             "cost_paid": 0.0,
+            "average_invested_ratio": 0.0,
             "cost_assumption": cost_assumption,
         }
         metrics["score"] = score_metrics(metrics)
@@ -532,6 +559,7 @@ def summarize_metrics(
         "turnover": float(total_turnover),
         "trade_count": int(len(closed)),
         "cost_paid": float(total_cost),
+        "average_invested_ratio": float(mean([row["gross_exposure"] for row in curve])),
         "cost_assumption": cost_assumption,
     }
     metrics["score"] = score_metrics(metrics)
@@ -865,6 +893,10 @@ def build_policies(recent_failure_tickers: tuple[str, ...]) -> list[PolicyConfig
         PolicyConfig(name="no_lookahead_failure_half_size", min_confidence=0.66, max_names=4, max_position=0.08, max_gross=0.40, min_risk_reward=0.9, require_positive_trend=True, trend_lookback=2, use_anomaly_veto=True, anomaly_return_threshold=0.18, drawdown_guard=0.45, drawdown_guard_threshold=0.02, loss_streak_threshold=2, loss_streak_guard=0.50, new_entry_loss_streak_threshold=2, min_holding_days=4, rebalance_threshold=0.05, universe="single_stock", failure_memory_mode="scale", failure_memory_loss_threshold=-0.03, failure_memory_days=8, failure_memory_scale=0.5),
         PolicyConfig(name="no_lookahead_failure_veto", min_confidence=0.66, max_names=4, max_position=0.08, max_gross=0.40, min_risk_reward=0.9, require_positive_trend=True, trend_lookback=2, use_anomaly_veto=True, anomaly_return_threshold=0.18, drawdown_guard=0.45, drawdown_guard_threshold=0.02, loss_streak_threshold=2, loss_streak_guard=0.50, new_entry_loss_streak_threshold=2, min_holding_days=4, rebalance_threshold=0.05, universe="single_stock", failure_memory_mode="veto", failure_memory_loss_threshold=-0.03, failure_memory_days=8),
     ]
+    base.extend([
+        PolicyConfig(name="full_deployment_diversified_hold10", min_confidence=0.65, max_names=10, max_position=0.10, max_gross=1.0, min_risk_reward=0.8, use_anomaly_veto=True, anomaly_return_threshold=0.18, drawdown_guard=1.0, min_holding_days=10, rebalance_threshold=0.05),
+        PolicyConfig(name="full_deployment_lower_churn_hold15", min_confidence=0.65, max_names=10, max_position=0.10, max_gross=1.0, min_risk_reward=0.8, use_anomaly_veto=True, anomaly_return_threshold=0.18, drawdown_guard=1.0, min_holding_days=15, rebalance_threshold=0.08),
+    ])
     if recent_failure_tickers:
         base.extend(
             [
@@ -1671,14 +1703,21 @@ def main() -> int:
                 "sharpe": metrics["sharpe"],
                 "turnover": metrics["turnover"],
                 "trade_count": metrics["trade_count"],
+                "average_invested_ratio": metrics.get("average_invested_ratio", 0.0),
                 "cost_assumption": metrics["cost_assumption"],
                 "score": metrics["score"],
                 "notes": "standard-library fallback local delayed daily signal simulation; no external market data",
             }
         )
 
+    policies_by_name = {policy.name: policy for policy in policies}
     best_name = max(
-        [name for name in results if promotable(name)],
+        [
+            name for name in results
+            if promotable(name)
+            and policies_by_name[name].max_gross >= 0.99
+            and policies_by_name[name].max_names * policies_by_name[name].max_position >= 0.99
+        ],
         key=lambda name: results[name]["metrics"]["score"],
     )
     best_policy = next(policy for policy in policies if policy.name == best_name)
@@ -1703,6 +1742,7 @@ def main() -> int:
             "sharpe": simplified_result["metrics"]["sharpe"],
             "turnover": simplified_result["metrics"]["turnover"],
             "trade_count": simplified_result["metrics"]["trade_count"],
+            "average_invested_ratio": simplified_result["metrics"].get("average_invested_ratio", 0.0),
             "cost_assumption": simplified_result["metrics"]["cost_assumption"],
             "score": simplified_result["metrics"]["score"],
             "notes": "simplification stage: removed excess anomaly tuning",

@@ -30,6 +30,7 @@ PRICE_READINESS_BLOCKED_POSITION_SCALE = 0.1
 PRICE_READINESS_PARTIAL_POSITION_SCALE = 0.25
 PRICE_READINESS_STALLED_POSITION_SCALE = 0.05
 PRICE_READINESS_STALLED_MIN_RUNS = 3
+SIMULATION_TARGET_INVESTED_RATIO = 1.0
 
 
 @dataclass(frozen=True)
@@ -820,11 +821,16 @@ def gross_exposure_position_cap(
     current_position: float | None,
     current_gross_exposure: float | None,
 ) -> float | None:
-    """Return the largest target position that keeps simulated gross under max_gross."""
-    if context.max_gross is None or current_position is None or current_gross_exposure is None:
+    """Prevent leverage while keeping all simulated capital inside the portfolio."""
+    if current_position is None or current_gross_exposure is None:
         return None
+    effective_max_gross = max(
+        SIMULATION_TARGET_INVESTED_RATIO,
+        float(context.max_gross or 0.0),
+    )
+    effective_max_gross = min(effective_max_gross, 1.0)
     other_gross = max(0.0, float(current_gross_exposure) - max(float(current_position), 0.0))
-    return max(0.0, float(context.max_gross) - other_gross)
+    return max(0.0, effective_max_gross - other_gross)
 
 
 def recent_prediction_observation_count(
@@ -1379,7 +1385,7 @@ def apply_heuristic_risk_cap(
         elif ctx.min_signal_count > 1:
             reason += f"；latest policy要求至少{ctx.min_signal_count}条本地同日预测观察支持"
         if gross_cap is not None and gross_cap < target_position:
-            reason += f"；组合总模拟仓位上限{ctx.max_gross:.1%}，该标的当前可用仓位{gross_cap:.1%}"
+            reason += f"；组合禁止杠杆且目标满投资，当前可用仓位{gross_cap:.1%}"
         return capped, reason
     if sleeve_reason:
         return capped, sleeve_reason
@@ -1426,7 +1432,7 @@ def apply_heuristic_risk_cap(
             f"latest policy要求至少{ctx.min_signal_count}条本地同日预测观察支持，单条孤证只允许观察/小仓"
         )
     if gross_cap is not None and gross_cap <= max(0.0, target_position) + 1e-12:
-        risk_notes.append(f"组合总模拟仓位上限{ctx.max_gross:.1%}已纳入交易约束")
+        risk_notes.append("组合目标投资比例100%，仅禁止杠杆，不因风险偏好保留战略现金")
     tape_note = format_tape_update_note(ctx)
     if tape_note:
         if tape_update_cap is not None:
@@ -1559,6 +1565,7 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
         ),
         f"- 稳健性: {ctx.warning}",
         "- 用法: 只能作为本地风控约束/解释，不得编造成外部市场事实；禁止因此放大仓位。",
+        "- 资金用途: 模拟资金目标投资比例为100%；风险控制必须通过标的替换、分散、减仓后再配置完成，不得把战略现金当作默认避险资产。",
     ]
     if ctx.evaluation_engine:
         engine_line = f"- 评估引擎: {ctx.evaluation_engine}"
@@ -1746,8 +1753,7 @@ def format_policy_checklist(context: HeuristicRiskContext) -> str:
         gates.append(f"风险收益比>={context.min_risk_reward:.2f}")
     if context.min_holding_days:
         gates.append(f"最短持有>={context.min_holding_days}天")
-    if context.max_gross is not None:
-        gates.append(f"组合总模拟仓位<={context.max_gross:.0%}")
+    gates.append("组合目标投资比例=100%（仅允许手续费/整手约束造成的操作性余款，禁止战略现金）")
     if context.min_signal_count > 1:
         gates.append(f"同日观察>={context.min_signal_count}条")
     coverage_cap = weak_price_coverage_position_cap(context)
