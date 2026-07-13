@@ -102,12 +102,66 @@ class HeuristicRiskContext:
         except (TypeError, ValueError):
             return False
 
+    @property
+    def stale_tape_entry_veto(self) -> bool:
+        """Whether local evidence is too old to justify a new simulated long."""
+        status = str(self.tape_update.get("validation_status", ""))
+        return status in {"stale_tape", "empty_prediction_tape"}
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def refresh_tape_update_freshness(
+    tape_update: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Recompute tape age when a user entry loads an older run artifact.
+
+    The cycle artifact is an immutable historical record, but its age is not.
+    Returning a copy keeps old artifacts reproducible while preventing entry
+    points from treating a once-fresh tape as fresh forever.
+    """
+    if not isinstance(tape_update, dict) or not tape_update:
+        return {}
+    refreshed = dict(tape_update)
+    latest_raw = refreshed.get("current_latest_prediction_date")
+    if not latest_raw:
+        refreshed["validation_status"] = "empty_prediction_tape"
+        refreshed["enough_for_policy_widening"] = False
+        return refreshed
+    try:
+        latest_date = datetime.fromisoformat(str(latest_raw)[:10]).date()
+    except (TypeError, ValueError):
+        return refreshed
+    current_date = (now or datetime.now()).date()
+    age_days = max(0, (current_date - latest_date).days)
+    refreshed["latest_prediction_age_days"] = age_days
+    max_age = _safe_int(refreshed.get("max_latest_prediction_age_days"), 3)
+    min_new_rows = _safe_int(refreshed.get("min_new_rows_for_validation"), 20)
+    min_latest_rows = _safe_int(refreshed.get("min_latest_date_rows_for_validation"), 5)
+    new_rows = _safe_int(refreshed.get("new_prediction_rows_since_previous"))
+    latest_rows = _safe_int(refreshed.get("latest_date_prediction_rows"))
+    enough_breadth = new_rows >= min_new_rows and latest_rows >= min_latest_rows
+    if age_days > max_age:
+        refreshed["validation_status"] = "stale_tape"
+        refreshed["enough_for_policy_widening"] = False
+        refreshed["entry_veto_reason"] = (
+            f"latest local prediction tape is {age_days} days old, above {max_age}-day limit"
+        )
+    elif enough_breadth:
+        refreshed["validation_status"] = "fresh_tape_update"
+        refreshed["enough_for_policy_widening"] = True
+        refreshed.pop("entry_veto_reason", None)
+    else:
+        refreshed["validation_status"] = "thin_tape_update"
+        refreshed["enough_for_policy_widening"] = False
+        refreshed.pop("entry_veto_reason", None)
+    return refreshed
 
 
 def _recent_run_dirs(runs_root: Path) -> list[Path]:
@@ -1008,7 +1062,9 @@ def load_latest_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskC
     evaluation_engine = str(project_context.get("evaluation_engine", ""))
     evaluation_warning = str(project_context.get("evaluation_warning", ""))
     price_coverage = _read_json(run_dir / "price_coverage.json") or project_context.get("price_coverage", {})
-    tape_update = _read_json(run_dir / "tape_update.json") or project_context.get("tape_update", {})
+    tape_update = refresh_tape_update_freshness(
+        _read_json(run_dir / "tape_update.json") or project_context.get("tape_update", {})
+    )
     price_readiness = _read_json(run_dir / "price_readiness.json") or project_context.get("price_readiness", {})
     price_readiness_stall = (
         _read_json(run_dir / "price_readiness_stall.json")
@@ -1155,6 +1211,11 @@ def apply_heuristic_risk_cap(
         return target_position, None
 
     capped = min(max(target_position, 0.0), ctx.max_position)
+    stale_entry_veto = ctx.stale_tape_entry_veto
+    if stale_entry_veto:
+        # Never turn a stale-data expansion veto into an accidental liquidation.
+        # Existing positions may be held or reduced through their normal paths.
+        capped = min(capped, max(0.0, float(current_position or 0.0)))
     sleeve_reason = sleeve_constraint_reason(ctx, ticker)
     if sleeve_reason:
         capped = min(capped, ctx.max_position * 0.5)
@@ -1185,6 +1246,12 @@ def apply_heuristic_risk_cap(
         capped = min(capped, ctx.max_position * 0.3)
     elif confidence is not None and confidence < 0.6:
         capped = min(capped, ctx.max_position * 0.5)
+
+    if stale_entry_veto:
+        # A long-side entry veto is not a sell instruction. Preserve an existing
+        # position when the proposal asks to expand it; explicit sell/short paths
+        # remain responsible for reductions and exits.
+        capped = min(max(target_position, 0.0), max(0.0, float(current_position or 0.0)))
 
     if capped < target_position:
         reason = f"heuristic风控将{ticker}目标仓位从{target_position:.1%}限制到{capped:.1%}"
@@ -1221,6 +1288,8 @@ def apply_heuristic_risk_cap(
             reason += f"；本地tape验证{tape_note}"
             if tape_update_cap is not None:
                 reason += f"，薄样本验证模拟买入上限{tape_update_cap:.1%}"
+        if stale_entry_veto:
+            reason += "；本地预测已超过新增长仓时效阈值，拒绝新增或扩大模拟多头仓位"
         if signal_count_cap is not None:
             observed = 0 if signal_count is None else signal_count
             reason += (
@@ -1286,6 +1355,8 @@ def apply_heuristic_risk_cap(
             )
         else:
             risk_notes.append(f"本地tape验证{tape_note}，仅作本地风控约束")
+    if stale_entry_veto:
+        risk_notes.append("本地预测已超过时效阈值，拒绝新增或扩大模拟多头仓位")
     if risk_notes:
         return capped, "；".join(risk_notes)
     return capped, None
@@ -1523,6 +1594,8 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
     tape_cap = thin_tape_update_position_cap(ctx)
     if tape_cap is not None:
         lines.append(f"   薄样本验证模拟买入上限: {tape_cap:.1%}")
+    if ctx.stale_tape_entry_veto:
+        lines.append("   陈旧tape前置否决: 已启用（禁止新增/扩大模拟多头，减仓与退出不受阻）")
     readiness_note = format_price_readiness_note(ctx)
     if readiness_note:
         lines.append(f"   daily_prices补齐: {readiness_note}")

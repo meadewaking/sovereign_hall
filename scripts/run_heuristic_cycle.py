@@ -752,6 +752,34 @@ def analyze_failures(result: dict[str, Any], daily: pd.DataFrame, policy: Policy
             }
         ]
 
+    total_turnover = float(curve["turnover"].sum()) if "turnover" in curve else 0.0
+    if not trades and total_turnover <= 1e-12:
+        failures.append(
+            {
+                "case_type": "insufficient_trade_evidence",
+                "time_range": f"{curve.iloc[0]['date']}..{curve.iloc[-1]['date']}",
+                "market_state": {
+                    "evaluated_days": int(len(curve)),
+                    "gross_exposure": 0.0,
+                    "turnover": 0.0,
+                },
+                "signals": {"policy": policy.name, "filters": asdict(policy)},
+                "positions": {},
+                "result": "no positions opened and no closed trades available for path-quality analysis",
+                "suspected_reason": (
+                    "the retained evidence and risk gates rejected every candidate on the available local tape"
+                ),
+                "repair_direction": (
+                    "collect a fresh, broader local tape and independently validated daily prices before "
+                    "considering any gate relaxation"
+                ),
+            }
+        )
+        missed = find_missed_opportunity(curve, daily)
+        if missed:
+            failures.append(missed)
+        return failures
+
     equity = curve.set_index("date")["equity"]
     dd, peak_date, trough_date = max_drawdown(equity)
     window = curve[(curve["date"] >= peak_date) & (curve["date"] <= trough_date)]
@@ -1057,15 +1085,28 @@ def split_checks(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -
     test = run_backtest(daily[daily["date"].isin(test_dates)], policy, costs)["metrics"]
     high_cost = replace(costs, slippage=costs.slippage * 3.0)
     cost_stress = run_backtest(daily, policy, high_cost)["metrics"]
+    insufficient_trade_evidence = min(
+        int(train.get("trade_count", 0) or 0),
+        int(test.get("trade_count", 0) or 0),
+        int(cost_stress.get("trade_count", 0) or 0),
+    ) < 3
     return {
         "split_date": dates[split],
         "train": train,
         "out_of_sample": test,
         "cost_stress_3x_slippage": cost_stress,
+        "insufficient_trade_evidence": insufficient_trade_evidence,
+        "inconclusive_reason": (
+            "fewer than 3 closed trades in at least one robustness slice; "
+            "zero/very sparse trading is risk avoidance, not evidence of return robustness"
+            if insufficient_trade_evidence
+            else ""
+        ),
         "overfit_risk": (
             test["score"] < 0
             or test["score"] < train["score"] * 0.25
             or cost_stress["score"] < 0
+            or insufficient_trade_evidence
         ),
     }
 
@@ -1661,7 +1702,7 @@ def write_readme(
     except (TypeError, ValueError):
         zero_new_tape = False
     tape_cap_decision = (
-        "no new local predictions since the previous cycle; keep as cap/warning and apply a stricter zero-new-tape observational size (10% of policy cap)."
+        "no new local predictions since the previous cycle; when the latest date exceeds the freshness limit, veto new/expanded simulated longs while keeping exits available."
         if zero_new_tape
         else "not enough fresh local tape for exposure widening; keep as cap/warning and apply thin-tape observational sizing."
     )
@@ -1689,8 +1730,10 @@ def write_readme(
 ## Blocking & Repeated Warning Review
 - Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
-- Root cause advanced this cycle: local CSV validation could previously report ticker-level plan coverage when a row merely landed inside a planned date range; that was weaker than the DB/status gate, which requires exact missing signal-date coverage with bounded as-of matching.
-- System fix: `scripts/backfill_daily_prices.py --import-csv ... --dry-run --plan ...` now reports exact signal-date coverage, and MarketDataService fetches are blocked unless explicitly opted in with `--allow-market-fetch` or `SOVEREIGN_HALL_ALLOW_MARKET_BACKFILL=1`.
+- Root cause advanced this cycle: freshness recovery did not have one explicit boundary rule; age, new-row count, and latest-day breadth could be read independently, making it unclear exactly when a stale-tape veto was safe to clear.
+- System fix: `services/heuristic_policy.py` now recomputes one tape state from all three gates at every entry load. The veto clears only when age is within the limit, new rows meet the validation floor, and latest-day breadth meets its floor; otherwise the state remains thin or stale.
+- Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
+- Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
 - Integration decision: do not promote a return-seeking default or relax caps this round; use the retained policy only as a risk cap/warning until independently supplied local OHLC rows pass exact plan-date validation and a new cycle confirms coverage.
 
 ## What Changed
@@ -1729,6 +1772,9 @@ def write_readme(
 - Fixed stalled-readiness accounting so multiple manual reruns on the same calendar date count as one heuristic cycle; this prevents a debugging rerun from prematurely tightening simulated-buy caps.
 - Advanced the prior fresh-tape validation direction by writing `tape_update.json`; thin tape updates are surfaced as a user-entry warning and an observational simulated-buy cap instead of being treated as validation for wider exposure.
 - Tightened the fresh-tape entry loop: if the latest cycle has zero new local prediction rows, simulated long proposals are capped to 10% of the retained policy single-name cap until a meaningful tape update arrives.
+- Closed the stale-artifact gap: entry points dynamically recompute prediction age from the latest local tape date, so freshness cannot remain frozen at artifact creation time.
+- Added a stale-tape entry veto: expired local evidence can no longer create or expand simulated long positions; existing positions are not accidentally liquidated and explicit reductions/exits remain available.
+- Closed the veto-recovery boundary: fresh age alone is insufficient to clear the gate; the shared loader also requires the configured new-row and latest-day breadth thresholds, with a regression test at the exact age boundary.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
 - Closed the portfolio-gross loop: simulated long proposals now enforce the retained policy `max_gross` as a real local cap instead of only showing it in the policy checklist.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
@@ -1810,6 +1856,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved simulated-investment safety: weak or unvalidated price coverage now reduces simulated long proposals by coverage quality; with zero independent daily_prices rows the user-entry cap is one-quarter of the latest policy cap rather than a fixed half-cap.
 - Improved fresh-tape closure: `check_db`, research prompt context, and simulated trade reasons now surface `tape_update.json`; when the current cycle only adds a thin local tape update, simulated long proposals are capped to observational sizing and the policy is not treated as validation for widening.
 - Improved zero-new-tape closure: when `tape_update.json` reports no new prediction rows since the previous run, `check_db`, research prompts, and simulated trade reasons show the stricter zero-new-tape cap instead of treating repeated samples as validation.
+- Improved stale-tape closure this cycle: all three entries recompute a single freshness state from age and breadth; `check_db` shows the current state, while `run_discussion`/simulation clear the veto only after all configured local-tape thresholds pass.
 - Improved sleeve-allocator closure: `services/heuristic_policy.py` now exposes `sleeve_diagnostics.json`; because ETF sleeve checks are not promotable this run, ETF simulated long proposals are capped to half of the latest policy cap with an explicit local-risk reason.
 - Improved reduced-exposure closure: all three user entry paths inherit the retained single-stock cap and local evidence floor from `policy_snapshot.py` without adding a separate trading rule.
 - Improved evidence-gate closure: `run_discussion` and `InvestmentSimulation.execute_trade` now apply the retained `min_signal_count` requirement to actual simulated long proposals; proposals with fewer fresh same-day local prediction observations are limited to a small observation-size cap.
@@ -1818,7 +1865,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Still not fully integrated: portfolio sleeve allocator is not promoted because both sleeves did not pass the required primary/OOS/cost-stress checks.
 - Still not integrated as a default: sparse high-score policies are recorded as diagnostic-only when they produce too few closed trades for a defensible rule.
 - Still not integrated as a default: the 3-name/15% gross-cap diagnostic needs another tape update because its score is driven by only two closed trades.
-- Still not integrated as an exposure-increasing default: the current best keeps passing basic robustness checks, but local prices remain only partially validated.
+- Still not integrated as an exposure-increasing default: the current best has zero closed trades in robustness slices, so its 0 score reflects risk avoidance rather than validated return robustness; local prices also remain only partially validated.
 - Still not integrated as a default trading allocator: price coverage is too weak for exposure expansion when `price_coverage.json` reports unvalidated fallback or high missing held-position slots.
 - Still not integrated as validation for exposure widening: `tape_update.json` does not meet the minimum fresh-row/latest-day observation thresholds when marked as thin or stale.
 - Next minimum loop closure: backfill independently validated local `daily_prices` for the latest missing tickers shown by `check_db`, then validate whether the evidence-gated cap, observation-count cap, and ETF-sleeve caps reduce churn/drawdown over another tape update before widening exposure.
@@ -1830,7 +1877,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Validate the 6-day evidence-gated reduced-exposure single-stock policy and the live insufficient-observation/薄tape cap only after a meaningful fresh tape update meets the `tape_update.json` thresholds.
+- Validate the 6-day evidence-gated reduced-exposure single-stock policy only after a meaningful fresh tape update meets the now-tested age/new-row/latest-day thresholds; keep the boundary regression test aligned with any future threshold change.
 - Keep ETF sleeve as cap/warning only; promote an ETF/single-stock allocator only if both sleeves pass primary/OOS/cost stress with 3x-slippage score >= 0.02.
 - Replace prediction-current-price fallback with validated local daily prices by using the local CSV import path; if priority queue coverage is still incomplete next run, continue backfill tooling/status work and do not add return-seeking leaderboard branches.
 """

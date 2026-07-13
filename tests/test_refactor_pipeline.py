@@ -1287,6 +1287,164 @@ def test_recent_prediction_observation_count_uses_latest_fresh_day(tmp_path):
     assert stale_count == 0
 
 
+def test_tape_freshness_is_recomputed_and_vetoes_new_simulated_long(tmp_path):
+    from sovereign_hall.services.heuristic_policy import refresh_tape_update_freshness
+
+    tape = refresh_tape_update_freshness(
+        {
+            "validation_status": "thin_tape_update",
+            "current_latest_prediction_date": "2026-07-06",
+            "latest_prediction_age_days": 3,
+            "max_latest_prediction_age_days": 3,
+            "new_prediction_rows_since_previous": 0,
+        },
+        now=datetime.fromisoformat("2026-07-11T09:00:00"),
+    )
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="stale_tape_guard",
+        score=0.0,
+        max_position=0.04,
+        overfit_risk=False,
+        warning="local only",
+        failure_cases=[],
+        tape_update=tape,
+    )
+
+    new_cap, new_reason = apply_heuristic_risk_cap(
+        "600519", 0.04, 0.8, current_position=0.0, current_gross_exposure=0.0, context=context
+    )
+    held_cap, held_reason = apply_heuristic_risk_cap(
+        "600519", 0.04, 0.8, current_position=0.02, current_gross_exposure=0.02, context=context
+    )
+    status = format_heuristic_status(context)
+
+    assert tape["latest_prediction_age_days"] == 5
+    assert tape["validation_status"] == "stale_tape"
+    assert new_cap == 0.0
+    assert held_cap == pytest.approx(0.02)
+    assert "拒绝新增或扩大模拟多头仓位" in new_reason
+    assert "拒绝新增或扩大模拟多头仓位" in held_reason
+    assert "陈旧tape前置否决" in status
+
+
+def test_tape_entry_veto_clears_only_with_fresh_broad_update(tmp_path):
+    from sovereign_hall.services.heuristic_policy import refresh_tape_update_freshness
+
+    base = {
+        "validation_status": "stale_tape",
+        "current_latest_prediction_date": "2026-07-09",
+        "latest_prediction_age_days": 9,
+        "max_latest_prediction_age_days": 3,
+        "min_new_rows_for_validation": 20,
+        "min_latest_date_rows_for_validation": 5,
+        "entry_veto_reason": "old artifact value",
+    }
+    boundary_now = datetime.fromisoformat("2026-07-12T09:00:00")
+    broad = refresh_tape_update_freshness(
+        {**base, "new_prediction_rows_since_previous": 20, "latest_date_prediction_rows": 5},
+        now=boundary_now,
+    )
+    thin = refresh_tape_update_freshness(
+        {**base, "new_prediction_rows_since_previous": 20, "latest_date_prediction_rows": 4},
+        now=boundary_now,
+    )
+    expired = refresh_tape_update_freshness(
+        {
+            **base,
+            "current_latest_prediction_date": "2026-07-08",
+            "new_prediction_rows_since_previous": 20,
+            "latest_date_prediction_rows": 5,
+        },
+        now=boundary_now,
+    )
+
+    assert broad["latest_prediction_age_days"] == 3
+    assert broad["validation_status"] == "fresh_tape_update"
+    assert broad["enough_for_policy_widening"] is True
+    assert "entry_veto_reason" not in broad
+    assert thin["validation_status"] == "thin_tape_update"
+    assert thin["enough_for_policy_widening"] is False
+    assert "entry_veto_reason" not in thin
+    assert expired["latest_prediction_age_days"] == 4
+    assert expired["validation_status"] == "stale_tape"
+    assert expired["enough_for_policy_widening"] is False
+
+
+def test_sparse_split_checks_are_inconclusive_not_robust():
+    import pandas as pd
+
+    module = load_script_module("run_heuristic_cycle_sparse_split_module", "scripts/run_heuristic_cycle.py")
+    daily = pd.DataFrame(
+        [
+            {
+                "date": f"2026-06-{day:02d}",
+                "ticker": "600519",
+                "price": 10.0,
+                "price_source": "daily_prices",
+                "confidence": 0.1,
+                "risk_reward": 0.0,
+                "close_observations": 1,
+                "stop_gap": 0.05,
+                "signal_strength": 0.1,
+                "return_1d": 0.0,
+                "momentum_2d": 0.0,
+                "momentum_3d": 0.0,
+                "momentum_5d": 0.0,
+                "vol_2d": 0.0,
+                "vol_3d": 0.0,
+                "vol_5d": 0.0,
+            }
+            for day in range(1, 11)
+        ]
+    )
+    checks = module.split_checks(daily, module.PolicyConfig(name="no_trade"), module.CostConfig())
+
+    assert checks["insufficient_trade_evidence"] is True
+    assert checks["overfit_risk"] is True
+    assert "risk avoidance" in checks["inconclusive_reason"]
+
+
+def test_zero_trade_failure_analysis_does_not_invent_drawdown_or_overtrading():
+    import pandas as pd
+
+    module = load_script_module("run_heuristic_cycle_zero_trade_failure_module", "scripts/run_heuristic_cycle.py")
+    curve = pd.DataFrame(
+        [
+            {
+                "date": "2026-07-01",
+                "signal_date": "2026-06-30",
+                "equity": 1.0,
+                "net_return": 0.0,
+                "turnover": 0.0,
+                "gross_exposure": 0.0,
+                "cost": 0.0,
+                "positions": "{}",
+            },
+            {
+                "date": "2026-07-02",
+                "signal_date": "2026-07-01",
+                "equity": 1.0,
+                "net_return": 0.0,
+                "turnover": 0.0,
+                "gross_exposure": 0.0,
+                "cost": 0.0,
+                "positions": "{}",
+            },
+        ]
+    )
+    daily = pd.DataFrame(
+        columns=["date", "ticker", "price", "confidence", "risk_reward", "close_observations"]
+    )
+    failures = module.analyze_failures(
+        {"curve": curve, "trades": []}, daily, module.PolicyConfig(name="no_trade")
+    )
+
+    assert [row["case_type"] for row in failures] == ["insufficient_trade_evidence"]
+    assert failures[0]["market_state"]["gross_exposure"] == 0.0
+    assert "no positions opened" in failures[0]["result"]
+
+
 def test_heuristic_context_surfaces_price_coverage(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
