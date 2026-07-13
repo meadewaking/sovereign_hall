@@ -1430,7 +1430,7 @@ def build_price_readiness_report(
 
 
 def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
-    """Snapshot the real simulated account without creating trades or marks."""
+    """Snapshot lifecycle metadata without pretending stored marks are current value."""
     generated_at = datetime.now().isoformat(timespec="seconds")
     target_invested_ratio = 1.0
     with sqlite3.connect(db_path) as conn:
@@ -1484,11 +1484,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
 
     now = datetime.now()
     positions: list[dict[str, Any]] = []
-    market_value = 0.0
     for row in rows:
-        mark_price = float(row[4]) if row[4] is not None else float(row[2])
-        value = float(row[1]) * mark_price
-        market_value += value
         try:
             held_days = max((now - datetime.fromisoformat(str(row[3]))).days, 0) if row[3] else None
         except ValueError:
@@ -1502,37 +1498,34 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                 "ticker": str(row[0]),
                 "shares": float(row[1]),
                 "avg_cost": float(row[2]),
-                "mark_price": mark_price,
-                "market_value": value,
                 "opened_at": row[3],
                 "held_days": held_days,
-                "last_mark_at": row[5],
-                "quote_age_days": quote_age_days,
-                "last_mark_source": row[6],
+                "audit_last_mark_price": float(row[4]) if row[4] is not None else None,
+                "audit_last_mark_at": row[5],
+                "audit_quote_age_days": quote_age_days,
+                "audit_last_mark_source": row[6],
                 "last_reviewed_at": row[7],
                 "review_status": row[8] or "pending_review",
                 "review_reason": row[9] or "not yet reviewed",
             }
         )
 
-    total_assets = cash + market_value
-    invested_ratio = market_value / total_assets if total_assets > 0 else 0.0
-    deployment_gap = max(target_invested_ratio * total_assets - market_value, 0.0)
-    blocked_count = sum(row["review_status"] == "blocked_stale_price" for row in positions)
+    blocked_count = sum(str(row["review_status"]).startswith("blocked_") for row in positions)
     return {
         "generated_at": generated_at,
-        "status": "blocked_stale_prices" if blocked_count else "reviewed",
+        "status": "realtime_valuation_required",
+        "valuation_complete": False,
         "target_invested_ratio": target_invested_ratio,
         "cash": cash,
-        "market_value": market_value,
-        "total_assets": total_assets,
-        "invested_ratio": invested_ratio,
-        "deployment_gap": deployment_gap,
+        "market_value": None,
+        "total_assets": None,
+        "invested_ratio": None,
+        "deployment_gap": None,
         "position_count": len(positions),
-        "blocked_stale_price_count": blocked_count,
+        "blocked_price_count": blocked_count,
         "rule": (
-            "Cash is an operational deployment gap, never a risk reserve. "
-            "Do not create simulated fills from stale prices."
+            "Current account value, PnL, invested ratio and simulated fills require realtime quotes. "
+            "Stored marks are audit metadata only and are never valuation fallbacks."
         ),
         "positions": positions,
     }
@@ -1881,6 +1874,14 @@ def write_readme(
     )
     tape_update = tape_update or {}
     portfolio_lifecycle = portfolio_lifecycle or {}
+    portfolio_invested = portfolio_lifecycle.get("invested_ratio")
+    portfolio_gap = portfolio_lifecycle.get("deployment_gap")
+    portfolio_invested_text = (
+        f"{float(portfolio_invested):.2%}" if portfolio_invested is not None else "N/A (realtime quote required)"
+    )
+    portfolio_gap_text = (
+        f"{float(portfolio_gap):.2f}" if portfolio_gap is not None else "N/A (realtime quote required)"
+    )
     new_rows = tape_update.get("new_prediction_rows_since_previous")
     new_rows_text = "unknown" if new_rows is None else str(new_rows)
     try:
@@ -1917,7 +1918,7 @@ def write_readme(
 - Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
 - Root cause advanced this cycle: entry risk gates prevented new exposure, but no mandatory lifecycle review covered legacy holdings; `simulation_positions` lacked stop/age/mark/review state, and low `max_gross` treated strategic cash as risk control.
-- System fix: the simulation now targets 100% invested capital, reviews every holding before new proposals, persists lifecycle/mark metadata, triggers stop/take-profit/max-hold exits only on fresh reproducible prices, and redistributes approved candidate weights instead of silently retaining strategic cash.
+- System fix: the simulation now targets 100% invested capital, reviews every holding before new proposals, persists lifecycle/quote metadata, triggers stop/take-profit/max-hold exits only on freshly fetched realtime quotes during market hours, and redistributes approved candidate weights instead of silently retaining strategic cash.
 - Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
 - Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
 - Integration decision: full deployment is now a portfolio invariant, while unavailable/stale prices remain an explicit operational blocker rather than a reason to fabricate fills; risk is expressed through rotation, diversification, and per-position exits instead of strategic cash.
@@ -1925,7 +1926,7 @@ def write_readme(
 ## What Changed
 - Added `services/portfolio_policy.py` with deterministic stop-loss, take-profit, max-holding, fresh-price, deployment-gap, and candidate-allocation rules.
 - Migrated `simulation_positions` with opened/mark/review lifecycle fields and backfilled legacy opening times from local simulated buy history.
-- `run_discussion` now reviews every open position before considering new proposals; stale marks block fake exits, while fresh stop/expiry breaches generate real simulated sells.
+- `run_discussion` now reviews every open position before considering new proposals; missing realtime quotes block valuation/trading, while realtime stop/expiry breaches generate simulated sells only during market hours.
 - Simulation capital now targets 100% investment. Approved new long candidates receive a deployment floor from the remaining gap; per-name/evidence rules redistribute exposure instead of reserving cash.
 - `check_db` now displays invested ratio, deployment gap, holding age, quote age, and the current mandatory action for every holding.
 - Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
@@ -2014,9 +2015,9 @@ def write_readme(
 
 ## Simulated Portfolio Lifecycle
 - Status: {portfolio_lifecycle.get('status', 'unknown')}
-- Current invested ratio: {float(portfolio_lifecycle.get('invested_ratio', 0.0)):.2%}; target: {float(portfolio_lifecycle.get('target_invested_ratio', 1.0)):.2%}
-- Operational deployment gap: {float(portfolio_lifecycle.get('deployment_gap', 0.0)):.2f}; cash is not a strategic risk reserve.
-- Open positions reviewed: {int(portfolio_lifecycle.get('position_count', 0))}; stale-price execution blockers: {int(portfolio_lifecycle.get('blocked_stale_price_count', 0))}
+- Current invested ratio: {portfolio_invested_text}; target: {float(portfolio_lifecycle.get('target_invested_ratio', 1.0)):.2%}
+- Operational deployment gap: {portfolio_gap_text}; cash is not a strategic risk reserve.
+- Open positions recorded: {int(portfolio_lifecycle.get('position_count', 0))}; quote blockers: {int(portfolio_lifecycle.get('blocked_price_count', 0))}
 - Machine-readable snapshot: `portfolio_lifecycle_review.json`. No trade is generated by this report.
 
 ## Overfitting Risk
@@ -2029,11 +2030,11 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## User Entry Impact
 - Improved `check_db`: users now see whether capital is actually deployed, why any cash is operationally blocked, and each position's age/quote-age/exit status.
 - Improved `run_discussion`: every open position is reviewed before new proposals; absence of a new committee ticker no longer silently freezes legacy holdings.
-- Improved simulation lifecycle: stop-loss (-8%), take-profit (+15%), and maximum holding period (30 days) are explicit, persisted, and executable only with <=3-day local/reproducible prices.
+- Improved simulation lifecycle: stop-loss (-8%), take-profit (+15%), and maximum holding period (30 days) are explicit, persisted, and executable only after a fresh realtime quote is fetched during market hours.
 - Improved capital use: target invested ratio is 100%; cash is never labeled a risk reserve, and eligible approved candidates receive the undeployed allocation before per-name constraints.
 - Improved entry: `python -m sovereign_hall.check_db` now shows latest best policy, score, overfit warning, single-name cap, and recent failure cases.
 - Improved entry safety: `python -m sovereign_hall.check_db` now treats closed stdin as a safe non-interactive exit after printing status.
-- Local-only guard: `check_db` now uses local cost basis for position valuation by default; realtime quote lookup requires `SOVEREIGN_HALL_REALTIME_QUOTES=1`.
+- Realtime valuation guard: `check_db` enables realtime quotes by default; if any quote is unavailable it shows N/A and never falls back to local daily prices, predictions, artifacts, or cost basis.
 - Improved simulation path: `run_discussion` and `InvestmentSimulation.execute_trade` now cap simulated long positions using the latest local heuristic max position; weak or lower-scoring policies are used only as warnings/risk caps, not as return-seeking exposure increases.
 - Improved manual advice path: `python -m sovereign_hall.research_interactive` now prints and saves the latest heuristic policy, overfit warning, and recent failure cases alongside the generated report.
 - Improved research prompt path: `run_discussion` and `research_interactive` now pass the latest local heuristic policy, failure-case tickers, and overfit warning into proposal, voting, and conclusion prompts as explicit risk constraints.
@@ -2081,7 +2082,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Import fresh local marks for all seven legacy holdings, rerun mandatory lifecycle review, and verify that triggered exits use fresh reproducible fills rather than old prediction prices.
+- Rerun mandatory lifecycle review during A-share trading hours and verify all triggered exits use newly fetched realtime quotes rather than old prediction or local marks.
 - Evaluate 100%-gross diversified policies across time split and 3x-slippage stress, including average invested ratio and turnover; reduce risk through allocation/rotation, not strategic cash.
 - Close the redeployment loop after exits: verify proceeds are reassigned to fresh, committee-approved candidates subject to per-name and evidence constraints, with only fee/board-lot residual cash.
 """

@@ -1435,7 +1435,14 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
     history_reflection = await simulation.get_recent_reflection(limit=2)
     assets = await simulation.calculate_assets()
     heuristic_context = load_latest_heuristic_context()
-    print(f"   当前资产: {assets['total_assets']:.2f}元 | 现金: {assets['cash']:.2f}元 | 持仓: {assets['positions_value']:.2f}元")
+    if assets.get("valuation_complete"):
+        print(f"   当前资产: {assets['total_assets']:.2f}元 | 现金: {assets['cash']:.2f}元 | 持仓: {assets['positions_value']:.2f}元（实时现价）")
+    else:
+        print(
+            "   当前资产: N/A | 现金: "
+            f"{assets['cash']:.2f}元 | 缺少实时现价: "
+            f"{', '.join(assets.get('missing_price_tickers', []))}"
+        )
     if heuristic_context.available:
         print(
             f"   Heuristic风控: {heuristic_context.policy_name} "
@@ -1455,20 +1462,23 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 print(f"   📉 风控退出 {ticker}: {reason}")
             else:
                 print(f"   ⚠️ {ticker} 触发退出但未成交: {execution.get('reason', reason)}")
-        elif action == "blocked_stale_price":
-            print(f"   ⛔ {ticker} 复核阻塞: {reason}；不得用旧价伪造成交")
+        elif action.startswith("blocked_"):
+            print(f"   ⛔ {ticker} 复核阻塞: {reason}")
         else:
             pnl = review.get("pnl_pct")
             pnl_text = "N/A" if pnl is None else f"{float(pnl):.1%}"
             print(f"   ➖ {ticker} 复核持有: PnL={pnl_text}；{reason}")
 
     assets = await simulation.calculate_assets()
-    print(
-        f"   资金部署: 已投资{assets.get('invested_ratio', 0.0):.1%} / "
-        f"目标{assets.get('target_invested_ratio', 1.0):.1%}，"
-        f"待部署{assets.get('deployment_gap', 0.0):.2f}元"
-    )
-    if assets.get('deployment_gap', 0.0) > 0:
+    if assets.get("valuation_complete"):
+        print(
+            f"   资金部署: 已投资{assets['invested_ratio']:.1%} / "
+            f"目标{assets.get('target_invested_ratio', 1.0):.1%}，"
+            f"待部署{assets['deployment_gap']:.2f}元"
+        )
+    else:
+        print("   资金部署: N/A；组合实时估值不完整，禁止新增或扩大仓位")
+    if assets.get('deployment_gap') is not None and assets['deployment_gap'] > 0:
         print("   规则: 待部署现金不是风险储备；仅因缺少合格标的、新鲜价格、手续费或整手约束暂时未成交")
 
     current_positions = assets.get('positions', {})
@@ -1488,7 +1498,7 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
         and simulation._normalize_ticker(decision.get("ticker")) not in current_ticker_codes
     ]
     deployment_position_floor = 0.0
-    if deployable_new_longs and assets.get('total_assets', 0.0) > 0:
+    if deployable_new_longs and assets.get('total_assets') is not None and assets['total_assets'] > 0:
         deployment_position_floor = calculate_deployment_position_floor(
             assets.get('deployment_gap', 0.0),
             assets['total_assets'],
@@ -1512,7 +1522,7 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             target_position = float(decision.get('target_position', 0.0))
             current_price, price_source = await simulation.resolve_trade_price(ticker)
             if current_price is None:
-                print(f"   ⏭️ {ticker}: 无法获取本地价格，跳过交易")
+                print(f"   ⏭️ {ticker}: 无法获取实时现价，跳过模拟交易")
                 continue
 
             has_position = ticker in current_ticker_codes
@@ -1603,7 +1613,13 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
         print(f"   💤 投委会无新交易裁决且空仓，保持观望")
 
     final_assets = await simulation.calculate_assets()
-    print(f"   📊 交易后: 现金 {final_assets['cash']:.2f}元 | 持仓 {final_assets['positions_value']:.2f}元")
+    if final_assets.get("valuation_complete"):
+        print(f"   📊 交易后: 现金 {final_assets['cash']:.2f}元 | 持仓 {final_assets['positions_value']:.2f}元（实时现价）")
+    else:
+        print(
+            f"   📊 交易后: 现金 {final_assets['cash']:.2f}元 | 当前资产N/A；"
+            f"缺少实时现价: {', '.join(final_assets.get('missing_price_tickers', []))}"
+        )
 
     reflection = await simulation.daily_reflection(llm)
     if reflection:

@@ -46,7 +46,9 @@ simulation:
   enabled: true
   initial_capital: 10000  # 初始资金 10000 元
   target_invested_ratio: 1.0  # 模拟资金全部属于投资组合，不因风险偏好保留战略现金
-  max_trade_price_age_days: 3  # 模拟成交必须使用足够新鲜且可复现的本地价格
+  realtime_quotes_required: true  # 当前估值、盈亏、持仓复核和模拟成交只允许实时行情
+  trade_during_market_hours_only: true  # 闭市行情仅查看，不执行模拟成交
+  max_trade_price_age_days: 3  # 实时行情时间戳异常时的防御性上限
   stop_loss_pct: -0.08  # 逐仓强制复核默认止损
   take_profit_pct: 0.15  # 逐仓强制复核默认止盈
   max_holding_days: 30  # 超期持仓必须退出并重新配置，而不是无限冻结

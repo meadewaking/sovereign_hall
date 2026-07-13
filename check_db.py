@@ -30,7 +30,7 @@ def format_size(size_bytes: int) -> str:
 
 
 def get_realtime_prices(tickers: list) -> dict:
-    """获取实时价格"""
+    """获取实时价格、来源和抓取时间；失败时不使用历史价格兜底。"""
     import asyncio
     from sovereign_hall.services.market_data import get_market_data
 
@@ -38,42 +38,20 @@ def get_realtime_prices(tickers: list) -> dict:
         md = get_market_data()
         prices = {}
         for ticker in tickers:
-            price = await md.get_current_price(ticker)
-            if price:
-                prices[ticker] = price
+            if hasattr(md, "get_current_quote"):
+                quote = await md.get_current_quote(ticker)
+            else:
+                price = await md.get_current_price(ticker)
+                quote = {
+                    "price": price,
+                    "source": "realtime_quote",
+                    "fetched_at": datetime.now().isoformat(),
+                } if price else None
+            if quote and quote.get("price"):
+                prices[ticker] = quote
         return prices
 
     return asyncio.run(fetch())
-
-
-def get_latest_local_prices(conn: sqlite3.Connection, tickers: list) -> dict:
-    """从 daily_prices 读取每只持仓最近的本地收盘价。"""
-    if not tickers:
-        return {}
-
-    c = conn.cursor()
-    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_prices'")
-    if not c.fetchone():
-        return {}
-
-    placeholders = ",".join("?" for _ in tickers)
-    c.execute(f"""
-        SELECT p.ticker, p.close, p.date
-        FROM daily_prices p
-        JOIN (
-            SELECT ticker, MAX(date) AS latest_date
-            FROM daily_prices
-            WHERE ticker IN ({placeholders})
-            GROUP BY ticker
-        ) latest
-          ON p.ticker = latest.ticker
-         AND p.date = latest.latest_date
-        WHERE p.close IS NOT NULL AND p.close > 0
-    """, tickers)
-    return {
-        row[0]: {"price": float(row[1]), "date": row[2]}
-        for row in c.fetchall()
-    }
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -81,41 +59,9 @@ def normalize_ticker(ticker: str) -> str:
     return code.split(".")[0] if "." in code else code
 
 
-def get_latest_prediction_prices(conn: sqlite3.Connection, tickers: list) -> dict:
-    """Use the latest locally recorded prediction entry price as a weak fallback."""
-    wanted = {normalize_ticker(ticker) for ticker in tickers if normalize_ticker(ticker)}
-    if not wanted:
-        return {}
-
-    c = conn.cursor()
-    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='price_predictions'")
-    if not c.fetchone():
-        return {}
-
-    latest: dict[str, dict] = {}
-    c.execute(
-        """
-        SELECT ticker, current_price, predicted_at
-        FROM price_predictions
-        WHERE current_price IS NOT NULL
-          AND current_price > 0
-          AND predicted_at IS NOT NULL
-        ORDER BY datetime(predicted_at) DESC
-        """
-    )
-    for ticker, price, predicted_at in c.fetchall():
-        code = normalize_ticker(ticker)
-        if code not in wanted or code in latest:
-            continue
-        latest[code] = {"price": float(price), "date": str(predicted_at)[:10]}
-        if len(latest) == len(wanted):
-            break
-    return latest
-
-
 def realtime_quotes_enabled() -> bool:
-    """默认只用本地价格；显式设 SOVEREIGN_HALL_REALTIME_QUOTES=1 才查实时行情。"""
-    value = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES", "0").strip().lower()
+    """Realtime valuation is the default; explicit opt-out yields N/A, never fallback."""
+    value = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES", "1").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 
@@ -858,49 +804,42 @@ def show_investment_status(db_path):
         trades = []
 
     tickers = [pos[0] for pos in positions]
-    local_prices = get_latest_local_prices(conn, tickers)
-    prediction_prices = get_latest_prediction_prices(conn, tickers)
     conn.close()
 
-    # 投资状态默认本地估值；实时行情必须显式 opt in。
+    # 投资状态只接受实时行情；关闭或失败时显示不可估值，绝不回退旧价/成本价。
     use_realtime_quotes = realtime_quotes_enabled()
     realtime_prices = get_realtime_prices(tickers) if tickers and use_realtime_quotes else {}
 
     # 计算当前资产
-    total_value = cash
+    known_position_value = 0.0
+    missing_realtime_tickers = []
     position_details = []
     lifecycle_details = []
     for pos in positions:
         ticker = pos[0]
         shares = pos[1]
         cost = pos[2]
-        if ticker in realtime_prices:
-            current_price = realtime_prices[ticker]
-            price_label = "实时现价"
-            price_at = datetime.now().isoformat()
-            price_source = "opt-in realtime quote"
-        elif ticker in local_prices:
-            current_price = local_prices[ticker]["price"]
-            price_label = f"本地收盘({local_prices[ticker]['date']})"
-            price_at = local_prices[ticker]["date"]
-            price_source = "local daily_prices"
-        elif normalize_ticker(ticker) in prediction_prices:
-            current_price = prediction_prices[normalize_ticker(ticker)]["price"]
-            price_label = f"本地最近预测价({prediction_prices[normalize_ticker(ticker)]['date']})"
-            price_at = prediction_prices[normalize_ticker(ticker)]["date"]
-            price_source = "local prediction current_price"
+        quote = realtime_prices.get(ticker)
+        if quote:
+            current_price = float(quote["price"])
+            price_at = str(quote.get("fetched_at") or datetime.now().isoformat())
+            price_source = str(quote.get("source") or "realtime_quote")
+            position_value = shares * current_price
+            known_position_value += position_value
+            change = (current_price - cost) / cost * 100 if cost > 0 else 0
+            sign = '+' if change >= 0 else ''
+            position_details.append(
+                f"  {ticker}: {shares}股 @ 实时现价{current_price:.3f} 成本{cost:.3f} "
+                f"({sign}{change:.1f}%) | {price_source} @ {price_at}"
+            )
         else:
-            current_price = cost
-            price_label = "成本价兜底"
+            current_price = None
             price_at = ""
-            price_source = "cost fallback"
-        position_value = shares * current_price
-        total_value += position_value
-        change = (current_price - cost) / cost * 100 if cost > 0 else 0
-        sign = '+' if change >= 0 else ''
-        position_details.append(
-            f"  {ticker}: {shares}股 @ {price_label}{current_price:.3f} 成本{cost:.3f} ({sign}{change:.1f}%)"
-        )
+            price_source = "realtime_quote_unavailable"
+            missing_realtime_tickers.append(ticker)
+            position_details.append(
+                f"  {ticker}: {shares}股 @ 实时现价不可用；不使用本地估值/预测价/成本价兜底"
+            )
         opened_at = None
         if "opened_at" in metadata_columns:
             opened_at = pos["opened_at"]
@@ -909,7 +848,7 @@ def show_investment_status(db_path):
             ticker=ticker,
             avg_cost=float(cost),
             opened_at=opened_at,
-            price=float(current_price) if price_source != "cost fallback" else None,
+            price=float(current_price) if current_price is not None else None,
             price_at=price_at,
             price_source=price_source,
             now=datetime.now(),
@@ -923,33 +862,42 @@ def show_investment_status(db_path):
             f"quote_age={lifecycle.price_age_days if lifecycle.price_age_days is not None else 'unknown'}d, {lifecycle.reason}"
         )
 
-    profit = total_value - initial_capital
-    profit_pct = (profit / initial_capital) * 100
+    valuation_complete = not missing_realtime_tickers
+    total_value = cash + known_position_value if valuation_complete else None
+    profit = total_value - initial_capital if total_value is not None else None
+    profit_pct = (profit / initial_capital) * 100 if profit is not None else None
 
     print("\n" + "="*60)
     print("📊 投资模拟状态")
     print("="*60)
     print(f"   初始资金: {initial_capital:.2f} 元")
-    print(f"   当前资产: {total_value:.2f} 元")
-    if profit >= 0:
-        print(f"   📈 盈亏: +{profit:.2f} 元 ({profit_pct:+.2f}%)")
+    if total_value is None:
+        print(f"   当前资产: N/A（缺少实时现价: {', '.join(missing_realtime_tickers)}）")
+        print("   盈亏: N/A（拒绝使用本地估值、历史预测价或成本价推算）")
     else:
+        print(f"   当前资产: {total_value:.2f} 元（实时现价）")
+    if profit is not None and profit >= 0:
+        print(f"   📈 盈亏: +{profit:.2f} 元 ({profit_pct:+.2f}%)")
+    elif profit is not None:
         print(f"   📉 盈亏: {profit:.2f} 元 ({profit_pct:+.2f}%)")
     print(f"   现金: {cash:.2f} 元")
-    deployment = deployment_status(cash, total_value, 1.0)
-    print(
-        f"   资金部署: {deployment['invested_ratio']:.1%} / 目标100.0%；"
-        f"待部署 {deployment['deployment_gap']:.2f} 元"
-    )
-    if deployment['deployment_gap'] > 0:
-        print("   说明: 现金不是风险储备；只允许因缺少合格标的、新鲜价格、手续费或整手约束暂时留存")
+    if total_value is None:
+        print("   资金部署: N/A / 目标100.0%（实时估值不完整，禁止据此调仓）")
+    else:
+        deployment = deployment_status(cash, total_value, 1.0)
+        print(
+            f"   资金部署: {deployment['invested_ratio']:.1%} / 目标100.0%；"
+            f"待部署 {deployment['deployment_gap']:.2f} 元"
+        )
+        if deployment['deployment_gap'] > 0:
+            print("   说明: 现金不是风险储备；只允许因缺少合格标的、实时报价、手续费或整手约束暂时留存")
 
     print(f"\n   📦 当前持仓:")
     if position_details:
         for pd in position_details:
             print(pd)
         if not use_realtime_quotes:
-            print("   提示: 当前为本地估值；实时估值请设置 SOVEREIGN_HALL_REALTIME_QUOTES=1")
+            print("   提示: 实时行情被显式关闭，因此资产/盈亏为N/A；系统不会回退本地估值")
     else:
         print("   (空仓)")
 

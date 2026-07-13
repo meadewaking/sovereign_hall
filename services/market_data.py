@@ -7,8 +7,9 @@ simulation all share the same price source and never fall back to fake prices.
 
 import asyncio
 import logging
+import os
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 
@@ -25,7 +26,7 @@ class MarketDataService:
     def __init__(self, timeout: int = 10):
         self.timeout = timeout
         self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
-        self._quote_cache: Dict[str, Tuple[float, datetime]] = {}
+        self._quote_cache: Dict[str, Dict[str, Any]] = {}
         self._quote_ttl_seconds = 60
         self._eastmoney_ohlc_failures = 0
         self._eastmoney_ohlc_cooldown_until: Optional[datetime] = None
@@ -86,10 +87,27 @@ class MarketDataService:
             return True
         return target in trade_days
 
+    async def is_market_open(self, when: Optional[datetime] = None) -> bool:
+        """Return whether A-share continuous trading is currently open."""
+        current = when or datetime.now()
+        if not await self.is_trading_day(current):
+            return False
+        minutes = current.hour * 60 + current.minute
+        return (9 * 60 + 30 <= minutes <= 11 * 60 + 30) or (
+            13 * 60 <= minutes <= 15 * 60
+        )
+
     async def _load_trade_days(self) -> Optional[Set[date]]:
         global _trade_days_cache
         if _trade_days_cache is not None:
             return _trade_days_cache
+
+        # The optional akshare stack is not required for realtime quotes and can be
+        # binary-incompatible with the active numpy runtime. Avoid importing it in
+        # the normal simulation path; explicit opt-in keeps the failure contained.
+        use_akshare = os.environ.get("SOVEREIGN_HALL_USE_AKSHARE_CALENDAR", "0").strip().lower()
+        if use_akshare not in {"1", "true", "yes", "on"}:
+            return None
 
         try:
             import akshare as ak
@@ -110,23 +128,41 @@ class MarketDataService:
             return None
 
     async def get_current_price(self, ticker: str) -> Optional[float]:
-        """Return the latest quote, or None if no reliable quote is available."""
+        """Return the latest realtime quote price, or None when unavailable."""
+        quote = await self.get_current_quote(ticker)
+        return float(quote["price"]) if quote else None
+
+    async def get_current_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Return a realtime quote with provider and retrieval timestamp."""
         code = self.normalize_ticker(ticker)
         if not code:
             return None
 
         cached = self._quote_cache.get(code)
-        if cached and (datetime.now() - cached[1]).total_seconds() < self._quote_ttl_seconds:
-            return cached[0]
+        if cached:
+            cached_at = cached.get("fetched_at_datetime")
+            if isinstance(cached_at, datetime) and (
+                datetime.now() - cached_at
+            ).total_seconds() < self._quote_ttl_seconds:
+                return {key: value for key, value in cached.items() if key != "fetched_at_datetime"}
 
         self._ensure_client()
         price = await self._fetch_tencent_quote(code)
+        source = "tencent_realtime_quote"
         if price is None:
             price = await self._fetch_eastmoney_quote(code)
+            source = "eastmoney_realtime_quote"
 
         if price is not None and price > 0:
-            self._quote_cache[code] = (price, datetime.now())
-            return price
+            fetched_at = datetime.now()
+            quote = {
+                "ticker": code,
+                "price": float(price),
+                "source": source,
+                "fetched_at": fetched_at.isoformat(),
+            }
+            self._quote_cache[code] = {**quote, "fetched_at_datetime": fetched_at}
+            return quote
 
         logger.warning("No market quote for %s", code)
         return None

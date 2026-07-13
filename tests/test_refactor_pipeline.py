@@ -154,17 +154,17 @@ def test_research_interactive_help_is_cli_only():
     assert exc.value.code == 0
 
 
-def test_check_db_realtime_quotes_are_opt_in(monkeypatch):
+def test_check_db_realtime_quotes_are_on_by_default(monkeypatch):
     import sovereign_hall.check_db as check_db
 
     monkeypatch.delenv("SOVEREIGN_HALL_REALTIME_QUOTES", raising=False)
-    assert check_db.realtime_quotes_enabled() is False
-
-    monkeypatch.setenv("SOVEREIGN_HALL_REALTIME_QUOTES", "1")
     assert check_db.realtime_quotes_enabled() is True
 
+    monkeypatch.setenv("SOVEREIGN_HALL_REALTIME_QUOTES", "0")
+    assert check_db.realtime_quotes_enabled() is False
 
-def test_check_db_uses_latest_prediction_price_before_cost_fallback(tmp_path, monkeypatch, capsys):
+
+def test_check_db_requires_realtime_quote_without_local_fallback(tmp_path, monkeypatch, capsys):
     import sovereign_hall.check_db as check_db
 
     db_path = tmp_path / "test.db"
@@ -189,13 +189,49 @@ def test_check_db_uses_latest_prediction_price_before_cost_fallback(tmp_path, mo
     conn.commit()
     conn.close()
     monkeypatch.delenv("SOVEREIGN_HALL_REALTIME_QUOTES", raising=False)
+    monkeypatch.setattr(check_db, "get_realtime_prices", lambda tickers: {})
 
     check_db.show_investment_status(db_path)
     output = capsys.readouterr().out
 
-    assert "本地最近预测价(2026-06-15)12.300" in output
-    assert "成本10.000 (+23.0%)" in output
-    assert "实时估值请设置 SOVEREIGN_HALL_REALTIME_QUOTES=1" in output
+    assert "当前资产: N/A" in output
+    assert "实时现价不可用" in output
+    assert "不使用本地估值/预测价/成本价兜底" in output
+    assert "本地最近预测价" not in output
+
+
+def test_check_db_values_positions_from_realtime_quote(tmp_path, monkeypatch, capsys):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE system_stats (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO system_stats VALUES ('simulation_cash', '9000')")
+    conn.execute("CREATE TABLE simulation_positions (ticker TEXT, shares INTEGER, avg_cost REAL)")
+    conn.execute("INSERT INTO simulation_positions VALUES ('600519', 100, 10.0)")
+    conn.execute(
+        "CREATE TABLE simulation_trades (ticker TEXT, direction TEXT, shares INTEGER, price REAL, reason TEXT, traded_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        check_db,
+        "get_realtime_prices",
+        lambda tickers: {
+            "600519": {
+                "price": 12.3,
+                "source": "test_realtime_quote",
+                "fetched_at": "2026-07-13T15:00:00",
+            }
+        },
+    )
+
+    check_db.show_investment_status(db_path)
+    output = capsys.readouterr().out
+
+    assert "当前资产: 10230.00 元（实时现价）" in output
+    assert "实时现价12.300" in output
+    assert "test_realtime_quote" in output
 
 
 def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
@@ -920,17 +956,17 @@ async def test_simulation_refuses_trade_without_real_price(monkeypatch):
     sim = InvestmentSimulation()
     fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)})()
     monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
-    sim.get_current_price = AsyncMock(return_value=None)
+    sim.get_current_quote = AsyncMock(return_value=None)
 
     result = await sim.execute_trade(
         ticker="600519",
         direction="long",
         target_position=0.1,
-        current_price=None,
+        current_price=999.0,
     )
 
     assert result["success"] is False
-    assert "本地价格" in result["reason"]
+    assert "实时现价" in result["reason"]
 
 
 @pytest.mark.asyncio
@@ -1008,11 +1044,12 @@ def test_portfolio_policy_targets_full_deployment_without_strategic_cash(tmp_pat
         )
     report = evaluator.build_portfolio_lifecycle_report(db_path)
     assert report["cash"] == pytest.approx(7200.0)
-    assert report["invested_ratio"] == pytest.approx(450.0 / 7650.0)
-    assert report["deployment_gap"] == pytest.approx(7200.0)
+    assert report["status"] == "realtime_valuation_required"
+    assert report["invested_ratio"] is None
+    assert report["deployment_gap"] is None
 
 
-def test_position_review_blocks_stale_price_instead_of_fabricating_exit():
+def test_position_review_blocks_non_realtime_price_instead_of_fabricating_exit():
     review = review_position(
         ticker="512660",
         avg_cost=1.483,
@@ -1024,7 +1061,7 @@ def test_position_review_blocks_stale_price_instead_of_fabricating_exit():
         max_price_age_days=3,
     )
 
-    assert review.action == "blocked_stale_price"
+    assert review.action == "blocked_non_realtime_price"
     assert review.holding_days == 62
     assert review.price_age_days == 38
 
@@ -1036,7 +1073,7 @@ def test_position_review_exits_fresh_stop_or_max_holding_breach():
         opened_at="2026-07-01T09:00:00",
         price=1.30,
         price_at="2026-07-13T09:00:00",
-        price_source="local daily_prices",
+        price_source="test realtime quote",
         now=datetime.fromisoformat("2026-07-13T10:00:00"),
         max_price_age_days=3,
         stop_loss_pct=-0.08,
@@ -1047,7 +1084,7 @@ def test_position_review_exits_fresh_stop_or_max_holding_breach():
         opened_at="2026-05-11T09:00:00",
         price=4.60,
         price_at="2026-07-13T09:00:00",
-        price_source="local daily_prices",
+        price_source="test realtime quote",
         now=datetime.fromisoformat("2026-07-13T10:00:00"),
         max_holding_days=30,
     )
@@ -1068,13 +1105,12 @@ async def test_simulation_reviews_every_position_and_only_executes_fresh_exit():
     sim.resolve_trade_price_detail = AsyncMock(side_effect=[
         {
             "price": None,
-            "candidate_price": 1.278,
-            "source": "stale local prediction current_price",
-            "price_at": "2026-06-05",
+            "source": "realtime_quote_unavailable",
+            "price_at": "",
         },
         {
             "price": 4.10,
-            "source": "local daily_prices",
+            "source": "test realtime quote",
             "price_at": datetime.now().isoformat(),
         },
     ])
@@ -1082,7 +1118,7 @@ async def test_simulation_reviews_every_position_and_only_executes_fresh_exit():
 
     reviews = await sim.review_open_positions()
 
-    assert [row["action"] for row in reviews] == ["blocked_stale_price", "exit"]
+    assert [row["action"] for row in reviews] == ["blocked_realtime_price", "exit"]
     sim.execute_trade.assert_awaited_once()
     assert sim.execute_trade.await_args.kwargs["ticker"] == "600050"
 
@@ -2344,6 +2380,11 @@ def test_interactive_research_extracts_general_investment_keywords():
 @pytest.mark.asyncio
 async def test_simulation_applies_heuristic_position_cap(monkeypatch):
     sim = InvestmentSimulation()
+    sim.get_current_quote = AsyncMock(return_value={
+        "price": 9.0,
+        "source": "test_realtime_quote",
+        "fetched_at": datetime.now().isoformat(),
+    })
     fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)})()
     monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
     monkeypatch.setattr(
@@ -2362,7 +2403,20 @@ async def test_simulation_applies_heuristic_position_cap(monkeypatch):
     )
 
     assert result["action"] == "buy"
+    assert result["price"] == pytest.approx(9.0)
     assert sim.positions["600519"]["shares"] == 100
+
+
+@pytest.mark.asyncio
+async def test_market_data_realtime_execution_window():
+    market = MarketDataService()
+    market.is_trading_day = AsyncMock(return_value=True)
+    try:
+        assert await market.is_market_open(datetime.fromisoformat("2026-07-13T10:00:00")) is True
+        assert await market.is_market_open(datetime.fromisoformat("2026-07-13T12:30:00")) is False
+        assert await market.is_market_open(datetime.fromisoformat("2026-07-13T17:00:00")) is False
+    finally:
+        await market.close()
 
 
 @pytest.mark.asyncio
@@ -2372,6 +2426,19 @@ async def test_simulation_passes_portfolio_gross_to_heuristic_cap(monkeypatch):
     sim.positions = {"000001": {"shares": 100, "avg_cost": 20.0}}
     fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)})()
     seen = {}
+    quotes = {
+        "600519": 4.0,
+        "000001": 20.0,
+    }
+
+    async def realtime_quote(ticker):
+        return {
+            "price": quotes[ticker],
+            "source": "test_realtime_quote",
+            "fetched_at": datetime.now().isoformat(),
+        }
+
+    sim.get_current_quote = AsyncMock(side_effect=realtime_quote)
 
     def fake_cap(ticker, target_position, confidence, **kwargs):
         seen.update(kwargs)
@@ -2399,7 +2466,7 @@ async def test_simulation_passes_portfolio_gross_to_heuristic_cap(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_simulation_assets_use_latest_prediction_price_when_quote_missing(tmp_path):
+async def test_simulation_assets_are_na_when_realtime_quote_missing(tmp_path):
     db_path = tmp_path / "test.db"
     db = DatabaseService(str(db_path))
     await db._init_db()
@@ -2418,17 +2485,19 @@ async def test_simulation_assets_use_latest_prediction_price_when_quote_missing(
     sim = InvestmentSimulation(db)
     sim.cash = 9000.0
     sim.positions = {"600519": {"shares": 100, "avg_cost": 10.0}}
-    sim.get_current_price = AsyncMock(return_value=None)
+    sim.get_current_quote = AsyncMock(return_value=None)
 
-    assets = await sim.calculate_assets()
+    assets = await sim.calculate_assets(prices={"600519": 999.0})
     await db.close()
 
-    assert assets["total_assets"] == pytest.approx(10230.0)
-    assert assets["positions_value"] == pytest.approx(1230.0)
+    assert assets["valuation_complete"] is False
+    assert assets["total_assets"] is None
+    assert assets["positions_value"] is None
+    assert assets["missing_price_tickers"] == ["600519"]
 
 
 @pytest.mark.asyncio
-async def test_simulation_assets_prefer_local_daily_price_over_quote_and_prediction(tmp_path, monkeypatch):
+async def test_simulation_assets_use_realtime_quote_not_local_or_prediction(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     db = DatabaseService(str(db_path))
     await db._init_db()
@@ -2455,18 +2524,23 @@ async def test_simulation_assets_prefer_local_daily_price_over_quote_and_predict
     sim = InvestmentSimulation(db)
     sim.cash = 9000.0
     sim.positions = {"600519": {"shares": 100, "avg_cost": 10.0}}
-    sim.get_current_price = AsyncMock(return_value=99.0)
+    sim.get_current_quote = AsyncMock(return_value={
+        "price": 99.0,
+        "source": "test_realtime_quote",
+        "fetched_at": datetime.now().isoformat(),
+    })
 
     assets = await sim.calculate_assets()
     await db.close()
 
-    assert assets["total_assets"] == pytest.approx(10200.0)
-    assert assets["positions_value"] == pytest.approx(1200.0)
-    sim.get_current_price.assert_not_awaited()
+    assert assets["valuation_complete"] is True
+    assert assets["total_assets"] == pytest.approx(18900.0)
+    assert assets["positions_value"] == pytest.approx(9900.0)
+    sim.get_current_quote.assert_awaited_once_with("600519")
 
 
 @pytest.mark.asyncio
-async def test_simulation_assets_ignore_stale_local_daily_price(tmp_path, monkeypatch):
+async def test_simulation_assets_do_not_fallback_to_stale_local_price(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     db = DatabaseService(str(db_path))
     await db._init_db()
@@ -2493,18 +2567,18 @@ async def test_simulation_assets_ignore_stale_local_daily_price(tmp_path, monkey
     sim = InvestmentSimulation(db)
     sim.cash = 9000.0
     sim.positions = {"600519": {"shares": 100, "avg_cost": 10.0}}
-    sim.get_current_price = AsyncMock(return_value=99.0)
+    sim.get_current_quote = AsyncMock(return_value=None)
 
     assets = await sim.calculate_assets()
     await db.close()
 
-    assert assets["total_assets"] == pytest.approx(10500.0)
-    assert assets["positions_value"] == pytest.approx(1500.0)
-    sim.get_current_price.assert_not_awaited()
+    assert assets["valuation_complete"] is False
+    assert assets["total_assets"] is None
+    assert assets["positions_value"] is None
 
 
 @pytest.mark.asyncio
-async def test_simulation_trade_resolves_local_prediction_price_without_quote(tmp_path, monkeypatch):
+async def test_simulation_trade_refuses_local_prediction_without_realtime_quote(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     db = DatabaseService(str(db_path))
     await db._init_db()
@@ -2525,23 +2599,24 @@ async def test_simulation_trade_resolves_local_prediction_price_without_quote(tm
 
     sim = InvestmentSimulation(db)
     sim.cash = 9000.0
-    sim.get_current_price = AsyncMock(return_value=99.0)
+    sim.get_current_quote = AsyncMock(return_value=None)
 
     result = await sim.execute_trade(
         ticker="600519",
         direction="long",
         target_position=0.2,
         current_price=None,
-        reason="local-only simulation",
+        reason="prediction-only simulation",
         confidence=0.8,
         signal_count=2,
         risk_cap_already_applied=True,
     )
     await db.close()
 
-    assert result["action"] == "buy"
-    assert result["price"] == pytest.approx(12.3)
-    sim.get_current_price.assert_not_awaited()
+    assert result["success"] is False
+    assert result["action"] == "hold"
+    assert "实时现价" in result["reason"]
+    assert sim.positions == {}
 
 
 @pytest.mark.asyncio

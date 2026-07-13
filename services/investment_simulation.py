@@ -40,6 +40,10 @@ class InvestmentSimulation:
         self.trading_fee = self.config.get('trading_fee', 0.0003)  # 佣金万三
         self.stamp_duty = self.config.get('stamp_duty', 0.001)  # 印花税千一
         self.target_invested_ratio = float(self.config.get('target_invested_ratio', 1.0))
+        self.realtime_quotes_required = bool(self.config.get('realtime_quotes_required', True))
+        self.trade_during_market_hours_only = bool(
+            self.config.get('trade_during_market_hours_only', True)
+        )
         self.max_trade_price_age_days = int(self.config.get('max_trade_price_age_days', 3))
         self.stop_loss_pct = float(self.config.get('stop_loss_pct', -0.08))
         self.take_profit_pct = float(self.config.get('take_profit_pct', 0.15))
@@ -155,19 +159,18 @@ class InvestmentSimulation:
             logger.warning("解析最近交易日期失败 %s=%r: %s", ticker, last_trade, exc)
             return False
 
-    def _estimate_trade_assets(self, ticker: str, price: float) -> tuple[Dict[str, float], float]:
-        """Estimate local portfolio value for risk caps without external quote calls."""
-        position_values: Dict[str, float] = {}
-        for held_ticker, pos in self.positions.items():
-            shares = float(pos.get('shares', 0) or 0)
-            if shares <= 0:
-                continue
-            mark = price if held_ticker == ticker else float(pos.get('avg_cost', 0.0) or 0.0)
-            if mark <= 0:
-                continue
-            position_values[held_ticker] = shares * mark
-        total_assets = self.cash + sum(position_values.values())
-        return position_values, total_assets
+    async def _estimate_trade_assets(
+        self,
+        ticker: str,
+        price: float,
+    ) -> tuple[Dict[str, float], float, List[str]]:
+        """Value the portfolio from realtime quotes before sizing a simulated trade."""
+        assets = await self.calculate_assets()
+        return (
+            dict(assets.get("position_values") or {}),
+            float(assets.get("known_total_assets") or 0.0),
+            list(assets.get("missing_price_tickers") or []),
+        )
 
     async def save_state(self):
         """保存状态到数据库"""
@@ -219,10 +222,29 @@ class InvestmentSimulation:
             logger.warning(f"Failed to save simulation state: {e}")
 
     async def get_current_price(self, ticker: str) -> Optional[float]:
-        """获取当前价格（这里需要接入真实行情或使用AI预测）"""
+        """获取实时行情价格；不使用AI预测或历史价格替代。"""
         from .market_data import get_market_data
 
         return await get_market_data().get_current_price(ticker)
+
+    async def get_current_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """获取带来源和抓取时间的实时行情。"""
+        from .market_data import get_market_data
+
+        market_data = get_market_data()
+        if hasattr(market_data, "get_current_quote"):
+            return await market_data.get_current_quote(ticker)
+        if not hasattr(market_data, "get_current_price"):
+            return None
+        price = await market_data.get_current_price(ticker)
+        if not price:
+            return None
+        return {
+            "ticker": self._normalize_ticker(ticker),
+            "price": float(price),
+            "source": "realtime_quote",
+            "fetched_at": datetime.now().isoformat(),
+        }
 
     @staticmethod
     def _normalize_ticker(ticker: str) -> str:
@@ -231,175 +253,29 @@ class InvestmentSimulation:
 
     @staticmethod
     def realtime_quotes_enabled() -> bool:
-        """Use external quotes only when explicitly requested for simulation."""
-        value = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES", "0").strip().lower()
+        """Realtime quotes are mandatory by default; opt-out means no valuation/trade."""
+        value = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES", "1").strip().lower()
         return value in {"1", "true", "yes", "on"}
 
-    @staticmethod
-    def _local_price_is_fresh(day: Any, max_age_days: int | None = 7) -> bool:
-        if max_age_days is None:
-            return True
-        try:
-            price_date = datetime.fromisoformat(str(day)[:10]).date()
-        except Exception:
-            return False
-        age_days = (datetime.now().date() - price_date).days
-        return 0 <= age_days <= max_age_days
-
-    async def _latest_local_daily_prices(
-        self,
-        tickers: List[str],
-        max_age_days: int | None = 7,
-    ) -> Dict[str, Dict[str, Any]]:
-        """Return latest local daily_prices rows keyed by normalized ticker."""
-        if not self.db_service or not tickers:
-            return {}
-        wanted = {self._normalize_ticker(ticker) for ticker in tickers if self._normalize_ticker(ticker)}
-        if not wanted:
-            return {}
-
-        try:
-            conn = self.db_service._connection
-            async with conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_prices'"
-            ) as cursor:
-                exists = await cursor.fetchone()
-            if not exists:
-                return {}
-
-            placeholders = ",".join("?" for _ in wanted)
-            async with conn.execute(
-                f"""
-                SELECT p.ticker, p.close, p.date
-                FROM daily_prices p
-                JOIN (
-                    SELECT ticker, MAX(date) AS latest_date
-                    FROM daily_prices
-                    WHERE ticker IN ({placeholders})
-                    GROUP BY ticker
-                ) latest
-                  ON p.ticker = latest.ticker
-                 AND p.date = latest.latest_date
-                WHERE p.close IS NOT NULL AND p.close > 0
-                """,
-                tuple(wanted),
-            ) as cursor:
-                rows = await cursor.fetchall()
-        except Exception as exc:
-            logger.warning("Failed to read latest local daily prices: %s", exc)
-            return {}
-
-        latest: Dict[str, Dict[str, Any]] = {}
-        for ticker, price, day in rows:
-            code = self._normalize_ticker(ticker)
-            if code in wanted and self._local_price_is_fresh(day, max_age_days=max_age_days):
-                latest[code] = {"price": float(price), "date": str(day)[:10]}
-        return latest
-
-    async def _latest_prediction_prices(self, tickers: List[str]) -> Dict[str, float]:
-        """Return latest locally recorded prediction prices as a weak valuation fallback."""
-        details = await self._latest_prediction_price_details(tickers)
-        return {ticker: float(item["price"]) for ticker, item in details.items()}
-
-    async def _latest_prediction_price_details(self, tickers: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Return latest locally recorded prediction prices with dates."""
-        if not self.db_service or not tickers:
-            return {}
-        wanted = {self._normalize_ticker(ticker) for ticker in tickers if self._normalize_ticker(ticker)}
-        if not wanted:
-            return {}
-
-        try:
-            conn = self.db_service._connection
-            async with conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='price_predictions'"
-            ) as cursor:
-                exists = await cursor.fetchone()
-            if not exists:
-                return {}
-
-            async with conn.execute(
-                """
-                SELECT ticker, current_price, predicted_at
-                FROM price_predictions
-                WHERE current_price IS NOT NULL
-                  AND current_price > 0
-                  AND predicted_at IS NOT NULL
-                ORDER BY datetime(predicted_at) DESC
-                """
-            ) as cursor:
-                rows = await cursor.fetchall()
-        except Exception as exc:
-            logger.warning("Failed to read latest local prediction prices: %s", exc)
-            return {}
-
-        latest: Dict[str, Dict[str, Any]] = {}
-        for ticker, price, predicted_at in rows:
-            code = self._normalize_ticker(ticker)
-            if code not in wanted or code in latest:
-                continue
-            latest[code] = {"price": float(price), "date": str(predicted_at)[:10]}
-            if len(latest) == len(wanted):
-                break
-        return latest
-
     async def resolve_trade_price_detail(self, ticker: str) -> Dict[str, Any]:
-        """Resolve a fresh simulated fill price with reproducible source metadata."""
+        """Resolve a realtime simulated fill price; never fall back to local marks."""
         code = self._normalize_ticker(ticker)
-        local_daily = await self._latest_local_daily_prices(
-            [code], max_age_days=self.max_trade_price_age_days
-        )
-        if code in local_daily:
-            item = local_daily[code]
-            return {
-                "price": float(item["price"]),
-                "source": "local daily_prices",
-                "price_at": str(item.get("date", ""))[:10],
-            }
-
-        prediction_prices = await self._latest_prediction_price_details([code])
-        if code in prediction_prices:
-            item = prediction_prices[code]
-            day = str(item.get("date", ""))[:10]
-            if self._local_price_is_fresh(day, max_age_days=self.max_trade_price_age_days):
-                return {
-                    "price": float(item["price"]),
-                    "source": "local prediction current_price",
-                    "price_at": day,
-                }
-
-        stale_daily = await self._latest_local_daily_prices([code], max_age_days=None)
-        stale_candidates: List[Dict[str, Any]] = []
-        if code in stale_daily:
-            item = stale_daily[code]
-            stale_candidates.append({
-                "candidate_price": float(item["price"]),
-                "source": "stale local daily_prices",
-                "price_at": str(item.get("date", ""))[:10],
-            })
-        if code in prediction_prices:
-            item = prediction_prices[code]
-            stale_candidates.append({
-                "candidate_price": float(item["price"]),
-                "source": "stale local prediction current_price",
-                "price_at": str(item.get("date", ""))[:10],
-            })
-        if stale_candidates:
-            latest_candidate = max(stale_candidates, key=lambda item: str(item.get("price_at", "")))
-            return {"price": None, **latest_candidate}
-
         if self.realtime_quotes_enabled():
-            price = await self.get_current_price(code)
-            if price is not None and price > 0:
+            quote = await self.get_current_quote(code)
+            if quote and quote.get("price") and float(quote["price"]) > 0:
                 return {
-                    "price": float(price),
-                    "source": "opt-in realtime quote",
-                    "price_at": datetime.now().isoformat(),
+                    "price": float(quote["price"]),
+                    "source": str(quote.get("source") or "realtime_quote"),
+                    "price_at": str(quote.get("fetched_at") or datetime.now().isoformat()),
                 }
-        return {"price": None, "source": "no fresh local price", "price_at": ""}
+        return {
+            "price": None,
+            "source": "realtime_quote_unavailable",
+            "price_at": "",
+        }
 
     async def resolve_trade_price(self, ticker: str) -> tuple[Optional[float], str]:
-        """Resolve a simulated-trade price without fetching quotes by default."""
+        """Resolve a realtime-only simulated-trade price."""
         detail = await self.resolve_trade_price_detail(ticker)
         source = str(detail.get("source", ""))
         price_at = str(detail.get("price_at", ""))
@@ -444,6 +320,17 @@ class InvestmentSimulation:
                 'ticker': ticker,
                 'reason': '当前非交易日，暂停模拟交易'
             }
+        if (
+            self.trade_during_market_hours_only
+            and hasattr(market_data, "is_market_open")
+            and not await market_data.is_market_open()
+        ):
+            return {
+                'success': False,
+                'action': 'hold',
+                'ticker': ticker,
+                'reason': '当前不在A股交易时段，实时行情仅用于查看；暂停模拟成交'
+            }
 
         # 检查冷却期
         if self.is_in_cooldown(ticker) and direction_norm not in ("short", "sell"):
@@ -454,19 +341,6 @@ class InvestmentSimulation:
                 'reason': f'冷却期内，上次交易{self.last_trade_records.get(ticker, "")[:10]}'
             }
 
-        price = current_price
-        price_source = "provided decision price" if price and price > 0 else ""
-        if price is None or price <= 0:
-            price, price_source = await self.resolve_trade_price(ticker)
-        if price is None or price <= 0:
-            return {
-                'success': False,
-                'action': 'hold',
-                'ticker': ticker,
-                'reason': '无法获取本地价格，拒绝模拟交易'
-            }
-
-        # 计算当前持仓
         current_shares = self.positions.get(ticker, {}).get('shares', 0)
         if direction_norm in ("hold", "neutral", "观望"):
             return {
@@ -475,17 +349,39 @@ class InvestmentSimulation:
                 'ticker': ticker,
                 'reason': '投委会裁决为观望'
             }
+        if direction_norm in ("short", "sell") and current_shares <= 0:
+            return {
+                'success': False,
+                'action': 'hold',
+                'ticker': ticker,
+                'reason': '模拟账户不支持裸做空，空仓不交易'
+            }
+
+        # 委员会/调用方给出的价格仅是意见上下文，模拟成交必须重新取得实时行情。
+        price, price_source = await self.resolve_trade_price(ticker)
+        if price is None or price <= 0:
+            return {
+                'success': False,
+                'action': 'hold',
+                'ticker': ticker,
+                'reason': '无法获取实时现价，拒绝模拟交易；不使用本地估值或历史价格兜底'
+            }
+
+        # 计算当前持仓
         if direction_norm in ("short", "sell"):
-            if current_shares <= 0:
-                return {
-                    'success': False,
-                    'action': 'hold',
-                    'ticker': ticker,
-                    'reason': '模拟账户不支持裸做空，空仓不交易'
-                }
             target_position = 0.0
 
-        position_values, total_assets = self._estimate_trade_assets(ticker, price)
+        position_values, total_assets, missing_price_tickers = await self._estimate_trade_assets(ticker, price)
+        if missing_price_tickers and direction_norm == "long":
+            return {
+                'success': False,
+                'action': 'hold',
+                'ticker': ticker,
+                'reason': (
+                    '组合实时估值不完整，拒绝新增/扩大模拟仓位；缺少实时现价: '
+                    + ', '.join(missing_price_tickers)
+                ),
+            }
         current_position_value = position_values.get(ticker, 0.0)
         current_gross_exposure = sum(position_values.values()) / total_assets if total_assets > 0 else 0.0
         current_position_pct = current_position_value / total_assets if total_assets > 0 else 0.0
@@ -596,7 +492,11 @@ class InvestmentSimulation:
         elif diff_value < 0 and current_shares > 0:
             # 需要卖出
             sell_value = abs(diff_value)
-            shares_to_sell = int(sell_value / price / self.min_unit) * self.min_unit
+            shares_to_sell = (
+                current_shares
+                if target_position <= 0
+                else int(sell_value / price / self.min_unit) * self.min_unit
+            )
 
             if shares_to_sell <= 0:
                 return {'success': True, 'action': 'hold', 'reason': '数量不足一手'}
@@ -789,41 +689,63 @@ class InvestmentSimulation:
                     risk_cap_already_applied=True,
                 )
                 result["execution"] = execution
+                if not execution.get("success") and ticker in self.positions:
+                    pos["review_status"] = "exit_pending_execution"
+                    pos["review_reason"] = f"{review.reason}；待执行: {execution.get('reason', 'unknown')}"
+                    result["action"] = "exit_pending_execution"
+                    result["reason"] = pos["review_reason"]
             reviews.append(result)
 
         await self.save_state()
         return reviews
 
     async def calculate_assets(self, prices: Dict[str, float] = None) -> Dict:
-        """计算当前总资产"""
-        total_value = self.cash
-        tickers = list(self.positions)
-        local_prices = await self._latest_local_daily_prices(tickers) if not prices else {}
-        prediction_prices = await self._latest_prediction_prices(tickers) if not prices else {}
-
+        """按实时现价计算资产；任一行情缺失时明确标记估值不完整。"""
+        known_total_assets = self.cash
+        # Keep the argument for API compatibility, but never trust caller-supplied
+        # marks for current account valuation.
+        position_prices: Dict[str, float] = {}
+        position_values: Dict[str, float] = {}
+        quote_details: Dict[str, Dict[str, Any]] = {}
+        missing_price_tickers: List[str] = []
         for ticker, pos in self.positions.items():
             code = self._normalize_ticker(ticker)
-            price = (prices or {}).get(ticker) or (prices or {}).get(code)
+            price = None
+            if self.realtime_quotes_enabled():
+                quote = await self.get_current_quote(code)
+                if quote and quote.get("price") and float(quote["price"]) > 0:
+                    price = float(quote["price"])
+                    quote_details[code] = dict(quote)
             if not price:
-                price = local_prices.get(code, {}).get("price")
-            if not price:
-                price = prediction_prices.get(code)
-            if not price and self.realtime_quotes_enabled():
-                price = await self.get_current_price(ticker)
-            if not price:
-                price = pos['avg_cost']
-            total_value += pos['shares'] * price
+                missing_price_tickers.append(code)
+                continue
+            position_prices[code] = price
+            value = float(pos['shares']) * price
+            position_values[code] = value
+            known_total_assets += value
 
-        deployment = deployment_status(self.cash, total_value, self.target_invested_ratio)
+        valuation_complete = not missing_price_tickers
+        deployment = (
+            deployment_status(self.cash, known_total_assets, self.target_invested_ratio)
+            if valuation_complete
+            else None
+        )
         return {
             'cash': self.cash,
-            'positions_value': total_value - self.cash,
-            'total_assets': total_value,
+            'positions_value': known_total_assets - self.cash if valuation_complete else None,
+            'total_assets': known_total_assets if valuation_complete else None,
+            'known_total_assets': known_total_assets,
             'positions': self.positions.copy(),
+            'position_prices': position_prices,
+            'position_values': position_values,
+            'quote_details': quote_details,
+            'valuation_complete': valuation_complete,
+            'missing_price_tickers': missing_price_tickers,
             'last_trade_date': self.last_trade_date.isoformat() if self.last_trade_date else None,
-            'target_invested_ratio': deployment['target_invested_ratio'],
-            'invested_ratio': deployment['invested_ratio'],
-            'deployment_gap': deployment['deployment_gap'],
+            'target_invested_ratio': self.target_invested_ratio,
+            'invested_ratio': deployment['invested_ratio'] if deployment else None,
+            'deployment_gap': deployment['deployment_gap'] if deployment else None,
+            'valuation_rule': 'realtime quotes only; no local/prediction/cost fallback',
         }
 
     async def daily_reflection(self, llm: LLMClient = None) -> str:
@@ -839,6 +761,11 @@ class InvestmentSimulation:
 
         # 获取当前资产
         assets = await self.calculate_assets()
+        if not assets.get("valuation_complete"):
+            return (
+                "实时行情不完整，跳过资产收益反思与调仓推断；缺少实时现价: "
+                + ", ".join(assets.get("missing_price_tickers", []))
+            )
 
         # 获取持仓详情
         positions_text = ""
@@ -1054,6 +981,12 @@ class InvestmentSimulation:
 
         try:
             assets = await self.calculate_assets()
+            if not assets.get("valuation_complete"):
+                logger.warning(
+                    "Skip simulation snapshot: realtime quotes unavailable for %s",
+                    ", ".join(assets.get("missing_price_tickers", [])),
+                )
+                return
             conn = self.db_service._connection
 
             await conn.execute("""
@@ -1107,7 +1040,7 @@ async def run_daily_simulation(llm: LLMClient, db_service, proposals: List[Dict]
 
             current_price, price_source = await simulation.resolve_trade_price(ticker)
             if current_price is None:
-                logger.info(f"Skip simulation trade for {ticker}: no local price")
+                logger.info(f"Skip simulation trade for {ticker}: no realtime quote")
                 continue
 
             result = await simulation.execute_trade(
@@ -1142,6 +1075,15 @@ async def show_investment_status(db_service) -> str:
     trades = await simulation.get_trade_history(days=30, limit=20)
 
     initial = simulation.initial_capital
+    if not assets.get("valuation_complete"):
+        missing = ", ".join(assets.get("missing_price_tickers", []))
+        return (
+            "\n📊 投资模拟状态\n================\n"
+            f"初始资金: {simulation.initial_capital:.2f} 元\n"
+            f"当前资产: N/A（缺少实时现价: {missing}）\n"
+            f"现金: {assets['cash']:.2f} 元\n"
+            "规则: 只接受实时现价，不使用本地估值、历史预测价或成本价兜底。\n"
+        )
     total = assets['total_assets']
     profit = total - initial
     profit_pct = (profit / initial) * 100
