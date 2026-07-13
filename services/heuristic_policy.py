@@ -106,7 +106,9 @@ class HeuristicRiskContext:
     def stale_tape_entry_veto(self) -> bool:
         """Whether local evidence is too old to justify a new simulated long."""
         status = str(self.tape_update.get("validation_status", ""))
-        return status in {"stale_tape", "empty_prediction_tape"}
+        return status in {"stale_tape", "empty_prediction_tape"} or bool(
+            self.tape_update.get("freshness_recovery_pending", False)
+        )
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -129,6 +131,7 @@ def refresh_tape_update_freshness(
     if not isinstance(tape_update, dict) or not tape_update:
         return {}
     refreshed = dict(tape_update)
+    prior_status = str(refreshed.get("validation_status", ""))
     latest_raw = refreshed.get("current_latest_prediction_date")
     if not latest_raw:
         refreshed["validation_status"] = "empty_prediction_tape"
@@ -156,12 +159,86 @@ def refresh_tape_update_freshness(
     elif enough_breadth:
         refreshed["validation_status"] = "fresh_tape_update"
         refreshed["enough_for_policy_widening"] = True
+        refreshed["freshness_recovery_pending"] = False
         refreshed.pop("entry_veto_reason", None)
     else:
         refreshed["validation_status"] = "thin_tape_update"
         refreshed["enough_for_policy_widening"] = False
+        if prior_status in {"stale_tape", "empty_prediction_tape"}:
+            refreshed["freshness_recovery_pending"] = True
         refreshed.pop("entry_veto_reason", None)
     return refreshed
+
+
+def refresh_tape_update_from_local_db(
+    tape_update: dict[str, Any],
+    db_path: Path = DEFAULT_DB_PATH,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Overlay an immutable run artifact with the current local prediction tape.
+
+    A user entry may run after new predictions have been written but before the
+    next heuristic cycle.  In that interval, relying only on ``tape_update.json``
+    reports stale row counts and dates.  This read-only overlay keeps the run
+    artifact unchanged while making entry-point risk decisions from the current
+    local database.  Any database/schema error safely falls back to the artifact.
+    """
+    if not isinstance(tape_update, dict) or not tape_update:
+        return {}
+
+    overlaid = dict(tape_update)
+    if not db_path.exists():
+        return refresh_tape_update_freshness(overlaid, now=now)
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='price_predictions'"
+            ).fetchone()
+            if not table_exists:
+                return refresh_tape_update_freshness(overlaid, now=now)
+            row = conn.execute(
+                """
+                SELECT COUNT(*), MIN(predicted_at), MAX(predicted_at)
+                FROM price_predictions
+                WHERE predicted_at IS NOT NULL
+                """
+            ).fetchone()
+            current_rows = _safe_int(row[0] if row else 0)
+            earliest_at = str(row[1]) if row and row[1] else ""
+            latest_at = str(row[2]) if row and row[2] else ""
+            latest_date = latest_at[:10]
+            latest_date_rows = 0
+            if latest_date:
+                latest_date_rows = _safe_int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM price_predictions
+                        WHERE predicted_at IS NOT NULL AND date(predicted_at) = ?
+                        """,
+                        (latest_date,),
+                    ).fetchone()[0]
+                )
+    except (OSError, sqlite3.Error):
+        return refresh_tape_update_freshness(overlaid, now=now)
+
+    artifact_rows = _safe_int(overlaid.get("current_prediction_rows"))
+    artifact_new_rows = _safe_int(overlaid.get("new_prediction_rows_since_previous"))
+    appended_rows = max(0, current_rows - artifact_rows)
+    overlaid.update(
+        {
+            "current_prediction_rows": current_rows,
+            "new_prediction_rows_since_previous": artifact_new_rows + appended_rows,
+            "current_earliest_prediction_at": earliest_at,
+            "current_latest_prediction_at": latest_at,
+            "current_latest_prediction_date": latest_date,
+            "latest_date_prediction_rows": latest_date_rows,
+            "live_db_refresh": True,
+            "live_db_appended_rows_since_run": appended_rows,
+        }
+    )
+    return refresh_tape_update_freshness(overlaid, now=now)
 
 
 def _recent_run_dirs(runs_root: Path) -> list[Path]:
@@ -1062,7 +1139,7 @@ def load_latest_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskC
     evaluation_engine = str(project_context.get("evaluation_engine", ""))
     evaluation_warning = str(project_context.get("evaluation_warning", ""))
     price_coverage = _read_json(run_dir / "price_coverage.json") or project_context.get("price_coverage", {})
-    tape_update = refresh_tape_update_freshness(
+    tape_update = refresh_tape_update_from_local_db(
         _read_json(run_dir / "tape_update.json") or project_context.get("tape_update", {})
     )
     price_readiness = _read_json(run_dir / "price_readiness.json") or project_context.get("price_readiness", {})
@@ -1289,7 +1366,10 @@ def apply_heuristic_risk_cap(
             if tape_update_cap is not None:
                 reason += f"，薄样本验证模拟买入上限{tape_update_cap:.1%}"
         if stale_entry_veto:
-            reason += "；本地预测已超过新增长仓时效阈值，拒绝新增或扩大模拟多头仓位"
+            if bool(ctx.tape_update.get("freshness_recovery_pending", False)):
+                reason += "；陈旧tape恢复仍未满足新增行/最新日广度门槛，拒绝新增或扩大模拟多头仓位"
+            else:
+                reason += "；本地预测已超过新增长仓时效阈值，拒绝新增或扩大模拟多头仓位"
         if signal_count_cap is not None:
             observed = 0 if signal_count is None else signal_count
             reason += (
@@ -1356,7 +1436,10 @@ def apply_heuristic_risk_cap(
         else:
             risk_notes.append(f"本地tape验证{tape_note}，仅作本地风控约束")
     if stale_entry_veto:
-        risk_notes.append("本地预测已超过时效阈值，拒绝新增或扩大模拟多头仓位")
+        if bool(ctx.tape_update.get("freshness_recovery_pending", False)):
+            risk_notes.append("陈旧tape恢复仍缺少足够新增样本与最新日广度，拒绝新增或扩大模拟多头仓位")
+        else:
+            risk_notes.append("本地预测已超过时效阈值，拒绝新增或扩大模拟多头仓位")
     if risk_notes:
         return capped, "；".join(risk_notes)
     return capped, None
@@ -1595,7 +1678,10 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
     if tape_cap is not None:
         lines.append(f"   薄样本验证模拟买入上限: {tape_cap:.1%}")
     if ctx.stale_tape_entry_veto:
-        lines.append("   陈旧tape前置否决: 已启用（禁止新增/扩大模拟多头，减仓与退出不受阻）")
+        if bool(ctx.tape_update.get("freshness_recovery_pending", False)):
+            lines.append("   tape恢复前置否决: 已启用（年龄已恢复但样本广度不足；禁止新增/扩大模拟多头，减仓与退出不受阻）")
+        else:
+            lines.append("   陈旧tape前置否决: 已启用（禁止新增/扩大模拟多头，减仓与退出不受阻）")
     readiness_note = format_price_readiness_note(ctx)
     if readiness_note:
         lines.append(f"   daily_prices补齐: {readiness_note}")

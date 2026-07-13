@@ -726,6 +726,42 @@ def previous_tape_stats(run_dir: Path | None) -> dict[str, Any]:
     return {"current_prediction_rows": sample_count} if sample_count is not None else {}
 
 
+def tape_recovery_was_pending(stats: dict[str, Any], max_hops: int = 20) -> bool:
+    """Follow thin-run ancestry until the last stale or fresh tape decision."""
+    current = stats
+    seen: set[str] = set()
+    for _ in range(max_hops):
+        if bool(current.get("freshness_recovery_pending", False)):
+            return True
+        status = str(current.get("validation_status", ""))
+        if status in {"stale_tape", "empty_prediction_tape"}:
+            return True
+        if status != "thin_tape_update":
+            return False
+        prior_raw = current.get("previous_run")
+        if not prior_raw or str(prior_raw) in seen:
+            return False
+        seen.add(str(prior_raw))
+        current = previous_tape_stats(Path(str(prior_raw)))
+    return False
+
+
+def distinct_date_tape_baseline(run_dir: Path | None, current_date: str) -> Path | None:
+    """Skip same-day reruns so tape growth is measured per automation cycle date."""
+    current = run_dir
+    seen: set[str] = set()
+    while current is not None and current.name.startswith(current_date):
+        if str(current) in seen:
+            return current
+        seen.add(str(current))
+        stats = previous_tape_stats(current)
+        prior_raw = stats.get("previous_run")
+        if not prior_raw:
+            return current
+        current = Path(str(prior_raw))
+    return current
+
+
 def build_tape_update_report(predictions: list[dict[str, Any]], previous_run: Path | None) -> dict[str, Any]:
     if not predictions:
         return {"validation_status": "empty_prediction_tape", "rule": "Do not widen exposure without local prediction tape."}
@@ -733,7 +769,11 @@ def build_tape_update_report(predictions: list[dict[str, Any]], previous_run: Pa
     earliest = min(row["predicted_at"] for row in predictions)
     latest_date = latest.date()
     latest_rows = sum(1 for row in predictions if row["predicted_at"].date() == latest_date)
-    previous_rows_raw = previous_tape_stats(previous_run).get("current_prediction_rows")
+    baseline_run = distinct_date_tape_baseline(previous_run, datetime.now().strftime("%Y%m%d"))
+    previous_stats = previous_tape_stats(baseline_run)
+    previous_rows_raw = previous_stats.get("current_prediction_rows")
+    previous_status = str(previous_stats.get("validation_status", ""))
+    previous_recovery_pending = tape_recovery_was_pending(previous_stats)
     try:
         previous_rows = int(previous_rows_raw) if previous_rows_raw is not None else None
     except (TypeError, ValueError):
@@ -762,7 +802,11 @@ def build_tape_update_report(predictions: list[dict[str, Any]], previous_run: Pa
         "min_latest_date_rows_for_validation": 5,
         "max_latest_prediction_age_days": 3,
         "enough_for_policy_widening": status == "fresh_tape_update",
-        "previous_run": str(previous_run) if previous_run else None,
+        "freshness_recovery_pending": (
+            (previous_status in {"stale_tape", "empty_prediction_tape"} or previous_recovery_pending)
+            and status != "fresh_tape_update"
+        ),
+        "previous_run": str(baseline_run) if baseline_run else None,
         "rule": "Do not widen exposure or relax caps when the cycle has fewer than 20 new local prediction rows, fewer than 5 latest-day rows, or stale latest predictions.",
     }
 

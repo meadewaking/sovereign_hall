@@ -1365,10 +1365,119 @@ def test_tape_entry_veto_clears_only_with_fresh_broad_update(tmp_path):
     assert "entry_veto_reason" not in broad
     assert thin["validation_status"] == "thin_tape_update"
     assert thin["enough_for_policy_widening"] is False
+    assert thin["freshness_recovery_pending"] is True
     assert "entry_veto_reason" not in thin
     assert expired["latest_prediction_age_days"] == 4
     assert expired["validation_status"] == "stale_tape"
     assert expired["enough_for_policy_widening"] is False
+
+
+def test_entry_tape_refresh_overlays_new_local_db_rows(tmp_path):
+    from sovereign_hall.services.heuristic_policy import refresh_tape_update_from_local_db
+
+    db_path = tmp_path / "local.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE price_predictions (ticker TEXT, predicted_at TEXT)")
+        conn.executemany(
+            "INSERT INTO price_predictions VALUES (?, ?)",
+            [
+                ("600030", "2026-07-06T10:00:00"),
+                ("159995", "2026-07-06T11:00:00"),
+                ("159985", "2026-07-13T01:31:37"),
+            ],
+        )
+
+    refreshed = refresh_tape_update_from_local_db(
+        {
+            "validation_status": "stale_tape",
+            "current_prediction_rows": 2,
+            "new_prediction_rows_since_previous": 0,
+            "current_latest_prediction_date": "2026-07-06",
+            "latest_date_prediction_rows": 2,
+            "min_new_rows_for_validation": 20,
+            "min_latest_date_rows_for_validation": 5,
+            "max_latest_prediction_age_days": 3,
+        },
+        db_path=db_path,
+        now=datetime.fromisoformat("2026-07-13T09:00:00"),
+    )
+
+    assert refreshed["current_prediction_rows"] == 3
+    assert refreshed["new_prediction_rows_since_previous"] == 1
+    assert refreshed["current_latest_prediction_date"] == "2026-07-13"
+    assert refreshed["latest_date_prediction_rows"] == 1
+    assert refreshed["latest_prediction_age_days"] == 0
+    assert refreshed["validation_status"] == "thin_tape_update"
+    assert refreshed["enough_for_policy_widening"] is False
+    assert refreshed["freshness_recovery_pending"] is True
+    assert refreshed["live_db_appended_rows_since_run"] == 1
+
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="recovery_guard",
+        score=0.0,
+        max_position=0.04,
+        overfit_risk=True,
+        warning="local only",
+        failure_cases=[],
+        tape_update=refreshed,
+    )
+    assert context.stale_tape_entry_veto is True
+
+
+def test_cycle_propagates_pending_stale_recovery_across_thin_runs(tmp_path):
+    import pandas as pd
+
+    module = load_script_module("run_heuristic_cycle_recovery_module", "scripts/run_heuristic_cycle.py")
+    stale_run = tmp_path / "20260712_120000"
+    thin_run = tmp_path / "20260713_120000"
+    stale_run.mkdir()
+    thin_run.mkdir()
+    (stale_run / "tape_update.json").write_text(
+        json.dumps({"validation_status": "stale_tape", "current_prediction_rows": 2}),
+        encoding="utf-8",
+    )
+    (thin_run / "tape_update.json").write_text(
+        json.dumps(
+            {
+                "validation_status": "thin_tape_update",
+                "current_prediction_rows": 3,
+                "previous_run": str(stale_run),
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = datetime.now()
+    predictions = pd.DataFrame(
+        {"predicted_at": pd.to_datetime([now, now, now])}
+    )
+
+    report = module.build_tape_update_report(predictions, thin_run)
+
+    assert report["validation_status"] == "thin_tape_update"
+    assert report["freshness_recovery_pending"] is True
+
+
+def test_cycle_tape_baseline_skips_same_day_reruns(tmp_path):
+    module = load_script_module("run_heuristic_cycle_baseline_module", "scripts/run_heuristic_cycle.py")
+    old_run = tmp_path / "20260712_120000"
+    rerun_one = tmp_path / "20260713_120000"
+    rerun_two = tmp_path / "20260713_121000"
+    for run in (old_run, rerun_one, rerun_two):
+        run.mkdir()
+    (old_run / "tape_update.json").write_text(
+        json.dumps({"validation_status": "stale_tape", "current_prediction_rows": 2}), encoding="utf-8"
+    )
+    (rerun_one / "tape_update.json").write_text(
+        json.dumps({"validation_status": "thin_tape_update", "previous_run": str(old_run)}), encoding="utf-8"
+    )
+    (rerun_two / "tape_update.json").write_text(
+        json.dumps({"validation_status": "thin_tape_update", "previous_run": str(rerun_one)}), encoding="utf-8"
+    )
+
+    baseline = module.distinct_date_tape_baseline(rerun_two, "20260713")
+
+    assert baseline == old_run
 
 
 def test_sparse_split_checks_are_inconclusive_not_robust():

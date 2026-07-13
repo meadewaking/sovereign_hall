@@ -985,6 +985,42 @@ def previous_tape_stats(run_dir: Path | None) -> dict[str, Any]:
     return {"current_prediction_rows": sample_count} if sample_count is not None else {}
 
 
+def tape_recovery_was_pending(stats: dict[str, Any], max_hops: int = 20) -> bool:
+    """Follow thin-run ancestry until the last stale or fresh tape decision."""
+    current = stats
+    seen: set[str] = set()
+    for _ in range(max_hops):
+        if bool(current.get("freshness_recovery_pending", False)):
+            return True
+        status = str(current.get("validation_status", ""))
+        if status in {"stale_tape", "empty_prediction_tape"}:
+            return True
+        if status != "thin_tape_update":
+            return False
+        prior_raw = current.get("previous_run")
+        if not prior_raw or str(prior_raw) in seen:
+            return False
+        seen.add(str(prior_raw))
+        current = previous_tape_stats(Path(str(prior_raw)))
+    return False
+
+
+def distinct_date_tape_baseline(run_dir: Path | None, current_date: str) -> Path | None:
+    """Skip same-day reruns so tape growth is measured per automation cycle date."""
+    current = run_dir
+    seen: set[str] = set()
+    while current is not None and current.name.startswith(current_date):
+        if str(current) in seen:
+            return current
+        seen.add(str(current))
+        stats = previous_tape_stats(current)
+        prior_raw = stats.get("previous_run")
+        if not prior_raw:
+            return current
+        current = Path(str(prior_raw))
+    return current
+
+
 def build_tape_update_report(
     predictions: pd.DataFrame,
     previous_run: Path | None,
@@ -1003,7 +1039,10 @@ def build_tape_update_report(
     earliest_ts = predictions["predicted_at"].min()
     latest_date = latest_ts.date()
     latest_date_rows = int((predictions["predicted_at"].dt.date == latest_date).sum())
-    previous_stats = previous_tape_stats(previous_run)
+    baseline_run = distinct_date_tape_baseline(previous_run, datetime.now().strftime("%Y%m%d"))
+    previous_stats = previous_tape_stats(baseline_run)
+    previous_status = str(previous_stats.get("validation_status", ""))
+    previous_recovery_pending = tape_recovery_was_pending(previous_stats)
     previous_rows = previous_stats.get("current_prediction_rows")
     try:
         previous_rows_int = int(previous_rows) if previous_rows is not None else None
@@ -1038,7 +1077,11 @@ def build_tape_update_report(
         "min_latest_date_rows_for_validation": int(min_latest_date_rows_for_validation),
         "max_latest_prediction_age_days": int(max_latest_prediction_age_days),
         "enough_for_policy_widening": status == "fresh_tape_update",
-        "previous_run": str(previous_run) if previous_run else None,
+        "freshness_recovery_pending": (
+            (previous_status in {"stale_tape", "empty_prediction_tape"} or previous_recovery_pending)
+            and status != "fresh_tape_update"
+        ),
+        "previous_run": str(baseline_run) if baseline_run else None,
         "rule": (
             "Do not widen exposure or relax caps when the cycle has fewer than "
             f"{min_new_rows_for_validation} new local prediction rows, fewer than "
@@ -1730,8 +1773,8 @@ def write_readme(
 ## Blocking & Repeated Warning Review
 - Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
-- Root cause advanced this cycle: freshness recovery did not have one explicit boundary rule; age, new-row count, and latest-day breadth could be read independently, making it unclear exactly when a stale-tape veto was safe to clear.
-- System fix: `services/heuristic_policy.py` now recomputes one tape state from all three gates at every entry load. The veto clears only when age is within the limit, new rows meet the validation floor, and latest-day breadth meets its floor; otherwise the state remains thin or stale.
+- Root cause advanced this cycle: user entries refreshed artifact age but not live SQLite row count/latest date, so predictions appended after the last cycle could remain invisible; a one-row refresh could also clear the stale-entry veto before breadth recovered.
+- System fix: `services/heuristic_policy.py` now overlays immutable tape artifacts with the current local `price_predictions` state. A stale tape enters `freshness_recovery_pending`; the veto clears only when age, new-row count, and latest-day breadth all pass.
 - Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
 - Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
 - Integration decision: do not promote a return-seeking default or relax caps this round; use the retained policy only as a risk cap/warning until independently supplied local OHLC rows pass exact plan-date validation and a new cycle confirms coverage.
@@ -1775,6 +1818,7 @@ def write_readme(
 - Closed the stale-artifact gap: entry points dynamically recompute prediction age from the latest local tape date, so freshness cannot remain frozen at artifact creation time.
 - Added a stale-tape entry veto: expired local evidence can no longer create or expand simulated long positions; existing positions are not accidentally liquidated and explicit reductions/exits remain available.
 - Closed the veto-recovery boundary: fresh age alone is insufficient to clear the gate; the shared loader also requires the configured new-row and latest-day breadth thresholds, with a regression test at the exact age boundary.
+- Closed the live-artifact mismatch: all three user entries now see predictions appended after the latest cycle without mutating historical artifacts, while an isolated refresh remains vetoed until breadth recovers.
 - Connected sleeve diagnostics as a conservative user-entry constraint: failed ETF sleeve checks are surfaced as warnings and ETF simulated buys are capped for small observational sizing instead of treated as a promoted allocator.
 - Closed the portfolio-gross loop: simulated long proposals now enforce the retained policy `max_gross` as a real local cap instead of only showing it in the policy checklist.
 - Kept the latest best as a conservative risk constraint; even when split/cost checks pass, a lower score versus historical best is treated as a stability warning rather than a reason to increase exposure.
