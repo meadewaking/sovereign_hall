@@ -122,8 +122,29 @@ class InvestmentSimulation:
 
             # 加载交易记录用于冷却期判断
             await self._load_trade_records_for_cooldown()
+            await self._bootstrap_redeployment_state()
         except Exception as e:
             logger.warning(f"Failed to load simulation state: {e}")
+
+    async def _bootstrap_redeployment_state(self) -> None:
+        """Recover an actionable deployment queue after a process restart.
+
+        An empty book needs no quote, so its full cash deployment gap is known
+        exactly.  This recovery never invents a price or a trade.
+        """
+        if not self.db_service or self.positions or self.cash <= 0:
+            return
+        current = await self.get_redeployment_state()
+        if current and current.get("status") not in {"completed", "not_required"}:
+            return
+        await self._write_redeployment_state(
+            status="pending_approved_candidates",
+            deployment_gap=self.cash,
+            blocker_code="missing_approved_candidates",
+            blocker_reason="空仓资金等待投委会批准且可取得实时行情的合格标的",
+            next_action="下一轮投委会先消费该队列；成交前重新取得实时行情",
+            source="account_state_recovery",
+        )
 
     async def _load_trade_records_for_cooldown(self):
         """加载最近的交易记录，用于冷却期判断"""
@@ -220,6 +241,159 @@ class InvestmentSimulation:
             await conn.commit()
         except Exception as e:
             logger.warning(f"Failed to save simulation state: {e}")
+
+    async def get_redeployment_state(self) -> Dict[str, Any]:
+        """Return the durable operational-cash deployment state."""
+        if not self.db_service:
+            return {}
+        conn = self.db_service._connection
+        try:
+            async with conn.execute(
+                """
+                SELECT status, deployment_gap, blocker_code, blocker_reason,
+                       next_action, source, attempt_count, last_attempt_at,
+                       last_candidate_count, last_trade_count, created_at,
+                       updated_at, completed_at
+                FROM simulation_redeployment_state WHERE id = 1
+                """
+            ) as cursor:
+                row = await cursor.fetchone()
+            return dict(row) if row else {}
+        except Exception:
+            return {}
+
+    async def _write_redeployment_state(
+        self,
+        *,
+        status: str,
+        deployment_gap: float | None,
+        blocker_code: str,
+        blocker_reason: str,
+        next_action: str,
+        source: str,
+        increment_attempt: bool = False,
+        candidate_count: int = 0,
+        trade_count: int = 0,
+    ) -> None:
+        if not self.db_service:
+            return
+        conn = self.db_service._connection
+        now = datetime.now().isoformat()
+        completed_at = now if status == "completed" else None
+        await conn.execute(
+            """
+            INSERT INTO simulation_redeployment_state (
+                id, status, deployment_gap, blocker_code, blocker_reason,
+                next_action, source, attempt_count, last_attempt_at,
+                last_candidate_count, last_trade_count, created_at, updated_at,
+                completed_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                deployment_gap = excluded.deployment_gap,
+                blocker_code = excluded.blocker_code,
+                blocker_reason = excluded.blocker_reason,
+                next_action = excluded.next_action,
+                source = excluded.source,
+                attempt_count = simulation_redeployment_state.attempt_count + ?,
+                last_attempt_at = CASE WHEN ? THEN excluded.last_attempt_at ELSE simulation_redeployment_state.last_attempt_at END,
+                last_candidate_count = CASE WHEN ? THEN excluded.last_candidate_count ELSE simulation_redeployment_state.last_candidate_count END,
+                last_trade_count = CASE WHEN ? THEN excluded.last_trade_count ELSE simulation_redeployment_state.last_trade_count END,
+                updated_at = excluded.updated_at,
+                completed_at = excluded.completed_at
+            """,
+            (
+                status, deployment_gap, blocker_code, blocker_reason, next_action,
+                source, 1 if increment_attempt else 0,
+                now if increment_attempt else None, candidate_count, trade_count,
+                now, now, completed_at,
+                1 if increment_attempt else 0,
+                1 if increment_attempt else 0,
+                1 if increment_attempt else 0,
+                1 if increment_attempt else 0,
+            ),
+        )
+        await conn.commit()
+
+    async def mark_redeployment_required(self, proceeds: float, source: str) -> None:
+        """Put released simulated-sale cash into the durable redeployment queue."""
+        if proceeds <= 0:
+            return
+        await self._write_redeployment_state(
+            status="pending_approved_candidates",
+            deployment_gap=self.cash if not self.positions else None,
+            blocker_code="released_capital_pending_redeployment",
+            blocker_reason=f"模拟卖出释放 {proceeds:.2f} 元，等待同一投资闭环再配置",
+            next_action="投委会提供合格标的后，以实时行情重新估值并模拟成交",
+            source=source,
+        )
+
+    async def record_redeployment_attempt(
+        self,
+        assets: Dict[str, Any],
+        *,
+        candidate_count: int,
+        trade_count: int,
+        blockers: List[str] | None = None,
+        source: str = "run_discussion",
+    ) -> Dict[str, Any]:
+        """Persist one committee redeployment attempt and its exact blocker."""
+        blockers = [str(item) for item in (blockers or []) if str(item).strip()]
+        if not assets.get("valuation_complete"):
+            status = "blocked_valuation_incomplete"
+            gap = None
+            blocker_code = "realtime_valuation_incomplete"
+            blocker_reason = "组合实时估值不完整；" + "；".join(blockers)
+            next_action = "补齐所有持仓实时行情后重试；禁止用旧价或成本价兜底"
+        else:
+            gap = float(assets.get("deployment_gap") or 0.0)
+            if gap <= 0.01:
+                status = "completed"
+                blocker_code = ""
+                blocker_reason = "资金部署达到100%目标"
+                next_action = "继续逐仓生命周期复核"
+            elif trade_count > 0:
+                status = "partially_redeployed"
+                blocker_code = "residual_operational_cash"
+                blocker_reason = "已完成部分再配置；" + ("；".join(blockers) or "余款受整手/手续费约束")
+                next_action = "下一轮继续消费剩余部署缺口"
+            elif candidate_count <= 0:
+                status = "blocked_no_approved_candidates"
+                blocker_code = "missing_approved_candidates"
+                blocker_reason = "投委会没有批准可执行的多头候选；" + "；".join(blockers)
+                next_action = "下一轮投委会必须给出合格候选或逐项记录证据否决原因"
+            else:
+                status = "blocked_candidate_execution"
+                blocker_code = "candidate_execution_blocked"
+                blocker_reason = "候选未能成交；" + ("；".join(blockers) or "未返回可执行成交")
+                next_action = "按记录的实时行情/证据/整手阻塞逐项重试"
+        await self._write_redeployment_state(
+            status=status,
+            deployment_gap=gap,
+            blocker_code=blocker_code,
+            blocker_reason=blocker_reason,
+            next_action=next_action,
+            source=source,
+            increment_attempt=True,
+            candidate_count=candidate_count,
+            trade_count=trade_count,
+        )
+        return await self.get_redeployment_state()
+
+    async def count_trades_on_date(self, day: datetime | None = None) -> int:
+        """Count persisted simulated fills so the daily cap survives restarts."""
+        if not self.db_service:
+            return 0
+        target = (day or datetime.now()).date().isoformat()
+        try:
+            async with self.db_service._connection.execute(
+                "SELECT COUNT(*) FROM simulation_trades WHERE date(traded_at) = ?",
+                (target,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            return int(row[0] if row else 0)
+        except Exception:
+            return 0
 
     async def get_current_price(self, ticker: str) -> Optional[float]:
         """获取实时行情价格；不使用AI预测或历史价格替代。"""
@@ -523,7 +697,7 @@ class InvestmentSimulation:
             self.last_trade_records[ticker] = datetime.now().isoformat()
 
             # 记录交易
-            await self._record_trade(
+            trade_id = await self._record_trade(
                 ticker=ticker,
                 direction='sell',
                 shares=shares_to_sell,
@@ -535,6 +709,10 @@ class InvestmentSimulation:
             )
 
             await self.save_state()
+            await self.mark_redeployment_required(
+                net_proceeds,
+                source=f"simulation_sell_trade:{trade_id or 'unknown'}:{ticker}",
+            )
             await self.refresh_simulation_risk_memory()
 
             return {
@@ -558,22 +736,24 @@ class InvestmentSimulation:
         price: float,
         fee: float,
         reason: str = ""
-    ):
+    ) -> int | None:
         """记录交易到数据库"""
         if not self.db_service:
             return
 
         try:
             conn = self.db_service._connection
-            await conn.execute("""
+            cursor = await conn.execute("""
                 INSERT INTO simulation_trades (ticker, direction, shares, price, fee, reason, traded_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 ticker, direction, shares, price, fee, reason, datetime.now().isoformat()
             ))
             await conn.commit()
+            return int(cursor.lastrowid)
         except Exception as e:
             logger.warning(f"Failed to record trade: {e}")
+            return None
 
     async def refresh_simulation_risk_memory(self) -> List[Dict]:
         """Persist recent realized-loss memory derived from local simulated trades."""
@@ -968,6 +1148,25 @@ class InvestmentSimulation:
                 last_updated TEXT NOT NULL,
                 expires_at TEXT,
                 reason TEXT
+            )
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS simulation_redeployment_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                status TEXT NOT NULL,
+                deployment_gap REAL,
+                blocker_code TEXT,
+                blocker_reason TEXT,
+                next_action TEXT,
+                source TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                last_candidate_count INTEGER NOT NULL DEFAULT 0,
+                last_trade_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
             )
         """)
 

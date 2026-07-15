@@ -1139,7 +1139,8 @@ async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(mo
     )
 
     simulation = type("FakeSimulation", (), {})()
-    simulation.last_trade_date = None
+    # Same-day fills must not bypass the mandatory lifecycle review.
+    simulation.last_trade_date = datetime.now()
     simulation.last_trade_records = {}
     simulation.positions = {}
     simulation.calculate_assets = AsyncMock(return_value={
@@ -1164,6 +1165,12 @@ async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(mo
     simulation.resolve_trade_price = AsyncMock(return_value=(10.0, "test_realtime_quote"))
     simulation._estimate_trade_assets = AsyncMock(return_value=({}, 10_000.0, []))
     simulation.execute_trade = AsyncMock(return_value={"success": True, "action": "hold"})
+    simulation.count_trades_on_date = AsyncMock(return_value=1)
+    simulation.record_redeployment_attempt = AsyncMock(return_value={
+        "status": "blocked_candidate_execution",
+        "deployment_gap": 10_000.0,
+        "blocker_code": "candidate_execution_blocked",
+    })
     market_data = type(
         "FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)}
     )()
@@ -1182,6 +1189,47 @@ async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(mo
 
     simulation._estimate_trade_assets.assert_awaited_once_with("600519", 10.0)
     simulation.execute_trade.assert_awaited_once()
+    simulation.review_open_positions.assert_awaited_once()
+    simulation.record_redeployment_attempt.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path):
+    db = DatabaseService(str(tmp_path / "test.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    sim.cash = 9_727.22
+    sim.positions = {}
+    await sim.save_state()
+
+    await sim._bootstrap_redeployment_state()
+    recovered = await sim.get_redeployment_state()
+    assert recovered["status"] == "pending_approved_candidates"
+    assert recovered["deployment_gap"] == pytest.approx(9_727.22)
+    assert recovered["source"] == "account_state_recovery"
+
+    await sim.record_redeployment_attempt(
+        {
+            "valuation_complete": True,
+            "deployment_gap": 9_727.22,
+        },
+        candidate_count=0,
+        trade_count=0,
+        blockers=["投委会无批准的可执行多头候选"],
+    )
+    attempted = await sim.get_redeployment_state()
+    assert attempted["status"] == "blocked_no_approved_candidates"
+    assert attempted["attempt_count"] == 1
+    assert attempted["last_candidate_count"] == 0
+    assert "投委会" in attempted["blocker_reason"]
+
+    restarted = InvestmentSimulation(db)
+    await restarted.initialize()
+    persisted = await restarted.get_redeployment_state()
+    assert persisted["status"] == "blocked_no_approved_candidates"
+    assert persisted["attempt_count"] == 1
+    await db.close()
 
 
 @pytest.mark.asyncio

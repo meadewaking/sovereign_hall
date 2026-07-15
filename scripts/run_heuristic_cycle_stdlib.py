@@ -529,6 +529,7 @@ def summarize_metrics(
             "trade_count": 0,
             "cost_paid": 0.0,
             "average_invested_ratio": 0.0,
+            "average_cash_ratio": 1.0,
             "cost_assumption": cost_assumption,
         }
         metrics["score"] = score_metrics(metrics)
@@ -560,6 +561,7 @@ def summarize_metrics(
         "trade_count": int(len(closed)),
         "cost_paid": float(total_cost),
         "average_invested_ratio": float(mean([row["gross_exposure"] for row in curve])),
+        "average_cash_ratio": 1.0 - float(mean([row["gross_exposure"] for row in curve])),
         "cost_assumption": cost_assumption,
     }
     metrics["score"] = score_metrics(metrics)
@@ -1704,6 +1706,7 @@ def main() -> int:
                 "turnover": metrics["turnover"],
                 "trade_count": metrics["trade_count"],
                 "average_invested_ratio": metrics.get("average_invested_ratio", 0.0),
+                "average_cash_ratio": metrics.get("average_cash_ratio", 1.0),
                 "cost_assumption": metrics["cost_assumption"],
                 "score": metrics["score"],
                 "notes": "standard-library fallback local delayed daily signal simulation; no external market data",
@@ -1743,6 +1746,7 @@ def main() -> int:
             "turnover": simplified_result["metrics"]["turnover"],
             "trade_count": simplified_result["metrics"]["trade_count"],
             "average_invested_ratio": simplified_result["metrics"].get("average_invested_ratio", 0.0),
+            "average_cash_ratio": simplified_result["metrics"].get("average_cash_ratio", 1.0),
             "cost_assumption": simplified_result["metrics"]["cost_assumption"],
             "score": simplified_result["metrics"]["score"],
             "notes": "simplification stage: removed excess anomaly tuning",

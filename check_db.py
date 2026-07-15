@@ -803,6 +803,21 @@ def show_investment_status(db_path):
     except:
         trades = []
 
+    redeployment_state = None
+    try:
+        c.execute(
+            """
+            SELECT status, deployment_gap, blocker_code, blocker_reason,
+                   next_action, source, attempt_count, last_attempt_at,
+                   last_candidate_count, last_trade_count, updated_at
+            FROM simulation_redeployment_state WHERE id = 1
+            """
+        )
+        row = c.fetchone()
+        redeployment_state = dict(row) if row else None
+    except sqlite3.Error:
+        redeployment_state = None
+
     tickers = [pos[0] for pos in positions]
     conn.close()
 
@@ -891,6 +906,31 @@ def show_investment_status(db_path):
         )
         if deployment['deployment_gap'] > 0:
             print("   说明: 现金不是风险储备；只允许因缺少合格标的、实时报价、手续费或整手约束暂时留存")
+
+    print("\n   🧾 资金再配置队列:")
+    if redeployment_state:
+        gap = redeployment_state.get("deployment_gap")
+        gap_text = "N/A" if gap is None else f"{float(gap):.2f} 元"
+        print(
+            f"   状态: {redeployment_state.get('status')} | gap={gap_text} | "
+            f"尝试={int(redeployment_state.get('attempt_count') or 0)}次"
+        )
+        print(
+            f"   最近尝试: {redeployment_state.get('last_attempt_at') or '尚未执行'} | "
+            f"候选={int(redeployment_state.get('last_candidate_count') or 0)} | "
+            f"成交={int(redeployment_state.get('last_trade_count') or 0)}"
+        )
+        if redeployment_state.get("blocker_code"):
+            print(
+                f"   操作性阻塞: {redeployment_state.get('blocker_code')}；"
+                f"{redeployment_state.get('blocker_reason') or ''}"
+            )
+        print(f"   下一动作: {redeployment_state.get('next_action') or '下一轮继续评估'}")
+        print(f"   状态来源: {redeployment_state.get('source') or 'unknown'}")
+    elif total_value is not None and cash > 0:
+        print("   状态尚未持久化；下一次 run_discussion 初始化时将从空仓现金恢复待部署队列")
+    else:
+        print("   (无待处理再配置状态)")
 
     print(f"\n   📦 当前持仓:")
     if position_details:

@@ -1415,15 +1415,16 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
     from sovereign_hall.services.portfolio_policy import (
         deployment_position_floor as calculate_deployment_position_floor,
     )
-    should_trade = (
-        not simulation.last_trade_date or
-        (datetime.now() - simulation.last_trade_date).days >= 1
-    )
-    if not should_trade:
-        return
-
     if not await market_data.is_trading_day():
         print("\n💰 当前非交易日，跳过每日投资模拟交易")
+        assets = await simulation.calculate_assets()
+        if hasattr(simulation, "record_redeployment_attempt"):
+            await simulation.record_redeployment_attempt(
+                assets,
+                candidate_count=0,
+                trade_count=0,
+                blockers=["当前非交易日；只能查看实时行情，不能模拟成交"],
+            )
         reflection = await simulation.daily_reflection(llm)
         if reflection:
             print(f"\n📝 每日投资反思:")
@@ -1485,7 +1486,13 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
     current_tickers = set(current_positions.keys())
     current_ticker_codes = {simulation._normalize_ticker(ticker) for ticker in current_tickers}
     max_daily_trades = 5
+    prior_trade_count = (
+        await simulation.count_trades_on_date()
+        if hasattr(simulation, "count_trades_on_date")
+        else 0
+    )
     trade_count = 0
+    redeployment_blockers: List[str] = []
 
     trade_candidates = [
         decision for decision in decisions
@@ -1510,10 +1517,13 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             ticker = simulation._normalize_ticker(decision.get('ticker'))
             if not ticker:
                 continue
-            if trade_count >= max_daily_trades:
-                print(f"   ⏹️ 今日已达最大交易次数 ({max_daily_trades}次)，停止交易")
+            if prior_trade_count + trade_count >= max_daily_trades:
+                blocker = f"今日已达持久化最大交易次数 ({max_daily_trades}次)"
+                redeployment_blockers.append(blocker)
+                print(f"   ⏹️ {blocker}，停止交易")
                 break
             if simulation.is_in_cooldown(ticker):
+                redeployment_blockers.append(f"{ticker}: 冷却期")
                 print(f"   ⏳ {ticker} 在冷却期内，跳过交易")
                 continue
 
@@ -1522,6 +1532,7 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             target_position = float(decision.get('target_position', 0.0))
             current_price, price_source = await simulation.resolve_trade_price(ticker)
             if current_price is None:
+                redeployment_blockers.append(f"{ticker}: 实时行情不可用")
                 print(f"   ⏭️ {ticker}: 无法获取实时现价，跳过模拟交易")
                 continue
 
@@ -1561,6 +1572,9 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 missing_price_tickers,
             ) = await simulation._estimate_trade_assets(ticker, current_price)
             if missing_price_tickers and direction == "long":
+                redeployment_blockers.append(
+                    f"{ticker}: 组合实时估值不完整({','.join(missing_price_tickers)})"
+                )
                 print(
                     f"   ⏭️ {ticker}: 组合实时估值不完整，拒绝新增/扩大模拟仓位；"
                     f"缺少实时现价: {', '.join(missing_price_tickers)}"
@@ -1603,6 +1617,7 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             )
 
             if result.get('success') is False:
+                redeployment_blockers.append(f"{ticker}: {result.get('reason', '交易失败')}")
                 print(f"   ⏭️ {ticker}: {result.get('reason', '交易失败')}")
             elif result.get('action') == 'buy':
                 print(f"   📈 买入 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
@@ -1611,6 +1626,7 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 print(f"   📉 卖出 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
                 trade_count += 1
             elif result.get('action') == 'hold' and result.get('reason'):
+                redeployment_blockers.append(f"{ticker}: {result.get('reason')}")
                 print(f"   ➖ 持有 {ticker}: {result['reason']}")
     elif current_positions:
         print(f"   💤 投委会无新交易裁决，保持当前持仓不动")
@@ -1624,9 +1640,22 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                     logger.debug("解析持仓日期失败 %s=%r: %s", ticker, simulation.last_trade_records[ticker], exc)
             print(f"      - {ticker}: {pos['shares']}股 @ 成本{pos['avg_cost']:.2f} (持有{days_held}天)")
     else:
+        redeployment_blockers.append("投委会无批准的可执行多头候选")
         print(f"   💤 投委会无新交易裁决且空仓，保持观望")
 
     final_assets = await simulation.calculate_assets()
+    if hasattr(simulation, "record_redeployment_attempt"):
+        state = await simulation.record_redeployment_attempt(
+            final_assets,
+            candidate_count=len(deployable_new_longs),
+            trade_count=trade_count,
+            blockers=redeployment_blockers,
+        )
+        if state and final_assets.get("deployment_gap"):
+            print(
+                f"   🧾 再配置队列: {state.get('status')} | "
+                f"gap={state.get('deployment_gap')} | blocker={state.get('blocker_code')}"
+            )
     if final_assets.get("valuation_complete"):
         print(f"   📊 交易后: 现金 {final_assets['cash']:.2f}元 | 持仓 {final_assets['positions_value']:.2f}元（实时现价）")
     else:

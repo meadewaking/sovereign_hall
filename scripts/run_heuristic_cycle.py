@@ -568,6 +568,7 @@ def summarize_metrics(
             "trade_count": 0,
             "cost_paid": 0.0,
             "average_invested_ratio": 0.0,
+            "average_cash_ratio": 1.0,
             "cost_assumption": cost_assumption,
         }
         base["score"] = score_metrics(base)
@@ -601,6 +602,10 @@ def summarize_metrics(
         "trade_count": int(sum(1 for t in trades if t.get("exit_date"))),
         "cost_paid": float(total_cost),
         "average_invested_ratio": float(curve["gross_exposure"].mean()) if "gross_exposure" in curve else 0.0,
+        "average_cash_ratio": (
+            1.0 - float(curve["gross_exposure"].mean())
+            if "gross_exposure" in curve else 1.0
+        ),
         "cost_assumption": cost_assumption,
     }
     metrics["score"] = score_metrics(metrics)
@@ -991,6 +996,17 @@ def latest_completed_run(root: Path) -> Path | None:
             pass
     candidates = [path.parent for path in root.glob("*/README.md") if path.parent.is_dir()]
     return sorted(candidates)[-1] if candidates else None
+
+
+def completed_run_best_score(run_dir: Path | None) -> float | None:
+    """Read the immediate prior run score separately from the all-time best."""
+    if run_dir is None:
+        return None
+    try:
+        frame = pd.read_csv(run_dir / "summary.csv")
+        return float(frame["score"].max()) if not frame.empty and "score" in frame else None
+    except Exception:
+        return None
 
 
 def _samples_from_readme(run_dir: Path | None) -> int | None:
@@ -1482,6 +1498,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
             """
         ).fetchall()
         recent_lifecycle_exits: list[dict[str, Any]] = []
+        redeployment_state: dict[str, Any] = {}
         if "simulation_trades" in table_names:
             trade_columns = {
                 str(row[1]) for row in conn.execute("PRAGMA table_info(simulation_trades)").fetchall()
@@ -1512,6 +1529,22 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                     }
                     for exit_row in exit_rows
                 ]
+        if "simulation_redeployment_state" in table_names:
+            state_row = conn.execute(
+                """
+                SELECT status, deployment_gap, blocker_code, blocker_reason,
+                       next_action, source, attempt_count, last_attempt_at,
+                       last_candidate_count, last_trade_count, updated_at
+                FROM simulation_redeployment_state WHERE id = 1
+                """
+            ).fetchone()
+            if state_row:
+                state_keys = [
+                    "status", "deployment_gap", "blocker_code", "blocker_reason",
+                    "next_action", "source", "attempt_count", "last_attempt_at",
+                    "last_candidate_count", "last_trade_count", "updated_at",
+                ]
+                redeployment_state = dict(zip(state_keys, state_row))
 
     now = datetime.now()
     positions: list[dict[str, Any]] = []
@@ -1559,11 +1592,15 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
             "deployment_gap": cash,
             "position_count": 0,
             "blocked_price_count": 0,
-            "lifecycle_review_ran": bool(recent_lifecycle_exits),
+            "lifecycle_review_ran": True,
+            "reviewed_position_count": 0,
             "triggered_exit_count": len(recent_lifecycle_exits),
             "triggered_exit_net_proceeds": exit_proceeds,
             "recent_lifecycle_exits": recent_lifecycle_exits,
-            "redeployment_status": "pending_committee_approved_fresh_candidates",
+            "redeployment_status": redeployment_state.get(
+                "status", "pending_committee_approved_fresh_candidates"
+            ),
+            "redeployment_state": redeployment_state,
             "operational_cash_reason": (
                 "all holdings exited through realtime lifecycle rules; proceeds await "
                 "fresh committee-approved candidates and must not be treated as strategic cash"
@@ -1588,6 +1625,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
         "deployment_gap": None,
         "position_count": len(positions),
         "blocked_price_count": blocked_count,
+        "redeployment_state": redeployment_state,
         "rule": (
             "Current account value, PnL, invested ratio and simulated fills require realtime quotes. "
             "Stored marks are audit metadata only and are never valuation fallbacks."
@@ -1783,6 +1821,8 @@ def write_readme(
     price_readiness_stall: dict[str, Any] | None = None,
     tape_update: dict[str, Any] | None = None,
     portfolio_lifecycle: dict[str, Any] | None = None,
+    previous_latest_run: Path | None = None,
+    previous_latest_score: float | None = None,
 ) -> None:
     failed = [t for t in trials if t["trial_name"] != best_name]
     best_row = next((t for t in trials if t["trial_name"] == best_name), {})
@@ -1801,6 +1841,12 @@ def write_readme(
         comparison = (
             f"Previous best score {previous_score:.6f} from {previous_path}; "
             f"delta {best_metrics['score'] - previous_score:+.6f}."
+        )
+    latest_comparison = "No immediate prior completed run was found."
+    if previous_latest_score is not None:
+        latest_comparison = (
+            f"Immediate prior run score {previous_latest_score:.6f} from {previous_latest_run}; "
+            f"delta {best_metrics['score'] - previous_latest_score:+.6f}."
         )
     def diagnostic_reason(trial_name: str) -> str:
         if "validated_daily_price_only" in trial_name:
@@ -1947,6 +1993,7 @@ def write_readme(
     portfolio_gap_text = (
         f"{float(portfolio_gap):.2f}" if portfolio_gap is not None else "N/A (realtime quote required)"
     )
+    redeployment_state = portfolio_lifecycle.get("redeployment_state") or {}
     new_rows = tape_update.get("new_prediction_rows_since_previous")
     new_rows_text = "unknown" if new_rows is None else str(new_rows)
     try:
@@ -1977,19 +2024,21 @@ def write_readme(
 - Samples consumed: {sample_count} prediction rows
 - Best policy: `{best_name}`
 - Current best score: {best_metrics['score']:.6f}
-- Previous best comparison: {comparison}
+- Immediate prior run comparison: {latest_comparison}
+- Historical best comparison: {comparison}
 
 ## Blocking & Repeated Warning Review
 - Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
-- Root cause advanced this cycle: the mandatory lifecycle review can release capital, but the post-exit committee sizing path called the async realtime valuation helper without `await` and unpacked the wrong return shape; redeployment could fail before reaching simulated execution.
-- System fix: the simulation continues to target 100% invested capital and review every holding first; post-exit candidate sizing now awaits complete realtime account valuation, rejects missing quotes explicitly, and can continue to the existing per-name/evidence constraints without fabricating a fill.
+- Root cause advanced this cycle: forced-exit cash and its blockers were only printed or written to a run artifact; no durable database state survived process restarts, and a same-day trade timestamp could return before mandatory position review.
+- System fix: `simulation_redeployment_state` now persists the deployment gap, attempt count, candidate/fill count, exact operational blocker, and next action. `run_discussion` always runs lifecycle review first and enforces its daily fill cap from persisted trades.
 - Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
 - Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
 - Integration decision: full deployment is now a portfolio invariant, while unavailable/stale prices remain an explicit operational blocker rather than a reason to fabricate fills; risk is expressed through rotation, diversification, and per-position exits instead of strategic cash.
 
 ## What Changed
 - Added `services/portfolio_policy.py` with deterministic stop-loss, take-profit, max-holding, fresh-price, deployment-gap, and candidate-allocation rules.
+- Added a single-row durable redeployment state machine; simulated sells enqueue released cash, committee rounds record exact failures, and empty-book state is recovered without using a quote fallback.
 - Migrated `simulation_positions` with opened/mark/review lifecycle fields and backfilled legacy opening times from local simulated buy history.
 - `run_discussion` now reviews every open position before considering new proposals; missing realtime quotes block valuation/trading, while realtime stop/expiry breaches generate simulated sells only during market hours.
 - Fixed `run_discussion` post-exit candidate sizing to await the realtime portfolio valuation triple and stop cleanly on incomplete quotes instead of raising before redeployment.
@@ -2050,6 +2099,7 @@ def write_readme(
 - Turnover: {best_metrics['turnover']:.3f}
 - Trade count: {best_metrics['trade_count']}
 - Average invested ratio: {best_metrics.get('average_invested_ratio', 0.0):.2%}
+- Average cash ratio: {best_metrics.get('average_cash_ratio', 1.0):.2%}
 - Cost assumption: {best_metrics['cost_assumption']}
 
 ## Failed Or Weaker Directions
@@ -2086,7 +2136,9 @@ def write_readme(
 - Operational deployment gap: {portfolio_gap_text}; cash is not a strategic risk reserve.
 - Open positions recorded: {int(portfolio_lifecycle.get('position_count', 0))}; quote blockers: {int(portfolio_lifecycle.get('blocked_price_count', 0))}
 - Lifecycle review ran: {bool(portfolio_lifecycle.get('lifecycle_review_ran', False))}; triggered/executed exits today: {int(portfolio_lifecycle.get('triggered_exit_count', 0))}; exit net proceeds: {float(portfolio_lifecycle.get('triggered_exit_net_proceeds', 0.0) or 0.0):.2f}
+- Positions reviewed: {int(portfolio_lifecycle.get('reviewed_position_count', portfolio_lifecycle.get('position_count', 0)))}; current invested ratio={portfolio_invested_text}; deployment gap={portfolio_gap_text}.
 - Redeployment status: {portfolio_lifecycle.get('redeployment_status', 'not_applicable')}; operational cash reason: {portfolio_lifecycle.get('operational_cash_reason', 'N/A')}
+- Durable redeployment queue: status={redeployment_state.get('status', 'missing')}; gap={redeployment_state.get('deployment_gap', 'N/A')}; attempts={redeployment_state.get('attempt_count', 0)}; last candidates/fills={redeployment_state.get('last_candidate_count', 0)}/{redeployment_state.get('last_trade_count', 0)}; blocker={redeployment_state.get('blocker_code', 'N/A')}; next={redeployment_state.get('next_action', 'N/A')}
 - Machine-readable snapshot: `portfolio_lifecycle_review.json`. No trade is generated by this report.
 
 ## Overfitting Risk
@@ -2097,7 +2149,10 @@ def write_readme(
 Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe split/cost-stress failure detected"}.
 
 ## User Entry Impact
-- This cycle fixed the `run_discussion` post-exit redeployment crash: realtime account valuation is now awaited and its missing-quote result is enforced before committee sizing.
+- This cycle closes the post-exit persistence gap: `run_discussion` records every redeployment attempt and `check_db` shows the durable queue, exact blocker, attempt count, and next executable action.
+- Same-day simulated fills no longer bypass the mandatory review of every existing position; the daily trade cap is counted from SQLite and survives restarts.
+- Per-position review result this run: reviewed {int(portfolio_lifecycle.get('reviewed_position_count', portfolio_lifecycle.get('position_count', 0)))} open positions; triggered exits={int(portfolio_lifecycle.get('triggered_exit_count', 0))}; blocked exits={int(portfolio_lifecycle.get('blocked_price_count', 0))}.
+- Capital lifecycle result this run: invested ratio={portfolio_invested_text}, deployment gap={portfolio_gap_text}; exit/released cash is {portfolio_lifecycle.get('redeployment_status', 'not_applicable')} and has not been classified as strategic cash.
 - Lifecycle audit now treats an empty portfolio as completely valued (0% invested, full cash deployment gap) and records same-day realtime lifecycle exits plus pending redeployment instead of incorrectly reporting valuation N/A.
 - Improved `check_db`: users now see whether capital is actually deployed, why any cash is operationally blocked, and each position's age/quote-age/exit status.
 - Improved `run_discussion`: every open position is reviewed before new proposals; absence of a new committee ticker no longer silently freezes legacy holdings.
@@ -2153,8 +2208,8 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Persist a durable redeployment queue/attempt state so forced-exit proceeds remain explicitly actionable across process restarts and committee rounds.
-- Verify same-cycle reinvestment into fresh, realtime-priced, committee-approved candidates after the repaired sizing path; if evidence gates reject every candidate, record exact blockers and the next executable action rather than strategic cash.
+- Exercise the durable queue with a fresh, realtime-priced, committee-approved candidate; verify partial/full completion and exact residual-cash classification after an actual simulated fill.
+- Add committee evidence-gate rejection codes before LLM execution so stale tape, missing quote, cooldown, and lot-size blockers aggregate cleanly by cause across rounds.
 - Backfill independently validated `daily_prices` starting with the latest unlock ticker and collect a meaningful tape update (>=20 new rows, >=5 latest-day rows) before reconsidering allocator promotion.
 """
     path.write_text(text, encoding="utf-8")
@@ -2225,6 +2280,7 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=False)
 
     previous_latest_run = latest_completed_run(runs_root)
+    previous_latest_score = completed_run_best_score(previous_latest_run)
     recent_failure_tickers = extract_failure_tickers_from_run(previous_latest_run)
     previous_score, previous_path = previous_best_score(runs_root)
     predictions = load_predictions(db_path)
@@ -2792,7 +2848,8 @@ def main() -> int:
             "sharpe": metrics["sharpe"],
             "turnover": metrics["turnover"],
             "trade_count": metrics["trade_count"],
-            "average_invested_ratio": metrics.get("average_invested_ratio", 0.0),
+                "average_invested_ratio": metrics.get("average_invested_ratio", 0.0),
+                "average_cash_ratio": metrics.get("average_cash_ratio", 1.0),
             "cost_assumption": metrics["cost_assumption"],
             "score": metrics["score"],
             "notes": "local delayed daily signal simulation; no external market data",
@@ -2841,6 +2898,7 @@ def main() -> int:
             "turnover": simplified_metrics["turnover"],
             "trade_count": simplified_metrics["trade_count"],
             "average_invested_ratio": simplified_metrics.get("average_invested_ratio", 0.0),
+            "average_cash_ratio": simplified_metrics.get("average_cash_ratio", 1.0),
             "cost_assumption": simplified_metrics["cost_assumption"],
             "score": simplified_metrics["score"],
             "notes": "simplification stage: removed volatility scaling and excess anomaly tuning",
@@ -2959,6 +3017,8 @@ def main() -> int:
         price_readiness_stall=price_readiness_stall,
         tape_update=tape_update,
         portfolio_lifecycle=portfolio_lifecycle,
+        previous_latest_run=previous_latest_run,
+        previous_latest_score=previous_latest_score,
     )
 
     latest = runs_root / "LATEST"
