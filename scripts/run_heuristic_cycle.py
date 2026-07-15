@@ -1481,6 +1481,37 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
             ORDER BY ticker
             """
         ).fetchall()
+        recent_lifecycle_exits: list[dict[str, Any]] = []
+        if "simulation_trades" in table_names:
+            trade_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(simulation_trades)").fetchall()
+            }
+            required_trade_columns = {
+                "ticker", "direction", "shares", "price", "fee", "reason", "traded_at"
+            }
+            if required_trade_columns.issubset(trade_columns):
+                exit_rows = conn.execute(
+                    """
+                    SELECT ticker, shares, price, fee, reason, traded_at
+                    FROM simulation_trades
+                    WHERE lower(direction) = 'sell'
+                      AND reason LIKE '%逐仓强制复核%'
+                      AND date(traded_at) = date('now', 'localtime')
+                    ORDER BY datetime(traded_at), id
+                    """
+                ).fetchall()
+                recent_lifecycle_exits = [
+                    {
+                        "ticker": str(exit_row[0]),
+                        "shares": float(exit_row[1]),
+                        "price": float(exit_row[2]),
+                        "fee": float(exit_row[3] or 0.0),
+                        "net_proceeds": float(exit_row[1]) * float(exit_row[2]) - float(exit_row[3] or 0.0),
+                        "reason": str(exit_row[4] or ""),
+                        "traded_at": str(exit_row[5] or ""),
+                    }
+                    for exit_row in exit_rows
+                ]
 
     now = datetime.now()
     positions: list[dict[str, Any]] = []
@@ -1511,6 +1542,40 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
         )
 
     blocked_count = sum(str(row["review_status"]).startswith("blocked_") for row in positions)
+    if not positions:
+        # An empty book needs no quote, so its cash and deployment gap are exactly
+        # known.  Reporting valuation_incomplete here hid the most urgent lifecycle
+        # state: forced exits succeeded but all proceeds still await redeployment.
+        exit_proceeds = sum(row["net_proceeds"] for row in recent_lifecycle_exits)
+        return {
+            "generated_at": generated_at,
+            "status": "fully_cash_operational_redeployment_blocked",
+            "valuation_complete": True,
+            "target_invested_ratio": target_invested_ratio,
+            "cash": cash,
+            "market_value": 0.0,
+            "total_assets": cash,
+            "invested_ratio": 0.0,
+            "deployment_gap": cash,
+            "position_count": 0,
+            "blocked_price_count": 0,
+            "lifecycle_review_ran": bool(recent_lifecycle_exits),
+            "triggered_exit_count": len(recent_lifecycle_exits),
+            "triggered_exit_net_proceeds": exit_proceeds,
+            "recent_lifecycle_exits": recent_lifecycle_exits,
+            "redeployment_status": "pending_committee_approved_fresh_candidates",
+            "operational_cash_reason": (
+                "all holdings exited through realtime lifecycle rules; proceeds await "
+                "fresh committee-approved candidates and must not be treated as strategic cash"
+                if recent_lifecycle_exits
+                else "no open holdings; cash awaits fresh committee-approved candidates"
+            ),
+            "rule": (
+                "An empty portfolio is completely valued without a quote. Cash is an operational "
+                "deployment gap and must re-enter the committee allocation queue."
+            ),
+            "positions": [],
+        }
     return {
         "generated_at": generated_at,
         "status": "realtime_valuation_required",
@@ -1917,8 +1982,8 @@ def write_readme(
 ## Blocking & Repeated Warning Review
 - Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
-- Root cause advanced this cycle: entry risk gates prevented new exposure, but no mandatory lifecycle review covered legacy holdings; `simulation_positions` lacked stop/age/mark/review state, and low `max_gross` treated strategic cash as risk control.
-- System fix: the simulation now targets 100% invested capital, reviews every holding before new proposals, persists lifecycle/quote metadata, triggers stop/take-profit/max-hold exits only on freshly fetched realtime quotes during market hours, and redistributes approved candidate weights instead of silently retaining strategic cash.
+- Root cause advanced this cycle: the mandatory lifecycle review can release capital, but the post-exit committee sizing path called the async realtime valuation helper without `await` and unpacked the wrong return shape; redeployment could fail before reaching simulated execution.
+- System fix: the simulation continues to target 100% invested capital and review every holding first; post-exit candidate sizing now awaits complete realtime account valuation, rejects missing quotes explicitly, and can continue to the existing per-name/evidence constraints without fabricating a fill.
 - Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
 - Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
 - Integration decision: full deployment is now a portfolio invariant, while unavailable/stale prices remain an explicit operational blocker rather than a reason to fabricate fills; risk is expressed through rotation, diversification, and per-position exits instead of strategic cash.
@@ -1927,6 +1992,8 @@ def write_readme(
 - Added `services/portfolio_policy.py` with deterministic stop-loss, take-profit, max-holding, fresh-price, deployment-gap, and candidate-allocation rules.
 - Migrated `simulation_positions` with opened/mark/review lifecycle fields and backfilled legacy opening times from local simulated buy history.
 - `run_discussion` now reviews every open position before considering new proposals; missing realtime quotes block valuation/trading, while realtime stop/expiry breaches generate simulated sells only during market hours.
+- Fixed `run_discussion` post-exit candidate sizing to await the realtime portfolio valuation triple and stop cleanly on incomplete quotes instead of raising before redeployment.
+- Empty-book lifecycle artifacts now report exact 0% invested ratio/full deployment gap and audit same-day forced exits; they no longer label a quote-free empty book as valuation incomplete.
 - Simulation capital now targets 100% investment. Approved new long candidates receive a deployment floor from the remaining gap; per-name/evidence rules redistribute exposure instead of reserving cash.
 - `check_db` now displays invested ratio, deployment gap, holding age, quote age, and the current mandatory action for every holding.
 - Extended the local-only delayed-signal heuristic evaluation loop for this cycle.
@@ -2018,6 +2085,8 @@ def write_readme(
 - Current invested ratio: {portfolio_invested_text}; target: {float(portfolio_lifecycle.get('target_invested_ratio', 1.0)):.2%}
 - Operational deployment gap: {portfolio_gap_text}; cash is not a strategic risk reserve.
 - Open positions recorded: {int(portfolio_lifecycle.get('position_count', 0))}; quote blockers: {int(portfolio_lifecycle.get('blocked_price_count', 0))}
+- Lifecycle review ran: {bool(portfolio_lifecycle.get('lifecycle_review_ran', False))}; triggered/executed exits today: {int(portfolio_lifecycle.get('triggered_exit_count', 0))}; exit net proceeds: {float(portfolio_lifecycle.get('triggered_exit_net_proceeds', 0.0) or 0.0):.2f}
+- Redeployment status: {portfolio_lifecycle.get('redeployment_status', 'not_applicable')}; operational cash reason: {portfolio_lifecycle.get('operational_cash_reason', 'N/A')}
 - Machine-readable snapshot: `portfolio_lifecycle_review.json`. No trade is generated by this report.
 
 ## Overfitting Risk
@@ -2028,6 +2097,8 @@ def write_readme(
 Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe split/cost-stress failure detected"}.
 
 ## User Entry Impact
+- This cycle fixed the `run_discussion` post-exit redeployment crash: realtime account valuation is now awaited and its missing-quote result is enforced before committee sizing.
+- Lifecycle audit now treats an empty portfolio as completely valued (0% invested, full cash deployment gap) and records same-day realtime lifecycle exits plus pending redeployment instead of incorrectly reporting valuation N/A.
 - Improved `check_db`: users now see whether capital is actually deployed, why any cash is operationally blocked, and each position's age/quote-age/exit status.
 - Improved `run_discussion`: every open position is reviewed before new proposals; absence of a new committee ticker no longer silently freezes legacy holdings.
 - Improved simulation lifecycle: stop-loss (-8%), take-profit (+15%), and maximum holding period (30 days) are explicit, persisted, and executable only after a fresh realtime quote is fetched during market hours.
@@ -2082,9 +2153,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Rerun mandatory lifecycle review during A-share trading hours and verify all triggered exits use newly fetched realtime quotes rather than old prediction or local marks.
-- Evaluate 100%-gross diversified policies across time split and 3x-slippage stress, including average invested ratio and turnover; reduce risk through allocation/rotation, not strategic cash.
-- Close the redeployment loop after exits: verify proceeds are reassigned to fresh, committee-approved candidates subject to per-name and evidence constraints, with only fee/board-lot residual cash.
+- Persist a durable redeployment queue/attempt state so forced-exit proceeds remain explicitly actionable across process restarts and committee rounds.
+- Verify same-cycle reinvestment into fresh, realtime-priced, committee-approved candidates after the repaired sizing path; if evidence gates reject every candidate, record exact blockers and the next executable action rather than strategic cash.
+- Backfill independently validated `daily_prices` starting with the latest unlock ticker and collect a meaningful tape update (>=20 new rows, >=5 latest-day rows) before reconsidering allocator promotion.
 """
     path.write_text(text, encoding="utf-8")
 

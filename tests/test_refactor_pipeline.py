@@ -57,6 +57,7 @@ from sovereign_hall.run_discussion import (
     select_next_topic,
     stage2_deep_research,
     stage3_ic_discussion,
+    run_committee_approved_simulation,
 )
 from sovereign_hall.services.persistence import PersistenceManager
 import sovereign_hall.services.persistence as persistence_module
@@ -1121,6 +1122,66 @@ async def test_simulation_reviews_every_position_and_only_executes_fresh_exit():
     assert [row["action"] for row in reviews] == ["blocked_realtime_price", "exit"]
     sim.execute_trade.assert_awaited_once()
     assert sim.execute_trade.await_args.kwargs["ticker"] == "600050"
+
+
+@pytest.mark.asyncio
+async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(monkeypatch):
+    """A lifecycle exit must be able to flow into same-cycle candidate sizing."""
+    import sovereign_hall.run_discussion as discussion_module
+
+    context = HeuristicRiskContext(None, "", None, 0.10, True, "test", [])
+    monkeypatch.setattr(discussion_module, "load_latest_heuristic_context", lambda: context)
+    monkeypatch.setattr(discussion_module, "recent_prediction_observation_count", lambda ticker: 1)
+    monkeypatch.setattr(
+        discussion_module,
+        "apply_heuristic_risk_cap",
+        lambda ticker, target, confidence, **kwargs: (target, ""),
+    )
+
+    simulation = type("FakeSimulation", (), {})()
+    simulation.last_trade_date = None
+    simulation.last_trade_records = {}
+    simulation.positions = {}
+    simulation.calculate_assets = AsyncMock(return_value={
+        "valuation_complete": True,
+        "total_assets": 10_000.0,
+        "known_total_assets": 10_000.0,
+        "cash": 10_000.0,
+        "positions_value": 0.0,
+        "positions": {},
+        "position_values": {},
+        "invested_ratio": 0.0,
+        "deployment_gap": 10_000.0,
+        "target_invested_ratio": 1.0,
+        "missing_price_tickers": [],
+    })
+    simulation.get_recent_reflection = AsyncMock(return_value="")
+    simulation.review_open_positions = AsyncMock(return_value=[])
+    simulation.daily_reflection = AsyncMock(return_value="")
+    simulation.save_snapshot = AsyncMock()
+    simulation.is_in_cooldown = lambda ticker: False
+    simulation._normalize_ticker = lambda ticker: ticker
+    simulation.resolve_trade_price = AsyncMock(return_value=(10.0, "test_realtime_quote"))
+    simulation._estimate_trade_assets = AsyncMock(return_value=({}, 10_000.0, []))
+    simulation.execute_trade = AsyncMock(return_value={"success": True, "action": "hold"})
+    market_data = type(
+        "FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)}
+    )()
+
+    await run_committee_approved_simulation(
+        simulation,
+        market_data,
+        None,
+        [{
+            "ticker": "600519",
+            "direction": "long",
+            "confidence": 0.8,
+            "target_position": 0.1,
+        }],
+    )
+
+    simulation._estimate_trade_assets.assert_awaited_once_with("600519", 10.0)
+    simulation.execute_trade.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -1551,7 +1551,21 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 trade_reason = f"{trade_reason}；价格来源={price_source}"
 
             signal_count = recent_prediction_observation_count(ticker)
-            position_values, total_assets_for_cap = simulation._estimate_trade_assets(ticker, current_price)
+            # Revalue the whole account from realtime quotes before sizing.  This
+            # helper is async and also returns the set of missing quotes; ignoring
+            # either detail used to crash the post-exit redeployment path before a
+            # committee-approved candidate could reach execute_trade().
+            (
+                position_values,
+                total_assets_for_cap,
+                missing_price_tickers,
+            ) = await simulation._estimate_trade_assets(ticker, current_price)
+            if missing_price_tickers and direction == "long":
+                print(
+                    f"   ⏭️ {ticker}: 组合实时估值不完整，拒绝新增/扩大模拟仓位；"
+                    f"缺少实时现价: {', '.join(missing_price_tickers)}"
+                )
+                continue
             current_position_value = position_values.get(ticker, 0.0)
             current_gross_exposure = (
                 sum(position_values.values()) / total_assets_for_cap
