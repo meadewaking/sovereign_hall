@@ -252,13 +252,23 @@ class InvestmentSimulation:
                 """
                 SELECT status, deployment_gap, blocker_code, blocker_reason,
                        next_action, source, attempt_count, last_attempt_at,
-                       last_candidate_count, last_trade_count, created_at,
-                       updated_at, completed_at
+                       last_candidate_count, last_trade_count,
+                       last_rejection_counts, rejection_counts_total,
+                       created_at, updated_at, completed_at
                 FROM simulation_redeployment_state WHERE id = 1
                 """
             ) as cursor:
                 row = await cursor.fetchone()
-            return dict(row) if row else {}
+            if not row:
+                return {}
+            result = dict(row)
+            for key in ("last_rejection_counts", "rejection_counts_total"):
+                raw = result.get(key)
+                try:
+                    result[key] = json.loads(raw) if raw else {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result[key] = {}
+            return result
         except Exception:
             return {}
 
@@ -274,20 +284,44 @@ class InvestmentSimulation:
         increment_attempt: bool = False,
         candidate_count: int = 0,
         trade_count: int = 0,
+        rejection_counts: Dict[str, int] | None = None,
     ) -> None:
         if not self.db_service:
             return
         conn = self.db_service._connection
         now = datetime.now().isoformat()
         completed_at = now if status == "completed" else None
+        normalized_rejections = {
+            str(code): int(count)
+            for code, count in (rejection_counts or {}).items()
+            if str(code).strip() and int(count) > 0
+        }
+        cumulative_rejections: Dict[str, int] = {}
+        try:
+            async with conn.execute(
+                "SELECT rejection_counts_total FROM simulation_redeployment_state WHERE id = 1"
+            ) as cursor:
+                existing_row = await cursor.fetchone()
+            if existing_row and existing_row[0]:
+                cumulative_rejections = {
+                    str(code): int(count)
+                    for code, count in json.loads(existing_row[0]).items()
+                }
+        except (TypeError, ValueError, json.JSONDecodeError, aiosqlite.Error):
+            cumulative_rejections = {}
+        if increment_attempt:
+            for code, count in normalized_rejections.items():
+                cumulative_rejections[code] = cumulative_rejections.get(code, 0) + count
+        last_rejections_json = json.dumps(normalized_rejections, ensure_ascii=False, sort_keys=True)
+        cumulative_rejections_json = json.dumps(cumulative_rejections, ensure_ascii=False, sort_keys=True)
         await conn.execute(
             """
             INSERT INTO simulation_redeployment_state (
                 id, status, deployment_gap, blocker_code, blocker_reason,
                 next_action, source, attempt_count, last_attempt_at,
-                last_candidate_count, last_trade_count, created_at, updated_at,
-                completed_at
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_candidate_count, last_trade_count, last_rejection_counts,
+                rejection_counts_total, created_at, updated_at, completed_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 deployment_gap = excluded.deployment_gap,
@@ -299,6 +333,8 @@ class InvestmentSimulation:
                 last_attempt_at = CASE WHEN ? THEN excluded.last_attempt_at ELSE simulation_redeployment_state.last_attempt_at END,
                 last_candidate_count = CASE WHEN ? THEN excluded.last_candidate_count ELSE simulation_redeployment_state.last_candidate_count END,
                 last_trade_count = CASE WHEN ? THEN excluded.last_trade_count ELSE simulation_redeployment_state.last_trade_count END,
+                last_rejection_counts = CASE WHEN ? THEN excluded.last_rejection_counts ELSE simulation_redeployment_state.last_rejection_counts END,
+                rejection_counts_total = excluded.rejection_counts_total,
                 updated_at = excluded.updated_at,
                 completed_at = excluded.completed_at
             """,
@@ -306,7 +342,9 @@ class InvestmentSimulation:
                 status, deployment_gap, blocker_code, blocker_reason, next_action,
                 source, 1 if increment_attempt else 0,
                 now if increment_attempt else None, candidate_count, trade_count,
+                last_rejections_json, cumulative_rejections_json,
                 now, now, completed_at,
+                1 if increment_attempt else 0,
                 1 if increment_attempt else 0,
                 1 if increment_attempt else 0,
                 1 if increment_attempt else 0,
@@ -335,10 +373,18 @@ class InvestmentSimulation:
         candidate_count: int,
         trade_count: int,
         blockers: List[str] | None = None,
+        rejections: List[Dict[str, Any]] | None = None,
         source: str = "run_discussion",
     ) -> Dict[str, Any]:
         """Persist one committee redeployment attempt and its exact blocker."""
         blockers = [str(item) for item in (blockers or []) if str(item).strip()]
+        rejection_counts: Dict[str, int] = {}
+        for item in rejections or []:
+            code = str(item.get("code") or "unknown_rejection").strip()
+            rejection_counts[code] = rejection_counts.get(code, 0) + 1
+        rejection_summary = ", ".join(
+            f"{code}={count}" for code, count in sorted(rejection_counts.items())
+        )
         if not assets.get("valuation_complete"):
             status = "blocked_valuation_incomplete"
             gap = None
@@ -361,7 +407,11 @@ class InvestmentSimulation:
                 status = "blocked_no_approved_candidates"
                 blocker_code = "missing_approved_candidates"
                 blocker_reason = "投委会没有批准可执行的多头候选；" + "；".join(blockers)
-                next_action = "下一轮投委会必须给出合格候选或逐项记录证据否决原因"
+                next_action = (
+                    f"下一轮优先处理拒绝码: {rejection_summary}；补齐对应证据或输入后再提交候选"
+                    if rejection_summary
+                    else "下一轮投委会必须给出合格候选或逐项记录证据否决原因"
+                )
             else:
                 status = "blocked_candidate_execution"
                 blocker_code = "candidate_execution_blocked"
@@ -377,6 +427,7 @@ class InvestmentSimulation:
             increment_attempt=True,
             candidate_count=candidate_count,
             trade_count=trade_count,
+            rejection_counts=rejection_counts,
         )
         return await self.get_redeployment_state()
 
@@ -1164,11 +1215,22 @@ class InvestmentSimulation:
                 last_attempt_at TEXT,
                 last_candidate_count INTEGER NOT NULL DEFAULT 0,
                 last_trade_count INTEGER NOT NULL DEFAULT 0,
+                last_rejection_counts TEXT NOT NULL DEFAULT '{}',
+                rejection_counts_total TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 completed_at TEXT
             )
         """)
+
+        async with conn.execute("PRAGMA table_info(simulation_redeployment_state)") as cursor:
+            redeployment_columns = {row[1] for row in await cursor.fetchall()}
+        for column in ("last_rejection_counts", "rejection_counts_total"):
+            if column not in redeployment_columns:
+                await conn.execute(
+                    f"ALTER TABLE simulation_redeployment_state "
+                    f"ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'"
+                )
 
         await conn.commit()
         await self.refresh_simulation_risk_memory()

@@ -53,6 +53,7 @@ from sovereign_hall.run_discussion import (
     build_lessons_with_heuristic_context,
     cli_args_can_run_without_instance_lock,
     parse_committee_vote,
+    preflight_committee_decisions,
     proposal_priority_score,
     select_next_topic,
     stage2_deep_research,
@@ -84,6 +85,49 @@ def test_entry_imports():
 def test_run_discussion_help_does_not_need_instance_lock():
     assert cli_args_can_run_without_instance_lock(["--help"]) is True
     assert cli_args_can_run_without_instance_lock(["--once"]) is False
+
+
+def test_committee_preflight_records_every_non_executable_decision():
+    executable, rejected = preflight_committee_decisions(
+        [
+            {"ticker": "600519.SH", "direction": "hold", "risk_flags": ["证据不足"]},
+            {"ticker": "", "direction": "long", "target_position": 0.1},
+            {"ticker": "600050", "direction": "short"},
+            {"ticker": "510300", "direction": "long", "target_position": 0.1},
+        ],
+        current_tickers=set(),
+        normalize_ticker=lambda ticker: ticker.replace(".SH", ""),
+    )
+
+    assert [row["ticker"] for row in executable] == ["510300"]
+    assert {row["code"] for row in rejected} == {
+        "committee_hold",
+        "missing_ticker",
+        "short_without_position",
+    }
+    assert "证据不足" in rejected[0]["reason"]
+
+
+def test_cycle_comparison_uses_retained_best_not_diagnostic_max(tmp_path):
+    module = load_script_module(
+        "run_heuristic_cycle_retained_best_module",
+        "scripts/run_heuristic_cycle.py",
+    )
+    run_dir = tmp_path / "20260715_000000"
+    run_dir.mkdir()
+    (run_dir / "best_metrics.json").write_text(
+        json.dumps({"score": -0.284204}),
+        encoding="utf-8",
+    )
+    (run_dir / "summary.csv").write_text(
+        "trial_name,score\nretained,-0.284204\ndiagnostic_only,0.022448\n",
+        encoding="utf-8",
+    )
+
+    assert module.completed_run_best_score(run_dir) == pytest.approx(-0.284204)
+    score, path = module.previous_best_score(tmp_path)
+    assert score == pytest.approx(-0.284204)
+    assert path == run_dir / "best_metrics.json"
 
 
 def test_token_format_uses_short_units():
@@ -1217,18 +1261,41 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path):
         candidate_count=0,
         trade_count=0,
         blockers=["投委会无批准的可执行多头候选"],
+        rejections=[
+            {"code": "committee_hold", "ticker": "600519", "reason": "证据不足"},
+            {"code": "committee_hold", "ticker": "510300", "reason": "证据不足"},
+        ],
     )
     attempted = await sim.get_redeployment_state()
     assert attempted["status"] == "blocked_no_approved_candidates"
     assert attempted["attempt_count"] == 1
     assert attempted["last_candidate_count"] == 0
     assert "投委会" in attempted["blocker_reason"]
+    assert attempted["last_rejection_counts"] == {"committee_hold": 2}
+    assert attempted["rejection_counts_total"] == {"committee_hold": 2}
+    assert "committee_hold=2" in attempted["next_action"]
+
+    await sim.record_redeployment_attempt(
+        {"valuation_complete": True, "deployment_gap": 9_727.22},
+        candidate_count=0,
+        trade_count=0,
+        blockers=["ticker缺失"],
+        rejections=[{"code": "missing_ticker", "ticker": "", "reason": "ticker缺失"}],
+    )
+    attempted = await sim.get_redeployment_state()
+    assert attempted["attempt_count"] == 2
+    assert attempted["last_rejection_counts"] == {"missing_ticker": 1}
+    assert attempted["rejection_counts_total"] == {
+        "committee_hold": 2,
+        "missing_ticker": 1,
+    }
 
     restarted = InvestmentSimulation(db)
     await restarted.initialize()
     persisted = await restarted.get_redeployment_state()
     assert persisted["status"] == "blocked_no_approved_candidates"
-    assert persisted["attempt_count"] == 1
+    assert persisted["attempt_count"] == 2
+    assert persisted["rejection_counts_total"]["committee_hold"] == 2
     await db.close()
 
 

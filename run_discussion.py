@@ -16,7 +16,7 @@ import json
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Any, List, Dict, Optional
+from typing import Any, Callable, List, Dict, Optional
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -997,6 +997,83 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
     }
 
 
+def preflight_committee_decisions(
+    decisions: List[Dict],
+    current_tickers: set[str],
+    normalize_ticker: Callable[[str], str],
+) -> tuple[List[Dict], List[Dict[str, str]]]:
+    """Separate executable committee decisions from deterministic rejections.
+
+    This runs before quote lookup or simulated execution.  Previously non-trade
+    decisions disappeared from the deployment path, leaving repeated empty-book
+    rounds with only the unhelpful ``missing_approved_candidates`` label.
+    """
+    executable: List[Dict] = []
+    rejections: List[Dict[str, str]] = []
+    normalized_positions = {normalize_ticker(ticker) for ticker in current_tickers}
+
+    for index, decision in enumerate(decisions):
+        raw_ticker = str(decision.get("ticker") or "").strip()
+        ticker = normalize_ticker(raw_ticker) if raw_ticker else ""
+        direction = str(decision.get("direction") or "hold").strip().lower()
+        risk_flags = [str(item) for item in (decision.get("risk_flags") or []) if str(item).strip()]
+        suffix = f"；risk_flags={','.join(risk_flags[:3])}" if risk_flags else ""
+
+        if not ticker:
+            rejections.append({
+                "code": "missing_ticker",
+                "ticker": f"decision_{index + 1}",
+                "reason": "投委会裁决缺少可识别ticker" + suffix,
+            })
+            continue
+        if direction in {"hold", "neutral", "watch", "观望"}:
+            rejections.append({
+                "code": "committee_hold",
+                "ticker": ticker,
+                "reason": "投委会证据未形成多头/退出裁决" + suffix,
+            })
+            continue
+        if direction not in {"long", "short", "sell"}:
+            rejections.append({
+                "code": "unsupported_direction",
+                "ticker": ticker,
+                "reason": f"不支持的裁决方向={direction}" + suffix,
+            })
+            continue
+        if direction in {"short", "sell"} and ticker not in normalized_positions:
+            rejections.append({
+                "code": "short_without_position",
+                "ticker": ticker,
+                "reason": "模拟账户无该持仓且禁止裸做空",
+            })
+            continue
+        if direction == "long" and ticker in normalized_positions:
+            rejections.append({
+                "code": "already_held_long",
+                "ticker": ticker,
+                "reason": "已有持仓；新增提案不能替代独立生命周期复核",
+            })
+            continue
+        try:
+            target_position = float(decision.get("target_position") or 0.0)
+        except (TypeError, ValueError):
+            target_position = 0.0
+        if direction == "long" and target_position <= 0:
+            rejections.append({
+                "code": "zero_target_position",
+                "ticker": ticker,
+                "reason": "多头裁决目标仓位为0，不能进入模拟成交",
+            })
+            continue
+
+        normalized = dict(decision)
+        normalized["ticker"] = ticker
+        normalized["direction"] = "short" if direction == "sell" else direction
+        executable.append(normalized)
+
+    return executable, rejections
+
+
 # ============================================================================
 # 阶段3：投委会审议（多轮辩论）
 # ============================================================================
@@ -1493,11 +1570,29 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
     )
     trade_count = 0
     redeployment_blockers: List[str] = []
+    trade_candidates, redeployment_rejections = preflight_committee_decisions(
+        decisions,
+        current_tickers,
+        simulation._normalize_ticker,
+    )
 
-    trade_candidates = [
-        decision for decision in decisions
-        if decision.get("direction") in ("long", "short")
-    ]
+    def reject(code: str, reason: str, ticker: str = "") -> None:
+        item = {"code": code, "ticker": ticker, "reason": reason}
+        redeployment_rejections.append(item)
+        label = f"{ticker}: " if ticker else ""
+        redeployment_blockers.append(f"[{code}] {label}{reason}")
+
+    if redeployment_rejections:
+        counts: Dict[str, int] = {}
+        for item in redeployment_rejections:
+            code = item["code"]
+            counts[code] = counts.get(code, 0) + 1
+            label = f"{item.get('ticker')}: " if item.get("ticker") else ""
+            redeployment_blockers.append(f"[{code}] {label}{item.get('reason', '')}")
+        print(
+            "   🧪 投委会裁决预检否决: "
+            + ", ".join(f"{code}={count}" for code, count in sorted(counts.items()))
+        )
     deployable_new_longs = [
         decision for decision in trade_candidates
         if decision.get("direction") == "long"
@@ -1519,11 +1614,11 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 continue
             if prior_trade_count + trade_count >= max_daily_trades:
                 blocker = f"今日已达持久化最大交易次数 ({max_daily_trades}次)"
-                redeployment_blockers.append(blocker)
+                reject("daily_trade_limit", blocker)
                 print(f"   ⏹️ {blocker}，停止交易")
                 break
             if simulation.is_in_cooldown(ticker):
-                redeployment_blockers.append(f"{ticker}: 冷却期")
+                reject("cooldown", "同一标的仍在交易冷却期", ticker)
                 print(f"   ⏳ {ticker} 在冷却期内，跳过交易")
                 continue
 
@@ -1532,7 +1627,7 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             target_position = float(decision.get('target_position', 0.0))
             current_price, price_source = await simulation.resolve_trade_price(ticker)
             if current_price is None:
-                redeployment_blockers.append(f"{ticker}: 实时行情不可用")
+                reject("realtime_quote_unavailable", "实时行情不可用", ticker)
                 print(f"   ⏭️ {ticker}: 无法获取实时现价，跳过模拟交易")
                 continue
 
@@ -1572,8 +1667,10 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 missing_price_tickers,
             ) = await simulation._estimate_trade_assets(ticker, current_price)
             if missing_price_tickers and direction == "long":
-                redeployment_blockers.append(
-                    f"{ticker}: 组合实时估值不完整({','.join(missing_price_tickers)})"
+                reject(
+                    "valuation_incomplete",
+                    f"组合实时估值不完整({','.join(missing_price_tickers)})",
+                    ticker,
                 )
                 print(
                     f"   ⏭️ {ticker}: 组合实时估值不完整，拒绝新增/扩大模拟仓位；"
@@ -1603,6 +1700,14 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             if cap_reason:
                 trade_reason = f"{trade_reason}；{cap_reason}"
             trade_position = capped_position
+            if direction == "long" and trade_position <= current_position_pct:
+                reject(
+                    "heuristic_entry_veto",
+                    cap_reason or "heuristic风控未允许新增或扩大仓位",
+                    ticker,
+                )
+                print(f"   ⛔ {ticker}: heuristic入场否决；{cap_reason or '目标仓位未增加'}")
+                continue
 
             result = await simulation.execute_trade(
                 ticker=ticker,
@@ -1617,7 +1722,18 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             )
 
             if result.get('success') is False:
-                redeployment_blockers.append(f"{ticker}: {result.get('reason', '交易失败')}")
+                reason = result.get('reason', '交易失败')
+                if "交易时段" in reason or "非交易日" in reason:
+                    code = "market_closed"
+                elif "实时现价" in reason:
+                    code = "realtime_quote_unavailable"
+                elif "估值不完整" in reason:
+                    code = "valuation_incomplete"
+                elif "冷却期" in reason:
+                    code = "cooldown"
+                else:
+                    code = "execution_failed"
+                reject(code, reason, ticker)
                 print(f"   ⏭️ {ticker}: {result.get('reason', '交易失败')}")
             elif result.get('action') == 'buy':
                 print(f"   📈 买入 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
@@ -1626,7 +1742,11 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 print(f"   📉 卖出 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
                 trade_count += 1
             elif result.get('action') == 'hold' and result.get('reason'):
-                redeployment_blockers.append(f"{ticker}: {result.get('reason')}")
+                reason = result.get('reason')
+                code = "lot_size_or_cash" if any(
+                    marker in reason for marker in ("一手", "资金不足", "数量不足")
+                ) else "no_position_change"
+                reject(code, reason, ticker)
                 print(f"   ➖ 持有 {ticker}: {result['reason']}")
     elif current_positions:
         print(f"   💤 投委会无新交易裁决，保持当前持仓不动")
@@ -1640,7 +1760,8 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                     logger.debug("解析持仓日期失败 %s=%r: %s", ticker, simulation.last_trade_records[ticker], exc)
             print(f"      - {ticker}: {pos['shares']}股 @ 成本{pos['avg_cost']:.2f} (持有{days_held}天)")
     else:
-        redeployment_blockers.append("投委会无批准的可执行多头候选")
+        if not redeployment_rejections:
+            reject("no_committee_decisions", "投委会没有返回任何结构化裁决")
         print(f"   💤 投委会无新交易裁决且空仓，保持观望")
 
     final_assets = await simulation.calculate_assets()
@@ -1650,6 +1771,7 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             candidate_count=len(deployable_new_longs),
             trade_count=trade_count,
             blockers=redeployment_blockers,
+            rejections=redeployment_rejections,
         )
         if state and final_assets.get("deployment_gap"):
             print(

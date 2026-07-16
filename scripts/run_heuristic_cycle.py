@@ -971,17 +971,15 @@ def find_missed_opportunity(curve: pd.DataFrame, daily: pd.DataFrame) -> dict[st
 def previous_best_score(root: Path) -> tuple[float | None, Path | None]:
     best_score = None
     best_path = None
-    for summary in sorted(root.glob("*/summary.csv")):
-        try:
-            df = pd.read_csv(summary)
-        except Exception:
+    for run_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        if (run_dir / "INVALIDATED.json").exists():
             continue
-        if "score" not in df or df.empty:
+        score = completed_run_best_score(run_dir)
+        if score is None:
             continue
-        score = float(df["score"].max())
         if best_score is None or score > best_score:
             best_score = score
-            best_path = summary
+            best_path = run_dir / "best_metrics.json"
     return best_score, best_path
 
 
@@ -999,9 +997,17 @@ def latest_completed_run(root: Path) -> Path | None:
 
 
 def completed_run_best_score(run_dir: Path | None) -> float | None:
-    """Read the immediate prior run score separately from the all-time best."""
+    """Read the retained policy score, never a diagnostic-only leaderboard max."""
     if run_dir is None:
         return None
+    best_metrics = read_json(run_dir / "best_metrics.json")
+    try:
+        score = best_metrics.get("score")
+        if score is not None:
+            return float(score)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    # Compatibility for early runs that predate best_metrics.json.
     try:
         frame = pd.read_csv(run_dir / "summary.csv")
         return float(frame["score"].max()) if not frame.empty and "score" in frame else None
@@ -1530,11 +1536,21 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                     for exit_row in exit_rows
                 ]
         if "simulation_redeployment_state" in table_names:
+            state_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(simulation_redeployment_state)").fetchall()
+            }
+            rejection_columns = [
+                name for name in ("last_rejection_counts", "rejection_counts_total")
+                if name in state_columns
+            ]
+            rejection_select = ", " + ", ".join(rejection_columns) if rejection_columns else ""
             state_row = conn.execute(
-                """
+                f"""
                 SELECT status, deployment_gap, blocker_code, blocker_reason,
                        next_action, source, attempt_count, last_attempt_at,
                        last_candidate_count, last_trade_count, updated_at
+                       {rejection_select}
                 FROM simulation_redeployment_state WHERE id = 1
                 """
             ).fetchone()
@@ -1543,8 +1559,13 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                     "status", "deployment_gap", "blocker_code", "blocker_reason",
                     "next_action", "source", "attempt_count", "last_attempt_at",
                     "last_candidate_count", "last_trade_count", "updated_at",
-                ]
+                ] + rejection_columns
                 redeployment_state = dict(zip(state_keys, state_row))
+                for key in rejection_columns:
+                    try:
+                        redeployment_state[key] = json.loads(redeployment_state[key] or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        redeployment_state[key] = {}
 
     now = datetime.now()
     positions: list[dict[str, Any]] = []
@@ -2030,8 +2051,8 @@ def write_readme(
 ## Blocking & Repeated Warning Review
 - Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
-- Root cause advanced this cycle: forced-exit cash and its blockers were only printed or written to a run artifact; no durable database state survived process restarts, and a same-day trade timestamp could return before mandatory position review.
-- System fix: `simulation_redeployment_state` now persists the deployment gap, attempt count, candidate/fill count, exact operational blocker, and next action. `run_discussion` always runs lifecycle review first and enforces its daily fill cap from persisted trades.
+- Root cause advanced this cycle: empty-book committee rounds silently discarded hold, missing-ticker, unsupported-direction, and non-executable short decisions before redeployment accounting. After many rounds, users still saw only `missing_approved_candidates`, so the next repair action was unknowable.
+- System fix: `run_discussion` now performs deterministic committee-decision preflight before quote lookup/execution, assigns explicit rejection codes, and persists both last-round and cumulative code counts in `simulation_redeployment_state`; `check_db` exposes those counts. Historical attempts are not retroactively relabeled because their discarded decisions cannot be reconstructed.
 - Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
 - Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
 - Integration decision: full deployment is now a portfolio invariant, while unavailable/stale prices remain an explicit operational blocker rather than a reason to fabricate fills; risk is expressed through rotation, diversification, and per-position exits instead of strategic cash.
@@ -2149,10 +2170,12 @@ def write_readme(
 Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe split/cost-stress failure detected"}.
 
 ## User Entry Impact
-- This cycle closes the post-exit persistence gap: `run_discussion` records every redeployment attempt and `check_db` shows the durable queue, exact blocker, attempt count, and next executable action.
+- This cycle closes the opaque-redeployment gap: `run_discussion` records every deterministic committee rejection and `check_db` shows last-round plus cumulative rejection-code counts alongside the durable queue.
+- Decision preflight covers committee hold, missing ticker, unsupported direction, empty-book short, already-held long, zero target, cooldown, missing realtime quote, valuation-incomplete, heuristic veto, market closed, lot/cash, and generic execution failures without weakening any trading safety gate.
 - Same-day simulated fills no longer bypass the mandatory review of every existing position; the daily trade cap is counted from SQLite and survives restarts.
 - Per-position review result this run: reviewed {int(portfolio_lifecycle.get('reviewed_position_count', portfolio_lifecycle.get('position_count', 0)))} open positions; triggered exits={int(portfolio_lifecycle.get('triggered_exit_count', 0))}; blocked exits={int(portfolio_lifecycle.get('blocked_price_count', 0))}.
 - Capital lifecycle result this run: invested ratio={portfolio_invested_text}, deployment gap={portfolio_gap_text}; exit/released cash is {portfolio_lifecycle.get('redeployment_status', 'not_applicable')} and has not been classified as strategic cash.
+- Redeployment rejection diagnostics: last={json.dumps(redeployment_state.get('last_rejection_counts', {}), ensure_ascii=False, sort_keys=True)}; cumulative={json.dumps(redeployment_state.get('rejection_counts_total', {}), ensure_ascii=False, sort_keys=True)}. Empty counts mean no post-migration committee round has run; the existing historical attempt total is preserved but not fabricated into categories.
 - Lifecycle audit now treats an empty portfolio as completely valued (0% invested, full cash deployment gap) and records same-day realtime lifecycle exits plus pending redeployment instead of incorrectly reporting valuation N/A.
 - Improved `check_db`: users now see whether capital is actually deployed, why any cash is operationally blocked, and each position's age/quote-age/exit status.
 - Improved `run_discussion`: every open position is reviewed before new proposals; absence of a new committee ticker no longer silently freezes legacy holdings.
@@ -2209,7 +2232,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 
 ## Next 3 Directions
 - Exercise the durable queue with a fresh, realtime-priced, committee-approved candidate; verify partial/full completion and exact residual-cash classification after an actual simulated fill.
-- Add committee evidence-gate rejection codes before LLM execution so stale tape, missing quote, cooldown, and lot-size blockers aggregate cleanly by cause across rounds.
+- Use the new cumulative rejection counts from the next genuine committee round to fix the dominant cause (prompt evidence, ticker extraction, realtime quote, cooldown, heuristic veto, or lot size) instead of repeating a generic no-candidate warning.
 - Backfill independently validated `daily_prices` starting with the latest unlock ticker and collect a meaningful tape update (>=20 new rows, >=5 latest-day rows) before reconsidering allocator promotion.
 """
     path.write_text(text, encoding="utf-8")

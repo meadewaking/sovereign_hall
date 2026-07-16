@@ -42,7 +42,7 @@ class Config:
                 'provider': 'openai',
                 'model': 'GLM-5.2-FP8',
                 'api_key_env': 'OPENAI_API_KEY',
-                'base_url': 'http://172.18.5.19:8000/v1',
+                'base_url': 'https://llm-gateway.omega129.cn/v1',
                 'model_uuid': '',
                 'max_concurrent': 16,
                 'temperature': 0.7,

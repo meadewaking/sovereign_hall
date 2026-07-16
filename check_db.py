@@ -8,6 +8,7 @@
 import sys
 import os
 import csv
+import json
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -805,11 +806,20 @@ def show_investment_status(db_path):
 
     redeployment_state = None
     try:
+        state_columns = {
+            row[1] for row in c.execute("PRAGMA table_info(simulation_redeployment_state)")
+        }
+        rejection_columns = [
+            name for name in ("last_rejection_counts", "rejection_counts_total")
+            if name in state_columns
+        ]
+        rejection_select = ", " + ", ".join(rejection_columns) if rejection_columns else ""
         c.execute(
-            """
+            f"""
             SELECT status, deployment_gap, blocker_code, blocker_reason,
                    next_action, source, attempt_count, last_attempt_at,
                    last_candidate_count, last_trade_count, updated_at
+                   {rejection_select}
             FROM simulation_redeployment_state WHERE id = 1
             """
         )
@@ -925,6 +935,22 @@ def show_investment_status(db_path):
                 f"   操作性阻塞: {redeployment_state.get('blocker_code')}；"
                 f"{redeployment_state.get('blocker_reason') or ''}"
             )
+        for label, key in (
+            ("本轮裁决否决", "last_rejection_counts"),
+            ("累计裁决否决", "rejection_counts_total"),
+        ):
+            raw_counts = redeployment_state.get(key)
+            if not raw_counts:
+                continue
+            try:
+                counts = json.loads(raw_counts) if isinstance(raw_counts, str) else raw_counts
+            except (TypeError, ValueError, json.JSONDecodeError):
+                counts = {}
+            if counts:
+                summary = ", ".join(
+                    f"{code}={int(count)}" for code, count in sorted(counts.items())
+                )
+                print(f"   {label}: {summary}")
         print(f"   下一动作: {redeployment_state.get('next_action') or '下一轮继续评估'}")
         print(f"   状态来源: {redeployment_state.get('source') or 'unknown'}")
     elif total_value is not None and cash > 0:
