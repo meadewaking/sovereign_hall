@@ -129,7 +129,7 @@ class SpiderSwarm:
         self.default_sources = spider_config.get('search_sources') or ['ddg', 'bing', 'sogou']
         if isinstance(self.default_sources, str):
             self.default_sources = [s.strip() for s in self.default_sources.split(',') if s.strip()]
-        default_source_timeout = max(5, min(10, self.timeout // 3 or 5))
+        default_source_timeout = max(10, min(20, self.timeout // 2 or 15))
         self.source_timeout = int(spider_config.get('source_timeout', default_source_timeout))
 
         # 搜索结果缓存（类级别共享，同一轮次内有效）
@@ -170,7 +170,8 @@ class SpiderSwarm:
             timeout=self.timeout,
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=100),
             follow_redirects=True,
-            proxy=proxy
+            proxy=proxy,
+            trust_env=False,
         )
 
     async def close(self):
@@ -392,8 +393,10 @@ class SpiderSwarm:
                 return []
 
         # 1. 尝试 DuckDuckGO 搜索（带代理）
+        # 使用 deep_fetch=False 避免深度抓取URL导致超时
+        # DDG snippet 通常足够用于研究分析
         if 'ddg' in sources:
-            ddg_results = await _run_source("DDG", self._ddg_search(query, max_results))
+            ddg_results = await _run_source("DDG", self._ddg_search(query, max_results, deep_fetch=False))
             if ddg_results:
                 docs.extend(ddg_results)
                 logger.info(f"DDG search for '{query}': found {len(ddg_results)} results")
@@ -462,70 +465,74 @@ class SpiderSwarm:
     async def _bing_search(self, query: str, max_results: int) -> List[Doc]:
         """Bing搜索"""
         import httpx
+        import urllib.parse
 
-        url = f"https://www.bing.com/search?q={query}"
+        url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         }
 
-        try:
-            # 复用类实例的HTTP客户端
-            resp = await self.client.get(url, headers=headers)
-            resp.raise_for_status()
+        for attempt in range(2):
+            try:
+                resp = await self.client.get(url, headers=headers)
+                resp.raise_for_status()
 
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            results = soup.find_all('li', class_='b_algo')
+                # 检测 CAPTCHA / 反爬页面
+                text_lower = resp.text[:3000].lower()
+                if 'captcha' in text_lower or 'class="captcha"' in resp.text:
+                    logger.debug(f"Bing CAPTCHA triggered for '{query}', skipping silently")
+                    return []
 
-            docs = []
-            for result in results[:max_results]:
-                try:
-                    title_elem = result.find('h2')
-                    if title_elem:
-                        title_link = title_elem.find('a')
-                        if title_link:
-                            title = title_link.get_text(strip=True)
-                            link_url = title_link.get('href', '')
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                results = soup.find_all('li', class_='b_algo')
 
-                            desc_elem = result.find('div', class_='b_caption')
-                            snippet = ""
-                            if desc_elem:
-                                p_elem = desc_elem.find('p')
-                                if p_elem:
-                                    snippet = p_elem.get_text(strip=True)
+                docs = []
+                for result in results[:max_results]:
+                    try:
+                        title_elem = result.find('h2')
+                        if title_elem:
+                            title_link = title_elem.find('a')
+                            if title_link:
+                                title = title_link.get_text(strip=True)
+                                link_url = title_link.get('href', '')
 
-                            if link_url and link_url.startswith('http'):
-                                doc = Doc(
-                                    id=generate_id('doc'),
-                                    title=title,
-                                    content=snippet,
-                                    url=link_url,
-                                    source='bing',
-                                    publish_time=datetime.now(),
-                                    sector=self._infer_sector(query),
-                                    keywords=[query],
-                                )
-                                docs.append(doc)
-                except Exception as e:
-                    logger.debug(f"Failed to parse Bing result: {e}")
+                                desc_elem = result.find('div', class_='b_caption')
+                                snippet = ""
+                                if desc_elem:
+                                    p_elem = desc_elem.find('p')
+                                    if p_elem:
+                                        snippet = p_elem.get_text(strip=True)
+
+                                if link_url and link_url.startswith('http'):
+                                    doc = Doc(
+                                        id=generate_id('doc'),
+                                        title=title,
+                                        content=snippet,
+                                        url=link_url,
+                                        source='bing',
+                                        publish_time=datetime.now(),
+                                        sector=self._infer_sector(query),
+                                        keywords=[query],
+                                    )
+                                    docs.append(doc)
+                    except Exception as e:
+                        logger.debug(f"Failed to parse Bing result: {e}")
+                        continue
+
+                return docs
+
+            except httpx.ConnectError as e:
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
                     continue
-
-            return docs
-
-        except httpx.ConnectError as e:
-            logger.warning(f"Bing connection failed (DNS/network): {e}")
-            return []
-        except httpx.TimeoutException:
-            logger.warning(f"Bing search timeout for: {query}")
-            return []
-        except OSError as e:
-            # DNS errors, socket errors, etc.
-            logger.warning(f"Bing network error: {e}")
-            return []
-        except Exception as e:
-            logger.warning(f"Bing search failed: {e}")
-            return []
+                logger.warning(f"Bing connection failed (DNS/network): {e}")
+                return []
+            except httpx.TimeoutException:
+                logger.warning(f"Bing search timeout for: {query}")
+                return []
+        return []
 
     async def _baidu_search(self, query: str, max_results: int) -> List[Doc]:
         """百度搜索"""
@@ -648,9 +655,10 @@ class SpiderSwarm:
         """搜狗搜索（备用搜索引擎）"""
         try:
             import httpx
+            import urllib.parse
 
             # 搜狗搜索
-            url = f"https://www.sogou.com/web?query={query}"
+            url = f"https://www.sogou.com/web?query={urllib.parse.quote(query)}"
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -660,6 +668,13 @@ class SpiderSwarm:
 
             resp = await self.client.get(url, headers=headers, follow_redirects=True)
             resp.encoding = 'utf-8'
+
+            # 检测反爬重定向：Sogou 会把请求重定向到 /antispider/ 页面
+            final_url = str(resp.url) if hasattr(resp, 'url') else ''
+            if 'antispider' in final_url or 'antispider' in resp.text[:2000].lower():
+                logger.debug(f"Sogou anti-spider triggered for '{query}', skipping silently")
+                return []
+
             resp.raise_for_status()
 
             soup = BeautifulSoup(resp.text, 'html.parser')

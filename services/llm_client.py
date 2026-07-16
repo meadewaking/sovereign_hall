@@ -347,6 +347,13 @@ class LLMClient:
             'service unavailable',
             'bad gateway',
             'gateway timeout',
+            'disconnect',
+            'remote protocol',
+            'remoteerror',
+            'server disconnected',
+            'incomplete read',
+            'chunked encoding',
+            'peer closed',
         ]
 
         return any(pattern in error_str for pattern in retryable_patterns)
@@ -370,7 +377,10 @@ class LLMClient:
             if body:
                 details.append(f"body={body[:500]}")
 
-        request = getattr(error, "request", None)
+        try:
+            request = getattr(error, "request", None)
+        except Exception:
+            request = None
         if request is not None:
             method = getattr(request, "method", "")
             url = getattr(request, "url", "")

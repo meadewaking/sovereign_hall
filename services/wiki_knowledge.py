@@ -36,6 +36,9 @@ RRF_K = 60.0
 TITLE_WEIGHT = 5.0
 BODY_WEIGHT = 1.0
 MAX_SEARCH_PAGES = 10000
+# 向量检索预筛页面数：先用关键词排序取 top N，再做 embedding
+# 71700 全量 embedding 会超时，预筛后只需 embedding N 个页面
+VECTOR_PREFILTER_TOP_N = 200
 MIN_WIKI_SOURCE_CHARS = 80
 NOISY_SOURCE_TITLE_RE = re.compile(
     r"(?:^|\b)(403|404|operations too frequent|google search|microsoft bing|search -|"
@@ -818,9 +821,25 @@ class WikiSearchIndex:
             return []
 
         keyword_hits = self._keyword_search(query, pages)
+        # 预筛：取关键词得分最高的 VECTOR_PREFILTER_TOP_N 页面做向量检索
+        # 避免 71700+ 页面全量 embedding 导致超时
+        prefilter_sorted = sorted(keyword_hits, key=lambda item: item[1], reverse=True)
+        prefilter_pages = [
+            page for page in pages
+            if any(page.rel_path == hit[0] for hit in prefilter_sorted[:VECTOR_PREFILTER_TOP_N])
+        ]
+        # 如果关键词命中不足，从全部页面里随机补足，保证向量检索有候选
+        if len(prefilter_pages) < VECTOR_PREFILTER_TOP_N:
+            existing = {p.rel_path for p in prefilter_pages}
+            for page in pages:
+                if page.rel_path not in existing:
+                    prefilter_pages.append(page)
+                    if len(prefilter_pages) >= VECTOR_PREFILTER_TOP_N:
+                        break
+
         vector_hits: List[Tuple[str, float]] = []
         if self.embedding_enabled and self.llm_client:
-            vector_hits = await self._vector_search(query, pages)
+            vector_hits = await self._vector_search(query, prefilter_pages)
 
         hits = self._merge_hits(query, pages, keyword_hits, vector_hits)
         hits = [hit for hit in hits if hit.score >= min_similarity]
