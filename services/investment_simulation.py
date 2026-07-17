@@ -448,6 +448,69 @@ class InvestmentSimulation:
         except Exception:
             return 0
 
+    async def record_pending_decision(
+        self,
+        *,
+        ticker: str,
+        direction: str,
+        target_position: float,
+        reason: str,
+        defer_code: str,
+        confidence: float | None = None,
+        source: str = "investment_simulation",
+    ) -> int | None:
+        """Persist an unfilled ruling without trusting or storing a proposed price.
+
+        Pending decisions are evidence for the next trading session, not orders.
+        Any later executor must pass the normal market-hours, realtime-quote,
+        valuation, risk-cap, and daily-frequency gates again.
+        """
+        if not self.db_service:
+            return None
+        conn = self.db_service._connection
+        if conn is None:
+            return None
+        now = datetime.now().isoformat()
+        try:
+            cursor = await conn.execute(
+                """
+                INSERT INTO simulation_pending_decisions (
+                    ticker, direction, target_position, confidence, reason,
+                    defer_code, source, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_next_trading_session', ?, ?)
+                """,
+                (
+                    self._normalize_ticker(ticker),
+                    str(direction or "hold").lower(),
+                    max(0.0, min(float(target_position or 0.0), 1.0)),
+                    confidence,
+                    str(reason or "")[:2000],
+                    str(defer_code or "execution_deferred"),
+                    str(source or "investment_simulation"),
+                    now,
+                    now,
+                ),
+            )
+            await conn.commit()
+            return int(cursor.lastrowid)
+        except Exception as exc:
+            logger.warning("Failed to persist pending simulated decision for %s: %s", ticker, exc)
+            return None
+
+    async def pending_decision_count(self) -> int:
+        """Return unresolved deferred rulings for entry-point diagnostics."""
+        if not self.db_service or self.db_service._connection is None:
+            return 0
+        try:
+            async with self.db_service._connection.execute(
+                "SELECT COUNT(*) FROM simulation_pending_decisions "
+                "WHERE status = 'pending_next_trading_session'"
+            ) as cursor:
+                row = await cursor.fetchone()
+            return int(row[0] if row else 0)
+        except Exception:
+            return 0
+
     async def get_current_price(self, ticker: str) -> Optional[float]:
         """获取实时行情价格；不使用AI预测或历史价格替代。"""
         from .market_data import get_market_data
@@ -541,33 +604,60 @@ class InvestmentSimulation:
         direction_norm = (direction or "").lower()
 
         if not await market_data.is_trading_day():
+            pending_id = await self.record_pending_decision(
+                ticker=ticker,
+                direction=direction_norm,
+                target_position=target_position,
+                confidence=confidence,
+                reason=reason or "非交易日裁决",
+                defer_code="non_trading_day",
+            )
             return {
                 'success': False,
-                'action': 'hold',
+                'action': 'pending',
                 'ticker': ticker,
-                'reason': '当前非交易日，暂停模拟交易'
+                'pending_decision_id': pending_id,
+                'reason': '当前非交易日，裁决已延至下一交易时段；届时必须重新取得实时行情'
             }
         if (
             self.trade_during_market_hours_only
             and hasattr(market_data, "is_market_open")
             and not await market_data.is_market_open()
         ):
+            pending_id = await self.record_pending_decision(
+                ticker=ticker,
+                direction=direction_norm,
+                target_position=target_position,
+                confidence=confidence,
+                reason=reason or "闭市裁决",
+                defer_code="market_closed",
+            )
             return {
                 'success': False,
-                'action': 'hold',
+                'action': 'pending',
                 'ticker': ticker,
-                'reason': '当前不在A股交易时段，实时行情仅用于查看；暂停模拟成交'
+                'pending_decision_id': pending_id,
+                'reason': '当前不在A股交易时段，仅记录待执行裁决；下一交易时段重新取得实时行情后再判断'
             }
 
         trades_today = await self.count_trades_on_date()
         if trades_today >= self.max_daily_trades:
+            pending_id = await self.record_pending_decision(
+                ticker=ticker,
+                direction=direction_norm,
+                target_position=target_position,
+                confidence=confidence,
+                reason=reason or "超过每日成交硬门",
+                defer_code="daily_trade_limit",
+            )
             return {
                 'success': False,
-                'action': 'hold',
+                'action': 'pending',
                 'ticker': ticker,
+                'pending_decision_id': pending_id,
                 'reason': (
                     f'今日模拟成交已达硬上限 {self.max_daily_trades} 笔；'
-                    '保留裁决到下一交易日，不允许任何调用方绕过'
+                    '裁决已持久化到下一交易时段，不允许任何调用方绕过'
                 ),
             }
 
@@ -1236,6 +1326,28 @@ class InvestmentSimulation:
                 completed_at TEXT
             )
         """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS simulation_pending_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                target_position REAL NOT NULL,
+                confidence REAL,
+                reason TEXT,
+                defer_code TEXT NOT NULL,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                resolved_at TEXT,
+                resolution TEXT
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_simulation_pending_status "
+            "ON simulation_pending_decisions(status, created_at)"
+        )
 
         async with conn.execute("PRAGMA table_info(simulation_redeployment_state)") as cursor:
             redeployment_columns = {row[1] for row in await cursor.fetchall()}

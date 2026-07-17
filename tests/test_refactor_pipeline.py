@@ -2680,7 +2680,80 @@ async def test_simulation_daily_trade_limit_cannot_be_bypassed_by_direct_call(mo
     )
 
     assert result["success"] is False
+    assert result["action"] == "pending"
     assert "硬上限 5 笔" in result["reason"]
+    sim.resolve_trade_price.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_daily_limit_persists_price_free_pending_decision(tmp_path, monkeypatch):
+    db = DatabaseService(str(tmp_path / "pending.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    sim.max_daily_trades = MAX_DAILY_TRADES
+    sim.count_trades_on_date = AsyncMock(return_value=MAX_DAILY_TRADES)
+    sim.resolve_trade_price = AsyncMock(return_value=(10.0, "should_not_be_used"))
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {"is_trading_day": AsyncMock(return_value=True), "is_market_open": AsyncMock(return_value=True)},
+    )()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+
+    result = await sim.execute_trade(
+        ticker="600519",
+        direction="long",
+        target_position=0.1,
+        current_price=999.0,
+        reason="committee ruling",
+        confidence=0.7,
+    )
+
+    row = await (await db._connection.execute(
+        "SELECT ticker, direction, target_position, defer_code, status FROM simulation_pending_decisions"
+    )).fetchone()
+    columns = {item[1] for item in await (await db._connection.execute(
+        "PRAGMA table_info(simulation_pending_decisions)"
+    )).fetchall()}
+    await db.close()
+
+    assert result["action"] == "pending"
+    assert tuple(row) == ("600519", "long", 0.1, "daily_trade_limit", "pending_next_trading_session")
+    assert "price" not in columns
+    sim.resolve_trade_price.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_market_closed_persists_exit_without_filling(tmp_path, monkeypatch):
+    db = DatabaseService(str(tmp_path / "closed.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    sim.positions = {"600519": {"shares": 100, "avg_cost": 10.0}}
+    sim.resolve_trade_price = AsyncMock(return_value=(12.0, "should_not_be_used"))
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {"is_trading_day": AsyncMock(return_value=True), "is_market_open": AsyncMock(return_value=False)},
+    )()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+
+    result = await sim.execute_trade(
+        ticker="600519",
+        direction="sell",
+        target_position=0.0,
+        current_price=999.0,
+        reason="stop loss",
+    )
+    pending = await sim.pending_decision_count()
+    trade_count = (await (await db._connection.execute("SELECT COUNT(*) FROM simulation_trades")).fetchone())[0]
+    await db.close()
+
+    assert result["action"] == "pending"
+    assert pending == 1
+    assert trade_count == 0
+    assert sim.positions["600519"]["shares"] == 100
     sim.resolve_trade_price.assert_not_awaited()
 
 

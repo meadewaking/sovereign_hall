@@ -1610,14 +1610,28 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
         )
 
     if trade_candidates:
-        for decision in trade_candidates[:5]:
+        bounded_candidates = trade_candidates[:5]
+        for decision_index, decision in enumerate(bounded_candidates):
             ticker = simulation._normalize_ticker(decision.get('ticker'))
             if not ticker:
                 continue
             if prior_trade_count + trade_count >= max_daily_trades:
                 blocker = f"今日已达持久化最大交易次数 ({max_daily_trades}次)"
                 reject("daily_trade_limit", blocker)
-                print(f"   ⏹️ {blocker}，停止交易")
+                for deferred in bounded_candidates[decision_index:]:
+                    deferred_ticker = simulation._normalize_ticker(deferred.get("ticker"))
+                    if not deferred_ticker:
+                        continue
+                    await simulation.record_pending_decision(
+                        ticker=deferred_ticker,
+                        direction=deferred.get("direction", "hold"),
+                        target_position=float(deferred.get("target_position", 0.0)),
+                        confidence=float(deferred.get("confidence", 0.5)),
+                        reason="投委会裁决超过当日5笔共享硬门",
+                        defer_code="daily_trade_limit",
+                        source="run_discussion_preflight",
+                    )
+                print(f"   ⏹️ {blocker}，剩余裁决已记录到下一交易时段")
                 break
             if simulation.is_in_cooldown(ticker):
                 reject("cooldown", "同一标的仍在交易冷却期", ticker)

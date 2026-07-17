@@ -1673,6 +1673,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ## User Entry Impact
 - Improved reward alignment: `{REWARD_VERSION}` makes net total account return after modeled transaction costs the primary positive term and penalizes the magnitude and duration of excess cash.
 - Improved transaction-frequency control: offline rebalancing, `run_discussion`, and direct `InvestmentSimulation.execute_trade` share a hard maximum of {MAX_DAILY_TRADES} simulated transaction actions per day, with exits/reductions before increases.
+- Closed the deferred-ruling gap: daily-limit and market-hours rejections persist price-free pending decisions for the next trading session, while `check_db` exposes the queue; every future attempt must fetch a new realtime quote and re-run all safety gates.
 - Improved status/prompt alignment: `check_db` prints the active reward formula and today's transaction count, while research and committee prompts receive the same reward objective and daily limit.
 - Improved entry: `python -m sovereign_hall.check_db` now reads this run and can show that the evaluator used `stdlib_fallback` due local scientific-stack import failure.
 - User-visible change: latest heuristic status/research prompts include evaluation-engine reliability, weak price coverage, tape freshness, sleeve diagnostics, and current simulated-buy caps.

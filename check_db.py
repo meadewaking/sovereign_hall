@@ -846,6 +846,28 @@ def show_investment_status(db_path):
     except sqlite3.Error:
         redeployment_state = None
 
+    pending_decisions = []
+    pending_decision_total = 0
+    try:
+        c.execute(
+            "SELECT COUNT(*) FROM simulation_pending_decisions "
+            "WHERE status = 'pending_next_trading_session'"
+        )
+        pending_decision_total = int(c.fetchone()[0])
+        c.execute(
+            """
+            SELECT ticker, direction, target_position, defer_code, created_at
+            FROM simulation_pending_decisions
+            WHERE status = 'pending_next_trading_session'
+            ORDER BY datetime(created_at), id
+            LIMIT 10
+            """
+        )
+        pending_decisions = c.fetchall()
+    except sqlite3.Error:
+        pending_decisions = []
+        pending_decision_total = 0
+
     tickers = [pos[0] for pos in positions]
     conn.close()
 
@@ -925,6 +947,12 @@ def show_investment_status(db_path):
         print(f"   📉 盈亏: {profit:.2f} 元 ({profit_pct:+.2f}%)")
     print(f"   现金: {cash:.2f} 元")
     print(f"   今日模拟成交: {trades_today}/{max_daily_trades} 笔（每日硬上限）")
+    print(f"   待执行裁决: {pending_decision_total} 条（成交前必须重新取实时行情并重过全部风控）")
+    for pending in pending_decisions[:5]:
+        print(
+            f"      - {pending['ticker']} {pending['direction']} -> "
+            f"{float(pending['target_position']):.1%} | {pending['defer_code']} | {pending['created_at']}"
+        )
     print(f"   Reward: {REWARD_FORMULA}")
     if total_value is None:
         print("   资金部署: N/A / 目标100.0%（实时估值不完整，禁止据此调仓）")
