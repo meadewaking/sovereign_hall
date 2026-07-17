@@ -22,6 +22,12 @@ from sovereign_hall.services.portfolio_policy import (
     deployment_status,
     review_position,
 )
+from sovereign_hall.services.reward_policy import (
+    MAX_DAILY_TRADES,
+    capital_reward_breakdown,
+    idle_cash_exposure_penalty,
+    limit_rebalance_actions,
+)
 from sovereign_hall.services.heuristic_policy import (
     HeuristicRiskContext,
     apply_heuristic_risk_cap,
@@ -87,6 +93,73 @@ def test_run_discussion_help_does_not_need_instance_lock():
     assert cli_args_can_run_without_instance_lock(["--once"]) is False
 
 
+def test_capital_reward_prioritizes_net_return_and_penalizes_long_idle_cash():
+    invested = {
+        "total_return": 0.08,
+        "max_drawdown": -0.05,
+        "cost_paid": 0.01,
+        "idle_cash_penalty": idle_cash_exposure_penalty([0.03] * 20),
+    }
+    lower_return = {**invested, "total_return": 0.05}
+    idle = {
+        **invested,
+        "idle_cash_penalty": idle_cash_exposure_penalty([0.80] * 20),
+    }
+
+    assert capital_reward_breakdown(invested)["score"] > capital_reward_breakdown(lower_return)["score"]
+    assert capital_reward_breakdown(invested)["score"] > capital_reward_breakdown(idle)["score"]
+    assert idle_cash_exposure_penalty([0.80] * 20) > idle_cash_exposure_penalty([0.80, 0.03] * 10)
+
+
+def test_rebalance_daily_limit_prioritizes_exits_before_buys():
+    current = {f"old{i}": 0.10 for i in range(6)}
+    target = {f"new{i}": 0.10 for i in range(6)}
+
+    limited, deferred = limit_rebalance_actions(current, target, MAX_DAILY_TRADES)
+
+    assert len(set(current) - set(limited)) == MAX_DAILY_TRADES
+    assert not (set(limited) & set(target))
+    assert deferred == 7
+
+
+def test_backtest_never_exceeds_five_transactions_per_day():
+    module = load_script_module(
+        "run_heuristic_cycle_daily_limit_module",
+        "scripts/run_heuristic_cycle.py",
+    )
+    rows = []
+    for day_index, day in enumerate(("2026-01-01", "2026-01-02", "2026-01-03")):
+        for ticker_index in range(10):
+            rows.append({
+                "date": day,
+                "ticker": f"{ticker_index:06d}",
+                "price": 10.0 + day_index * 0.1,
+                "confidence": 0.9,
+                "risk_reward": 2.0,
+                "close_observations": 3,
+                "stop_gap": 0.05,
+                "return_1d": 0.01,
+                "signal_strength": 1.0 - ticker_index * 0.01,
+                "price_source": "daily_prices",
+            })
+    result = module.run_backtest(
+        module.pd.DataFrame(rows),
+        module.PolicyConfig(
+            name="daily_limit",
+            max_names=10,
+            max_position=0.10,
+            max_gross=1.0,
+            min_confidence=0.65,
+            min_risk_reward=0.8,
+        ),
+        module.CostConfig(),
+    )
+
+    assert int(result["curve"]["trade_count"].max()) <= MAX_DAILY_TRADES
+    assert result["metrics"]["max_daily_trade_count"] <= MAX_DAILY_TRADES
+    assert result["metrics"]["trade_count"] == int(result["curve"]["trade_count"].sum())
+
+
 def test_committee_preflight_records_every_non_executable_decision():
     executable, rejected = preflight_committee_decisions(
         [
@@ -116,7 +189,7 @@ def test_cycle_comparison_uses_retained_best_not_diagnostic_max(tmp_path):
     run_dir = tmp_path / "20260715_000000"
     run_dir.mkdir()
     (run_dir / "best_metrics.json").write_text(
-        json.dumps({"score": -0.284204}),
+        json.dumps({"score": -0.284204, "reward_version": "capital_return_v2"}),
         encoding="utf-8",
     )
     (run_dir / "summary.csv").write_text(
@@ -2581,6 +2654,34 @@ async def test_simulation_applies_heuristic_position_cap(monkeypatch):
     assert result["action"] == "buy"
     assert result["price"] == pytest.approx(9.0)
     assert sim.positions["600519"]["shares"] == 100
+
+
+@pytest.mark.asyncio
+async def test_simulation_daily_trade_limit_cannot_be_bypassed_by_direct_call(monkeypatch):
+    sim = InvestmentSimulation()
+    sim.max_daily_trades = MAX_DAILY_TRADES
+    sim.count_trades_on_date = AsyncMock(return_value=MAX_DAILY_TRADES)
+    sim.resolve_trade_price = AsyncMock(return_value=(10.0, "test_realtime_quote"))
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {
+            "is_trading_day": AsyncMock(return_value=True),
+            "is_market_open": AsyncMock(return_value=True),
+        },
+    )()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+
+    result = await sim.execute_trade(
+        ticker="600519",
+        direction="long",
+        target_position=0.10,
+        current_price=999.0,
+    )
+
+    assert result["success"] is False
+    assert "硬上限 5 笔" in result["reason"]
+    sim.resolve_trade_price.assert_not_awaited()
 
 
 @pytest.mark.asyncio

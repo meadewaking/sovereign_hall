@@ -20,6 +20,23 @@ from pathlib import Path
 from statistics import mean, median, pstdev
 from typing import Any
 
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from sovereign_hall.services.reward_policy import (
+    MAX_DAILY_TRADES,
+    REWARD_FORMULA,
+    REWARD_VERSION,
+    capital_reward_breakdown,
+    idle_cash_exposure_penalty,
+    limit_rebalance_actions,
+    longest_high_cash_streak,
+    score_capital_reward,
+)
+
 
 @dataclass(frozen=True)
 class PolicyConfig:
@@ -474,14 +491,7 @@ def cost_for_rebalance(old: dict[str, float], new: dict[str, float], costs: Cost
 
 
 def score_metrics(metrics: dict[str, Any]) -> float:
-    turnover_penalty = max(0.0, safe_float(metrics.get("turnover")) - 1.0)
-    cost_penalty = safe_float(metrics.get("cost_paid"))
-    return (
-        safe_float(metrics.get("annualized_return"))
-        - 0.5 * abs(safe_float(metrics.get("max_drawdown")))
-        - 0.1 * turnover_penalty
-        - cost_penalty
-    )
+    return score_capital_reward(metrics)
 
 
 def max_drawdown_from_curve(curve: list[dict[str, Any]]) -> tuple[float, str, str]:
@@ -530,8 +540,19 @@ def summarize_metrics(
             "cost_paid": 0.0,
             "average_invested_ratio": 0.0,
             "average_cash_ratio": 1.0,
+            "idle_cash_penalty": idle_cash_exposure_penalty([]),
+            "max_high_cash_streak_days": 0,
+            "closed_trade_count": 0,
+            "max_daily_trade_count": 0,
+            "days_at_trade_limit": 0,
+            "deferred_trade_actions": 0,
+            "daily_trade_limit": MAX_DAILY_TRADES,
+            "gross_total_return_before_cost": 0.0,
             "cost_assumption": cost_assumption,
+            "reward_formula": REWARD_FORMULA,
+            "reward_version": REWARD_VERSION,
         }
+        metrics["score_breakdown"] = capital_reward_breakdown(metrics)
         metrics["score"] = score_metrics(metrics)
         return metrics
     returns = [row["net_return"] for row in curve]
@@ -547,6 +568,15 @@ def summarize_metrics(
     closed = [trade for trade in trades if trade.get("exit_date")]
     wins = [trade for trade in closed if safe_float(trade.get("pnl_pct")) > 0]
     win_rate = len(wins) / len(closed) if closed else sum(1 for r in returns if r > 0) / len(returns)
+    cash_ratios = [
+        1.0 - min(max(float(row["gross_exposure"]), 0.0), 1.0)
+        for row in curve
+    ]
+    transaction_count = sum(int(row.get("trade_count", 0)) for row in curve)
+    max_daily_trade_count = max((int(row.get("trade_count", 0)) for row in curve), default=0)
+    gross_equity = 1.0
+    for row in curve:
+        gross_equity *= 1.0 + float(row.get("gross_return", 0.0))
     metrics = {
         "sample_start": sample_start,
         "sample_end": sample_end,
@@ -558,12 +588,23 @@ def summarize_metrics(
         "sortino": float(sortino),
         "win_rate": float(win_rate),
         "turnover": float(total_turnover),
-        "trade_count": int(len(closed)),
+        "trade_count": int(transaction_count),
+        "closed_trade_count": int(len(closed)),
         "cost_paid": float(total_cost),
         "average_invested_ratio": float(mean([row["gross_exposure"] for row in curve])),
         "average_cash_ratio": 1.0 - float(mean([row["gross_exposure"] for row in curve])),
+        "idle_cash_penalty": idle_cash_exposure_penalty(cash_ratios),
+        "max_high_cash_streak_days": longest_high_cash_streak(cash_ratios),
+        "max_daily_trade_count": max_daily_trade_count,
+        "days_at_trade_limit": sum(1 for row in curve if int(row.get("trade_count", 0)) >= MAX_DAILY_TRADES),
+        "deferred_trade_actions": sum(int(row.get("deferred_trade_actions", 0)) for row in curve),
+        "daily_trade_limit": MAX_DAILY_TRADES,
+        "gross_total_return_before_cost": gross_equity - 1.0,
         "cost_assumption": cost_assumption,
+        "reward_formula": REWARD_FORMULA,
+        "reward_version": REWARD_VERSION,
     }
+    metrics["score_breakdown"] = capital_reward_breakdown(metrics)
     metrics["score"] = score_metrics(metrics)
     return metrics
 
@@ -610,6 +651,13 @@ def run_backtest(daily: list[dict[str, Any]], policy: PolicyConfig, costs: CostC
             consecutive_loss_days,
             active_memory,
         )
+        targets, deferred_changes = limit_rebalance_actions(
+            positions,
+            targets,
+            MAX_DAILY_TRADES,
+        )
+        if deferred_changes:
+            reasons.append(f"daily_trade_limit_deferred={deferred_changes}")
         turnover, rebalance_cost, trade_count = cost_for_rebalance(positions, targets, costs)
         prev_prices = prices_by_date[signal_date]
         today_prices = prices_by_date[date]
@@ -669,6 +717,7 @@ def run_backtest(daily: list[dict[str, Any]], policy: PolicyConfig, costs: CostC
                 "turnover": turnover,
                 "cost": rebalance_cost,
                 "trade_count": trade_count,
+                "deferred_trade_actions": deferred_changes,
                 "gross_exposure": sum(targets.values()),
                 "positions": json.dumps(targets, sort_keys=True),
                 "notes": ";".join(reasons + ([f"missing_prices={len(missing_prices)}"] if missing_prices else [])),
@@ -716,19 +765,14 @@ def read_json(path: Path) -> dict[str, Any]:
 def previous_best_score(root: Path) -> tuple[float | None, Path | None]:
     best: float | None = None
     best_path: Path | None = None
-    for summary in sorted(root.glob("*/summary.csv")):
-        try:
-            with summary.open("r", encoding="utf-8", newline="") as handle:
-                rows = list(csv.DictReader(handle))
-        except Exception:
+    for run_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        metrics = read_json(run_dir / "best_metrics.json")
+        if metrics.get("reward_version") != REWARD_VERSION:
             continue
-        for row in rows:
-            if "score" not in row:
-                continue
-            score = safe_float(row.get("score"), float("-inf"))
-            if best is None or score > best:
-                best = score
-                best_path = summary
+        score = safe_float(metrics.get("score"), float("-inf"))
+        if best is None or score > best:
+            best = score
+            best_path = run_dir / "best_metrics.json"
     return best, best_path
 
 
@@ -1545,6 +1589,8 @@ def write_readme(
 - Advanced the data-quality closure by measuring consecutive `blocked_no_daily_prices` and no-progress partial daily_prices cycles; repeated empty or unchanged partial coverage now appears as a stalled backfill task and stricter simulated-buy cap, not a new leaderboard branch.
 - Tightened local CSV validation to exact missing signal dates from the plan/tape, and disabled MarketDataService fetches by default so this automation remains local-only unless explicitly opted in.
 - Wrote `project_context.json` with `evaluation_engine=stdlib_fallback` so user entry points can surface evaluator reliability.
+- Replaced the annualized-return/turnover-dominated score with `{REWARD_VERSION}`: net total account return is primary, full transaction costs are already deducted from equity, and prolonged cash is penalized by magnitude and duration.
+- Enforced the shared `{MAX_DAILY_TRADES}`-transaction daily hard limit, applying exits/reductions before increases.
 
 ## Best Metrics
 - Total return: {best_metrics['total_return']:.4%}
@@ -1555,6 +1601,16 @@ def write_readme(
 - Win rate: {best_metrics['win_rate']:.2%}
 - Turnover: {best_metrics['turnover']:.3f}
 - Trade count: {best_metrics['trade_count']}
+- Closed trade count: {best_metrics.get('closed_trade_count', 0)}
+- Maximum trades in one day: {best_metrics.get('max_daily_trade_count', 0)} / {best_metrics.get('daily_trade_limit', MAX_DAILY_TRADES)}
+- Days at trade limit: {best_metrics.get('days_at_trade_limit', 0)}
+- Deferred transaction actions: {best_metrics.get('deferred_trade_actions', 0)}
+- Average invested ratio: {best_metrics.get('average_invested_ratio', 0.0):.2%}
+- Average cash ratio: {best_metrics.get('average_cash_ratio', 1.0):.2%}
+- Long-idle cash exposure penalty input: {best_metrics.get('idle_cash_penalty', 0.0):.6f}; longest >20% cash streak: {best_metrics.get('max_high_cash_streak_days', 0)} days
+- Gross total return before costs: {best_metrics.get('gross_total_return_before_cost', 0.0):.4%}; modeled cost paid: {best_metrics.get('cost_paid', 0.0):.4%}
+- Reward: `{best_metrics.get('reward_formula', REWARD_FORMULA)}`
+- Reward breakdown: `{json.dumps(best_metrics.get('score_breakdown', {}), ensure_ascii=False, sort_keys=True)}`
 - Cost assumption: {best_metrics['cost_assumption']}
 
 ## Failed Or Weaker Directions
@@ -1615,6 +1671,9 @@ def write_readme(
 Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe split/cost-stress failure detected"}.
 
 ## User Entry Impact
+- Improved reward alignment: `{REWARD_VERSION}` makes net total account return after modeled transaction costs the primary positive term and penalizes the magnitude and duration of excess cash.
+- Improved transaction-frequency control: offline rebalancing, `run_discussion`, and direct `InvestmentSimulation.execute_trade` share a hard maximum of {MAX_DAILY_TRADES} simulated transaction actions per day, with exits/reductions before increases.
+- Improved status/prompt alignment: `check_db` prints the active reward formula and today's transaction count, while research and committee prompts receive the same reward objective and daily limit.
 - Improved entry: `python -m sovereign_hall.check_db` now reads this run and can show that the evaluator used `stdlib_fallback` due local scientific-stack import failure.
 - User-visible change: latest heuristic status/research prompts include evaluation-engine reliability, weak price coverage, tape freshness, sleeve diagnostics, and current simulated-buy caps.
 - User-visible change: latest heuristic status/research prompts now include a daily_prices backfill readiness checklist and prioritized missing-price queue, not only the latest missing ticker.
@@ -1638,9 +1697,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Keep validating the standard-library fallback against the primary evaluator before trusting score deltas for promotion.
-- Wait for at least 20 new prediction rows and 5 latest-day rows before treating `anomaly12`/max3/min3 diagnostics as validation.
-- Replace prediction-current-price fallback with validated local daily prices; if it is still empty next run, continue local backfill tooling/status work and do not add return-seeking leaderboard branches.
+- Reduce OOS cash exposure without breaking the {MAX_DAILY_TRADES}-action limit by testing staged top-five deployment and exit-first rotation.
+- Exercise the durable queue with a fresh, realtime-priced, committee-approved candidate and require an actual simulated fill or precise rejection code for the current deployment gap.
+- Backfill independently validated local daily prices and collect a meaningful fresh tape before converting higher-return under-deployed diagnostics into 100%-capacity policies.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -1677,6 +1736,7 @@ def main() -> int:
         "scripts/run_heuristic_cycle.py",
         "scripts/run_heuristic_cycle_stdlib.py",
         "services/heuristic_policy.py",
+        "services/reward_policy.py",
         "check_db.py",
         "scripts/backfill_daily_prices.py",
         "research_interactive.py",
@@ -1707,6 +1767,15 @@ def main() -> int:
                 "trade_count": metrics["trade_count"],
                 "average_invested_ratio": metrics.get("average_invested_ratio", 0.0),
                 "average_cash_ratio": metrics.get("average_cash_ratio", 1.0),
+                "idle_cash_penalty": metrics.get("idle_cash_penalty", 0.0),
+                "max_high_cash_streak_days": metrics.get("max_high_cash_streak_days", 0),
+                "max_daily_trade_count": metrics.get("max_daily_trade_count", 0),
+                "days_at_trade_limit": metrics.get("days_at_trade_limit", 0),
+                "deferred_trade_actions": metrics.get("deferred_trade_actions", 0),
+                "gross_total_return_before_cost": metrics.get("gross_total_return_before_cost", 0.0),
+                "cost_paid": metrics.get("cost_paid", 0.0),
+                "reward_version": metrics.get("reward_version", REWARD_VERSION),
+                "score_breakdown": metrics.get("score_breakdown", {}),
                 "cost_assumption": metrics["cost_assumption"],
                 "score": metrics["score"],
                 "notes": "standard-library fallback local delayed daily signal simulation; no external market data",
@@ -1747,6 +1816,15 @@ def main() -> int:
             "trade_count": simplified_result["metrics"]["trade_count"],
             "average_invested_ratio": simplified_result["metrics"].get("average_invested_ratio", 0.0),
             "average_cash_ratio": simplified_result["metrics"].get("average_cash_ratio", 1.0),
+            "idle_cash_penalty": simplified_result["metrics"].get("idle_cash_penalty", 0.0),
+            "max_high_cash_streak_days": simplified_result["metrics"].get("max_high_cash_streak_days", 0),
+            "max_daily_trade_count": simplified_result["metrics"].get("max_daily_trade_count", 0),
+            "days_at_trade_limit": simplified_result["metrics"].get("days_at_trade_limit", 0),
+            "deferred_trade_actions": simplified_result["metrics"].get("deferred_trade_actions", 0),
+            "gross_total_return_before_cost": simplified_result["metrics"].get("gross_total_return_before_cost", 0.0),
+            "cost_paid": simplified_result["metrics"].get("cost_paid", 0.0),
+            "reward_version": simplified_result["metrics"].get("reward_version", REWARD_VERSION),
+            "score_breakdown": simplified_result["metrics"].get("score_breakdown", {}),
             "cost_assumption": simplified_result["metrics"]["cost_assumption"],
             "score": simplified_result["metrics"]["score"],
             "notes": "simplification stage: removed excess anomaly tuning",

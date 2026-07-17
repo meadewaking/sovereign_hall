@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from sovereign_hall.services.portfolio_policy import deployment_status, review_position
+from sovereign_hall.services.reward_policy import MAX_DAILY_TRADES, REWARD_FORMULA
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root.parent))
@@ -804,6 +805,23 @@ def show_investment_status(db_path):
     except:
         trades = []
 
+    try:
+        c.execute(
+            "SELECT COUNT(*) FROM simulation_trades "
+            "WHERE date(traded_at) = date('now', 'localtime')"
+        )
+        trades_today = int(c.fetchone()[0])
+    except sqlite3.Error:
+        trades_today = 0
+    try:
+        from sovereign_hall.core.config import get_config
+
+        max_daily_trades = int(
+            get_config().get("simulation", {}).get("max_daily_trades", MAX_DAILY_TRADES)
+        )
+    except Exception:
+        max_daily_trades = MAX_DAILY_TRADES
+
     redeployment_state = None
     try:
         state_columns = {
@@ -906,6 +924,8 @@ def show_investment_status(db_path):
     elif profit is not None:
         print(f"   📉 盈亏: {profit:.2f} 元 ({profit_pct:+.2f}%)")
     print(f"   现金: {cash:.2f} 元")
+    print(f"   今日模拟成交: {trades_today}/{max_daily_trades} 笔（每日硬上限）")
+    print(f"   Reward: {REWARD_FORMULA}")
     if total_value is None:
         print("   资金部署: N/A / 目标100.0%（实时估值不完整，禁止据此调仓）")
     else:

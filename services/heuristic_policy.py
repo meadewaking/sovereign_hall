@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .reward_policy import MAX_DAILY_TRADES, REWARD_FORMULA
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNS_ROOT = PROJECT_ROOT / "runs" / "heuristic_cycle"
@@ -1566,6 +1568,8 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
         f"- 稳健性: {ctx.warning}",
         "- 用法: 只能作为本地风控约束/解释，不得编造成外部市场事实；禁止因此放大仓位。",
         "- 资金用途: 模拟资金目标投资比例为100%；风险控制必须通过标的替换、分散、减仓后再配置完成，不得把战略现金当作默认避险资产。",
+        f"- 决策目标: 总资金净收益优先；{REWARD_FORMULA}。",
+        f"- 交易频率: 每个交易日最多{MAX_DAILY_TRADES}笔模拟成交；买卖、止损止盈和调仓合并计数，达到上限后形成待执行裁决。",
     ]
     if ctx.evaluation_engine:
         engine_line = f"- 评估引擎: {ctx.evaluation_engine}"

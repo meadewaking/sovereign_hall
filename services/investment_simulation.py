@@ -23,6 +23,7 @@ from ..services.heuristic_policy import (
     recent_prediction_observation_count,
 )
 from ..services.portfolio_policy import deployment_status, review_position
+from ..services.reward_policy import MAX_DAILY_TRADES
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class InvestmentSimulation:
         self.stop_loss_pct = float(self.config.get('stop_loss_pct', -0.08))
         self.take_profit_pct = float(self.config.get('take_profit_pct', 0.15))
         self.max_holding_days = int(self.config.get('max_holding_days', 30))
+        self.max_daily_trades = int(self.config.get('max_daily_trades', MAX_DAILY_TRADES))
 
         # 当前持仓
         self.positions: Dict[str, Dict] = {}  # {ticker: {shares, avg_cost}}
@@ -555,6 +557,18 @@ class InvestmentSimulation:
                 'action': 'hold',
                 'ticker': ticker,
                 'reason': '当前不在A股交易时段，实时行情仅用于查看；暂停模拟成交'
+            }
+
+        trades_today = await self.count_trades_on_date()
+        if trades_today >= self.max_daily_trades:
+            return {
+                'success': False,
+                'action': 'hold',
+                'ticker': ticker,
+                'reason': (
+                    f'今日模拟成交已达硬上限 {self.max_daily_trades} 笔；'
+                    '保留裁决到下一交易日，不允许任何调用方绕过'
+                ),
             }
 
         # 检查冷却期

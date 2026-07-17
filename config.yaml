@@ -4,9 +4,9 @@
 # LLM配置 (使用本地API)
 llm:
   provider: "openai"  # openai/anthropic/local
-  base_url: "https://llm-gateway.omega129.cn/v1"
+  base_url: "http://172.18.5.19:8000/v1"
   model: "GLM-5.2-FP8"
-  api_key: "gw_live_737e9812674339832c1681b6b13e110f"
+  api_key: "not_need"
   model_uuid: ""  # 用于Host header；8000 为独立入口，不需要 Host 路由
   max_concurrent: 12
   temperature: 0.7
@@ -55,6 +55,7 @@ simulation:
   min_unit: 100  # 最小买卖单位：一手=100股
   trading_fee: 0.0003  # 佣金万三
   stamp_duty: 0.001  # 印花税千一（卖出时）
+  max_daily_trades: 5  # 每个交易日最多5笔模拟成交；逐仓退出和投委会交易共用该额度
 
 # 向量数据库
 vector_db:

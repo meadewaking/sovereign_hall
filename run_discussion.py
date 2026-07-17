@@ -1492,6 +1492,7 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
     from sovereign_hall.services.portfolio_policy import (
         deployment_position_floor as calculate_deployment_position_floor,
     )
+    from sovereign_hall.services.reward_policy import MAX_DAILY_TRADES
     if not await market_data.is_trading_day():
         print("\n💰 当前非交易日，跳过每日投资模拟交易")
         assets = await simulation.calculate_assets()
@@ -1562,13 +1563,14 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
     current_positions = assets.get('positions', {})
     current_tickers = set(current_positions.keys())
     current_ticker_codes = {simulation._normalize_ticker(ticker) for ticker in current_tickers}
-    max_daily_trades = 5
+    max_daily_trades = int(getattr(simulation, "max_daily_trades", MAX_DAILY_TRADES))
     prior_trade_count = (
         await simulation.count_trades_on_date()
         if hasattr(simulation, "count_trades_on_date")
         else 0
     )
     trade_count = 0
+    print(f"   交易频率纪律: 今日已成交{prior_trade_count}/{max_daily_trades}笔；硬上限不允许绕过")
     redeployment_blockers: List[str] = []
     trade_candidates, redeployment_rejections = preflight_committee_decisions(
         decisions,
@@ -1725,6 +1727,8 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 reason = result.get('reason', '交易失败')
                 if "交易时段" in reason or "非交易日" in reason:
                     code = "market_closed"
+                elif "硬上限" in reason:
+                    code = "daily_trade_limit"
                 elif "实时现价" in reason:
                     code = "realtime_quote_unavailable"
                 elif "估值不完整" in reason:
