@@ -4,7 +4,7 @@ import json
 import inspect
 import importlib.util
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -350,6 +350,50 @@ def test_check_db_values_positions_from_realtime_quote(tmp_path, monkeypatch, ca
     assert "当前资产: 10230.00 元（实时现价）" in output
     assert "实时现价12.300" in output
     assert "test_realtime_quote" in output
+
+
+def test_check_db_reports_pending_decision_terminal_counts(tmp_path, capsys):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "pending_status.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE system_stats (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO system_stats VALUES ('simulation_cash', '10000')")
+    conn.execute("CREATE TABLE simulation_positions (ticker TEXT, shares INTEGER, avg_cost REAL)")
+    conn.execute(
+        "CREATE TABLE simulation_trades "
+        "(ticker TEXT, direction TEXT, shares INTEGER, price REAL, reason TEXT, traded_at TEXT)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE simulation_pending_decisions (
+            id INTEGER PRIMARY KEY, ticker TEXT, direction TEXT,
+            target_position REAL, defer_code TEXT, status TEXT,
+            created_at TEXT, updated_at TEXT, resolved_at TEXT,
+            resolution TEXT, replay_count INTEGER
+        )
+        """
+    )
+    rows = [
+        (1, "600519", "long", 0.1, "market_closed", "executed", "2026-07-18T10:00:00", "2026-07-19T10:01:00", "2026-07-19T10:01:00", "buy:filled", 1),
+        (2, "000001", "long", 0.1, "market_closed", "rejected", "2026-07-18T10:02:00", "2026-07-19T10:03:00", "2026-07-19T10:03:00", "hold:heuristic veto", 1),
+        (3, "159915", "sell", 0.0, "market_closed", "expired", "2026-07-10T10:00:00", "2026-07-19T10:04:00", "2026-07-19T10:04:00", "expired_without_open-session_replay", 0),
+        (4, "512880", "long", 0.1, "daily_trade_limit", "pending_next_trading_session", "2026-07-19T10:05:00", "2026-07-19T10:05:00", None, None, 0),
+    ]
+    conn.executemany(
+        "INSERT INTO simulation_pending_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+    check_db.show_investment_status(db_path)
+    output = capsys.readouterr().out
+
+    assert "待执行裁决: 1 条" in output
+    assert "executed=1, rejected=1, expired=1, pending=1" in output
+    assert "最近裁决结果: expired | 159915 sell" in output
+    assert "expired_without_open-session_replay" in output
 
 
 def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
@@ -2755,6 +2799,148 @@ async def test_market_closed_persists_exit_without_filling(tmp_path, monkeypatch
     assert trade_count == 0
     assert sim.positions["600519"]["shares"] == 100
     sim.resolve_trade_price.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_replay_waits_for_open_market_without_fetching_quote(tmp_path, monkeypatch):
+    db = DatabaseService(str(tmp_path / "pending_closed.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    await sim.record_pending_decision(
+        ticker="600519",
+        direction="sell",
+        target_position=0.0,
+        reason="closed-market stop",
+        defer_code="market_closed",
+    )
+    sim.execute_trade = AsyncMock()
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {"is_trading_day": AsyncMock(return_value=True), "is_market_open": AsyncMock(return_value=False)},
+    )()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+
+    result = await sim.replay_pending_decisions()
+    row = await (await db._connection.execute(
+        "SELECT status, replay_count FROM simulation_pending_decisions"
+    )).fetchone()
+    await db.close()
+
+    assert result["status"] == "waiting_market_open"
+    assert result["remaining"] == 1
+    assert tuple(row) == ("pending_next_trading_session", 0)
+    sim.execute_trade.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_replay_is_exit_first_and_resolves_each_row_once(tmp_path, monkeypatch):
+    db = DatabaseService(str(tmp_path / "pending_replay.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    buy_id = await sim.record_pending_decision(
+        ticker="600519", direction="long", target_position=0.1,
+        reason="deferred buy", defer_code="daily_trade_limit",
+    )
+    sell_id = await sim.record_pending_decision(
+        ticker="000001", direction="sell", target_position=0.0,
+        reason="deferred exit", defer_code="market_closed",
+    )
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {"is_trading_day": AsyncMock(return_value=True), "is_market_open": AsyncMock(return_value=True)},
+    )()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+    sim.count_trades_on_date = AsyncMock(return_value=0)
+    sim.execute_trade = AsyncMock(side_effect=[
+        {"success": True, "action": "sell", "ticker": "000001"},
+        {"success": False, "action": "hold", "ticker": "600519", "reason": "heuristic veto"},
+    ])
+
+    result = await sim.replay_pending_decisions()
+    second = await sim.replay_pending_decisions()
+    rows = await (await db._connection.execute(
+        "SELECT id, status, replay_count FROM simulation_pending_decisions ORDER BY id"
+    )).fetchall()
+    await db.close()
+
+    assert result["executed"] == 1
+    assert result["rejected"] == 1
+    assert result["remaining"] == 0
+    assert second["status"] == "empty"
+    assert [call.kwargs["ticker"] for call in sim.execute_trade.await_args_list] == ["000001", "600519"]
+    assert [call.kwargs["pending_decision_id"] for call in sim.execute_trade.await_args_list] == [sell_id, buy_id]
+    assert all(call.kwargs["current_price"] == 0.0 for call in sim.execute_trade.await_args_list)
+    assert [tuple(row) for row in rows] == [(buy_id, "rejected", 1), (sell_id, "executed", 1)]
+
+
+@pytest.mark.asyncio
+async def test_pending_replay_daily_limit_reuses_row_without_duplicate(tmp_path, monkeypatch):
+    db = DatabaseService(str(tmp_path / "pending_no_duplicate.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    pending_id = await sim.record_pending_decision(
+        ticker="600519", direction="long", target_position=0.1,
+        reason="deferred buy", defer_code="market_closed",
+    )
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {"is_trading_day": AsyncMock(return_value=True), "is_market_open": AsyncMock(return_value=True)},
+    )()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+    # Capacity exists when the queue is selected, then another caller consumes it.
+    sim.count_trades_on_date = AsyncMock(side_effect=[0, MAX_DAILY_TRADES])
+
+    result = await sim.replay_pending_decisions()
+    rows = await (await db._connection.execute(
+        "SELECT id, status, defer_code, replay_count FROM simulation_pending_decisions"
+    )).fetchall()
+    await db.close()
+
+    assert result["attempted"] == 1
+    assert result["remaining"] == 1
+    assert [tuple(row) for row in rows] == [
+        (pending_id, "pending_next_trading_session", "daily_trade_limit", 1)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pending_replay_expires_stale_ruling_without_trade(tmp_path, monkeypatch):
+    db = DatabaseService(str(tmp_path / "pending_expired.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    pending_id = await sim.record_pending_decision(
+        ticker="600519", direction="long", target_position=0.1,
+        reason="stale ruling", defer_code="market_closed",
+    )
+    await db._connection.execute(
+        "UPDATE simulation_pending_decisions SET expires_at = ? WHERE id = ?",
+        ((datetime.now() - timedelta(days=1)).isoformat(), pending_id),
+    )
+    await db._connection.commit()
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {"is_trading_day": AsyncMock(return_value=True), "is_market_open": AsyncMock(return_value=True)},
+    )()
+    monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
+    sim.execute_trade = AsyncMock()
+
+    result = await sim.replay_pending_decisions()
+    row = await (await db._connection.execute(
+        "SELECT status, resolution FROM simulation_pending_decisions WHERE id = ?", (pending_id,)
+    )).fetchone()
+    await db.close()
+
+    assert result["expired"] == 1
+    assert tuple(row) == ("expired", "expired_without_open-session_replay")
+    sim.execute_trade.assert_not_awaited()
 
 
 @pytest.mark.asyncio

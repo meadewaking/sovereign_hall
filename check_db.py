@@ -736,6 +736,62 @@ def format_daily_price_backfill_progress(
     return "\n".join(lines) + "\n"
 
 
+def pending_decision_diagnostics(conn):
+    """Return durable deferred-ruling lifecycle diagnostics for user entries."""
+    diagnostics = {
+        "unresolved_count": 0,
+        "status_counts": {},
+        "pending_rows": [],
+        "last_resolution": None,
+    }
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='simulation_pending_decisions'"
+        ).fetchone()
+        if not table:
+            return diagnostics
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(simulation_pending_decisions)")
+        }
+        status_rows = conn.execute(
+            "SELECT status, COUNT(*) FROM simulation_pending_decisions GROUP BY status"
+        ).fetchall()
+        diagnostics["status_counts"] = {
+            str(status): int(count) for status, count in status_rows
+        }
+        diagnostics["unresolved_count"] = sum(
+            diagnostics["status_counts"].get(status, 0)
+            for status in ("pending_next_trading_session", "replaying")
+        )
+        diagnostics["pending_rows"] = conn.execute(
+            """
+            SELECT ticker, direction, target_position, defer_code, created_at
+            FROM simulation_pending_decisions
+            WHERE status IN ('pending_next_trading_session', 'replaying')
+            ORDER BY datetime(created_at), id
+            LIMIT 10
+            """
+        ).fetchall()
+        terminal_columns = {"resolved_at", "resolution", "replay_count"}
+        if terminal_columns.issubset(columns):
+            row = conn.execute(
+                """
+                SELECT ticker, direction, status, resolution, resolved_at,
+                       replay_count, defer_code
+                FROM simulation_pending_decisions
+                WHERE status IN ('executed', 'rejected', 'expired')
+                ORDER BY datetime(COALESCE(resolved_at, updated_at)) DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            diagnostics["last_resolution"] = dict(row) if row else None
+    except sqlite3.Error:
+        return diagnostics
+    return diagnostics
+
+
 def show_investment_status(db_path):
     """显示投资模拟状态"""
     conn = sqlite3.connect(str(db_path))
@@ -846,27 +902,9 @@ def show_investment_status(db_path):
     except sqlite3.Error:
         redeployment_state = None
 
-    pending_decisions = []
-    pending_decision_total = 0
-    try:
-        c.execute(
-            "SELECT COUNT(*) FROM simulation_pending_decisions "
-            "WHERE status = 'pending_next_trading_session'"
-        )
-        pending_decision_total = int(c.fetchone()[0])
-        c.execute(
-            """
-            SELECT ticker, direction, target_position, defer_code, created_at
-            FROM simulation_pending_decisions
-            WHERE status = 'pending_next_trading_session'
-            ORDER BY datetime(created_at), id
-            LIMIT 10
-            """
-        )
-        pending_decisions = c.fetchall()
-    except sqlite3.Error:
-        pending_decisions = []
-        pending_decision_total = 0
+    pending_diagnostics = pending_decision_diagnostics(conn)
+    pending_decisions = pending_diagnostics["pending_rows"]
+    pending_decision_total = pending_diagnostics["unresolved_count"]
 
     tickers = [pos[0] for pos in positions]
     conn.close()
@@ -953,6 +991,25 @@ def show_investment_status(db_path):
             f"      - {pending['ticker']} {pending['direction']} -> "
             f"{float(pending['target_position']):.1%} | {pending['defer_code']} | {pending['created_at']}"
         )
+    pending_counts = pending_diagnostics["status_counts"]
+    print(
+        "   裁决生命周期累计: "
+        f"executed={pending_counts.get('executed', 0)}, "
+        f"rejected={pending_counts.get('rejected', 0)}, "
+        f"expired={pending_counts.get('expired', 0)}, "
+        f"pending={pending_decision_total}"
+    )
+    last_resolution = pending_diagnostics["last_resolution"]
+    if last_resolution:
+        print(
+            "   最近裁决结果: "
+            f"{last_resolution.get('status')} | {last_resolution.get('ticker')} "
+            f"{last_resolution.get('direction')} | {last_resolution.get('resolved_at')} | "
+            f"replay={int(last_resolution.get('replay_count') or 0)} | "
+            f"{last_resolution.get('resolution') or last_resolution.get('defer_code') or ''}"
+        )
+    else:
+        print("   最近裁决结果: 尚无已解决裁决")
     print(f"   Reward: {REWARD_FORMULA}")
     if total_value is None:
         print("   资金部署: N/A / 目标100.0%（实时估值不完整，禁止据此调仓）")

@@ -698,7 +698,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         content = getattr(doc, 'content', '') or ''
         title = getattr(doc, 'title', '') or ''
         url = getattr(doc, 'url', '') or ''
-        if len(content) > 200:
+        if len(content) > 50:
             doc_contents.append(f"【{title}】\n{content[:stage2_doc_chars]}\n来源: {url}")
 
     content_text = "\n\n".join(doc_contents)
@@ -1547,6 +1547,27 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
             pnl = review.get("pnl_pct")
             pnl_text = "N/A" if pnl is None else f"{float(pnl):.1%}"
             print(f"   ➖ {ticker} 复核持有: PnL={pnl_text}；{reason}")
+
+    pending_replay = (
+        await simulation.replay_pending_decisions()
+        if hasattr(simulation, "replay_pending_decisions")
+        else {"status": "not_supported", "pending_before": 0}
+    )
+    if pending_replay.get("pending_before"):
+        print(
+            "   🗂️ 待执行裁决: "
+            f"状态={pending_replay.get('status')}；"
+            f"尝试={pending_replay.get('attempted', 0)}，"
+            f"成交={pending_replay.get('executed', 0)}，"
+            f"拒绝={pending_replay.get('rejected', 0)}，"
+            f"过期={pending_replay.get('expired', 0)}，"
+            f"剩余={pending_replay.get('remaining', 0)}"
+        )
+        for replayed in pending_replay.get("results", []):
+            print(
+                f"      - #{replayed.get('id')} {replayed.get('ticker', '')}: "
+                f"{replayed.get('action', 'unknown')}；{replayed.get('reason', '')}"
+            )
 
     assets = await simulation.calculate_assets()
     if assets.get("valuation_complete"):

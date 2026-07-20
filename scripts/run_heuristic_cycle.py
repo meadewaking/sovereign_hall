@@ -1556,6 +1556,12 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
         ).fetchall()
         recent_lifecycle_exits: list[dict[str, Any]] = []
         redeployment_state: dict[str, Any] = {}
+        pending_decision_state: dict[str, Any] = {
+            "unresolved_count": 0,
+            "status_counts": {},
+            "schema_supports_replay": False,
+            "last_resolution": None,
+        }
         if "simulation_trades" in table_names:
             trade_columns = {
                 str(row[1]) for row in conn.execute("PRAGMA table_info(simulation_trades)").fetchall()
@@ -1617,6 +1623,46 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                         redeployment_state[key] = json.loads(redeployment_state[key] or "{}")
                     except (TypeError, ValueError, json.JSONDecodeError):
                         redeployment_state[key] = {}
+        if "simulation_pending_decisions" in table_names:
+            pending_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(simulation_pending_decisions)").fetchall()
+            }
+            pending_decision_state["schema_supports_replay"] = {
+                "expires_at", "replayed_at", "replay_count"
+            }.issubset(pending_columns)
+            status_rows = conn.execute(
+                "SELECT status, COUNT(*) FROM simulation_pending_decisions GROUP BY status"
+            ).fetchall()
+            pending_decision_state["status_counts"] = {
+                str(status): int(count) for status, count in status_rows
+            }
+            pending_decision_state["unresolved_count"] = int(
+                sum(
+                    pending_decision_state["status_counts"].get(status, 0)
+                    for status in ("pending_next_trading_session", "replaying")
+                )
+            )
+            terminal_columns = {"resolved_at", "resolution", "replay_count"}
+            if terminal_columns.issubset(pending_columns):
+                last_resolution = conn.execute(
+                    """
+                    SELECT ticker, direction, status, resolution, resolved_at,
+                           replay_count, defer_code
+                    FROM simulation_pending_decisions
+                    WHERE status IN ('executed', 'rejected', 'expired')
+                    ORDER BY datetime(COALESCE(resolved_at, updated_at)) DESC, id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if last_resolution:
+                    keys = (
+                        "ticker", "direction", "status", "resolution",
+                        "resolved_at", "replay_count", "defer_code",
+                    )
+                    pending_decision_state["last_resolution"] = dict(
+                        zip(keys, last_resolution)
+                    )
 
     now = datetime.now()
     positions: list[dict[str, Any]] = []
@@ -1673,6 +1719,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                 "status", "pending_committee_approved_fresh_candidates"
             ),
             "redeployment_state": redeployment_state,
+            "pending_decisions": pending_decision_state,
             "operational_cash_reason": (
                 "all holdings exited through realtime lifecycle rules; proceeds await "
                 "fresh committee-approved candidates and must not be treated as strategic cash"
@@ -1698,6 +1745,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
         "position_count": len(positions),
         "blocked_price_count": blocked_count,
         "redeployment_state": redeployment_state,
+        "pending_decisions": pending_decision_state,
         "rule": (
             "Current account value, PnL, invested ratio and simulated fills require realtime quotes. "
             "Stored marks are audit metadata only and are never valuation fallbacks."
@@ -2102,13 +2150,15 @@ def write_readme(
 ## Blocking & Repeated Warning Review
 - Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
-- Root cause advanced this cycle: empty-book committee rounds silently discarded hold, missing-ticker, unsupported-direction, and non-executable short decisions before redeployment accounting. After many rounds, users still saw only `missing_approved_candidates`, so the next repair action was unknowable.
-- System fix: `run_discussion` now performs deterministic committee-decision preflight before quote lookup/execution, assigns explicit rejection codes, and persists both last-round and cumulative code counts in `simulation_redeployment_state`; `check_db` exposes those counts. Historical attempts are not retroactively relabeled because their discarded decisions cannot be reconstructed.
+- Root cause advanced this cycle: deferred daily-limit/closed-market rulings were persisted and displayed, but no open-session consumer resolved them. A later session could neither replay nor expire a ruling, leaving the execution lifecycle incomplete.
+- System fix: `InvestmentSimulation.replay_pending_decisions` now consumes price-free rulings only during an open trading session, prioritizes exits, re-fetches realtime quotes through the normal execution path, re-applies every current gate, resolves each row once, reuses the same row if capacity disappears, and expires stale rulings after seven calendar days.
 - Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
 - Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
 - Integration decision: full deployment is now a portfolio invariant, while unavailable/stale prices remain an explicit operational blocker rather than a reason to fabricate fills; risk is expressed through rotation, diversification, and per-position exits instead of strategic cash.
 
 ## What Changed
+- Added a durable replay/expiry state machine for `simulation_pending_decisions`; the queue still contains no price and is not an order book.
+- Connected replay to `run_discussion` after mandatory position review and before new committee allocations, so exits and older rulings consume the same persisted five-fill daily capacity.
 - Added `services/portfolio_policy.py` with deterministic stop-loss, take-profit, max-holding, fresh-price, deployment-gap, and candidate-allocation rules.
 - Added a single-row durable redeployment state machine; simulated sells enqueue released cash, committee rounds record exact failures, and empty-book state is recovered without using a quote fallback.
 - Migrated `simulation_positions` with opened/mark/review lifecycle fields and backfilled legacy opening times from local simulated buy history.
@@ -2221,6 +2271,8 @@ def write_readme(
 - Positions reviewed: {int(portfolio_lifecycle.get('reviewed_position_count', portfolio_lifecycle.get('position_count', 0)))}; current invested ratio={portfolio_invested_text}; deployment gap={portfolio_gap_text}.
 - Redeployment status: {portfolio_lifecycle.get('redeployment_status', 'not_applicable')}; operational cash reason: {portfolio_lifecycle.get('operational_cash_reason', 'N/A')}
 - Durable redeployment queue: status={redeployment_state.get('status', 'missing')}; gap={redeployment_state.get('deployment_gap', 'N/A')}; attempts={redeployment_state.get('attempt_count', 0)}; last candidates/fills={redeployment_state.get('last_candidate_count', 0)}/{redeployment_state.get('last_trade_count', 0)}; blocker={redeployment_state.get('blocker_code', 'N/A')}; next={redeployment_state.get('next_action', 'N/A')}
+- Deferred-ruling queue: unresolved={int((portfolio_lifecycle.get('pending_decisions') or {}).get('unresolved_count', 0))}; status_counts={json.dumps((portfolio_lifecycle.get('pending_decisions') or {}).get('status_counts', {}), ensure_ascii=False, sort_keys=True)}; replay_schema={bool((portfolio_lifecycle.get('pending_decisions') or {}).get('schema_supports_replay', False))}
+- Last deferred-ruling resolution: {json.dumps((portfolio_lifecycle.get('pending_decisions') or {}).get('last_resolution'), ensure_ascii=False, sort_keys=True)}
 - Machine-readable snapshot: `portfolio_lifecycle_review.json`. No trade is generated by this report.
 
 ## Overfitting Risk
@@ -2231,6 +2283,9 @@ def write_readme(
 Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe split/cost-stress failure detected"}.
 
 ## User Entry Impact
+- This cycle makes the deferred-ruling lifecycle auditable in `check_db`: users now see cumulative executed/rejected/expired/pending counts and the latest terminal resolution instead of an ambiguous empty queue.
+- This cycle closes the deferred-ruling execution gap: `run_discussion` now replays unresolved rulings only after mandatory holding review, only in an open market, with a newly fetched realtime quote and the current valuation/risk/cooldown/daily-limit gates.
+- Replayed exits run before entries; a filled or rejected ruling is terminal, a capacity race reuses the original row, and an unattempted ruling expires after seven calendar days without fabricating a trade.
 - This cycle closes the opaque-redeployment gap: `run_discussion` records every deterministic committee rejection and `check_db` shows last-round plus cumulative rejection-code counts alongside the durable queue.
 - Decision preflight covers committee hold, missing ticker, unsupported direction, empty-book short, already-held long, zero target, cooldown, missing realtime quote, valuation-incomplete, heuristic veto, market closed, lot/cash, and generic execution failures without weakening any trading safety gate.
 - Same-day simulated fills no longer bypass the mandatory review of every existing position; the daily trade cap is counted from SQLite and survives restarts.
@@ -2244,7 +2299,7 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 - Improved capital use: target invested ratio is 100%; cash is never labeled a risk reserve, and eligible approved candidates receive the undeployed allocation before per-name constraints.
 - Improved reward alignment: `capital_return_v2` makes net total account return the primary positive term, deducts modeled fee/stamp-duty/slippage in equity, and penalizes both the magnitude and duration of excess cash.
 - Improved transaction-frequency control: offline rebalancing, `run_discussion`, and direct `InvestmentSimulation.execute_trade` share a hard maximum of {MAX_DAILY_TRADES} simulated transaction actions per day; exits/reductions consume capacity before increases and the counter persists in SQLite.
-- Closed the deferred-ruling gap: when the shared daily hard limit or market-hours gate blocks a simulated action, `InvestmentSimulation` stores a price-free `simulation_pending_decisions` row for the next trading session; `run_discussion` preserves every remaining bounded candidate and `check_db` exposes the queue. A future executor must fetch a new realtime quote and re-run every gate—this queue is not an order and cannot fabricate a fill.
+- Closed the deferred-ruling loop: when the shared daily hard limit or market-hours gate blocks a simulated action, `InvestmentSimulation` stores a price-free row; the next open-session simulation consumes it once through the normal fresh-quote execution path, while `check_db` exposes unresolved state. The queue is not an order and cannot fabricate a fill.
 - Improved status/prompt alignment: `check_db` prints the active reward formula and today's transaction count, while research and investment-committee prompts receive the same reward objective and daily limit.
 - Improved entry: `python -m sovereign_hall.check_db` now shows latest best policy, score, overfit warning, single-name cap, and recent failure cases.
 - Improved entry safety: `python -m sovereign_hall.check_db` now treats closed stdin as a safe non-interactive exit after printing status.
@@ -2296,9 +2351,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Reduce the OOS average-cash ratio without breaking the {MAX_DAILY_TRADES}-action limit by testing staged top-five deployment and exit-first rotation; cash must remain an operational exception, not a policy allocation.
 - Exercise the durable queue with a fresh, realtime-priced, committee-approved candidate and verify that the current 0%-invested deployment gap reaches an actual simulated fill or a precise rejection code.
 - Backfill independently validated `daily_prices` from the latest unlock ticker and collect a meaningful fresh tape before testing whether higher-return but under-deployed branches can be converted to 100%-capacity policies without failing cost/OOS checks.
+- After the queue has genuine terminal samples, aggregate replay latency and resolution codes so the next cycle can repair the dominant rejection or expiry cause instead of treating every empty queue as success.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -2941,6 +2996,7 @@ def main() -> int:
             "sharpe": metrics["sharpe"],
             "turnover": metrics["turnover"],
             "trade_count": metrics["trade_count"],
+            "total_trade_actions": metrics["trade_count"],
             "average_invested_ratio": metrics.get("average_invested_ratio", 0.0),
             "average_cash_ratio": metrics.get("average_cash_ratio", 1.0),
             "idle_cash_penalty": metrics.get("idle_cash_penalty", 0.0),
@@ -2999,6 +3055,7 @@ def main() -> int:
             "sharpe": simplified_metrics["sharpe"],
             "turnover": simplified_metrics["turnover"],
             "trade_count": simplified_metrics["trade_count"],
+            "total_trade_actions": simplified_metrics["trade_count"],
             "average_invested_ratio": simplified_metrics.get("average_invested_ratio", 0.0),
             "average_cash_ratio": simplified_metrics.get("average_cash_ratio", 1.0),
             "idle_cash_penalty": simplified_metrics.get("idle_cash_penalty", 0.0),

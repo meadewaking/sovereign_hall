@@ -50,6 +50,9 @@ class InvestmentSimulation:
         self.take_profit_pct = float(self.config.get('take_profit_pct', 0.15))
         self.max_holding_days = int(self.config.get('max_holding_days', 30))
         self.max_daily_trades = int(self.config.get('max_daily_trades', MAX_DAILY_TRADES))
+        self.pending_decision_max_age_days = int(
+            self.config.get('pending_decision_max_age_days', 7)
+        )
 
         # 当前持仓
         self.positions: Dict[str, Dict] = {}  # {ticker: {shares, avg_cost}}
@@ -458,6 +461,7 @@ class InvestmentSimulation:
         defer_code: str,
         confidence: float | None = None,
         source: str = "investment_simulation",
+        existing_id: int | None = None,
     ) -> int | None:
         """Persist an unfilled ruling without trusting or storing a proposed price.
 
@@ -470,14 +474,42 @@ class InvestmentSimulation:
         conn = self.db_service._connection
         if conn is None:
             return None
-        now = datetime.now().isoformat()
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        expires_at = (now_dt + timedelta(days=self.pending_decision_max_age_days)).isoformat()
         try:
+            if existing_id is not None:
+                cursor = await conn.execute(
+                    """
+                    UPDATE simulation_pending_decisions
+                    SET ticker = ?, direction = ?, target_position = ?, confidence = ?,
+                        reason = ?, defer_code = ?, source = ?,
+                        status = 'pending_next_trading_session', updated_at = ?,
+                        expires_at = COALESCE(expires_at, ?), resolution = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        self._normalize_ticker(ticker),
+                        str(direction or "hold").lower(),
+                        max(0.0, min(float(target_position or 0.0), 1.0)),
+                        confidence,
+                        str(reason or "")[:2000],
+                        str(defer_code or "execution_deferred"),
+                        str(source or "investment_simulation"),
+                        now,
+                        expires_at,
+                        f"replay_deferred:{defer_code}"[:500],
+                        int(existing_id),
+                    ),
+                )
+                await conn.commit()
+                return int(existing_id) if cursor.rowcount else None
             cursor = await conn.execute(
                 """
                 INSERT INTO simulation_pending_decisions (
                     ticker, direction, target_position, confidence, reason,
-                    defer_code, source, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_next_trading_session', ?, ?)
+                    defer_code, source, status, created_at, updated_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_next_trading_session', ?, ?, ?)
                 """,
                 (
                     self._normalize_ticker(ticker),
@@ -489,6 +521,7 @@ class InvestmentSimulation:
                     str(source or "investment_simulation"),
                     now,
                     now,
+                    expires_at,
                 ),
             )
             await conn.commit()
@@ -496,6 +529,161 @@ class InvestmentSimulation:
         except Exception as exc:
             logger.warning("Failed to persist pending simulated decision for %s: %s", ticker, exc)
             return None
+
+    async def replay_pending_decisions(self, max_count: int | None = None) -> Dict[str, Any]:
+        """Consume deferred rulings once, only in an open trading session.
+
+        The queue stores decisions, never orders or prices.  Every replay calls
+        ``execute_trade`` again, which fetches a fresh realtime quote and applies
+        the current valuation, risk, cooldown and daily-fill gates.  Exits are
+        replayed before entries.  A replay that does not fill is resolved as a
+        rejection instead of looping forever; a daily-limit deferral keeps the
+        same row pending and never creates a duplicate.
+        """
+        summary: Dict[str, Any] = {
+            "status": "not_available",
+            "pending_before": 0,
+            "attempted": 0,
+            "executed": 0,
+            "rejected": 0,
+            "expired": 0,
+            "remaining": 0,
+            "results": [],
+        }
+        if not self.db_service or self.db_service._connection is None:
+            return summary
+
+        conn = self.db_service._connection
+        from .market_data import get_market_data
+
+        market_data = get_market_data()
+        summary["pending_before"] = await self.pending_decision_count()
+        if summary["pending_before"] <= 0:
+            summary["status"] = "empty"
+            return summary
+        if not await market_data.is_trading_day():
+            summary["status"] = "waiting_trading_day"
+            summary["remaining"] = summary["pending_before"]
+            return summary
+        if (
+            self.trade_during_market_hours_only
+            and hasattr(market_data, "is_market_open")
+            and not await market_data.is_market_open()
+        ):
+            summary["status"] = "waiting_market_open"
+            summary["remaining"] = summary["pending_before"]
+            return summary
+
+        now = datetime.now()
+        now_text = now.isoformat()
+        # A prior process may have stopped between claiming and resolving a row.
+        await conn.execute(
+            """
+            UPDATE simulation_pending_decisions
+            SET status = 'pending_next_trading_session', updated_at = ?,
+                resolution = 'recovered_interrupted_replay'
+            WHERE status = 'replaying'
+              AND datetime(updated_at) < datetime(?, '-30 minutes')
+            """,
+            (now_text, now_text),
+        )
+        async with conn.execute(
+            """
+            SELECT id, ticker, direction, target_position, confidence, reason,
+                   defer_code, created_at, expires_at
+            FROM simulation_pending_decisions
+            WHERE status = 'pending_next_trading_session'
+            ORDER BY CASE WHEN direction IN ('sell', 'short') THEN 0 ELSE 1 END,
+                     datetime(created_at), id
+            """
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+
+        eligible: List[Dict[str, Any]] = []
+        for row in rows:
+            expiry_text = str(row.get("expires_at") or "")
+            try:
+                expired = bool(expiry_text and datetime.fromisoformat(expiry_text) < now)
+            except ValueError:
+                expired = True
+            if expired:
+                await conn.execute(
+                    """
+                    UPDATE simulation_pending_decisions
+                    SET status = 'expired', updated_at = ?, resolved_at = ?,
+                        resolution = 'expired_without_open-session_replay'
+                    WHERE id = ? AND status = 'pending_next_trading_session'
+                    """,
+                    (now_text, now_text, int(row["id"])),
+                )
+                summary["expired"] += 1
+            else:
+                eligible.append(row)
+        await conn.commit()
+
+        slots = max(0, self.max_daily_trades - await self.count_trades_on_date())
+        replay_limit = min(slots, max_count if max_count is not None else self.max_daily_trades)
+        for row in eligible[:replay_limit]:
+            pending_id = int(row["id"])
+            claimed = await conn.execute(
+                """
+                UPDATE simulation_pending_decisions
+                SET status = 'replaying', updated_at = ?, replayed_at = ?,
+                    replay_count = replay_count + 1
+                WHERE id = ? AND status = 'pending_next_trading_session'
+                """,
+                (datetime.now().isoformat(), datetime.now().isoformat(), pending_id),
+            )
+            await conn.commit()
+            if not claimed.rowcount:
+                continue
+            summary["attempted"] += 1
+            try:
+                result = await self.execute_trade(
+                    ticker=str(row["ticker"]),
+                    direction=str(row["direction"]),
+                    target_position=float(row["target_position"]),
+                    current_price=0.0,
+                    reason=f"待执行裁决重放: {row.get('reason') or row.get('defer_code') or ''}",
+                    confidence=row.get("confidence"),
+                    risk_cap_already_applied=False,
+                    pending_decision_id=pending_id,
+                )
+            except Exception as exc:
+                logger.exception("Pending simulated decision replay failed: id=%s", pending_id)
+                result = {"success": False, "action": "error", "reason": str(exc)}
+
+            action = str(result.get("action") or "")
+            if action in {"buy", "sell"} and result.get("success"):
+                status = "executed"
+                summary["executed"] += 1
+            elif action == "pending":
+                # ``execute_trade`` updated this same row; do not duplicate it.
+                summary["results"].append({"id": pending_id, **result})
+                continue
+            else:
+                status = "rejected"
+                summary["rejected"] += 1
+            resolution = f"{action or 'unknown'}:{result.get('reason', '')}"[:500]
+            await conn.execute(
+                """
+                UPDATE simulation_pending_decisions
+                SET status = ?, updated_at = ?, resolved_at = ?, resolution = ?
+                WHERE id = ? AND status = 'replaying'
+                """,
+                (status, datetime.now().isoformat(), datetime.now().isoformat(), resolution, pending_id),
+            )
+            await conn.commit()
+            summary["results"].append({"id": pending_id, **result})
+
+        summary["remaining"] = await self.pending_decision_count()
+        if summary["attempted"] or summary["expired"]:
+            summary["status"] = "processed"
+        elif slots <= 0:
+            summary["status"] = "waiting_daily_capacity"
+        else:
+            summary["status"] = "empty"
+        return summary
 
     async def pending_decision_count(self) -> int:
         """Return unresolved deferred rulings for entry-point diagnostics."""
@@ -583,6 +771,7 @@ class InvestmentSimulation:
         confidence: float | None = None,
         signal_count: int | None = None,
         risk_cap_already_applied: bool = False,
+        pending_decision_id: int | None = None,
     ) -> Dict:
         """
         执行交易（支持买入、卖出、持有）
@@ -611,6 +800,7 @@ class InvestmentSimulation:
                 confidence=confidence,
                 reason=reason or "非交易日裁决",
                 defer_code="non_trading_day",
+                existing_id=pending_decision_id,
             )
             return {
                 'success': False,
@@ -631,6 +821,7 @@ class InvestmentSimulation:
                 confidence=confidence,
                 reason=reason or "闭市裁决",
                 defer_code="market_closed",
+                existing_id=pending_decision_id,
             )
             return {
                 'success': False,
@@ -649,6 +840,7 @@ class InvestmentSimulation:
                 confidence=confidence,
                 reason=reason or "超过每日成交硬门",
                 defer_code="daily_trade_limit",
+                existing_id=pending_decision_id,
             )
             return {
                 'success': False,
@@ -1341,12 +1533,36 @@ class InvestmentSimulation:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 resolved_at TEXT,
-                resolution TEXT
+                resolution TEXT,
+                expires_at TEXT,
+                replayed_at TEXT,
+                replay_count INTEGER NOT NULL DEFAULT 0
             )
         """)
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_simulation_pending_status "
             "ON simulation_pending_decisions(status, created_at)"
+        )
+
+        async with conn.execute("PRAGMA table_info(simulation_pending_decisions)") as cursor:
+            pending_columns = {row[1] for row in await cursor.fetchall()}
+        pending_migrations = {
+            "expires_at": "TEXT",
+            "replayed_at": "TEXT",
+            "replay_count": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, definition in pending_migrations.items():
+            if column not in pending_columns:
+                await conn.execute(
+                    f"ALTER TABLE simulation_pending_decisions ADD COLUMN {column} {definition}"
+                )
+        await conn.execute(
+            """
+            UPDATE simulation_pending_decisions
+            SET expires_at = datetime(created_at, ?)
+            WHERE status = 'pending_next_trading_session' AND expires_at IS NULL
+            """,
+            (f"+{self.pending_decision_max_age_days} days",),
         )
 
         async with conn.execute("PRAGMA table_info(simulation_redeployment_state)") as cursor:
