@@ -277,6 +277,92 @@ class InvestmentSimulation:
         except Exception:
             return {}
 
+    async def get_candidate_rejection_memory(self, limit: int = 8) -> List[Dict[str, Any]]:
+        """Return durable per-ticker rejection counts for committee feedback.
+
+        This memory records only genuine post-migration simulation attempts.  It
+        does not infer or relabel older opaque attempts and never approves a
+        candidate by itself.
+        """
+        if not self.db_service or self.db_service._connection is None:
+            return []
+        try:
+            async with self.db_service._connection.execute(
+                """
+                SELECT ticker, code, rejection_count, last_reason,
+                       first_seen_at, last_seen_at
+                FROM simulation_candidate_rejections
+                ORDER BY rejection_count DESC, datetime(last_seen_at) DESC, ticker
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ) as cursor:
+                return [dict(row) async for row in cursor]
+        except Exception:
+            return []
+
+    async def format_redeployment_learning_context(self, limit: int = 5) -> str:
+        """Build a local-only feedback block for research and committee agents."""
+        # Temporary execution blockers (closed market, daily capacity, missing
+        # quote, cooldown) belong to the replay path and must not become a
+        # research blacklist.  Only evidence-related vetoes are fed back to
+        # proposal/voting agents.
+        rows = [
+            row
+            for row in await self.get_candidate_rejection_memory(limit=max(limit * 4, limit))
+            if row.get("code") in {"committee_hold", "heuristic_entry_veto"}
+        ][:limit]
+        if not rows:
+            return ""
+        lines = [
+            "【模拟再配置逐标的拒绝记忆】",
+            "- 以下记录来自本地模拟账户的真实投委会/执行拒绝，不是市场事实，也不是黑名单。",
+        ]
+        for row in rows:
+            reason = str(row.get("last_reason") or "未记录具体原因").replace("\n", " ")[:320]
+            lines.append(
+                f"- {row.get('ticker')} / {row.get('code')}: "
+                f"累计{int(row.get('rejection_count') or 0)}次；最近原因={reason}"
+            )
+        lines.append(
+            "- 协作规则: 不得原样重提上述候选；再次提交必须指出新增的本地可追溯证据、"
+            "它具体消除了哪条最近拒绝原因及失效条件，否则输出hold/空提案。"
+        )
+        return "\n".join(lines)
+
+    async def _record_candidate_rejections(
+        self,
+        rejections: List[Dict[str, Any]],
+        *,
+        source: str,
+    ) -> None:
+        """Upsert exact per-ticker rejection memory without reconstructing history."""
+        if not self.db_service or self.db_service._connection is None:
+            return
+        conn = self.db_service._connection
+        now = datetime.now().isoformat()
+        for item in rejections:
+            ticker = self._normalize_ticker(str(item.get("ticker") or ""))
+            if not ticker or ticker.startswith("DECISION_"):
+                continue
+            code = str(item.get("code") or "unknown_rejection").strip()
+            reason = str(item.get("reason") or "")[:2000]
+            await conn.execute(
+                """
+                INSERT INTO simulation_candidate_rejections (
+                    ticker, code, rejection_count, last_reason, source,
+                    first_seen_at, last_seen_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT(ticker, code) DO UPDATE SET
+                    rejection_count = simulation_candidate_rejections.rejection_count + 1,
+                    last_reason = excluded.last_reason,
+                    source = excluded.source,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (ticker, code, reason, source, now, now),
+            )
+        await conn.commit()
+
     async def _write_redeployment_state(
         self,
         *,
@@ -387,6 +473,7 @@ class InvestmentSimulation:
         for item in rejections or []:
             code = str(item.get("code") or "unknown_rejection").strip()
             rejection_counts[code] = rejection_counts.get(code, 0) + 1
+        await self._record_candidate_rejections(rejections or [], source=source)
         rejection_summary = ", ".join(
             f"{code}={count}" for code, count in sorted(rejection_counts.items())
         )
@@ -1539,6 +1626,23 @@ class InvestmentSimulation:
                 replay_count INTEGER NOT NULL DEFAULT 0
             )
         """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS simulation_candidate_rejections (
+                ticker TEXT NOT NULL,
+                code TEXT NOT NULL,
+                rejection_count INTEGER NOT NULL DEFAULT 0,
+                last_reason TEXT,
+                source TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (ticker, code)
+            )
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_simulation_candidate_rejections_count "
+            "ON simulation_candidate_rejections(rejection_count DESC, last_seen_at DESC)"
+        )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_simulation_pending_status "
             "ON simulation_pending_decisions(status, created_at)"

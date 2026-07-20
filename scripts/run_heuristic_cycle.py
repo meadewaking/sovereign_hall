@@ -1556,6 +1556,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
         ).fetchall()
         recent_lifecycle_exits: list[dict[str, Any]] = []
         redeployment_state: dict[str, Any] = {}
+        candidate_rejection_memory: list[dict[str, Any]] = []
         pending_decision_state: dict[str, Any] = {
             "unresolved_count": 0,
             "status_counts": {},
@@ -1623,6 +1624,23 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                         redeployment_state[key] = json.loads(redeployment_state[key] or "{}")
                     except (TypeError, ValueError, json.JSONDecodeError):
                         redeployment_state[key] = {}
+        if "simulation_candidate_rejections" in table_names:
+            rejection_rows = conn.execute(
+                """
+                SELECT ticker, code, rejection_count, last_reason,
+                       first_seen_at, last_seen_at
+                FROM simulation_candidate_rejections
+                ORDER BY rejection_count DESC, datetime(last_seen_at) DESC, ticker
+                LIMIT 10
+                """
+            ).fetchall()
+            rejection_keys = (
+                "ticker", "code", "rejection_count", "last_reason",
+                "first_seen_at", "last_seen_at",
+            )
+            candidate_rejection_memory = [
+                dict(zip(rejection_keys, rejection_row)) for rejection_row in rejection_rows
+            ]
         if "simulation_pending_decisions" in table_names:
             pending_columns = {
                 str(row[1])
@@ -1719,6 +1737,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                 "status", "pending_committee_approved_fresh_candidates"
             ),
             "redeployment_state": redeployment_state,
+            "candidate_rejection_memory": candidate_rejection_memory,
             "pending_decisions": pending_decision_state,
             "operational_cash_reason": (
                 "all holdings exited through realtime lifecycle rules; proceeds await "
@@ -1745,6 +1764,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
         "position_count": len(positions),
         "blocked_price_count": blocked_count,
         "redeployment_state": redeployment_state,
+        "candidate_rejection_memory": candidate_rejection_memory,
         "pending_decisions": pending_decision_state,
         "rule": (
             "Current account value, PnL, invested ratio and simulated fills require realtime quotes. "
@@ -2150,13 +2170,14 @@ def write_readme(
 ## Blocking & Repeated Warning Review
 - Reviewed automation memory and recent heuristic-cycle READMEs before running new trials. The repeated blocker remains exact local `daily_prices` plan-date coverage plus thin/stale local prediction tape, not a missing evaluation script.
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
-- Root cause advanced this cycle: deferred daily-limit/closed-market rulings were persisted and displayed, but no open-session consumer resolved them. A later session could neither replay nor expire a ruling, leaving the execution lifecycle incomplete.
-- System fix: `InvestmentSimulation.replay_pending_decisions` now consumes price-free rulings only during an open trading session, prioritizes exits, re-fetches realtime quotes through the normal execution path, re-applies every current gate, resolves each row once, reuses the same row if capacity disappears, and expires stale rulings after seven calendar days.
+- Root cause advanced this cycle: the redeployment state accumulated rejection codes but not per-ticker reasons, so proposal/voting agents could not distinguish a genuinely new case from an unchanged candidate already rejected for the same evidence gap.
+- System fix: `InvestmentSimulation` now persists genuine post-migration rejections by ticker/code, feeds only evidence-related holds/vetoes into the next `run_discussion` prompt, and `check_db` shows all categories for diagnosis. Temporary market-hours, quote, cooldown, and daily-cap blockers remain on the execution/replay path. Historical opaque attempts are not reconstructed.
 - Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
 - Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
 - Integration decision: full deployment is now a portfolio invariant, while unavailable/stale prices remain an explicit operational blocker rather than a reason to fabricate fills; risk is expressed through rotation, diversification, and per-position exits instead of strategic cash.
 
 ## What Changed
+- Added durable per-ticker candidate-rejection memory and a local-only prompt feedback block that requires exact new evidence before an unchanged held candidate may be resubmitted.
 - Added a durable replay/expiry state machine for `simulation_pending_decisions`; the queue still contains no price and is not an order book.
 - Connected replay to `run_discussion` after mandatory position review and before new committee allocations, so exits and older rulings consume the same persisted five-fill daily capacity.
 - Added `services/portfolio_policy.py` with deterministic stop-loss, take-profit, max-holding, fresh-price, deployment-gap, and candidate-allocation rules.
@@ -2271,6 +2292,7 @@ def write_readme(
 - Positions reviewed: {int(portfolio_lifecycle.get('reviewed_position_count', portfolio_lifecycle.get('position_count', 0)))}; current invested ratio={portfolio_invested_text}; deployment gap={portfolio_gap_text}.
 - Redeployment status: {portfolio_lifecycle.get('redeployment_status', 'not_applicable')}; operational cash reason: {portfolio_lifecycle.get('operational_cash_reason', 'N/A')}
 - Durable redeployment queue: status={redeployment_state.get('status', 'missing')}; gap={redeployment_state.get('deployment_gap', 'N/A')}; attempts={redeployment_state.get('attempt_count', 0)}; last candidates/fills={redeployment_state.get('last_candidate_count', 0)}/{redeployment_state.get('last_trade_count', 0)}; blocker={redeployment_state.get('blocker_code', 'N/A')}; next={redeployment_state.get('next_action', 'N/A')}
+- Per-ticker rejection memory: {json.dumps(portfolio_lifecycle.get('candidate_rejection_memory', []), ensure_ascii=False, sort_keys=True)}
 - Deferred-ruling queue: unresolved={int((portfolio_lifecycle.get('pending_decisions') or {}).get('unresolved_count', 0))}; status_counts={json.dumps((portfolio_lifecycle.get('pending_decisions') or {}).get('status_counts', {}), ensure_ascii=False, sort_keys=True)}; replay_schema={bool((portfolio_lifecycle.get('pending_decisions') or {}).get('schema_supports_replay', False))}
 - Last deferred-ruling resolution: {json.dumps((portfolio_lifecycle.get('pending_decisions') or {}).get('last_resolution'), ensure_ascii=False, sort_keys=True)}
 - Machine-readable snapshot: `portfolio_lifecycle_review.json`. No trade is generated by this report.
@@ -2283,6 +2305,9 @@ def write_readme(
 Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe split/cost-stress failure detected"}.
 
 ## User Entry Impact
+- This cycle closes the repeated-committee-hold feedback gap: genuine post-migration rejections are accumulated by ticker/code, evidence-related holds/vetoes are injected into the next `run_discussion` proposal and vote prompts, and all categories are shown by `check_db`; unchanged evidence-vetoed candidates must identify new local traceable evidence that resolves the latest rejection reason or remain hold.
+- The new rejection-memory table starts empty by design: the prior aggregate 97 attempts/62 holds are preserved but not reverse-engineered into per-ticker counts. The first future genuine rejection creates the first row.
+- An already-running `run_discussion` process retains its imported code until the user stops/restarts it; this cycle does not terminate that user process. New invocations receive the feedback block. `research_interactive` has no new rejection-memory behavior this cycle and continues to receive the shared heuristic/failure context only.
 - This cycle makes the deferred-ruling lifecycle auditable in `check_db`: users now see cumulative executed/rejected/expired/pending counts and the latest terminal resolution instead of an ambiguous empty queue.
 - This cycle closes the deferred-ruling execution gap: `run_discussion` now replays unresolved rulings only after mandatory holding review, only in an open market, with a newly fetched realtime quote and the current valuation/risk/cooldown/daily-limit gates.
 - Replayed exits run before entries; a filled or rejected ruling is terminal, a capacity race reuses the original row, and an unattempted ruling expires after seven calendar days without fabricating a trade.
@@ -2351,9 +2376,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Exercise the durable queue with a fresh, realtime-priced, committee-approved candidate and verify that the current 0%-invested deployment gap reaches an actual simulated fill or a precise rejection code.
+- Observe at least three post-migration per-ticker rejection-memory samples and verify that `run_discussion` stops unchanged resubmissions or records the exact new evidence that clears a prior hold.
 - Backfill independently validated `daily_prices` from the latest unlock ticker and collect a meaningful fresh tape before testing whether higher-return but under-deployed branches can be converted to 100%-capacity policies without failing cost/OOS checks.
-- After the queue has genuine terminal samples, aggregate replay latency and resolution codes so the next cycle can repair the dominant rejection or expiry cause instead of treating every empty queue as success.
+- Exercise the durable queue with a fresh, realtime-priced, committee-approved candidate during an open session and require either a fill or a precise terminal rejection without using stale/local-price fallback.
 """
     path.write_text(text, encoding="utf-8")
 

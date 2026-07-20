@@ -558,14 +558,19 @@ def dedupe_proposals(proposals: List[Dict]) -> List[Dict]:
     return list(by_key.values())
 
 
-def build_lessons_with_heuristic_context(lessons_prompt: str = "") -> str:
-    """Append the latest local heuristic risk constraints to agent prompts."""
+def build_lessons_with_heuristic_context(
+    lessons_prompt: str = "",
+    redeployment_context: str = "",
+) -> str:
+    """Append local heuristic and simulated-redeployment memory to prompts."""
     parts = []
     if lessons_prompt and lessons_prompt.strip():
         parts.append(lessons_prompt.strip())
     heuristic_prompt = format_heuristic_prompt_context()
     if heuristic_prompt:
         parts.append(heuristic_prompt)
+    if redeployment_context and redeployment_context.strip():
+        parts.append(redeployment_context.strip())
     return "\n\n".join(parts)
 
 
@@ -2161,7 +2166,15 @@ async def main():
 
                     print(f"   ✅ 文档已保存 (DB: {saved_docs}, Wiki: {vector_saved}, 跳过本地派生: {skipped_docs})")
 
-                prompt_lessons = build_lessons_with_heuristic_context(lessons_prompt)
+                redeployment_context = (
+                    await simulation.format_redeployment_learning_context()
+                    if hasattr(simulation, "format_redeployment_learning_context")
+                    else ""
+                )
+                prompt_lessons = build_lessons_with_heuristic_context(
+                    lessons_prompt,
+                    redeployment_context=redeployment_context,
+                )
 
                 # 阶段2：深度研报 → 提案
                 proposals = await stage2_deep_research(llm, docs, topic, db_service, lessons_prompt=prompt_lessons)

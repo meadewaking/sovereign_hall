@@ -902,6 +902,28 @@ def show_investment_status(db_path):
     except sqlite3.Error:
         redeployment_state = None
 
+    candidate_rejection_memory = []
+    candidate_rejection_memory_available = False
+    try:
+        candidate_rejection_memory_available = bool(
+            c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='simulation_candidate_rejections'"
+            ).fetchone()
+        )
+        c.execute(
+            """
+            SELECT ticker, code, rejection_count, last_reason, last_seen_at
+            FROM simulation_candidate_rejections
+            ORDER BY rejection_count DESC, datetime(last_seen_at) DESC, ticker
+            LIMIT 5
+            """
+        )
+        candidate_rejection_memory = [dict(row) for row in c.fetchall()]
+    except sqlite3.Error:
+        candidate_rejection_memory = []
+        candidate_rejection_memory_available = False
+
     pending_diagnostics = pending_decision_diagnostics(conn)
     pending_decisions = pending_diagnostics["pending_rows"]
     pending_decision_total = pending_diagnostics["unresolved_count"]
@@ -1056,6 +1078,17 @@ def show_investment_status(db_path):
                     f"{code}={int(count)}" for code, count in sorted(counts.items())
                 )
                 print(f"   {label}: {summary}")
+        if candidate_rejection_memory:
+            print("   逐标的重复拒绝记忆（仅统计迁移后真实尝试）:")
+            for item in candidate_rejection_memory:
+                reason = str(item.get("last_reason") or "未记录具体原因").replace("\n", " ")
+                print(
+                    f"      - {item.get('ticker')} / {item.get('code')} "
+                    f"x{int(item.get('rejection_count') or 0)} | {reason[:220]}"
+                )
+            print("   重提要求: 必须给出新增本地可追溯证据，并明确消除哪条最近拒绝原因；否则继续hold")
+        elif candidate_rejection_memory_available:
+            print("   逐标的重复拒绝记忆: 0 条（不反推旧记录；下一次真实拒绝开始累计并反馈给投委会prompt）")
         print(f"   下一动作: {redeployment_state.get('next_action') or '下一轮继续评估'}")
         print(f"   状态来源: {redeployment_state.get('source') or 'unknown'}")
     elif total_value is not None and cash > 0:

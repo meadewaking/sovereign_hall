@@ -1355,7 +1355,7 @@ async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(mo
 
 
 @pytest.mark.asyncio
-async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path):
+async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsys):
     db = DatabaseService(str(tmp_path / "test.db"))
     await db._init_db()
     sim = InvestmentSimulation(db)
@@ -1391,6 +1391,28 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path):
     assert attempted["last_rejection_counts"] == {"committee_hold": 2}
     assert attempted["rejection_counts_total"] == {"committee_hold": 2}
     assert "committee_hold=2" in attempted["next_action"]
+    rejection_memory = await sim.get_candidate_rejection_memory()
+    assert {(row["ticker"], row["code"], row["rejection_count"]) for row in rejection_memory} == {
+        ("600519", "committee_hold", 1),
+        ("510300", "committee_hold", 1),
+    }
+    feedback = await sim.format_redeployment_learning_context()
+    assert "模拟再配置逐标的拒绝记忆" in feedback
+    assert "600519 / committee_hold" in feedback
+    assert "不得原样重提" in feedback
+    await sim._record_candidate_rejections(
+        [{"code": "market_closed", "ticker": "600519", "reason": "等待开市"}],
+        source="test",
+    )
+    evidence_feedback = await sim.format_redeployment_learning_context()
+    assert "market_closed" not in evidence_feedback
+    assert "等待开市" not in evidence_feedback
+    combined_prompt = build_lessons_with_heuristic_context(
+        "历史教训",
+        redeployment_context=evidence_feedback,
+    )
+    assert "历史教训" in combined_prompt
+    assert "新增的本地可追溯证据" in combined_prompt
 
     await sim.record_redeployment_attempt(
         {"valuation_complete": True, "deployment_gap": 9_727.22},
@@ -1414,6 +1436,14 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path):
     assert persisted["attempt_count"] == 2
     assert persisted["rejection_counts_total"]["committee_hold"] == 2
     await db.close()
+
+    import sovereign_hall.check_db as check_db
+
+    check_db.show_investment_status(tmp_path / "test.db")
+    output = capsys.readouterr().out
+    assert "逐标的重复拒绝记忆" in output
+    assert "600519 / committee_hold x1" in output
+    assert "重提要求: 必须给出新增本地可追溯证据" in output
 
 
 @pytest.mark.asyncio
