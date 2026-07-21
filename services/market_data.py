@@ -41,6 +41,18 @@ class MarketDataService:
         return ticker
 
     @classmethod
+    def is_supported_ticker(cls, ticker: str) -> bool:
+        """Return whether ``ticker`` can identify an A-share/ETF quote.
+
+        Proposal prompts contain human-readable placeholders such as
+        ``推荐标的代码``.  Treating those as symbols pollutes committee memory and
+        needlessly reaches quote providers, so validation lives at the shared
+        market-data boundary rather than in prompt-only cleanup.
+        """
+        code = cls.normalize_ticker(ticker)
+        return len(code) == 6 and code.isdigit()
+
+    @classmethod
     def infer_market(cls, ticker: str) -> Optional[str]:
         code = cls.normalize_ticker(ticker)
         if not code.isdigit() or len(code) != 6:
@@ -135,7 +147,8 @@ class MarketDataService:
     async def get_current_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
         """Return a realtime quote with provider and retrieval timestamp."""
         code = self.normalize_ticker(ticker)
-        if not code:
+        if not self.is_supported_ticker(code):
+            logger.warning("Reject unsupported realtime quote ticker: %r", ticker)
             return None
 
         cached = self._quote_cache.get(code)

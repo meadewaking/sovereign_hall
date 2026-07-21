@@ -1557,6 +1557,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
         recent_lifecycle_exits: list[dict[str, Any]] = []
         redeployment_state: dict[str, Any] = {}
         candidate_rejection_memory: list[dict[str, Any]] = []
+        ignored_invalid_candidate_rejection_count = 0
         pending_decision_state: dict[str, Any] = {
             "unresolved_count": 0,
             "status_counts": {},
@@ -1625,13 +1626,15 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                     except (TypeError, ValueError, json.JSONDecodeError):
                         redeployment_state[key] = {}
         if "simulation_candidate_rejections" in table_names:
+            from services.market_data import MarketDataService
+
             rejection_rows = conn.execute(
                 """
                 SELECT ticker, code, rejection_count, last_reason,
                        first_seen_at, last_seen_at
                 FROM simulation_candidate_rejections
                 ORDER BY rejection_count DESC, datetime(last_seen_at) DESC, ticker
-                LIMIT 10
+                LIMIT 40
                 """
             ).fetchall()
             rejection_keys = (
@@ -1639,8 +1642,16 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
                 "first_seen_at", "last_seen_at",
             )
             candidate_rejection_memory = [
-                dict(zip(rejection_keys, rejection_row)) for rejection_row in rejection_rows
-            ]
+                dict(zip(rejection_keys, rejection_row))
+                for rejection_row in rejection_rows
+                if MarketDataService.is_supported_ticker(str(rejection_row[0] or ""))
+            ][:10]
+            ignored_invalid_candidate_rejection_count = len(rejection_rows) - len(
+                [
+                    row for row in rejection_rows
+                    if MarketDataService.is_supported_ticker(str(row[0] or ""))
+                ]
+            )
         if "simulation_pending_decisions" in table_names:
             pending_columns = {
                 str(row[1])
@@ -1738,6 +1749,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
             ),
             "redeployment_state": redeployment_state,
             "candidate_rejection_memory": candidate_rejection_memory,
+            "ignored_invalid_candidate_rejection_count": ignored_invalid_candidate_rejection_count,
             "pending_decisions": pending_decision_state,
             "operational_cash_reason": (
                 "all holdings exited through realtime lifecycle rules; proceeds await "
@@ -1765,6 +1777,7 @@ def build_portfolio_lifecycle_report(db_path: Path) -> dict[str, Any]:
         "blocked_price_count": blocked_count,
         "redeployment_state": redeployment_state,
         "candidate_rejection_memory": candidate_rejection_memory,
+        "ignored_invalid_candidate_rejection_count": ignored_invalid_candidate_rejection_count,
         "pending_decisions": pending_decision_state,
         "rule": (
             "Current account value, PnL, invested ratio and simulated fills require realtime quotes. "

@@ -166,6 +166,7 @@ def test_committee_preflight_records_every_non_executable_decision():
             {"ticker": "600519.SH", "direction": "hold", "risk_flags": ["证据不足"]},
             {"ticker": "", "direction": "long", "target_position": 0.1},
             {"ticker": "600050", "direction": "short"},
+            {"ticker": "推荐标的代码", "direction": "hold"},
             {"ticker": "510300", "direction": "long", "target_position": 0.1},
         ],
         current_tickers=set(),
@@ -176,6 +177,7 @@ def test_committee_preflight_records_every_non_executable_decision():
     assert {row["code"] for row in rejected} == {
         "committee_hold",
         "missing_ticker",
+        "invalid_ticker",
         "short_without_position",
     }
     assert "证据不足" in rejected[0]["reason"]
@@ -280,6 +282,18 @@ def test_check_db_realtime_quotes_are_on_by_default(monkeypatch):
 
     monkeypatch.setenv("SOVEREIGN_HALL_REALTIME_QUOTES", "0")
     assert check_db.realtime_quotes_enabled() is False
+
+
+def test_check_db_filters_placeholder_candidate_rejections():
+    import sovereign_hall.check_db as check_db
+
+    filtered = check_db.filter_supported_candidate_rejections([
+        {"ticker": "600519", "code": "committee_hold"},
+        {"ticker": "推荐标的代码", "code": "committee_hold"},
+        {"ticker": "06862", "code": "committee_hold"},
+    ])
+
+    assert filtered == [{"ticker": "600519", "code": "committee_hold"}]
 
 
 def test_check_db_requires_realtime_quote_without_local_fallback(tmp_path, monkeypatch, capsys):
@@ -948,6 +962,8 @@ def test_price_readiness_uses_signal_date_price_source_not_ticker_level_history(
 
 def test_market_data_ticker_mapping():
     svc = MarketDataService()
+    assert svc.is_supported_ticker("600519.SH") is True
+    assert svc.is_supported_ticker("推荐标的代码") is False
     assert svc.infer_market("600519") == "sh"
     assert svc.infer_market("159995") == "sz"
     assert svc.eastmoney_secid("512880") == "1.512880"
@@ -1204,11 +1220,24 @@ def test_portfolio_policy_targets_full_deployment_without_strategic_cash(tmp_pat
              'stale local price', '2026-07-13', 'blocked_stale_price', 'stale')
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE simulation_candidate_rejections (
+                ticker TEXT, code TEXT, rejection_count INTEGER, last_reason TEXT,
+                source TEXT, first_seen_at TEXT, last_seen_at TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO simulation_candidate_rejections VALUES (?, 'committee_hold', 1, 'x', 'test', '2026-07-21', '2026-07-21')",
+            [("600519",), ("推荐标的代码",), ("06862",)],
+        )
     report = evaluator.build_portfolio_lifecycle_report(db_path)
     assert report["cash"] == pytest.approx(7200.0)
     assert report["status"] == "realtime_valuation_required"
     assert report["invested_ratio"] is None
     assert report["deployment_gap"] is None
+    assert [row["ticker"] for row in report["candidate_rejection_memory"]] == ["600519"]
 
 
 def test_position_review_blocks_non_realtime_price_instead_of_fabricating_exit():
@@ -1413,6 +1442,17 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsy
     )
     assert "历史教训" in combined_prompt
     assert "新增的本地可追溯证据" in combined_prompt
+
+    await sim._record_candidate_rejections(
+        [{"code": "committee_hold", "ticker": "推荐标的代码", "reason": "示例占位符"}],
+        source="test",
+    )
+    async with db._connection.execute(
+        "SELECT ticker FROM simulation_candidate_rejections WHERE ticker = ?",
+        ("推荐标的代码",),
+    ) as cursor:
+        invalid_rows = await cursor.fetchall()
+    assert invalid_rows == []
 
     await sim.record_redeployment_attempt(
         {"valuation_complete": True, "deployment_gap": 9_727.22},

@@ -545,11 +545,13 @@ def select_next_topic(completed_topics: set, recent_topics=None) -> Optional[str
 
 def dedupe_proposals(proposals: List[Dict]) -> List[Dict]:
     """同一轮内按标的和方向去重，保留置信度最高的提案。"""
+    from sovereign_hall.services.market_data import MarketDataService
+
     by_key = {}
     for proposal in proposals:
         ticker = str(proposal.get("ticker", "")).strip().upper()
         direction = str(proposal.get("direction", "long")).strip().lower()
-        if not ticker:
+        if not MarketDataService.is_supported_ticker(ticker):
             continue
         key = (ticker, direction)
         previous = by_key.get(key)
@@ -772,9 +774,11 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 
         # 清洗数据（同时过滤黑名单）
         cleaned = []
+        from sovereign_hall.services.market_data import MarketDataService
+
         for p in proposals:
             ticker = str(p.get('ticker', '')).strip().upper()
-            if ticker and ticker != 'NULL' and len(ticker) >= 2:
+            if MarketDataService.is_supported_ticker(ticker):
                 # 过滤黑名单中的标的
                 if blacklist and ticker in blacklist:
                     logger.warning(f"Filtered blacklisted ticker: {ticker}")
@@ -1015,6 +1019,8 @@ def preflight_committee_decisions(
     """
     executable: List[Dict] = []
     rejections: List[Dict[str, str]] = []
+    from sovereign_hall.services.market_data import MarketDataService
+
     normalized_positions = {normalize_ticker(ticker) for ticker in current_tickers}
 
     for index, decision in enumerate(decisions):
@@ -1029,6 +1035,13 @@ def preflight_committee_decisions(
                 "code": "missing_ticker",
                 "ticker": f"decision_{index + 1}",
                 "reason": "投委会裁决缺少可识别ticker" + suffix,
+            })
+            continue
+        if not MarketDataService.is_supported_ticker(ticker):
+            rejections.append({
+                "code": "invalid_ticker",
+                "ticker": f"decision_{index + 1}",
+                "reason": f"投委会裁决ticker不是可执行的A股/ETF六位代码: {raw_ticker!r}" + suffix,
             })
             continue
         if direction in {"hold", "neutral", "watch", "观望"}:

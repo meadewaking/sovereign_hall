@@ -295,9 +295,15 @@ class InvestmentSimulation:
                 ORDER BY rejection_count DESC, datetime(last_seen_at) DESC, ticker
                 LIMIT ?
                 """,
-                (max(1, int(limit)),),
+                (max(20, int(limit) * 4),),
             ) as cursor:
-                return [dict(row) async for row in cursor]
+                rows = [dict(row) async for row in cursor]
+            from .market_data import MarketDataService
+
+            return [
+                row for row in rows
+                if MarketDataService.is_supported_ticker(str(row.get("ticker") or ""))
+            ][:max(1, int(limit))]
         except Exception:
             return []
 
@@ -341,9 +347,11 @@ class InvestmentSimulation:
             return
         conn = self.db_service._connection
         now = datetime.now().isoformat()
+        from .market_data import MarketDataService
+
         for item in rejections:
             ticker = self._normalize_ticker(str(item.get("ticker") or ""))
-            if not ticker or ticker.startswith("DECISION_"):
+            if not MarketDataService.is_supported_ticker(ticker):
                 continue
             code = str(item.get("code") or "unknown_rejection").strip()
             reason = str(item.get("reason") or "")[:2000]

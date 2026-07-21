@@ -61,6 +61,16 @@ def normalize_ticker(ticker: str) -> str:
     return code.split(".")[0] if "." in code else code
 
 
+def filter_supported_candidate_rejections(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only executable A-share/ETF symbols in decision feedback."""
+    from sovereign_hall.services.market_data import MarketDataService
+
+    return [
+        row for row in rows
+        if MarketDataService.is_supported_ticker(str(row.get("ticker") or ""))
+    ]
+
+
 def realtime_quotes_enabled() -> bool:
     """Realtime valuation is the default; explicit opt-out yields N/A, never fallback."""
     value = os.environ.get("SOVEREIGN_HALL_REALTIME_QUOTES", "1").strip().lower()
@@ -904,6 +914,7 @@ def show_investment_status(db_path):
 
     candidate_rejection_memory = []
     candidate_rejection_memory_available = False
+    ignored_invalid_rejection_count = 0
     try:
         candidate_rejection_memory_available = bool(
             c.execute(
@@ -916,10 +927,17 @@ def show_investment_status(db_path):
             SELECT ticker, code, rejection_count, last_reason, last_seen_at
             FROM simulation_candidate_rejections
             ORDER BY rejection_count DESC, datetime(last_seen_at) DESC, ticker
-            LIMIT 5
+            LIMIT 20
             """
         )
-        candidate_rejection_memory = [dict(row) for row in c.fetchall()]
+        raw_candidate_rejections = [dict(row) for row in c.fetchall()]
+        candidate_rejection_memory = filter_supported_candidate_rejections(
+            raw_candidate_rejections
+        )[:5]
+        ignored_invalid_rejection_count = (
+            len(raw_candidate_rejections)
+            - len(filter_supported_candidate_rejections(raw_candidate_rejections))
+        )
     except sqlite3.Error:
         candidate_rejection_memory = []
         candidate_rejection_memory_available = False
@@ -1089,6 +1107,11 @@ def show_investment_status(db_path):
             print("   重提要求: 必须给出新增本地可追溯证据，并明确消除哪条最近拒绝原因；否则继续hold")
         elif candidate_rejection_memory_available:
             print("   逐标的重复拒绝记忆: 0 条（不反推旧记录；下一次真实拒绝开始累计并反馈给投委会prompt）")
+        if ignored_invalid_rejection_count:
+            print(
+                f"   数据质量修复: 已隔离 {ignored_invalid_rejection_count} 条无效ticker拒绝记录；"
+                "保留数据库审计行，但不再注入投委会prompt或请求实时行情"
+            )
         print(f"   下一动作: {redeployment_state.get('next_action') or '下一轮继续评估'}")
         print(f"   状态来源: {redeployment_state.get('source') or 'unknown'}")
     elif total_value is not None and cash > 0:
