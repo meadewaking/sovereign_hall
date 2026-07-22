@@ -40,7 +40,9 @@ from sovereign_hall.services.heuristic_policy import (
     format_price_readiness_backfill_queue,
     format_price_readiness_stall_note,
     format_policy_checklist,
+    prepare_candidate_rejection_feedback,
     recent_prediction_observation_count,
+    sanitize_candidate_rejection_reason,
 )
 from sovereign_hall.services.market_data import MarketDataService
 from sovereign_hall.services.llm_client import LLMClient
@@ -58,6 +60,7 @@ from sovereign_hall.run_discussion import (
     build_proposal_thesis,
     build_lessons_with_heuristic_context,
     cli_args_can_run_without_instance_lock,
+    filter_repeated_rejection_proposals,
     parse_committee_vote,
     preflight_committee_decisions,
     proposal_priority_score,
@@ -160,6 +163,59 @@ def test_backtest_never_exceeds_five_transactions_per_day():
     assert result["metrics"]["trade_count"] == int(result["curve"]["trade_count"].sum())
 
 
+def test_backtest_marks_held_ticker_from_price_history_without_new_signal():
+    module = load_script_module(
+        "run_heuristic_cycle_independent_marks_module",
+        "scripts/run_heuristic_cycle.py",
+    )
+    daily = module.pd.DataFrame(
+        [
+            {"date": "2026-01-01", "ticker": "600519", "price": 10.0},
+            {"date": "2026-01-02", "ticker": "510300", "price": 4.0},
+        ]
+    )
+    history = module.pd.DataFrame(
+        [
+            {"date": "2026-01-01", "ticker": "600519", "close": 10.0},
+            {"date": "2026-01-02", "ticker": "600519", "close": 10.2},
+        ]
+    )
+
+    marks = module.build_mark_prices_by_date(daily, history)
+
+    assert marks["2026-01-02"]["600519"] == pytest.approx(10.2)
+
+
+def test_price_readiness_accepts_near_complete_history_when_latest_date_is_covered():
+    module = load_script_module(
+        "heuristic_cycle_near_complete_readiness_module",
+        "scripts/run_heuristic_cycle.py",
+    )
+    rows = []
+    for index in range(20):
+        rows.append(
+            {
+                "ticker": f"{index:06d}",
+                "date": "2026-01-02",
+                "price_source": "daily_prices",
+                "close_observations": 1,
+            }
+        )
+    rows.append(
+        {
+            "ticker": "999999",
+            "date": "2026-01-01",
+            "price_source": "prediction_current_price",
+            "close_observations": 1,
+        }
+    )
+
+    readiness = module.build_price_readiness_report(module.pd.DataFrame(rows), module.pd.DataFrame())
+
+    assert readiness["status"] == "ready_with_historical_provider_gaps"
+    assert readiness["latest_missing_tickers"] == []
+
+
 def test_committee_preflight_records_every_non_executable_decision():
     executable, rejected = preflight_committee_decisions(
         [
@@ -181,6 +237,88 @@ def test_committee_preflight_records_every_non_executable_decision():
         "short_without_position",
     }
     assert "证据不足" in rejected[0]["reason"]
+
+
+def test_rejection_feedback_keeps_audit_but_removes_obsolete_price_claims():
+    raw_reason = (
+        "投委会证据未形成多头/退出裁决；risk_flags="
+        "标的与逻辑错配未纠正,连续9轮partial daily_prices覆盖无进展,"
+        "止损物理性失效：98%缺价交易日导致退出无法执行"
+    )
+
+    active, superseded = sanitize_candidate_rejection_reason(raw_reason)
+    prepared = prepare_candidate_rejection_feedback([{"last_reason": raw_reason}])[0]
+
+    assert "标的与逻辑错配" in active
+    assert "daily_prices" not in active
+    assert "98%" not in active
+    assert len(superseded) == 2
+    assert prepared["last_reason"] == raw_reason
+    assert prepared["feedback_reason"] == active
+    assert prepared["feedback_usable"] is True
+
+
+def test_redeployment_state_preserves_raw_blocker_but_returns_sanitized_view(tmp_path):
+    async def run():
+        db = DatabaseService(str(tmp_path / "test.db"))
+        await db._init_db()
+        sim = InvestmentSimulation(db)
+        await sim.init_tables()
+        await sim._write_redeployment_state(
+            status="blocked_no_approved_candidates",
+            deployment_gap=1000.0,
+            blocker_code="missing_approved_candidates",
+            blocker_reason=(
+                "投委会未批准；risk_flags=止损物理性失效：98%缺价交易日导致平仓指令无法执行,"
+                "标的与逻辑错配"
+            ),
+            next_action="重新研究",
+            source="test",
+        )
+        state = await sim.get_redeployment_state()
+        raw = (
+            await db._connection.execute_fetchall(
+                "SELECT blocker_reason FROM simulation_redeployment_state WHERE id=1"
+            )
+        )[0][0]
+        await db.close()
+        return state, raw
+
+    state, raw = __import__("asyncio").run(run())
+    assert "98%" in raw
+    assert "98%" in state["blocker_reason_audit"]
+    assert "98%" not in state["blocker_reason"]
+    assert "标的与逻辑错配" in state["blocker_reason"]
+
+
+def test_repeated_candidate_requires_traceable_evidence_delta_during_cooldown():
+    now = datetime(2026, 7, 22, 14, 0, 0)
+    memory = [{
+        "ticker": "159995",
+        "code": "committee_hold",
+        "rejection_count": 48,
+        "last_seen_at": "2026-07-22T10:00:00",
+        "feedback_usable": True,
+        "feedback_reason": "标的与逻辑错配未纠正",
+    }]
+    unchanged = {"ticker": "159995", "direction": "long", "confidence": 0.8}
+    traceable = unchanged | {
+        "resolved_rejection": "标的与逻辑错配未纠正",
+        "evidence_delta": "本地文档doc-42确认该ETF成分与提案主题一致",
+        "evidence": ["doc-42 成分核验"],
+    }
+
+    eligible, rejected = filter_repeated_rejection_proposals(
+        [unchanged], memory, now=now
+    )
+    traceable_eligible, traceable_rejected = filter_repeated_rejection_proposals(
+        [traceable], memory, now=now
+    )
+
+    assert eligible == []
+    assert rejected[0]["code"] == "repeated_candidate_cooldown"
+    assert traceable_eligible == [traceable]
+    assert traceable_rejected == []
 
 
 def test_cycle_comparison_uses_retained_best_not_diagnostic_max(tmp_path):
@@ -480,8 +618,9 @@ def test_check_db_reports_live_daily_price_backfill_progress(tmp_path):
     assert "local_daily_prices_template.csv" in text
     assert "MarketDataService fetch 默认关闭" in text
     assert f"--plan {plan_path}" in text
-    assert "模拟买入上限维持 <= 0.5%" in text
-    assert "不得扩仓" in text
+    assert "旧历史artifact复用仓位上限 <= 0.5%" in text
+    assert "旧历史artifact复用仓位上限" in text
+    assert "不受该历史缺口停机帽约束" in text
 
 
 def test_check_db_exports_stable_local_daily_price_template(tmp_path):
@@ -811,6 +950,29 @@ def test_backfill_plan_uses_missing_date_range_and_csv_plan_coverage(tmp_path):
     assert "csv_exact_ticker_coverage=1/2" in coverage
     assert "signal_dates=1/2" in coverage
     assert "missing_top=600690" in coverage
+
+
+def test_backfill_market_request_extends_before_weekend_signal(tmp_path):
+    module = load_script_module("backfill_daily_prices_weekend_module", "scripts/backfill_daily_prices.py")
+    plan_path = tmp_path / "daily_price_backfill_plan.csv"
+    plan_path.write_text(
+        "priority_rank,ticker,missing_signal_days,first_missing_signal_date,last_missing_signal_date,"
+        "total_signal_observations,latest_signal_date,missing_latest_signal_date,"
+        "minimum_rows_to_unblock_latest,plan_action\n"
+        "1,600141,1,2026-05-30,2026-05-30,1,2026-05-30,True,1,backfill\n",
+        encoding="utf-8",
+    )
+
+    exact = module.requests_from_plan(plan_path, datetime(2026, 6, 1).date())
+    fetch = module.requests_from_plan(
+        plan_path,
+        datetime(2026, 6, 1).date(),
+        lookback_days=7,
+    )
+
+    assert exact[0].start.isoformat() == "2026-05-30"
+    assert fetch[0].start.isoformat() == "2026-05-23"
+    assert fetch[0].end.isoformat() == "2026-05-30"
 
 
 def test_backfill_plan_status_uses_exact_signal_tape_dates(tmp_path):
@@ -1706,8 +1868,8 @@ def test_heuristic_context_warns_when_price_source_is_unvalidated(tmp_path):
     assert "daily_prices缺失" in reason
     assert "禁止放大仓位" in reason
     assert "数据质量风险" in status
-    assert "弱价格覆盖模拟买入上限: 1.5%" in status
-    assert "弱价格覆盖仓位<=1.5%" in prompt
+    assert "弱价格覆盖历史证据复用上限: 1.5%" in status
+    assert "弱价格覆盖历史证据仓位<=1.5%" in prompt
     assert "current_price fallback" in prompt
 
 
@@ -1875,7 +2037,49 @@ def test_tape_freshness_is_recomputed_and_vetoes_new_simulated_long(tmp_path):
     assert held_cap == pytest.approx(0.02)
     assert "拒绝新增或扩大模拟多头仓位" in new_reason
     assert "拒绝新增或扩大模拟多头仓位" in held_reason
-    assert "陈旧tape前置否决" in status
+    assert "陈旧tape复用否决" in status
+
+
+def test_current_committee_evidence_is_not_frozen_by_historical_price_gaps(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="fresh_committee_deployment",
+        score=-0.01,
+        max_position=0.10,
+        min_confidence=0.65,
+        min_signal_count=1,
+        overfit_risk=True,
+        warning="historical coverage incomplete",
+        failure_cases=[],
+        price_source="prediction current_price fallback; daily_prices partial",
+        price_coverage={"status": "partial_daily_prices_low_signal_coverage", "independent_price_row_ratio": 0.0},
+        tape_update={"validation_status": "stale_tape"},
+        price_readiness_stall={"status": "stalled_partial_daily_prices"},
+    )
+
+    capped, reason = apply_heuristic_risk_cap(
+        "600519",
+        0.10,
+        0.80,
+        signal_count=1,
+        current_position=0.0,
+        current_gross_exposure=0.0,
+        fresh_local_evidence=True,
+        context=context,
+    )
+    stale_cap, _ = apply_heuristic_risk_cap(
+        "600519",
+        0.10,
+        0.80,
+        signal_count=1,
+        current_position=0.0,
+        current_gross_exposure=0.0,
+        context=context,
+    )
+
+    assert capped == pytest.approx(0.10)
+    assert "不再强制空仓" in reason
+    assert stale_cap == 0.0
 
 
 def test_tape_entry_veto_clears_only_with_fresh_broad_update(tmp_path):
@@ -2130,7 +2334,7 @@ def test_heuristic_context_surfaces_price_coverage(tmp_path):
     assert "持仓缺价槽位37.8%" in reason
     assert "弱覆盖模拟买入上限1.2%" in reason
     assert "价格覆盖" in status
-    assert "弱价格覆盖模拟买入上限: 1.2%" in status
+    assert "弱价格覆盖历史证据复用上限: 1.2%" in status
     assert "daily_prices覆盖0.0%" in prompt
     assert "弱覆盖模拟买入上限=1.2%" in prompt
 
@@ -2289,7 +2493,7 @@ def test_heuristic_context_surfaces_price_readiness(tmp_path):
     plan = format_price_readiness_backfill_plan(context)
 
     assert "daily_prices补齐: blocked_no_daily_prices" in status
-    assert "daily_prices阻塞模拟买入上限: 0.5%" in status
+    assert "daily_prices阻塞历史证据复用上限: 0.5%" in status
     assert "daily_prices优先补齐队列: 600519(missing_days=45d, obs=1585, missing_range=2026-05-01..2026-06-20)" in status
     assert "daily_prices补齐计划: plan=" in status
     assert "top=600519, 512880" in status
@@ -2477,7 +2681,7 @@ def test_heuristic_context_surfaces_price_readiness_stall(tmp_path):
     assert "daily_prices连续阻塞" in status
     assert "连续阻塞模拟买入上限=0.25%" in prompt
     assert "不得新增leaderboard分支" in prompt
-    assert "daily_prices连续阻塞仓位<=0.25%" in checklist
+    assert "daily_prices连续阻塞历史证据仓位<=0.25%" in checklist
     assert "下一步ticker=159995" in note
 
 
@@ -2506,7 +2710,7 @@ def test_heuristic_risk_cap_tightens_thin_tape_update(tmp_path):
     assert capped == pytest.approx(0.01)
     assert "薄样本验证模拟买入上限1.0%" in reason
     assert "较上轮新增1行" in status
-    assert "薄tape验证仓位<=1.0%" in prompt
+    assert "薄tape历史证据仓位<=1.0%" in prompt
 
 
 def test_heuristic_risk_cap_tightens_zero_new_tape_update(tmp_path):
@@ -2534,8 +2738,8 @@ def test_heuristic_risk_cap_tightens_zero_new_tape_update(tmp_path):
     assert capped == pytest.approx(0.005)
     assert "零新增样本" in reason
     assert "薄样本验证模拟买入上限0.5%" in reason
-    assert "薄样本验证模拟买入上限: 0.5%" in status
-    assert "薄tape验证仓位<=0.5%" in prompt
+    assert "薄样本历史证据复用上限: 0.5%" in status
+    assert "薄tape历史证据仓位<=0.5%" in prompt
 
 
 def test_simulation_trade_losses_derive_risk_memory():

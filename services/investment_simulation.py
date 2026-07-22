@@ -20,7 +20,9 @@ from ..services.heuristic_policy import (
     SIMULATION_RISK_MEMORY_DAYS,
     apply_heuristic_risk_cap,
     derive_simulation_risk_memory,
+    prepare_candidate_rejection_feedback,
     recent_prediction_observation_count,
+    sanitize_candidate_rejection_reason,
 )
 from ..services.portfolio_policy import deployment_status, review_position
 from ..services.reward_policy import MAX_DAILY_TRADES
@@ -273,6 +275,17 @@ class InvestmentSimulation:
                     result[key] = json.loads(raw) if raw else {}
                 except (TypeError, ValueError, json.JSONDecodeError):
                     result[key] = {}
+            raw_blocker_reason = str(result.get("blocker_reason") or "")
+            feedback_reason, superseded = sanitize_candidate_rejection_reason(
+                raw_blocker_reason
+            )
+            if superseded:
+                result["blocker_reason_audit"] = raw_blocker_reason
+                result["blocker_reason"] = feedback_reason or (
+                    "最近阻塞仅含已过期的历史价格/止损断言；保留数据库审计，"
+                    "下一轮必须重新形成当前证据"
+                )
+                result["superseded_blocker_reason_fragments"] = superseded
             return result
         except Exception:
             return {}
@@ -300,10 +313,11 @@ class InvestmentSimulation:
                 rows = [dict(row) async for row in cursor]
             from .market_data import MarketDataService
 
-            return [
+            supported = [
                 row for row in rows
                 if MarketDataService.is_supported_ticker(str(row.get("ticker") or ""))
             ][:max(1, int(limit))]
+            return prepare_candidate_rejection_feedback(supported)
         except Exception:
             return []
 
@@ -313,22 +327,40 @@ class InvestmentSimulation:
         # quote, cooldown) belong to the replay path and must not become a
         # research blacklist.  Only evidence-related vetoes are fed back to
         # proposal/voting agents.
-        rows = [
+        all_rows = [
             row
             for row in await self.get_candidate_rejection_memory(limit=max(limit * 4, limit))
             if row.get("code") in {"committee_hold", "heuristic_entry_veto"}
-        ][:limit]
+        ]
+        rows = [row for row in all_rows if row.get("feedback_usable")][:limit]
         if not rows:
-            return ""
+            superseded_count = sum(
+                len(row.get("superseded_reason_fragments") or []) for row in all_rows
+            )
+            return (
+                "【模拟再配置逐标的拒绝记忆】\n"
+                f"- {superseded_count}条瞬态旧理由已被当前实时估值/成交边界推翻，"
+                "保留审计但不再注入提案或投票prompt；本轮必须重新形成证据。"
+                if superseded_count
+                else ""
+            )
         lines = [
             "【模拟再配置逐标的拒绝记忆】",
             "- 以下记录来自本地模拟账户的真实投委会/执行拒绝，不是市场事实，也不是黑名单。",
         ]
         for row in rows:
-            reason = str(row.get("last_reason") or "未记录具体原因").replace("\n", " ")[:320]
+            reason = str(row.get("feedback_reason") or "未记录具体原因")[:320]
             lines.append(
                 f"- {row.get('ticker')} / {row.get('code')}: "
                 f"累计{int(row.get('rejection_count') or 0)}次；最近原因={reason}"
+            )
+        superseded_count = sum(
+            len(row.get("superseded_reason_fragments") or []) for row in all_rows
+        )
+        if superseded_count:
+            lines.append(
+                f"- 已隔离{superseded_count}条过期瞬态理由（历史daily_prices缺口不得证明"
+                "当前实时止损/成交不可执行）；原始数据库记录未删除。"
             )
         lines.append(
             "- 协作规则: 不得原样重提上述候选；再次提交必须指出新增的本地可追溯证据、"

@@ -609,7 +609,12 @@ def summarize_metrics(
     return metrics
 
 
-def run_backtest(daily: list[dict[str, Any]], policy: PolicyConfig, costs: CostConfig) -> dict[str, Any]:
+def run_backtest(
+    daily: list[dict[str, Any]],
+    policy: PolicyConfig,
+    costs: CostConfig,
+    price_history: dict[tuple[str, str], float] | None = None,
+) -> dict[str, Any]:
     dates = sorted({row["date"] for row in daily})
     cost_assumption = (
         f"fee={costs.trading_fee:.4%}, stamp_duty={costs.stamp_duty:.4%}, "
@@ -625,6 +630,13 @@ def run_backtest(daily: list[dict[str, Any]], policy: PolicyConfig, costs: CostC
         date: {row["ticker"]: row["price"] for row in rows}
         for date, rows in by_date.items()
     }
+    if price_history:
+        asof_prices = build_asof_price_history(price_history)
+        for date in dates:
+            for ticker in asof_prices:
+                mark = asof_daily_price(asof_prices, ticker, date)
+                if mark is not None:
+                    prices_by_date[date][ticker] = mark
     positions: dict[str, float] = {}
     position_age_days: dict[str, int] = {}
     entry_price: dict[str, float] = {}
@@ -940,8 +952,8 @@ def build_policies(recent_failure_tickers: tuple[str, ...]) -> list[PolicyConfig
         PolicyConfig(name="no_lookahead_failure_veto", min_confidence=0.66, max_names=4, max_position=0.08, max_gross=0.40, min_risk_reward=0.9, require_positive_trend=True, trend_lookback=2, use_anomaly_veto=True, anomaly_return_threshold=0.18, drawdown_guard=0.45, drawdown_guard_threshold=0.02, loss_streak_threshold=2, loss_streak_guard=0.50, new_entry_loss_streak_threshold=2, min_holding_days=4, rebalance_threshold=0.05, universe="single_stock", failure_memory_mode="veto", failure_memory_loss_threshold=-0.03, failure_memory_days=8),
     ]
     base.extend([
-        PolicyConfig(name="full_deployment_diversified_hold10", min_confidence=0.65, max_names=10, max_position=0.10, max_gross=1.0, min_risk_reward=0.8, use_anomaly_veto=True, anomaly_return_threshold=0.18, drawdown_guard=1.0, min_holding_days=10, rebalance_threshold=0.05),
-        PolicyConfig(name="full_deployment_lower_churn_hold15", min_confidence=0.65, max_names=10, max_position=0.10, max_gross=1.0, min_risk_reward=0.8, use_anomaly_veto=True, anomaly_return_threshold=0.18, drawdown_guard=1.0, min_holding_days=15, rebalance_threshold=0.08),
+        PolicyConfig(name="full_deployment_diversified_hold10", min_confidence=0.65, max_names=10, max_position=0.10, max_gross=1.0, min_risk_reward=0.8, use_anomaly_veto=True, anomaly_return_threshold=0.18, drawdown_guard=1.0, min_holding_days=10, rebalance_threshold=0.05, require_independent_price=True),
+        PolicyConfig(name="full_deployment_lower_churn_hold15", min_confidence=0.65, max_names=10, max_position=0.10, max_gross=1.0, min_risk_reward=0.8, use_anomaly_veto=True, anomaly_return_threshold=0.18, drawdown_guard=1.0, min_holding_days=15, rebalance_threshold=0.08, require_independent_price=True),
     ])
     if recent_failure_tickers:
         base.extend(
@@ -957,16 +969,21 @@ def promotable(policy_name: str) -> bool:
     return not policy_name.endswith("_diagnostic") and not policy_name.startswith("recent_failure")
 
 
-def split_checks(daily: list[dict[str, Any]], policy: PolicyConfig, costs: CostConfig) -> dict[str, Any]:
+def split_checks(
+    daily: list[dict[str, Any]],
+    policy: PolicyConfig,
+    costs: CostConfig,
+    price_history: dict[tuple[str, str], float] | None = None,
+) -> dict[str, Any]:
     dates = sorted({row["date"] for row in daily})
     if len(dates) < 6:
         return {"warning": "too few dates for split check", "overfit_risk": True}
     split = int(len(dates) * 0.6)
     train_dates = set(dates[:split])
     test_dates = set(dates[split - 1 :])
-    train = run_backtest([row for row in daily if row["date"] in train_dates], policy, costs)["metrics"]
-    test = run_backtest([row for row in daily if row["date"] in test_dates], policy, costs)["metrics"]
-    stress = run_backtest(daily, policy, replace(costs, slippage=costs.slippage * 3.0))["metrics"]
+    train = run_backtest([row for row in daily if row["date"] in train_dates], policy, costs, price_history)["metrics"]
+    test = run_backtest([row for row in daily if row["date"] in test_dates], policy, costs, price_history)["metrics"]
+    stress = run_backtest(daily, policy, replace(costs, slippage=costs.slippage * 3.0), price_history)["metrics"]
     return {
         "split_date": dates[split],
         "train": train,
@@ -981,6 +998,7 @@ def build_sleeve_diagnostics(
     policies: list[PolicyConfig],
     results: dict[str, dict[str, Any]],
     costs: CostConfig,
+    price_history: dict[tuple[str, str], float] | None = None,
 ) -> dict[str, Any]:
     policies_by_name = {policy.name: policy for policy in policies}
     single_candidates = [name for name in ("single_stock_hold6_cap5_min2obs_anomaly12", "single_stock_hold6_cap5_min2obs", "single_stock_hold6_cap4_min2obs") if name in results]
@@ -989,7 +1007,7 @@ def build_sleeve_diagnostics(
     for sleeve_name, trial_name in {"etf": "etf_only_cost_guard", "single_stock": single_trial}.items():
         policy = policies_by_name[trial_name]
         metrics = results[trial_name]["metrics"]
-        checks = split_checks(daily, policy, costs)
+        checks = split_checks(daily, policy, costs, price_history)
         oos = checks.get("out_of_sample", {}).get("score")
         stress = checks.get("cost_stress_3x_slippage", {}).get("score")
         reasons: list[str] = []
@@ -1123,10 +1141,21 @@ def build_price_readiness_report(
         reverse=True,
     )
 
+    ticker_coverage_ratio = (
+        (len(signal_tickers) - len(missing)) / len(signal_tickers)
+        if signal_tickers else 0.0
+    )
+    signal_row_coverage_ratio = priced_row_count / len(daily) if daily else 0.0
     if not signal_tickers:
         status = "no_signal_tickers"
     elif priced_row_count <= 0:
         status = "blocked_no_daily_prices"
+    elif (
+        not latest_missing
+        and ticker_coverage_ratio >= 0.95
+        and signal_row_coverage_ratio >= 0.90
+    ):
+        status = "ready_with_historical_provider_gaps" if missing else "ready_validated_daily_prices"
     elif missing:
         status = "partial_daily_price_backfill_needed"
     else:
@@ -1135,7 +1164,10 @@ def build_price_readiness_report(
     next_action = (
         "Backfill latest local daily_prices for the full latest_missing_tickers batch first, then rerun the cycle and require validated coverage before relaxing caps."
         if latest_missing
-        else "Latest signal-date prices are covered; continue historical priority backfill before relaxing weak-coverage caps."
+        else (
+            "Latest signal-date prices are covered. Retry provider-unavailable historical gaps or import "
+            "independent local OHLC, but do not treat those gaps as a current simulation shutdown."
+        )
     )
 
     return {
@@ -1143,6 +1175,8 @@ def build_price_readiness_report(
         "total_signal_ticker_count": len(signal_tickers),
         "priced_signal_ticker_count": len(signal_tickers) - len(missing),
         "missing_signal_ticker_count": len(missing),
+        "ticker_coverage_ratio": ticker_coverage_ratio,
+        "signal_row_coverage_ratio": signal_row_coverage_ratio,
         "latest_signal_date": latest_date,
         "latest_missing_tickers": latest_missing,
         "unblock_tickers": latest_missing,
@@ -1578,9 +1612,11 @@ def write_readme(
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
 - Root cause advanced this cycle: local CSV validation could previously report ticker-level plan coverage when a row merely landed inside a planned date range; that was weaker than the DB/status gate, which requires exact missing signal-date coverage with bounded as-of matching.
 - System fix: `scripts/backfill_daily_prices.py --import-csv ... --dry-run --plan ...` now reports exact signal-date coverage, and MarketDataService fetches are blocked unless explicitly opted in with `--allow-market-fetch` or `SOVEREIGN_HALL_ALLOW_MARKET_BACKFILL=1`.
+- Rejection-memory reliability fix: raw reasons remain auditable, while active agent/check_db feedback quarantines obsolete historical-price stop claims and unchanged repeatedly rejected candidates require a structured traceable evidence delta before committee reuse.
 - Integration decision: do not promote a return-seeking default or relax caps this round; use the retained policy only as a risk cap/warning until independently supplied local OHLC rows pass exact plan-date validation and a new cycle confirms coverage.
 
 ## What Changed
+- Separated raw rejection audit text from active feedback and added the shared repeated-candidate research cooldown used by `run_discussion`.
 - Ran the local-only heuristic cycle through the standard-library fallback because numpy/pandas import did not complete in the preflight window.
 - Preserved the existing interpretable policy family and retained promotion rules: diagnostic sparse/max3/min3/recent-failure trials are not default policies.
 - Advanced the prior fresh-tape direction by checking whether this run has meaningful new local predictions before treating the retained policy as validation for widening.
@@ -1749,7 +1785,7 @@ def main() -> int:
     trials: list[dict[str, Any]] = []
     timestamp = datetime.now().isoformat(timespec="seconds")
     for idx, policy in enumerate(policies):
-        result = run_backtest(daily, policy, costs)
+        result = run_backtest(daily, policy, costs, price_history)
         results[policy.name] = result
         metrics = result["metrics"]
         trials.append(
@@ -1796,7 +1832,7 @@ def main() -> int:
     best_policy = next(policy for policy in policies if policy.name == best_name)
     best_result = results[best_name]
     simplified = replace(best_policy, name="simplified_best_policy", anomaly_return_threshold=0.18)
-    simplified_result = run_backtest(daily, simplified, costs)
+    simplified_result = run_backtest(daily, simplified, costs, price_history)
     if simplified_result["metrics"]["score"] >= best_result["metrics"]["score"]:
         best_name = simplified.name
         best_policy = simplified
@@ -1832,8 +1868,8 @@ def main() -> int:
         }
     )
 
-    checks = split_checks(daily, best_policy, costs)
-    sleeve_diagnostics = build_sleeve_diagnostics(daily, policies, results, costs)
+    checks = split_checks(daily, best_policy, costs, price_history)
+    sleeve_diagnostics = build_sleeve_diagnostics(daily, policies, results, costs, price_history)
     price_coverage = build_price_coverage_report(daily, price_history, best_result)
     price_readiness = build_price_readiness_report(daily, price_history)
     backfill_plan_rows, backfill_plan_summary = build_daily_price_backfill_plan(daily, price_history, run_dir)

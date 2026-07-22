@@ -14,6 +14,10 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from sovereign_hall.services.heuristic_policy import (
+    prepare_candidate_rejection_feedback,
+    sanitize_candidate_rejection_reason,
+)
 from sovereign_hall.services.portfolio_policy import deployment_status, review_position
 from sovereign_hall.services.reward_policy import MAX_DAILY_TRADES, REWARD_FORMULA
 
@@ -738,11 +742,12 @@ def format_daily_price_backfill_progress(
         lines.append(f"   连续阻塞: {progress['stall_note']}")
     if progress.get("active_cap") is not None:
         lines.append(
-            "   系统动作: 补齐并重新评估前，模拟买入上限维持 <= "
-            f"{format_position_pct(progress['active_cap'])}，不得扩仓"
+            "   系统动作: 旧历史artifact复用仓位上限 <= "
+            f"{format_position_pct(progress['active_cap'])}；当轮新鲜且通过证据门槛的投委会裁决"
+            "不受该历史缺口停机帽约束，但仍必须通过实时行情、组合估值、单标的/分散风控和每日5笔硬门"
         )
     else:
-        lines.append("   系统动作: 仅作为本地数据质量提示，不触发扩仓")
+        lines.append("   系统动作: 仅作为历史数据质量提示，不触发当前模拟投资停机")
     return "\n".join(lines) + "\n"
 
 
@@ -931,8 +936,8 @@ def show_investment_status(db_path):
             """
         )
         raw_candidate_rejections = [dict(row) for row in c.fetchall()]
-        candidate_rejection_memory = filter_supported_candidate_rejections(
-            raw_candidate_rejections
+        candidate_rejection_memory = prepare_candidate_rejection_feedback(
+            filter_supported_candidate_rejections(raw_candidate_rejections)
         )[:5]
         ignored_invalid_rejection_count = (
             len(raw_candidate_rejections)
@@ -1076,10 +1081,24 @@ def show_investment_status(db_path):
             f"成交={int(redeployment_state.get('last_trade_count') or 0)}"
         )
         if redeployment_state.get("blocker_code"):
+            raw_blocker_reason = str(redeployment_state.get('blocker_reason') or '')
+            blocker_reason, superseded_blockers = sanitize_candidate_rejection_reason(
+                raw_blocker_reason
+            )
+            if not blocker_reason and superseded_blockers:
+                blocker_reason = (
+                    "最近阻塞仅含已过期的历史价格/止损断言；"
+                    "保留数据库审计，下一轮必须重新形成当前证据"
+                )
             print(
                 f"   操作性阻塞: {redeployment_state.get('blocker_code')}；"
-                f"{redeployment_state.get('blocker_reason') or ''}"
+                f"{blocker_reason}"
             )
+            if superseded_blockers:
+                print(
+                    f"   队列旧理由隔离: {len(superseded_blockers)}条片段不再作为当前阻塞事实；"
+                    "原始数据库字段保留供审计"
+                )
         for label, key in (
             ("本轮裁决否决", "last_rejection_counts"),
             ("累计裁决否决", "rejection_counts_total"),
@@ -1098,11 +1117,20 @@ def show_investment_status(db_path):
                 print(f"   {label}: {summary}")
         if candidate_rejection_memory:
             print("   逐标的重复拒绝记忆（仅统计迁移后真实尝试）:")
+            superseded_fragments = 0
             for item in candidate_rejection_memory:
-                reason = str(item.get("last_reason") or "未记录具体原因").replace("\n", " ")
+                superseded_fragments += len(item.get("superseded_reason_fragments") or [])
+                reason = str(item.get("feedback_reason") or "").replace("\n", " ")
+                if not reason:
+                    reason = "仅含已过期瞬态系统理由；保留审计但不再反馈给agent"
                 print(
                     f"      - {item.get('ticker')} / {item.get('code')} "
                     f"x{int(item.get('rejection_count') or 0)} | {reason[:220]}"
+                )
+            if superseded_fragments:
+                print(
+                    f"   过期理由隔离: {superseded_fragments}条片段不再注入prompt；"
+                    "原始拒绝记录未删除"
                 )
             print("   重提要求: 必须给出新增本地可追溯证据，并明确消除哪条最近拒绝原因；否则继续hold")
         elif candidate_rejection_memory_available:

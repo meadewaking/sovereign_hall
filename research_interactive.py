@@ -118,7 +118,7 @@ async def main(argv: list[str] | None = None):
     print("输入 'quit' 退出")
     print("="*60 + "\n")
 
-    default_question = "我最近看好存储行业，特别是ai方面的，选几个A股值得投资的股票"
+    default_question = "A股选一只持有1到3个月的股票，并给出止盈止损"
 
     while True:
         raw_question = safe_input("❓ 问题: ")

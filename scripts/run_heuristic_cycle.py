@@ -9,6 +9,7 @@ variants, and writes all artifacts to a timestamped run directory.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import csv
 import json
 import math
@@ -652,17 +653,59 @@ def summarize_metrics(
     return metrics
 
 
-def run_backtest(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -> dict[str, Any]:
+def build_mark_prices_by_date(
+    daily: pd.DataFrame,
+    price_history: pd.DataFrame | None = None,
+    max_age_days: int = 7,
+) -> dict[str, dict[str, float]]:
+    """Build bounded as-of marks independently from the signal rows.
+
+    A held ticker does not need a fresh prediction every day.  Previously the
+    backtest used only tickers present in that day's signal frame as its price
+    dictionary, so a quiet held ticker was incorrectly reported as unpriced.
+    """
+    dates = sorted(daily["date"].astype(str).unique())
+    by_date = {date: frame.copy() for date, frame in daily.groupby("date")}
+    marks = {
+        date: frame.set_index("ticker")["price"].to_dict()
+        for date, frame in by_date.items()
+    }
+    if price_history is None or price_history.empty:
+        return marks
+
+    histories: dict[str, tuple[list[pd.Timestamp], list[float]]] = {}
+    prices = price_history[["ticker", "date", "close"]].copy()
+    prices["ticker"] = prices["ticker"].map(normalize_ticker)
+    prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
+    prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
+    prices = prices.dropna(subset=["ticker", "date", "close"]).sort_values(["ticker", "date"])
+    for ticker, rows in prices.groupby("ticker"):
+        histories[str(ticker)] = (rows["date"].tolist(), rows["close"].astype(float).tolist())
+
+    tolerance = pd.Timedelta(days=max_age_days)
+    for date in dates:
+        mark_date = pd.Timestamp(date)
+        for ticker, (history_dates, history_prices) in histories.items():
+            index = bisect_right(history_dates, mark_date) - 1
+            if index < 0 or mark_date - history_dates[index] > tolerance:
+                continue
+            marks.setdefault(date, {})[ticker] = history_prices[index]
+    return marks
+
+
+def run_backtest(
+    daily: pd.DataFrame,
+    policy: PolicyConfig,
+    costs: CostConfig,
+    price_history: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     dates = sorted(daily["date"].unique())
     if len(dates) < 2:
         metrics = summarize_metrics(pd.DataFrame(), [], 0.0, 0.0, str(asdict(costs)), "", "")
         return {"metrics": metrics, "curve": pd.DataFrame(), "trades": []}
 
     by_date = {date: frame.copy() for date, frame in daily.groupby("date")}
-    prices_by_date = {
-        date: frame.set_index("ticker")["price"].to_dict()
-        for date, frame in by_date.items()
-    }
+    prices_by_date = build_mark_prices_by_date(daily, price_history)
 
     positions: dict[str, float] = {}
     position_age_days: dict[str, int] = {}
@@ -1222,17 +1265,22 @@ def extract_failure_tickers_from_run(run_dir: Path | None) -> tuple[str, ...]:
     return tuple(sorted(tickers))
 
 
-def split_checks(daily: pd.DataFrame, policy: PolicyConfig, costs: CostConfig) -> dict[str, Any]:
+def split_checks(
+    daily: pd.DataFrame,
+    policy: PolicyConfig,
+    costs: CostConfig,
+    price_history: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     dates = sorted(daily["date"].unique())
     if len(dates) < 6:
         return {"warning": "too few dates for split check"}
     split = int(len(dates) * 0.6)
     train_dates = set(dates[:split])
     test_dates = set(dates[split - 1 :])
-    train = run_backtest(daily[daily["date"].isin(train_dates)], policy, costs)["metrics"]
-    test = run_backtest(daily[daily["date"].isin(test_dates)], policy, costs)["metrics"]
+    train = run_backtest(daily[daily["date"].isin(train_dates)], policy, costs, price_history)["metrics"]
+    test = run_backtest(daily[daily["date"].isin(test_dates)], policy, costs, price_history)["metrics"]
     high_cost = replace(costs, slippage=costs.slippage * 3.0)
-    cost_stress = run_backtest(daily, policy, high_cost)["metrics"]
+    cost_stress = run_backtest(daily, policy, high_cost, price_history)["metrics"]
     insufficient_trade_evidence = min(
         int(train.get("trade_count", 0) or 0),
         int(test.get("trade_count", 0) or 0),
@@ -1283,6 +1331,7 @@ def build_sleeve_diagnostics(
     policies: list[PolicyConfig],
     results: dict[str, dict[str, Any]],
     costs: CostConfig,
+    price_history: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Check whether ETF and single-stock sleeves are robust enough to allocate."""
     single_stock_candidates = [
@@ -1306,7 +1355,7 @@ def build_sleeve_diagnostics(
     for sleeve_name, trial_name in trial_by_sleeve.items():
         policy = policies_by_name[trial_name]
         metrics = results[trial_name]["metrics"]
-        checks = split_checks(daily, policy, costs)
+        checks = split_checks(daily, policy, costs, price_history)
         oos_score = _metric_score(checks.get("out_of_sample"))
         cost_stress_score = _metric_score(checks.get("cost_stress_3x_slippage"))
         reasons: list[str] = []
@@ -1468,10 +1517,21 @@ def build_price_readiness_report(
             ascending=[False, False, False, False],
         )
 
+    ticker_coverage_ratio = (
+        (len(signal_tickers) - len(missing)) / len(signal_tickers)
+        if signal_tickers else 0.0
+    )
+    signal_row_coverage_ratio = priced_row_count / len(frame) if len(frame) else 0.0
     if not signal_tickers:
         status = "no_signal_tickers"
     elif priced_row_count <= 0:
         status = "blocked_no_daily_prices"
+    elif (
+        not latest_missing
+        and ticker_coverage_ratio >= 0.95
+        and signal_row_coverage_ratio >= 0.90
+    ):
+        status = "ready_with_historical_provider_gaps" if missing else "ready_validated_daily_prices"
     elif missing:
         status = "partial_daily_price_backfill_needed"
     else:
@@ -1481,7 +1541,10 @@ def build_price_readiness_report(
         "Backfill latest local daily_prices for the full latest_missing_tickers batch first, then "
         "rerun the cycle and require validated coverage before relaxing caps."
         if latest_missing
-        else "Latest signal-date prices are covered; continue historical priority backfill before relaxing weak-coverage caps."
+        else (
+            "Latest signal-date prices are covered. Retry provider-unavailable historical gaps or import "
+            "independent local OHLC, but do not treat those gaps as a current simulation shutdown."
+        )
     )
 
     return {
@@ -1489,6 +1552,8 @@ def build_price_readiness_report(
         "total_signal_ticker_count": len(signal_tickers),
         "priced_signal_ticker_count": len(signal_tickers) - len(missing),
         "missing_signal_ticker_count": len(missing),
+        "ticker_coverage_ratio": float(ticker_coverage_ratio),
+        "signal_row_coverage_ratio": float(signal_row_coverage_ratio),
         "latest_signal_date": latest_date,
         "latest_missing_tickers": latest_missing,
         "unblock_tickers": latest_missing,
@@ -2185,11 +2250,13 @@ def write_readme(
 - Current local status: Top priority `daily_prices` plan coverage is still incomplete, and `tape_update.json` does not meet the fresh-row/latest-day thresholds required for exposure widening.
 - Root cause advanced this cycle: the redeployment state accumulated rejection codes but not per-ticker reasons, so proposal/voting agents could not distinguish a genuinely new case from an unchanged candidate already rejected for the same evidence gap.
 - System fix: `InvestmentSimulation` now persists genuine post-migration rejections by ticker/code, feeds only evidence-related holds/vetoes into the next `run_discussion` prompt, and `check_db` shows all categories for diagnosis. Temporary market-hours, quote, cooldown, and daily-cap blockers remain on the execution/replay path. Historical opaque attempts are not reconstructed.
+- Rejection-memory reliability fix: immutable raw reasons remain in SQLite for audit, while active feedback and `check_db` quarantine obsolete historical-price/stop-execution claims. Candidates with at least three evidence rejections in three days cannot re-enter committee review without `resolved_rejection`, `evidence_delta`, and traceable `evidence`.
 - Evaluation fix: zero/very sparse trade slices are now marked as insufficient robustness evidence instead of passing split/cost checks merely because they avoid all exposure.
 - Failure-analysis fix: a zero-trade retained path is now recorded as insufficient trade evidence, not mislabeled as a drawdown or overtrading episode with zero exposure.
 - Integration decision: full deployment is now a portfolio invariant, while unavailable/stale prices remain an explicit operational blocker rather than a reason to fabricate fills; risk is expressed through rotation, diversification, and per-position exits instead of strategic cash.
 
 ## What Changed
+- Separated raw rejection audit text from the active agent/display view and added a deterministic repeated-candidate research cooldown; prompt reminders are no longer the only enforcement layer.
 - Added durable per-ticker candidate-rejection memory and a local-only prompt feedback block that requires exact new evidence before an unchanged held candidate may be resubmitted.
 - Added a durable replay/expiry state machine for `simulation_pending_decisions`; the queue still contains no price and is not an order book.
 - Connected replay to `run_discussion` after mandatory position review and before new committee allocations, so exits and older rulings consume the same persisted five-fill daily capacity.
@@ -2318,6 +2385,7 @@ def write_readme(
 Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe split/cost-stress failure detected"}.
 
 ## User Entry Impact
+- `check_db` displays current rejection evidence separately from superseded system-state fragments, and `run_discussion` hard-rejects unchanged repeated candidates before committee token use while allowing structured traceable evidence to clear the gate.
 - This cycle closes the repeated-committee-hold feedback gap: genuine post-migration rejections are accumulated by ticker/code, evidence-related holds/vetoes are injected into the next `run_discussion` proposal and vote prompts, and all categories are shown by `check_db`; unchanged evidence-vetoed candidates must identify new local traceable evidence that resolves the latest rejection reason or remain hold.
 - The new rejection-memory table starts empty by design: the prior aggregate 97 attempts/62 holds are preserved but not reverse-engineered into per-ticker counts. The first future genuine rejection creates the first row.
 - An already-running `run_discussion` process retains its imported code until the user stops/restarts it; this cycle does not terminate that user process. New invocations receive the feedback block. `research_interactive` has no new rejection-memory behavior this cycle and continues to receive the shared heuristic/failure context only.
@@ -2389,9 +2457,9 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
 ```
 
 ## Next 3 Directions
-- Observe at least three post-migration per-ticker rejection-memory samples and verify that `run_discussion` stops unchanged resubmissions or records the exact new evidence that clears a prior hold.
-- Backfill independently validated `daily_prices` from the latest unlock ticker and collect a meaningful fresh tape before testing whether higher-return but under-deployed branches can be converted to 100%-capacity policies without failing cost/OOS checks.
-- Exercise the durable queue with a fresh, realtime-priced, committee-approved candidate during an open session and require either a fill or a precise terminal rejection without using stale/local-price fallback.
+- Run one bounded fresh discussion and verify that the repeated-candidate hard gate rotates unchanged candidates or records the structured local evidence that clears a prior hold.
+- Collect a meaningful fresh tape and require non-negative OOS results before converting a higher-return, 100%-capacity branch into the default allocator.
+- Exercise the durable queue with a fresh, realtime-priced, committee-approved candidate during an open session and require either a fill or a precise terminal rejection without stale/local-price fallback.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -2969,6 +3037,7 @@ def main() -> int:
             max_position=0.10,
             max_gross=1.0,
             min_risk_reward=0.8,
+            require_independent_price=True,
             require_positive_trend=False,
             use_anomaly_veto=True,
             anomaly_return_threshold=0.18,
@@ -2984,6 +3053,7 @@ def main() -> int:
             max_position=0.10,
             max_gross=1.0,
             min_risk_reward=0.8,
+            require_independent_price=True,
             require_positive_trend=False,
             use_anomaly_veto=True,
             anomaly_return_threshold=0.18,
@@ -3018,7 +3088,7 @@ def main() -> int:
     trials_path = run_dir / "trials.jsonl"
 
     for index, policy in enumerate(policies):
-        result = run_backtest(daily, policy, costs)
+        result = run_backtest(daily, policy, costs, price_history)
         results[policy.name] = result
         metrics = result["metrics"]
         row = {
@@ -3078,7 +3148,7 @@ def main() -> int:
     best_without_name = {k: v for k, v in asdict(best_policy).items() if k != "name"}
     simplified_without_name = {k: v for k, v in asdict(simplified).items() if k != "name"}
     if simplified_without_name != best_without_name:
-        simplified_result = run_backtest(daily, simplified, costs)
+        simplified_result = run_backtest(daily, simplified, costs, price_history)
         simplified_metrics = simplified_result["metrics"]
         simplify_row = {
             "trial_index": len(trial_rows),
@@ -3136,9 +3206,9 @@ def main() -> int:
     failures = analyze_failures(best_result, daily, best_policy)
     append_jsonl(run_dir / "failure_cases.jsonl", failures)
 
-    checks = split_checks(daily, best_policy, costs)
+    checks = split_checks(daily, best_policy, costs, price_history)
     write_json(run_dir / "overfit_checks.json", checks)
-    sleeve_diagnostics = build_sleeve_diagnostics(daily, policies, results, costs)
+    sleeve_diagnostics = build_sleeve_diagnostics(daily, policies, results, costs, price_history)
     write_json(run_dir / "sleeve_diagnostics.json", sleeve_diagnostics)
     price_coverage = build_price_coverage_report(daily, price_history, best_result)
     write_json(run_dir / "price_coverage.json", price_coverage)

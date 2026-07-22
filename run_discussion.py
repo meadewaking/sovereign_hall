@@ -560,6 +560,79 @@ def dedupe_proposals(proposals: List[Dict]) -> List[Dict]:
     return list(by_key.values())
 
 
+def filter_repeated_rejection_proposals(
+    proposals: List[Dict],
+    rejection_memory: List[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+    rejection_threshold: int = 3,
+    cooldown_days: int = 3,
+) -> tuple[List[Dict], List[Dict[str, str]]]:
+    """Hard-stop unchanged, repeatedly rejected research candidates.
+
+    Prompt reminders alone did not stop the same ETF from being reconsidered
+    dozens of times.  A candidate under cooldown may re-enter only with an
+    explicit rejection point, a new local evidence delta, and traceable evidence
+    labels.  This is a research/committee gate, not a trading blacklist.
+    """
+    now_value = now or datetime.now()
+    memory_by_ticker: Dict[str, Dict[str, Any]] = {}
+    for row in rejection_memory:
+        if row.get("code") not in {"committee_hold", "heuristic_entry_veto"}:
+            continue
+        if not row.get("feedback_usable", True):
+            continue
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        previous = memory_by_ticker.get(ticker)
+        if previous is None or int(row.get("rejection_count") or 0) > int(
+            previous.get("rejection_count") or 0
+        ):
+            memory_by_ticker[ticker] = row
+
+    eligible: List[Dict] = []
+    suppressed: List[Dict[str, str]] = []
+    for proposal in proposals:
+        ticker = str(proposal.get("ticker") or "").strip().upper()
+        memory = memory_by_ticker.get(ticker)
+        if not memory or int(memory.get("rejection_count") or 0) < rejection_threshold:
+            eligible.append(proposal)
+            continue
+        try:
+            last_seen = datetime.fromisoformat(str(memory.get("last_seen_at") or ""))
+            age_days = max(0, (now_value.date() - last_seen.date()).days)
+        except (TypeError, ValueError):
+            age_days = cooldown_days
+        if age_days >= cooldown_days:
+            eligible.append(proposal)
+            continue
+
+        resolved_rejection = str(proposal.get("resolved_rejection") or "").strip()
+        evidence_delta = str(proposal.get("evidence_delta") or "").strip()
+        evidence = proposal.get("evidence") or []
+        has_traceable_delta = (
+            len(resolved_rejection) >= 4
+            and len(evidence_delta) >= 12
+            and isinstance(evidence, list)
+            and any(str(item).strip() for item in evidence)
+        )
+        if has_traceable_delta:
+            eligible.append(proposal)
+            continue
+
+        suppressed.append({
+            "code": "repeated_candidate_cooldown",
+            "ticker": ticker,
+            "reason": (
+                f"近{cooldown_days}天已有{int(memory.get('rejection_count') or 0)}次证据型拒绝；"
+                "本提案未同时给出resolved_rejection、evidence_delta和可追溯evidence，"
+                "不进入投委会，避免无变化重复消耗"
+            ),
+        })
+    return eligible, suppressed
+
+
 def build_lessons_with_heuristic_context(
     lessons_prompt: str = "",
     redeployment_context: str = "",
@@ -743,6 +816,8 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         "thesis": "事实: ...；推断: ...；新增性: ...",
         "sector": "行业分类",
         "evidence": ["来源标题或关键事实1", "来源标题或关键事实2"],
+        "resolved_rejection": "若该标的近期被拒绝，逐字指出本次消除的拒绝点；否则留空",
+        "evidence_delta": "新增本地资料标题/文档ID，以及它如何消除上述拒绝点；否则留空",
         "reject_if": "若出现什么情况应否决该提案"
     }}
 ]
@@ -751,6 +826,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 
 重要：必须排除黑名单中的标的！
 重要：holding_period 必须根据投资逻辑动态决定，范围3-180天，不要一律填30。
+重要：同一标的近期重复被拒绝时，缺少resolved_rejection、evidence_delta和evidence任一项都不得重提。
 """
 
     try:
@@ -793,6 +869,9 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
                     'thesis': build_proposal_thesis(p),
                     'sector': p.get('sector', '未知'),
                     'holding_period_reason': p.get('holding_period_reason', '')[:200],
+                    'evidence': [str(item)[:240] for item in (p.get('evidence') or [])[:8]],
+                    'resolved_rejection': str(p.get('resolved_rejection') or '')[:300],
+                    'evidence_delta': str(p.get('evidence_delta') or '')[:500],
                 }
                 cleaned_proposal['holding_period'] = normalize_proposal_holding_period(cleaned_proposal | {'holding_period': p.get('holding_period')}, topic)
                 cleaned.append(cleaned_proposal)
@@ -1505,7 +1584,13 @@ async def stage4_final_conclusion(llm, discussions: str, decisions: List[Dict], 
         }
 
 
-async def run_committee_approved_simulation(simulation, market_data, llm, decisions: List[Dict]):
+async def run_committee_approved_simulation(
+    simulation,
+    market_data,
+    llm,
+    decisions: List[Dict],
+    initial_rejections: Optional[List[Dict[str, str]]] = None,
+):
     """Run the daily simulated portfolio step after committee decisions exist."""
     from sovereign_hall.services.portfolio_policy import (
         deployment_position_floor as calculate_deployment_position_floor,
@@ -1616,6 +1701,8 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
         current_tickers,
         simulation._normalize_ticker,
     )
+    if initial_rejections:
+        redeployment_rejections = list(initial_rejections) + redeployment_rejections
 
     def reject(code: str, reason: str, ticker: str = "") -> None:
         item = {"code": code, "ticker": ticker, "reason": reason}
@@ -1750,6 +1837,7 @@ async def run_committee_approved_simulation(simulation, market_data, llm, decisi
                 signal_count=signal_count,
                 current_position=current_position_pct,
                 current_gross_exposure=current_gross_exposure,
+                fresh_local_evidence=True,
                 context=heuristic_context,
             )
             if cap_reason:
@@ -2192,6 +2280,23 @@ async def main():
                 # 阶段2：深度研报 → 提案
                 proposals = await stage2_deep_research(llm, docs, topic, db_service, lessons_prompt=prompt_lessons)
                 proposals = dedupe_proposals(proposals)
+                rejection_memory = (
+                    await simulation.get_candidate_rejection_memory(limit=100)
+                    if hasattr(simulation, "get_candidate_rejection_memory")
+                    else []
+                )
+                proposals, repeated_candidate_rejections = filter_repeated_rejection_proposals(
+                    proposals,
+                    rejection_memory,
+                )
+                if repeated_candidate_rejections:
+                    print(
+                        "   🧱 重复候选硬门: "
+                        + ", ".join(
+                            f"{item['ticker']}({item['code']})"
+                            for item in repeated_candidate_rejections
+                        )
+                    )
                 for proposal in proposals:
                     try:
                         await db_service.add_proposal(proposal)
@@ -2219,7 +2324,13 @@ async def main():
                 )
 
                 # 💰 每日投资模拟：只消费投委会裁决后的结构化决策
-                await run_committee_approved_simulation(simulation, market_data, llm, decisions)
+                await run_committee_approved_simulation(
+                    simulation,
+                    market_data,
+                    llm,
+                    decisions,
+                    initial_rejections=repeated_candidate_rejections,
+                )
 
                 # 更新已完成议题
                 completed_topics.add(topic)

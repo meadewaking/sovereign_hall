@@ -34,6 +34,30 @@ PRICE_READINESS_STALLED_POSITION_SCALE = 0.05
 PRICE_READINESS_STALLED_MIN_RUNS = 3
 SIMULATION_TARGET_INVESTED_RATIO = 1.0
 
+# These phrases describe an old implementation where historical ``daily_prices``
+# gaps were incorrectly treated as proof that a current stop could not execute.
+# Current valuation and every simulated fill use a newly fetched realtime quote,
+# so replaying these clauses into a new committee prompt would poison the next
+# decision with a system state that is no longer true.  The raw database reason
+# remains untouched for audit; only the feedback view is sanitized.
+OBSOLETE_REJECTION_REASON_MARKERS = (
+    "daily_prices",
+    "缺价交易日",
+    "止损物理性失效",
+    "止损指令可能无法执行",
+    "止损滑点可能",
+    "平仓指令无法执行",
+    "极端行情下平仓",
+    "历史最大回撤可达",
+    "夏普比率和最大回撤计算存在偏差",
+    "滑点可能高达",
+    "滑点可达",
+    "连续9轮",
+    "连续阻塞",
+    "模拟买入上限降至",
+    "回测数据不可靠",
+)
+
 
 @dataclass(frozen=True)
 class HeuristicRiskContext:
@@ -119,6 +143,64 @@ def _read_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def sanitize_candidate_rejection_reason(reason: Any) -> tuple[str, list[str]]:
+    """Return the active feedback reason and superseded transient fragments.
+
+    Historical rejection rows are immutable audit evidence.  This helper only
+    prevents obsolete data-readiness/stop-execution claims from being reused as
+    current market facts by proposal and voting agents.
+    """
+    text = str(reason or "").replace("\n", " ").strip()
+    if not text:
+        return "", []
+
+    prefix, separator, flags_text = text.partition("；risk_flags=")
+    if not separator:
+        if any(marker in text for marker in OBSOLETE_REJECTION_REASON_MARKERS):
+            return "", [text]
+        return text, []
+
+    active_flags: list[str] = []
+    superseded: list[str] = []
+    for fragment in re.split(r"[,，]", flags_text):
+        item = fragment.strip()
+        if not item:
+            continue
+        if any(marker in item for marker in OBSOLETE_REJECTION_REASON_MARKERS):
+            superseded.append(item)
+        else:
+            active_flags.append(item)
+
+    # The generic hold prefix is not a reusable failure explanation by itself.
+    # If every concrete flag was transient, force fresh research instead of
+    # feeding an empty "committee held" loop back to the agents.
+    if not active_flags and superseded:
+        return "", superseded
+    if not active_flags:
+        return prefix.strip(), superseded
+    return f"{prefix.strip()}；risk_flags={','.join(active_flags)}", superseded
+
+
+def prepare_candidate_rejection_feedback(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Annotate rejection rows without mutating their persisted audit text."""
+    prepared: list[dict[str, Any]] = []
+    for row in rows:
+        feedback_reason, superseded = sanitize_candidate_rejection_reason(
+            row.get("last_reason")
+        )
+        prepared.append(
+            dict(row)
+            | {
+                "feedback_reason": feedback_reason,
+                "feedback_usable": bool(feedback_reason),
+                "superseded_reason_fragments": superseded,
+            }
+        )
+    return prepared
 
 
 def refresh_tape_update_freshness(
@@ -1288,15 +1370,32 @@ def apply_heuristic_risk_cap(
     signal_count: int | None = None,
     current_position: float | None = None,
     current_gross_exposure: float | None = None,
+    fresh_local_evidence: bool = False,
     context: HeuristicRiskContext | None = None,
 ) -> tuple[float, str | None]:
-    """Cap a proposed simulation position using the latest robust local policy."""
+    """Cap a proposed simulation position using the latest robust local policy.
+
+    Missing historical ``daily_prices`` limits offline promotion.  It must not
+    permanently freeze a realtime-valued account when the current committee
+    round produced a fresh, qualified decision.  The explicit fresh-evidence
+    flag is only set by the committee path after its vote; direct callers keep
+    the conservative stale-tape behavior.
+    """
     ctx = context or load_latest_heuristic_context()
     if not ctx.available:
         return target_position, None
 
     capped = min(max(target_position, 0.0), ctx.max_position)
-    stale_entry_veto = ctx.stale_tape_entry_veto
+    minimum_confidence = float(ctx.min_confidence or 0.0)
+    required_signal_count = max(1, int(ctx.min_signal_count or 1))
+    qualified_fresh_evidence = bool(
+        fresh_local_evidence
+        and confidence is not None
+        and float(confidence) >= minimum_confidence
+        and signal_count is not None
+        and int(signal_count) >= required_signal_count
+    )
+    stale_entry_veto = ctx.stale_tape_entry_veto and not qualified_fresh_evidence
     if stale_entry_veto:
         # Never turn a stale-data expansion veto into an accidental liquidation.
         # Existing positions may be held or reduced through their normal paths.
@@ -1304,16 +1403,19 @@ def apply_heuristic_risk_cap(
     sleeve_reason = sleeve_constraint_reason(ctx, ticker)
     if sleeve_reason:
         capped = min(capped, ctx.max_position * 0.5)
-    price_coverage_cap = weak_price_coverage_position_cap(ctx)
+    # Historical coverage/readiness/tape caps apply to reused historical
+    # evidence.  A qualified current-round decision is still bounded by the
+    # policy single-name cap, sleeve/failure caps, confidence and gross exposure.
+    price_coverage_cap = None if qualified_fresh_evidence else weak_price_coverage_position_cap(ctx)
     if price_coverage_cap is not None:
         capped = min(capped, price_coverage_cap)
-    readiness_cap = price_readiness_position_cap(ctx, ticker)
+    readiness_cap = None if qualified_fresh_evidence else price_readiness_position_cap(ctx, ticker)
     if readiness_cap is not None:
         capped = min(capped, readiness_cap)
-    readiness_stall_cap = price_readiness_stall_position_cap(ctx)
+    readiness_stall_cap = None if qualified_fresh_evidence else price_readiness_stall_position_cap(ctx)
     if readiness_stall_cap is not None:
         capped = min(capped, readiness_stall_cap)
-    tape_update_cap = thin_tape_update_position_cap(ctx)
+    tape_update_cap = None if qualified_fresh_evidence else thin_tape_update_position_cap(ctx)
     if tape_update_cap is not None:
         capped = min(capped, tape_update_cap)
     signal_count_cap = insufficient_signal_position_cap(ctx, signal_count)
@@ -1392,6 +1494,11 @@ def apply_heuristic_risk_cap(
     if sleeve_reason:
         return capped, sleeve_reason
     risk_notes: list[str] = []
+    if qualified_fresh_evidence:
+        risk_notes.append(
+            "当轮投委会新证据已通过置信度/观察门槛；daily_prices缺口仅限制离线策略晋升，"
+            "不再强制空仓，成交仍须实时行情与全部组合硬门"
+        )
     if ctx.overfit_risk:
         risk_notes.append("latest heuristic policy仅作风险提示，未提高默认仓位")
     if ctx.thin_cost_stress_margin:
@@ -1565,9 +1672,10 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
             f"单标的模拟仓位上限={ctx.max_position:.1%}; "
             f"本地信号观察门槛={ctx.min_signal_count}条"
         ),
-        f"- 稳健性: {ctx.warning}",
-        "- 用法: 只能作为本地风控约束/解释，不得编造成外部市场事实；禁止因此放大仓位。",
+        f"- 历史评估稳健性告警（不等于当前轮次停机）: {ctx.warning}",
+        "- 用法: 只能作为本地风控约束/解释，不得编造成外部市场事实；历史评估不得直接放大仓位。",
         "- 资金用途: 模拟资金目标投资比例为100%；风险控制必须通过标的替换、分散、减仓后再配置完成，不得把战略现金当作默认避险资产。",
+        "- 关键边界: daily_prices只服务历史回测，不用于当前估值或模拟成交；其缺失不得单独构成致命级否决或永久0%仓位。当前轮次产生的新鲜本地证据若通过置信度/观察门槛，可在单标的、分散、实时行情和每日5笔硬门内小步部署。",
         f"- 决策目标: 总资金净收益优先；{REWARD_FORMULA}。",
         f"- 交易频率: 每个交易日最多{MAX_DAILY_TRADES}笔模拟成交；买卖、止损止盈和调仓合并计数，达到上限后形成待执行裁决。",
     ]
@@ -1591,12 +1699,12 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
     if coverage_note:
         coverage_cap = weak_price_coverage_position_cap(ctx)
         cap_text = f"；弱覆盖模拟买入上限={coverage_cap:.1%}" if coverage_cap is not None else ""
-        lines.append(f"- 价格覆盖: {coverage_note}{cap_text}；只能作为风险约束，不能作为扩仓依据。")
+        lines.append(f"- 价格覆盖: {coverage_note}{cap_text}；限制历史证据复用，不得单独否决当轮新鲜证据候选。")
     tape_note = format_tape_update_note(ctx)
     if tape_note:
         tape_cap = thin_tape_update_position_cap(ctx)
         cap_text = f"；薄样本验证模拟买入上限={tape_cap:.1%}" if tape_cap is not None else ""
-        lines.append(f"- 本地tape验证: {tape_note}{cap_text}；不能作为扩仓验证。")
+        lines.append(f"- 本地tape验证: {tape_note}{cap_text}；旧tape不能作为扩仓验证，当轮新研究不视为旧tape。")
     readiness_note = format_price_readiness_note(ctx)
     if readiness_note:
         readiness_cap = price_readiness_position_cap(ctx)
@@ -1612,7 +1720,7 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
         )
         lines.append(
             f"- daily_prices连续阻塞: {readiness_stall_note}{cap_text}；"
-            "本轮不得新增leaderboard分支或扩大模拟仓位。"
+            "本轮不得新增leaderboard分支；但不得因此把当轮合格候选永久锁成0仓位。"
         )
     readiness_queue = format_price_readiness_backfill_queue(ctx)
     if readiness_queue:
@@ -1661,6 +1769,7 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
         f"   单标的模拟仓位上限: {ctx.max_position:.1%}",
         f"   本地信号观察门槛: >={ctx.min_signal_count} 条同日预测观察",
         f"   风险标记: {ctx.warning}",
+        "   当轮新鲜证据路径: 通过置信度/同日观察门槛的投委会新裁决，可忽略历史daily_prices/tape停机帽；仍受单标的、分散、实时行情、组合估值和每日5笔硬门约束",
     ]
     if ctx.evaluation_engine:
         lines.append(f"   评估引擎: {ctx.evaluation_engine}")
@@ -1681,18 +1790,18 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
         lines.append(f"   价格覆盖: {coverage_note}")
     coverage_cap = weak_price_coverage_position_cap(ctx)
     if coverage_cap is not None:
-        lines.append(f"   弱价格覆盖模拟买入上限: {coverage_cap:.1%}")
+        lines.append(f"   弱价格覆盖历史证据复用上限: {coverage_cap:.1%}")
     tape_note = format_tape_update_note(ctx)
     if tape_note:
         lines.append(f"   本地tape验证: {tape_note}")
     tape_cap = thin_tape_update_position_cap(ctx)
     if tape_cap is not None:
-        lines.append(f"   薄样本验证模拟买入上限: {tape_cap:.1%}")
+        lines.append(f"   薄样本历史证据复用上限: {tape_cap:.1%}")
     if ctx.stale_tape_entry_veto:
         if bool(ctx.tape_update.get("freshness_recovery_pending", False)):
-            lines.append("   tape恢复前置否决: 已启用（年龄已恢复但样本广度不足；禁止新增/扩大模拟多头，减仓与退出不受阻）")
+            lines.append("   历史tape复用否决: 已启用（旧证据不得新增/扩仓；当轮新鲜合格投委会证据可走受限部署路径）")
         else:
-            lines.append("   陈旧tape前置否决: 已启用（禁止新增/扩大模拟多头，减仓与退出不受阻）")
+            lines.append("   陈旧tape复用否决: 已启用（旧证据不得新增/扩仓；当轮新鲜合格投委会证据可走受限部署路径）")
     readiness_note = format_price_readiness_note(ctx)
     if readiness_note:
         lines.append(f"   daily_prices补齐: {readiness_note}")
@@ -1704,13 +1813,13 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
         lines.append(f"   daily_prices补齐计划: {readiness_plan}")
     readiness_cap = price_readiness_position_cap(ctx)
     if readiness_cap is not None:
-        lines.append(f"   daily_prices阻塞模拟买入上限: {readiness_cap:.1%}")
+        lines.append(f"   daily_prices阻塞历史证据复用上限: {readiness_cap:.1%}")
     readiness_stall_note = format_price_readiness_stall_note(ctx)
     if readiness_stall_note:
         lines.append(f"   daily_prices连续阻塞: {readiness_stall_note}")
     readiness_stall_cap = price_readiness_stall_position_cap(ctx)
     if readiness_stall_cap is not None:
-        lines.append(f"   daily_prices连续阻塞模拟买入上限: {readiness_stall_cap:.2%}")
+        lines.append(f"   daily_prices连续阻塞历史证据复用上限: {readiness_stall_cap:.2%}")
     sleeve_text = format_sleeve_diagnostics(ctx)
     if sleeve_text:
         lines.append(f"   {sleeve_text}")
@@ -1762,20 +1871,23 @@ def format_policy_checklist(context: HeuristicRiskContext) -> str:
         gates.append(f"同日观察>={context.min_signal_count}条")
     coverage_cap = weak_price_coverage_position_cap(context)
     if coverage_cap is not None:
-        gates.append(f"弱价格覆盖仓位<={coverage_cap:.1%}")
+        gates.append(f"弱价格覆盖历史证据仓位<={coverage_cap:.1%}")
     tape_cap = thin_tape_update_position_cap(context)
     if tape_cap is not None:
-        gates.append(f"薄tape验证仓位<={tape_cap:.1%}")
+        gates.append(f"薄tape历史证据仓位<={tape_cap:.1%}")
     readiness_cap = price_readiness_position_cap(context)
     if readiness_cap is not None:
-        gates.append(f"daily_prices阻塞仓位<={readiness_cap:.1%}")
+        gates.append(f"daily_prices阻塞历史证据仓位<={readiness_cap:.1%}")
     readiness_stall_cap = price_readiness_stall_position_cap(context)
     if readiness_stall_cap is not None:
-        gates.append(f"daily_prices连续阻塞仓位<={readiness_stall_cap:.2%}")
+        gates.append(f"daily_prices连续阻塞历史证据仓位<={readiness_stall_cap:.2%}")
 
     if not gates:
         return ""
-    return "- Heuristic入场校验: " + "；".join(gates) + "；不满足则降仓或观望。"
+    return (
+        "- Heuristic入场校验: " + "；".join(gates)
+        + "；历史证据不满足则降仓或观望；当轮新鲜合格投委会证据使用单标的/组合硬门，不因daily_prices缺失强制0仓位。"
+    )
 
 
 def format_sleeve_diagnostics(context: HeuristicRiskContext) -> str:
