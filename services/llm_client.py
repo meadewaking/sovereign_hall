@@ -87,6 +87,8 @@ class LLMClient:
         # 并发控制
         self.max_concurrent = int(max_concurrent if max_concurrent is not None else llm_config.get('max_concurrent', 16))
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        # embedding 服务并发过高会整体超时，单独限流
+        self._embedding_semaphore = asyncio.Semaphore(4)
 
         # 统计
         self.token_stats = TokenStats()
@@ -603,37 +605,34 @@ class LLMClient:
 
         # 如果有API密钥，调用真实API
         if embedding_uuid and embedding_base_url:
-            try:
-                import httpx
-                # 使用 /encode 端点
-                url = f"{embedding_base_url}/encode"
-                # 添加 model 到 payload（按 test_embedding.py 的格式）
-                payload = {"sentence": [text[:8000]], "model": model_name}
-                headers = {
-                    "Host": embedding_uuid,
-                    "Content-Type": "application/json"
-                }
-                # 使用内网客户端（不走代理），30s 超时（实测 1s 即可）
-                t0 = datetime.now()
-                resp = await asyncio.wait_for(
-                    self._embedding_client.post(url, json=payload, headers=headers),
-                    timeout=30,
-                )
-                elapsed = (datetime.now() - t0).total_seconds()
-                resp.raise_for_status()
-                data = resp.json()
-                # 检查返回格式
-                if 'embedding' in data and data['embedding']:
-                    embeddings = data['embedding']
-                    if embeddings and len(embeddings) > 0:
-                        self._track_embedding_usage(text)
-                        tracked_embedding_usage = True
-                        logger.debug(f"Embedding API success: dim={len(embeddings[0])} in {elapsed:.1f}s")
-                        return embeddings[0]
-            except asyncio.TimeoutError:
-                logger.warning(f"Embedding API timeout (30s), using mock")
-            except Exception as e:
-                logger.warning(f"Embedding API failed: {e}, using mock")
+            async with self._embedding_semaphore:
+                try:
+                    import httpx
+                    url = f"{embedding_base_url}/encode"
+                    payload = {"sentence": [text[:8000]], "model": model_name}
+                    headers = {
+                        "Host": embedding_uuid,
+                        "Content-Type": "application/json"
+                    }
+                    t0 = datetime.now()
+                    resp = await asyncio.wait_for(
+                        self._embedding_client.post(url, json=payload, headers=headers),
+                        timeout=15,
+                    )
+                    elapsed = (datetime.now() - t0).total_seconds()
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if 'embedding' in data and data['embedding']:
+                        embeddings = data['embedding']
+                        if embeddings and len(embeddings) > 0:
+                            self._track_embedding_usage(text)
+                            tracked_embedding_usage = True
+                            logger.debug(f"Embedding API success: dim={len(embeddings[0])} in {elapsed:.1f}s")
+                            return embeddings[0]
+                except asyncio.TimeoutError:
+                    logger.warning(f"Embedding API timeout (15s), using mock")
+                except Exception as e:
+                    logger.warning(f"Embedding API failed: {e}, using mock")
 
         # 返回模拟向量
         import random

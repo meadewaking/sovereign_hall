@@ -357,18 +357,16 @@ class SpiderSwarm:
         sources: List[str] = None,
     ) -> List[Doc]:
         """
-        执行搜索 - 优先级：DDG → 百度 → 搜狗
-        搜索失败时进入告警模式，不再生成假数据
+        执行搜索 - 并行查询多个源，取最快返回的结果
         """
         import time
-        docs = []
+        docs: List[Doc] = []
         sources = sources or self.default_sources
 
         # 检查是否处于告警模式，如果是，检查是否超时需要恢复
         if SpiderSwarm._alarm_mode:
             elapsed = time.time() - SpiderSwarm._alarm_start_time
             if elapsed > SpiderSwarm._alarm_timeout:
-                # 超时自动恢复
                 SpiderSwarm._alarm_mode = False
                 SpiderSwarm._consecutive_failures = 0
                 logger.info(f"Spider alarm mode auto-recovered after {elapsed:.1f}s")
@@ -386,54 +384,41 @@ class SpiderSwarm:
             try:
                 return await asyncio.wait_for(search_coro, timeout=self.source_timeout)
             except asyncio.TimeoutError:
-                logger.warning(f"{source_name} search timeout for '{query}' after {self.source_timeout}s")
+                logger.debug(f"{source_name} search timeout for '{query}' after {self.source_timeout}s")
                 return []
             except Exception as exc:
-                logger.warning(f"{source_name} search failed: {exc}")
+                logger.debug(f"{source_name} search failed: {exc}")
                 return []
 
-        # 1. 尝试 DuckDuckGO 搜索（带代理）
-        # 使用 deep_fetch=False 避免深度抓取URL导致超时
-        # DDG snippet 通常足够用于研究分析
+        # 并行调度所有启用的源，每个源独立超时
+        source_tasks = {}
         if 'ddg' in sources:
-            ddg_results = await _run_source("DDG", self._ddg_search(query, max_results, deep_fetch=False))
-            if ddg_results:
-                docs.extend(ddg_results)
-                logger.info(f"DDG search for '{query}': found {len(ddg_results)} results")
+            source_tasks['ddg'] = asyncio.create_task(
+                self._ddg_search(query, max_results, deep_fetch=False)
+            )
+        if 'bing' in sources:
+            source_tasks['bing'] = asyncio.create_task(
+                self._bing_search(query, max_results)
+            )
+        if 'baidu' in sources:
+            source_tasks['baidu'] = asyncio.create_task(
+                self._baidu_search(query, max_results)
+            )
+        if 'sogou' in sources:
+            source_tasks['sogou'] = asyncio.create_task(
+                self._sogou_search(query, max_results)
+            )
 
-        # 2. 如果结果不足，尝试 Bing。Bing snippet 质量通常比被验证码拦截的中文搜索源稳定。
-        if 'bing' in sources and len(docs) < max_results:
-            remaining = max_results - len(docs)
-            bing_results = await _run_source("Bing", self._bing_search(query, remaining))
-            if bing_results:
-                docs.extend(bing_results)
-                logger.info(f"Bing search for '{query}': found {len(bing_results)} results")
-
-        # 3. 按配置尝试百度搜索
-        if 'baidu' in sources and len(docs) < max_results:
-            remaining = max_results - len(docs)
-            try:
-                baidu_results = await asyncio.wait_for(
-                    self._baidu_search(query, remaining),
-                    timeout=self.source_timeout,
-                )
-                if baidu_results:
-                    docs.extend(baidu_results)
-                    logger.info(f"Baidu search for '{query}': found {len(baidu_results)} results")
-            except asyncio.TimeoutError:
-                logger.warning(f"Baidu search timeout for '{query}' after {self.source_timeout}s")
-            except ConnectionError as e:
-                logger.warning(f"Baidu blocked/captcha: {e}")
-            except Exception as e:
-                logger.warning(f"Baidu search failed: {e}")
-
-        # 4. 如果结果不足，尝试搜狗
-        if 'sogou' in sources and len(docs) < max_results:
-            remaining = max_results - len(docs)
-            sogou_results = await _run_source("Sogou", self._sogou_search(query, remaining))
-            if sogou_results:
-                docs.extend(sogou_results)
-                logger.info(f"Sogou search for '{query}': found {len(sogou_results)} results")
+        # 并行等待所有源，每个源最多 source_timeout 秒
+        if source_tasks:
+            results = await asyncio.gather(*source_tasks.values(), return_exceptions=True)
+            for (name, _), result in zip(source_tasks.items(), results):
+                if isinstance(result, Exception):
+                    logger.debug(f"{name.upper()} search failed: {result}")
+                    continue
+                if result:
+                    docs.extend(result)
+                    logger.info(f"{name.upper()} search for '{query}': found {len(result)} results")
 
         # 3. 记录失败并更新告警状态
         if not docs:

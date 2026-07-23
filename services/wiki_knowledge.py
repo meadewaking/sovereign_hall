@@ -505,6 +505,7 @@ class WikiStore:
         self.cache_path = self.state_dir / "ingest-cache.json"
         self.index_path = root / "index.md"
         self.log_path = root / "log.md"
+        self._pages_cache: Optional[List[WikiPage]] = None
 
     def ensure_vault(self) -> None:
         for directory in [
@@ -565,6 +566,8 @@ class WikiStore:
             handle.write(f"## [{utc_timestamp()}] {action}\n\n{message.strip()}\n\n")
 
     def all_wiki_pages(self) -> List[WikiPage]:
+        if self._pages_cache is not None:
+            return self._pages_cache
         pages: List[WikiPage] = []
         for path in sorted(self.wiki_dir.rglob("*.md")):
             try:
@@ -582,12 +585,14 @@ class WikiStore:
                     frontmatter=frontmatter,
                 )
             )
+        self._pages_cache = pages
         return pages
 
     def write_page(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text(encoding="utf-8") if path.exists() else None
         path.write_text(merge_markdown_page(existing, content), encoding="utf-8")
+        self._pages_cache = None
 
     def rebuild_index(self) -> None:
         topics = self._index_links(self.topics_dir)
@@ -868,9 +873,9 @@ class WikiSearchIndex:
     async def _vector_search(self, query: str, pages: List[WikiPage]) -> List[Tuple[str, float]]:
         t0 = datetime.now()
         try:
-            query_vec = await asyncio.wait_for(self.llm_client.get_embedding(query), timeout=30)
+            query_vec = await asyncio.wait_for(self.llm_client.get_embedding(query), timeout=10)
         except asyncio.TimeoutError:
-            logger.warning("wiki embedding query timeout (30s)")
+            logger.warning("wiki embedding query timeout (10s)")
             return []
         except Exception as exc:
             logger.warning("wiki embedding query failed: %s", exc)
@@ -882,7 +887,7 @@ class WikiSearchIndex:
         async def _safe_page_vec(page: WikiPage) -> Optional[List[float]]:
             async with sem:
                 try:
-                    return await asyncio.wait_for(self._page_embedding(page), timeout=30)
+                    return await asyncio.wait_for(self._page_embedding(page), timeout=15)
                 except asyncio.TimeoutError:
                     logger.debug("wiki page embedding timeout: %s", page.rel_path)
                     return None

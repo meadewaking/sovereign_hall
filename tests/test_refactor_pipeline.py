@@ -1246,6 +1246,36 @@ async def test_dict_proposal_can_be_stored(tmp_path):
     assert len(proposals) == 1
     assert proposals[0]["ticker"] == "512880"
     assert proposals[0]["thesis"] == long_thesis
+    assert proposals[0]["created_at"]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_proposal_timestamp_repair_preserves_legacy_null_and_orders_new_first(tmp_path):
+    db_path = tmp_path / "legacy_proposals.db"
+    db = DatabaseService(str(db_path))
+    await db._init_db()
+    await db._connection.execute(
+        """
+        INSERT INTO proposals (proposal_id, ticker, direction, created_at)
+        VALUES ('legacy-null', '600000', 'long', NULL)
+        """
+    )
+    await db._connection.commit()
+
+    await db.add_proposal({
+        "proposal_id": "new-timestamped",
+        "ticker": "510300",
+        "direction": "long",
+        "created_at": "2026-07-23T15:00:00",
+    })
+
+    proposals = await db.get_proposals(limit=5)
+    assert [row["proposal_id"] for row in proposals] == [
+        "new-timestamped",
+        "legacy-null",
+    ]
+    assert proposals[1]["created_at"] is None
     await db.close()
 
 

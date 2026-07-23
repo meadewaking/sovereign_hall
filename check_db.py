@@ -1230,6 +1230,29 @@ def show_stats(db_path):
     print(f"\n   📈 研究讨论统计:")
     print(f"      - 讨论结论: {rc_count} 条")
     print(f"      - 反思总结: {rs_count} 条")
+    if "proposals" in tables:
+        try:
+            c.execute(
+                """
+                SELECT COUNT(*),
+                       SUM(CASE WHEN created_at IS NULL OR trim(created_at) = '' THEN 1 ELSE 0 END),
+                       MAX(created_at)
+                FROM proposals
+                """
+            )
+            proposal_total, proposal_missing_time, latest_proposal_at = c.fetchone()
+            proposal_missing_time = int(proposal_missing_time or 0)
+            print(
+                f"      - 提案时间链路: 可追溯 {int(proposal_total or 0) - proposal_missing_time:,}/"
+                f"{int(proposal_total or 0):,} 条；最新={latest_proposal_at or 'N/A'}"
+            )
+            if proposal_missing_time:
+                print(
+                    f"      - 历史提案缺时标: {proposal_missing_time:,} 条（保留NULL，不伪造时间；"
+                    "新提案将在重启后的讨论进程中显式写入created_at）"
+                )
+        except sqlite3.Error as exc:
+            print(f"      - 提案时间链路: 无法读取 ({exc})")
 
     if "price_predictions" in tables:
         try:
@@ -1347,7 +1370,16 @@ def generate_topic_from_db(db_path) -> str:
     c = conn.cursor()
 
     # 1. 获取最近的提案
-    c.execute("SELECT ticker, direction, thesis FROM proposals ORDER BY created_at DESC LIMIT 20")
+    c.execute(
+        """
+        SELECT ticker, direction, thesis
+        FROM proposals
+        ORDER BY CASE WHEN created_at IS NULL OR trim(created_at) = '' THEN 1 ELSE 0 END,
+                 datetime(created_at) DESC,
+                 rowid DESC
+        LIMIT 20
+        """
+    )
     proposals = c.fetchall()
 
     # 2. 获取最近的文档

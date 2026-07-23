@@ -505,12 +505,19 @@ class DatabaseService:
         def pget(name: str, default=None):
             return getattr(proposal, name, default)
 
+        # Older project databases have a ``created_at`` column without a
+        # DEFAULT, so omitting it silently stored NULL for every proposal.
+        # Preserve an explicitly supplied timestamp for reproducible imports;
+        # otherwise stamp only the new row.  Historical NULLs are deliberately
+        # not backfilled because their true creation time is unknowable.
+        created_at = pget("created_at") or datetime.now().isoformat()
         conn = await self._get_connection()
         await conn.execute("""
             INSERT OR REPLACE INTO proposals
             (proposal_id, ticker, direction, target_position, entry_price, stop_loss,
-             take_profit, holding_period, confidence, thesis, analyst_role, sector, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             take_profit, holding_period, confidence, thesis, analyst_role, sector, status,
+             created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             pget('proposal_id') or pget('id'),
             pget('ticker', ''),
@@ -524,7 +531,8 @@ class DatabaseService:
             pget('thesis', '') if pget('thesis') else None,
             analyst_role,
             pget('sector', None),
-            pget('status', 'pending')
+            pget('status', 'pending'),
+            created_at,
         ))
         await conn.commit()
 
@@ -538,7 +546,13 @@ class DatabaseService:
             sql += " WHERE status = ?"
             params.append(status)
 
-        sql += " ORDER BY created_at DESC LIMIT ?"
+        # Legacy proposal rows may have NULL timestamps.  Keep deterministic
+        # rowid ordering for those records while always preferring timestamped
+        # rows written by the repaired path.
+        sql += (
+            " ORDER BY CASE WHEN created_at IS NULL OR trim(created_at) = '' "
+            "THEN 1 ELSE 0 END, datetime(created_at) DESC, rowid DESC LIMIT ?"
+        )
         params.append(limit)
 
         async with conn.execute(sql, params) as cursor:

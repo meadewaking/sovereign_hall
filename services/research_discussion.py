@@ -182,6 +182,7 @@ class ResearchDiscussionSystem:
 ## 对当前问题的影响
 - 维持/降低/提高风险偏好；原因
 """
+        self.cio.set_topic(question[:80])
         response = await self.cio.think(prompt, max_tokens=5000)
         reflection = extract_actual_response(response)
 
@@ -473,6 +474,10 @@ class ResearchDiscussionSystem:
             AgentRole.RISK_OFFICER: self.agents[AgentRole.RISK_OFFICER],
             AgentRole.QUANT_RESEARCHER: self.agents[AgentRole.QUANT_RESEARCHER],
         }
+
+        topic = question[:80]
+        for agent in all_agents.values():
+            agent.set_topic(topic)
 
         print(f"   参与讨论: {[a.persona.name for a in all_agents.values()]}")
 

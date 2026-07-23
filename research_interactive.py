@@ -103,7 +103,7 @@ async def main(argv: list[str] | None = None):
     if args.question:
         try:
             await run_research_question(args.question.strip())
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
             print("\n\n🛑 用户中断")
         except Exception as e:
             print(f"\n❌ 错误: {e}")
@@ -138,7 +138,7 @@ async def main(argv: list[str] | None = None):
         try:
             await run_research_question(question)
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
             print("\n\n🛑 用户中断")
         except Exception as e:
             print(f"\n❌ 错误: {e}")
@@ -151,4 +151,8 @@ async def main(argv: list[str] | None = None):
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n\n🛑 已退出")
+        sys.exit(130)
