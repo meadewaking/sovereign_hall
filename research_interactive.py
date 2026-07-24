@@ -18,7 +18,7 @@ from sovereign_hall.services.heuristic_policy import format_heuristic_status
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sovereign Hall interactive local research entry")
+    parser = argparse.ArgumentParser(description="Sovereign Hall interactive research entry")
     parser.add_argument(
         "--question",
         help="直接运行一个研究问题；省略时进入交互模式",

@@ -227,6 +227,11 @@ class DatabaseService:
             await self._add_column_if_missing(conn, "proposals", "analyst_role", "TEXT")
             await self._add_column_if_missing(conn, "proposals", "sector", "TEXT")
             await self._add_column_if_missing(conn, "proposals", "status", "TEXT DEFAULT 'pending'")
+        await self._add_column_if_missing(conn, "proposals", "holding_period_reason", "TEXT")
+        await self._add_column_if_missing(conn, "proposals", "evidence", "TEXT")
+        await self._add_column_if_missing(conn, "proposals", "resolved_rejection", "TEXT")
+        await self._add_column_if_missing(conn, "proposals", "evidence_delta", "TEXT")
+        await self._add_column_if_missing(conn, "proposals", "reject_if", "TEXT")
 
         # meetings 表
         if 'meetings' not in existing_tables:
@@ -511,15 +516,17 @@ class DatabaseService:
         # otherwise stamp only the new row.  Historical NULLs are deliberately
         # not backfilled because their true creation time is unknowable.
         created_at = pget("created_at") or datetime.now().isoformat()
+        proposal_id = pget('proposal_id') or pget('id')
         conn = await self._get_connection()
         await conn.execute("""
             INSERT OR REPLACE INTO proposals
             (proposal_id, ticker, direction, target_position, entry_price, stop_loss,
              take_profit, holding_period, confidence, thesis, analyst_role, sector, status,
-             created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             created_at, holding_period_reason, evidence, resolved_rejection,
+             evidence_delta, reject_if)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            pget('proposal_id') or pget('id'),
+            proposal_id,
             pget('ticker', ''),
             pget('direction', 'long'),
             pget('target_position', 0.0),
@@ -533,8 +540,14 @@ class DatabaseService:
             pget('sector', None),
             pget('status', 'pending'),
             created_at,
+            pget('holding_period_reason', None),
+            json.dumps(pget('evidence', []), ensure_ascii=False),
+            pget('resolved_rejection', None),
+            pget('evidence_delta', None),
+            pget('reject_if', None),
         ))
         await conn.commit()
+        return proposal_id
 
     async def get_proposals(self, status: str = None, limit: int = 100) -> List[Dict]:
         """获取提案列表"""
@@ -578,6 +591,38 @@ class DatabaseService:
             json.dumps(getattr(meeting, 'action_items', []), ensure_ascii=False)
         ))
         await conn.commit()
+
+    async def add_meeting_record(
+        self,
+        *,
+        meeting_id: str,
+        proposal_id: str,
+        ticker: str,
+        decision: str,
+        discussion: str,
+        vote_details: Dict[str, Any],
+        action_items: List[str],
+    ) -> str:
+        """Persist one committee deliberation without requiring a domain object."""
+        conn = await self._get_connection()
+        await conn.execute(
+            """
+            INSERT INTO meetings
+            (id, proposal_id, ticker, decision, discussion, vote_details, action_items)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                meeting_id,
+                proposal_id,
+                ticker,
+                decision,
+                discussion,
+                json.dumps(vote_details, ensure_ascii=False, default=str),
+                json.dumps(action_items, ensure_ascii=False, default=str),
+            ),
+        )
+        await conn.commit()
+        return meeting_id
 
     async def get_meetings(self, limit: int = 100) -> List[Dict]:
         """获取会议纪要列表"""

@@ -807,6 +807,57 @@ def pending_decision_diagnostics(conn):
     return diagnostics
 
 
+def committee_outcome_diagnostics(conn, limit: int = 5):
+    """Read append-only committee vote audits without inventing legacy rows."""
+    diagnostics = {
+        "available": False,
+        "total": 0,
+        "direction_counts": {},
+        "quorum_failure_count": 0,
+        "recent": [],
+    }
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='simulation_committee_outcomes'"
+        ).fetchone()
+        diagnostics["available"] = bool(table)
+        if not table:
+            return diagnostics
+        diagnostics["total"] = int(
+            conn.execute("SELECT COUNT(*) FROM simulation_committee_outcomes").fetchone()[0]
+        )
+        diagnostics["direction_counts"] = {
+            str(direction): int(count)
+            for direction, count in conn.execute(
+                "SELECT direction, COUNT(*) FROM simulation_committee_outcomes "
+                "GROUP BY direction"
+            ).fetchall()
+        }
+        diagnostics["quorum_failure_count"] = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM simulation_committee_outcomes WHERE quorum_met = 0"
+            ).fetchone()[0]
+        )
+        diagnostics["recent"] = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT ticker, direction, vote_summary, vote_margin, vote_count,
+                       parsed_vote_count, invalid_vote_count, quorum_required,
+                       quorum_met, review_depth, created_at
+                FROM simulation_committee_outcomes
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        return diagnostics
+    return diagnostics
+
+
 def show_investment_status(db_path):
     """显示投资模拟状态"""
     conn = sqlite3.connect(str(db_path))
@@ -950,6 +1001,7 @@ def show_investment_status(db_path):
     pending_diagnostics = pending_decision_diagnostics(conn)
     pending_decisions = pending_diagnostics["pending_rows"]
     pending_decision_total = pending_diagnostics["unresolved_count"]
+    committee_diagnostics = committee_outcome_diagnostics(conn)
 
     tickers = [pos[0] for pos in positions]
     conn.close()
@@ -1147,6 +1199,36 @@ def show_investment_status(db_path):
     else:
         print("   (无待处理再配置状态)")
 
+    print("\n   🗳️ 投委会票型审计:")
+    if committee_diagnostics["available"] and committee_diagnostics["total"]:
+        counts = committee_diagnostics["direction_counts"]
+        print(
+            f"   累计={committee_diagnostics['total']} | "
+            f"long={counts.get('long', 0)}, short={counts.get('short', 0)}, "
+            f"hold={counts.get('hold', 0)} | "
+            f"法定人数失败={committee_diagnostics['quorum_failure_count']}"
+        )
+        for outcome in committee_diagnostics["recent"]:
+            try:
+                summary = json.loads(outcome.get("vote_summary") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                summary = {}
+            print(
+                f"      - {outcome.get('ticker') or 'N/A'} {outcome.get('direction')} | "
+                f"votes={summary} | margin={float(outcome.get('vote_margin') or 0):.4f} | "
+                f"有效票={int(outcome.get('parsed_vote_count') or 0)}/"
+                f"{int(outcome.get('vote_count') or 0)} "
+                f"(门槛{int(outcome.get('quorum_required') or 0)}) | "
+                f"{outcome.get('created_at')}"
+            )
+    elif committee_diagnostics["available"]:
+        print(
+            "   0 条（迁移前观望裁决不反推票型；重启 run_discussion 后，"
+            "每轮 long/short/hold 均追加保存票数、票差和有效票）"
+        )
+    else:
+        print("   尚未初始化；下一次 run_discussion 初始化会创建追加式票型审计表")
+
     print(f"\n   📦 当前持仓:")
     if position_details:
         for pd in position_details:
@@ -1226,10 +1308,17 @@ def show_stats(db_path):
     rc_count = c.fetchone()[0]
     c.execute("SELECT COUNT(*) FROM reflection_summary")
     rs_count = c.fetchone()[0]
+    meeting_count = 0
+    if "meetings" in tables:
+        c.execute("SELECT COUNT(*) FROM meetings")
+        meeting_count = c.fetchone()[0]
 
     print(f"\n   📈 研究讨论统计:")
     print(f"      - 讨论结论: {rc_count} 条")
     print(f"      - 反思总结: {rs_count} 条")
+    print(f"      - 可回放投委会会议: {meeting_count} 条")
+    if meeting_count == 0:
+        print("      - 会议记忆状态: 等待下一次 run_discussion 写入；不反推旧讨论内容")
     if "proposals" in tables:
         try:
             c.execute(
@@ -1269,6 +1358,22 @@ def show_stats(db_path):
             if prediction_rows:
                 for status, result, count in prediction_rows:
                     print(f"      - {status}/{result}: {count:,} 条")
+                c.execute("""
+                    SELECT
+                        SUM(CASE WHEN status = 'validated'
+                                  AND result IN ('correct', 'partial', 'wrong') THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'validated'
+                                  AND COALESCE(result, 'unknown') NOT IN ('correct', 'partial', 'wrong')
+                                 THEN 1 ELSE 0 END)
+                    FROM price_predictions
+                """)
+                judgeable_count, legacy_unknown_count = c.fetchone()
+                print(f"      - 可判定并参与学习: {int(judgeable_count or 0):,} 条")
+                if legacy_unknown_count:
+                    print(
+                        f"      - 历史不可判定记录: {int(legacy_unknown_count):,} 条"
+                        "（保留审计，但不计入胜率/错误画像）"
+                    )
                 c.execute("""
                     SELECT COUNT(*)
                     FROM price_predictions

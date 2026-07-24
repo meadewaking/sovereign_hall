@@ -107,6 +107,7 @@ class SpiderSwarm:
         user_agent: str = None,
         retry_times: Optional[int] = None,
         cache_ttl: int = 3600,  # 缓存有效期（秒），默认1小时
+        network_enabled: bool = True,
     ):
         """
         初始化爬虫集群
@@ -131,6 +132,7 @@ class SpiderSwarm:
             self.default_sources = [s.strip() for s in self.default_sources.split(',') if s.strip()]
         default_source_timeout = max(10, min(20, self.timeout // 2 or 15))
         self.source_timeout = int(spider_config.get('source_timeout', default_source_timeout))
+        self.network_enabled = bool(network_enabled)
 
         # 搜索结果缓存（类级别共享，同一轮次内有效）
         self._search_cache: Dict[str, Tuple[List[Doc], float]] = {}  # query -> (docs, timestamp)
@@ -160,7 +162,13 @@ class SpiderSwarm:
         # HTTP客户端
         self._init_client()
 
-        logger.info(f"Spider Swarm initialized: max_concurrent={self.max_concurrent}, timeout={self.timeout}, cache_ttl={cache_ttl}s")
+        logger.info(
+            "Spider Swarm initialized: max_concurrent=%s, timeout=%s, cache_ttl=%ss, network_enabled=%s",
+            self.max_concurrent,
+            self.timeout,
+            cache_ttl,
+            self.network_enabled,
+        )
 
     def _init_client(self):
         """初始化HTTP客户端（走代理）"""
@@ -203,6 +211,29 @@ class SpiderSwarm:
         import time
         if not queries:
             return []
+
+        if not self.network_enabled:
+            current_time = time.time()
+            cached_docs: List[Doc] = []
+            seen_urls: Set[str] = set()
+            for query in queries:
+                cached = self._search_cache.get(query)
+                if not cached:
+                    continue
+                docs, cached_at = cached
+                ttl = self._empty_cache_ttl if not docs else self._cache_ttl
+                if current_time - cached_at >= ttl:
+                    continue
+                for doc in docs:
+                    if doc.url not in seen_urls:
+                        cached_docs.append(doc)
+                        seen_urls.add(doc.url)
+            logger.info(
+                "Local-only search guard: blocked network search for %s queries; cache_docs=%s",
+                len(queries),
+                len(cached_docs),
+            )
+            return self._filter_documents(cached_docs)
 
         current_time = time.time()
         queries_to_search = []

@@ -403,6 +403,52 @@ class InvestmentSimulation:
             )
         await conn.commit()
 
+    async def record_committee_outcomes(
+        self,
+        decisions: List[Dict[str, Any]],
+        *,
+        source: str = "run_discussion",
+    ) -> None:
+        """Append vote diagnostics for every committee outcome, including holds.
+
+        Price predictions intentionally contain only actionable long/short calls.
+        This separate audit preserves hold/quorum evidence without relabeling it
+        as a prediction or a simulated fill.
+        """
+        if not self.db_service or self.db_service._connection is None:
+            return
+        conn = self.db_service._connection
+        now = datetime.now().isoformat()
+        for decision in decisions:
+            vote_summary = decision.get("vote_summary") or {}
+            await conn.execute(
+                """
+                INSERT INTO simulation_committee_outcomes (
+                    ticker, direction, confidence, target_position,
+                    vote_summary, vote_margin, vote_count, parsed_vote_count,
+                    invalid_vote_count, quorum_required, quorum_met,
+                    review_depth, source, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self._normalize_ticker(str(decision.get("ticker") or "")),
+                    str(decision.get("direction") or "hold").lower(),
+                    float(decision.get("confidence") or 0.0),
+                    float(decision.get("target_position") or 0.0),
+                    json.dumps(vote_summary, ensure_ascii=False, sort_keys=True),
+                    float(decision.get("vote_margin") or 0.0),
+                    int(decision.get("vote_count") or 0),
+                    int(decision.get("parsed_vote_count") or 0),
+                    int(decision.get("invalid_vote_count") or 0),
+                    int(decision.get("vote_quorum_required") or 0),
+                    1 if decision.get("vote_quorum_met") else 0,
+                    str(decision.get("review_depth") or ""),
+                    str(source or "run_discussion"),
+                    now,
+                ),
+            )
+        await conn.commit()
+
     async def _write_redeployment_state(
         self,
         *,
@@ -1679,9 +1725,32 @@ class InvestmentSimulation:
                 PRIMARY KEY (ticker, code)
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS simulation_committee_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                target_position REAL NOT NULL,
+                vote_summary TEXT NOT NULL,
+                vote_margin REAL NOT NULL,
+                vote_count INTEGER NOT NULL,
+                parsed_vote_count INTEGER NOT NULL,
+                invalid_vote_count INTEGER NOT NULL,
+                quorum_required INTEGER NOT NULL,
+                quorum_met INTEGER NOT NULL,
+                review_depth TEXT,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_simulation_candidate_rejections_count "
             "ON simulation_candidate_rejections(rejection_count DESC, last_seen_at DESC)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_simulation_committee_outcomes_created "
+            "ON simulation_committee_outcomes(created_at DESC, id DESC)"
         )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_simulation_pending_status "

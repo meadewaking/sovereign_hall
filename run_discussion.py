@@ -81,6 +81,49 @@ def _safe_parse_json(text: str, default=None):
     return safe_parse_json(text, default)
 
 
+def extract_stage2_proposal_array(text: str) -> tuple[List[Dict[str, Any]], str]:
+    """Recover a proposal array embedded after verbose model reasoning.
+
+    Some reasoning models ignore ``JSON only`` and prepend numbered analysis.
+    The generic parser then greedily starts at an earlier ``[1]`` marker and
+    discards an otherwise valid proposal array.  Scan JSON boundaries with the
+    standard decoder and accept only dictionaries carrying a ticker; never
+    synthesize a proposal from prose.
+    """
+    if not text or not isinstance(text, str):
+        return [], "empty"
+
+    direct = _safe_parse_json(text, None)
+    if isinstance(direct, list):
+        proposals = [item for item in direct if isinstance(item, dict) and item.get("ticker")]
+        if proposals:
+            return proposals, "generic_parser"
+
+    decoder = json.JSONDecoder()
+    object_candidates: List[Dict[str, Any]] = []
+    seen_objects = set()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, list):
+            proposals = [item for item in value if isinstance(item, dict) and item.get("ticker")]
+            if proposals:
+                return proposals, "embedded_array"
+        elif isinstance(value, dict) and value.get("ticker"):
+            identity = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            if identity not in seen_objects:
+                seen_objects.add(identity)
+                object_candidates.append(value)
+
+    if object_candidates:
+        return object_candidates, "embedded_objects"
+    return [], "unparsed"
+
+
 def _numeric_stat(stats: Dict[str, Any], *keys: str) -> float:
     for key in keys:
         if key in stats:
@@ -125,72 +168,6 @@ def build_proposal_thesis(raw: Dict) -> str:
     return "\n".join(parts)
 
 
-# 基于议题的默认提案映射
-TOPIC_PROPOSALS = {
-    "AI算力": [
-        {"ticker": "159995", "direction": "long", "sector": "科技", "thesis": "AI算力需求爆发"},
-        {"ticker": "512880", "direction": "long", "sector": "半导体", "thesis": "算力芯片国产替代"},
-    ],
-    "半导体": [
-        {"ticker": "512880", "direction": "long", "sector": "半导体", "thesis": "半导体国产替代"},
-        {"ticker": "688981", "direction": "long", "sector": "半导体", "thesis": "芯片龙头"},
-    ],
-    "消费": [
-        {"ticker": "159928", "direction": "long", "sector": "消费", "thesis": "消费复苏"},
-        {"ticker": "600519", "direction": "long", "sector": "白酒", "thesis": "白酒龙头"},
-    ],
-    "医药": [
-        {"ticker": "159915", "direction": "long", "sector": "医药", "thesis": "医药创新"},
-    ],
-    "新能源": [
-        {"ticker": "159825", "direction": "long", "sector": "新能源", "thesis": "新能源车"},
-        {"ticker": "159985", "direction": "long", "sector": "光伏", "thesis": "光伏产业链"},
-    ],
-    "银行": [
-        {"ticker": "159919", "direction": "long", "sector": "银行", "thesis": "高股息银行"},
-    ],
-}
-
-
-def generate_default_proposals(topic: str) -> List[Dict]:
-    """基于议题生成默认提案"""
-    proposals = []
-
-    # 匹配议题关键词
-    for key, default_list in TOPIC_PROPOSALS.items():
-        if key in topic:
-            for p in default_list:
-                proposals.append({
-                    'ticker': p['ticker'],
-                    'direction': p.get('direction', 'long'),
-                    'target_position': 0.1,
-                    'stop_loss': 5.0,
-                    'take_profit': 15.0,
-                    'holding_period': infer_default_holding_period(topic),
-                    'holding_period_reason': '根据议题性质自动推断验证窗口',
-                    'confidence': 0.5,
-                    'thesis': p.get('thesis', topic),
-                    'sector': p.get('sector', '未知'),
-                })
-            break
-    else:
-        # 默认使用科技ETF
-        proposals.append({
-            'ticker': '159995',
-            'direction': 'long',
-            'target_position': 0.1,
-            'stop_loss': 5.0,
-            'take_profit': 15.0,
-            'holding_period': infer_default_holding_period(topic),
-            'holding_period_reason': '根据议题性质自动推断验证窗口',
-            'confidence': 0.5,
-            'thesis': topic,
-            'sector': '综合',
-        })
-
-    return proposals
-
-
 def infer_default_holding_period(topic: str) -> int:
     """根据议题给默认验证窗口，作为模型缺省值的后备。"""
     return _normalize_expected_days(None, topic)
@@ -209,12 +186,18 @@ def normalize_proposal_holding_period(proposal: Dict, topic: str) -> int:
 logger = logging.getLogger(__name__)
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Sovereign Hall continuous discussion runner")
     parser.add_argument("--once", action="store_true", help="只运行一轮后退出")
     parser.add_argument("--max-rounds", type=int, default=0, help="最多运行轮数，0 表示无限")
     parser.add_argument("--skip-preflight", action="store_true", help="跳过 LLM/Embedding/搜索联通性检查")
-    return parser.parse_args()
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        default=False,
+        help="仅使用本地资料并禁止网络搜索（可选）；省略时允许系统使用既有联网研究能力",
+    )
+    return parser.parse_args(argv)
 
 
 def cli_args_can_run_without_instance_lock(argv: list[str] | None = None) -> bool:
@@ -223,7 +206,7 @@ def cli_args_can_run_without_instance_lock(argv: list[str] | None = None) -> boo
     return any(arg in {"-h", "--help"} for arg in args)
 
 
-async def run_startup_preflight(llm, spiders) -> bool:
+async def run_startup_preflight(llm, spiders, *, check_search: bool = True) -> bool:
     """Verify external dependencies before burning a research round."""
     print("\n🔌 启动前联通性检查...")
     checks = []
@@ -258,11 +241,16 @@ async def run_startup_preflight(llm, spiders) -> bool:
         if not docs:
             raise RuntimeError("搜索返回空结果")
 
-    for name, check, required in [
+    configured_checks = [
         ("LLM", _check_llm, True),
         ("Embedding", _check_embedding, True),
-        ("搜索", _check_search, False),
-    ]:
+    ]
+    if check_search:
+        configured_checks.append(("搜索", _check_search, False))
+    else:
+        print("   🚫 搜索: local-only 硬门禁用资料联网")
+
+    for name, check, required in configured_checks:
         try:
             await check()
             checks.append((name, True, "OK", required))
@@ -843,16 +831,21 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         logger.info(f"[diag] stage2 LLM response len={len(response or '')}, first 300: {(response or '')[:300]}")
 
         # 解析JSON
-        proposals = _safe_parse_json(response, [])
-        logger.info(f"[diag] stage2 parsed type={type(proposals).__name__}, len={len(proposals) if hasattr(proposals, '__len__') else 'N/A'}")
-        if not isinstance(proposals, list):
-            proposals = [proposals]
+        proposals, parse_mode = extract_stage2_proposal_array(response)
+        logger.info(
+            "[diag] stage2 parsed type=%s, len=%s, mode=%s",
+            type(proposals).__name__,
+            len(proposals),
+            parse_mode,
+        )
 
         # 清洗数据（同时过滤黑名单）
         cleaned = []
         from sovereign_hall.services.market_data import MarketDataService
 
         for p in proposals:
+            if not isinstance(p, dict):
+                continue
             ticker = str(p.get('ticker', '')).strip().upper()
             if MarketDataService.is_supported_ticker(ticker):
                 # 过滤黑名单中的标的
@@ -872,6 +865,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
                     'evidence': [str(item)[:240] for item in (p.get('evidence') or [])[:8]],
                     'resolved_rejection': str(p.get('resolved_rejection') or '')[:300],
                     'evidence_delta': str(p.get('evidence_delta') or '')[:500],
+                    'reject_if': str(p.get('reject_if') or '')[:500],
                 }
                 cleaned_proposal['holding_period'] = normalize_proposal_holding_period(cleaned_proposal | {'holding_period': p.get('holding_period')}, topic)
                 cleaned.append(cleaned_proposal)
@@ -882,12 +876,8 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         for p in cleaned:
             print(f"      {p['ticker']} | {p['direction']} | {p['holding_period']}天 | 置信度: {p['confidence']:.0%} | {p['thesis'][:30]}")
 
-        # 如果没有生成有效提案，使用基于议题的默认提案
         if not cleaned:
-            print("   ⚠️ 使用基于议题的默认提案")
-            default_proposals = generate_default_proposals(topic)
-            # 过滤默认提案中的黑名单
-            cleaned = [p for p in default_proposals if not blacklist or p['ticker'] not in blacklist]
+            print("   ⚠️ 本轮没有得到有证据支持的提案；不注入预设标的")
 
         return cleaned
 
@@ -903,11 +893,23 @@ def parse_committee_vote(text: str) -> Dict:
     """Parse a loose committee vote into a small structured signal."""
     parsed_json = _safe_parse_json(str(text or ""), None)
     if isinstance(parsed_json, dict):
-        direction = normalize_vote_direction(
+        raw_direction = (
             parsed_json.get("direction")
             or parsed_json.get("vote")
             or parsed_json.get("action")
             or parsed_json.get("decision")
+        )
+        direction_text = str(raw_direction or "").strip().lower()
+        is_valid = any(
+            word in direction_text
+            for word in (
+                "long", "buy", "买入", "看多", "做多",
+                "short", "sell", "卖出", "看空", "做空",
+                "hold", "defer", "neutral", "观望", "暂缓", "不建议", "反对", "拒绝",
+            )
+        )
+        direction = normalize_vote_direction(
+            raw_direction
         )
         confidence = parse_ratio_value(parsed_json.get("confidence"))
         position = parse_ratio_value(parsed_json.get("position") or parsed_json.get("target_position"))
@@ -921,11 +923,20 @@ def parse_committee_vote(text: str) -> Dict:
             "risk_flags": [str(flag)[:80] for flag in risk_flags[:5]] if isinstance(risk_flags, list) else [],
             "invalid_if": str(parsed_json.get("invalid_if") or parsed_json.get("reject_if") or "")[:200],
             "key_evidence": parsed_json.get("key_evidence") or parsed_json.get("evidence") or [],
+            "is_valid": is_valid,
+            "parse_mode": "structured_json" if is_valid else "invalid_json_direction",
         }
 
     value = str(text or "").lower()
     if not value:
-        return {"direction": "hold", "confidence": None, "position": None, "risk_flags": []}
+        return {
+            "direction": "hold",
+            "confidence": None,
+            "position": None,
+            "risk_flags": [],
+            "is_valid": False,
+            "parse_mode": "empty",
+        }
 
     has_sell = any(word in value for word in ("卖出", "看空", "做空", "short", "sell"))
     has_hold = any(word in value for word in ("观望", "暂缓", "不建议", "反对", "拒绝", "hold", "defer"))
@@ -950,7 +961,14 @@ def parse_committee_vote(text: str) -> Dict:
     if position_match:
         position = parse_ratio_value(position_match.group(1))
 
-    return {"direction": direction, "confidence": confidence, "position": position, "risk_flags": []}
+    return {
+        "direction": direction,
+        "confidence": confidence,
+        "position": position,
+        "risk_flags": [],
+        "is_valid": bool(has_sell or has_hold or has_buy),
+        "parse_mode": "natural_language" if (has_sell or has_hold or has_buy) else "unparsed",
+    }
 
 
 def normalize_vote_direction(value: Any) -> str:
@@ -1052,26 +1070,43 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
     weights = vote_weights or [2.0, 1.0, 1.0, 1.0, 1.0, 1.5, 1.0]
     scores = {"long": 0.0, "short": 0.0, "hold": 0.0}
     for index, vote in enumerate(parsed):
+        if not vote.get("is_valid"):
+            continue
         scores[vote["direction"]] += weights[index] if index < len(weights) else 1.0
 
-    if scores["long"] > scores["short"] and scores["long"] > scores["hold"]:
+    parsed_vote_count = sum(bool(vote.get("is_valid")) for vote in parsed)
+    quorum_required = max(2, (len(parsed) * 3 + 4) // 5) if parsed else 2
+    quorum_met = parsed_vote_count >= quorum_required
+    if quorum_met and scores["long"] > scores["short"] and scores["long"] > scores["hold"]:
         direction = "long"
-    elif scores["short"] > scores["long"] and scores["short"] > scores["hold"]:
+    elif quorum_met and scores["short"] > scores["long"] and scores["short"] > scores["hold"]:
         direction = "short"
     else:
         direction = "hold"
 
-    confidences = [vote["confidence"] for vote in parsed if vote["confidence"] is not None]
-    positions = [vote["position"] for vote in parsed if vote["position"] is not None]
+    confidences = [
+        vote["confidence"] for vote in parsed
+        if vote.get("is_valid") and vote["confidence"] is not None
+    ]
+    positions = [
+        vote["position"] for vote in parsed
+        if vote.get("is_valid") and vote["position"] is not None
+    ]
     confidence = sum(confidences) / len(confidences) if confidences else float(proposal.get("confidence", 0.5))
     target_position = sum(positions) / len(positions) if positions else float(proposal.get("target_position", 0.1))
     if direction == "hold":
         target_position = 0.0
-    total_weight = sum(weights[:len(parsed)]) if parsed else 0.0
+    total_weight = sum(
+        weights[index] if index < len(weights) else 1.0
+        for index, vote in enumerate(parsed)
+        if vote.get("is_valid")
+    )
     sorted_scores = sorted(scores.values(), reverse=True)
     margin = (sorted_scores[0] - sorted_scores[1]) / total_weight if total_weight and len(sorted_scores) > 1 else 0.0
     risk_flags = []
     for vote in parsed:
+        if not vote.get("is_valid"):
+            continue
         risk_flags.extend(vote.get("risk_flags") or [])
 
     return {
@@ -1081,6 +1116,13 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
         "vote_summary": scores,
         "vote_margin": round(margin, 4),
         "vote_count": len(parsed),
+        "parsed_vote_count": parsed_vote_count,
+        "invalid_vote_count": len(parsed) - parsed_vote_count,
+        "vote_quorum_required": quorum_required,
+        "vote_quorum_met": quorum_met,
+        "vote_parse_modes": [
+            str(vote.get("parse_mode") or "unknown") for vote in parsed
+        ],
         "risk_flags": list(dict.fromkeys(risk_flags))[:8],
     }
 
@@ -1108,6 +1150,18 @@ def preflight_committee_decisions(
         direction = str(decision.get("direction") or "hold").strip().lower()
         risk_flags = [str(item) for item in (decision.get("risk_flags") or []) if str(item).strip()]
         suffix = f"；risk_flags={','.join(risk_flags[:3])}" if risk_flags else ""
+        vote_summary = decision.get("vote_summary")
+        vote_count = int(decision.get("vote_count") or 0)
+        parsed_vote_count = int(decision.get("parsed_vote_count") or vote_count)
+        invalid_vote_count = int(decision.get("invalid_vote_count") or 0)
+        vote_margin = float(decision.get("vote_margin") or 0.0)
+        vote_audit = (
+            f"；vote_summary={vote_summary}；vote_margin={vote_margin:.4f}；"
+            f"parsed_votes={parsed_vote_count}/{vote_count}；invalid_votes={invalid_vote_count}"
+            if vote_summary is not None or vote_count
+            else ""
+        )
+        suffix += vote_audit
 
         if not ticker:
             rejections.append({
@@ -1124,10 +1178,18 @@ def preflight_committee_decisions(
             })
             continue
         if direction in {"hold", "neutral", "watch", "观望"}:
+            quorum_met = bool(decision.get("vote_quorum_met", True))
             rejections.append({
-                "code": "committee_hold",
+                "code": "committee_hold" if quorum_met else "committee_vote_quorum_failed",
                 "ticker": ticker,
-                "reason": "投委会证据未形成多头/退出裁决" + suffix,
+                "reason": (
+                    "投委会证据未形成多头/退出裁决"
+                    if quorum_met
+                    else (
+                        "投委会有效票不足法定人数"
+                        f"({parsed_vote_count}/{int(decision.get('vote_quorum_required') or 0)})"
+                    )
+                ) + suffix,
             })
             continue
         if direction not in {"long", "short", "sell"}:
@@ -1442,6 +1504,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                 'expected_days': expected_days,
                 'holding_period_reason': proposal.get('holding_period_reason', ''),
                 'sector': sector,
+                'discussion_excerpt': full_context[:24000],
             })
             final_decisions.append(committee_decision)
 
@@ -1494,7 +1557,13 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
 # ============================================================================
 # 阶段4：综合结论 + 结构化存储
 # ============================================================================
-async def stage4_final_conclusion(llm, discussions: str, decisions: List[Dict], topic: str) -> Dict:
+async def stage4_final_conclusion(
+    llm,
+    discussions: str,
+    decisions: List[Dict],
+    topic: str,
+    memory_prompt: str = "",
+) -> Dict:
     """阶段4：生成综合结论并结构化"""
     from sovereign_hall.core.config import get_config
 
@@ -1530,6 +1599,9 @@ async def stage4_final_conclusion(llm, discussions: str, decisions: List[Dict], 
                 user=f"""
 研究议题：{topic}
 
+历史记忆与已验证结果（旧结论不是当前事实）：
+{memory_prompt[:8000] if memory_prompt else "无"}
+
 讨论内容：
 {discussions[:conclusion_context_chars]}
 
@@ -1540,7 +1612,7 @@ async def stage4_final_conclusion(llm, discussions: str, decisions: List[Dict], 
 ## 关键逻辑（3条）
 1. 已验证事实：
 2. 核心推断：
-3. 触发/否决条件：
+3. 相对历史结论是维持、修正还是推翻，以及触发/否决条件：
 
 ## 操作建议
 仓位: XX% | 止损: XX% | 止盈: XX%
@@ -1687,6 +1759,8 @@ async def run_committee_approved_simulation(
     current_positions = assets.get('positions', {})
     current_tickers = set(current_positions.keys())
     current_ticker_codes = {simulation._normalize_ticker(ticker) for ticker in current_tickers}
+    if hasattr(simulation, "record_committee_outcomes"):
+        await simulation.record_committee_outcomes(decisions, source="run_discussion")
     max_daily_trades = int(getattr(simulation, "max_daily_trades", MAX_DAILY_TRADES))
     prior_trade_count = (
         await simulation.count_trades_on_date()
@@ -1957,7 +2031,7 @@ async def main():
     print("="*60)
     print("设计目标：")
     print("  - 预设议题池，循环研究")
-    print("  - 高并发搜索 + 多轮辩论")
+    print("  - 本地知识库 + 多轮辩论" if args.local_only else "  - 高并发搜索 + 多轮辩论")
     print("  - 结构化存储结论")
     print("  - 0.1秒间隔，持续燃烧Token")
     print("="*60 + "\n")
@@ -2025,6 +2099,8 @@ async def main():
     topic_cooldown_hours = int(system_config.get("topic_cooldown_hours", DEFAULT_TOPIC_COOLDOWN_HOURS) or 0)
     search_query_count = int(research_config.get("search_query_count", 30) or 30)
     force_search_interval = int(research_config.get("force_search_interval", 1) or 0)
+    if args.local_only:
+        force_search_interval = 0
 
     llm = LLMClient(
         max_concurrent=int(llm_config.get('max_concurrent', 12)),
@@ -2033,16 +2109,25 @@ async def main():
     )
     # 从配置中读取 Spider 并发数（已降低防止被封）
     spider_config = config.get_spider_config()
-    spiders = SpiderSwarm(max_concurrent=spider_config.get('max_concurrent', 10))
+    spiders = SpiderSwarm(
+        max_concurrent=spider_config.get('max_concurrent', 10),
+        network_enabled=not args.local_only,
+    )
 
     if not args.skip_preflight:
-        preflight_ok = await run_startup_preflight(llm, spiders)
+        preflight_ok = await run_startup_preflight(
+            llm,
+            spiders,
+            check_search=not args.local_only,
+        )
         if not preflight_ok:
             await spiders.close()
             await llm.close()
             raise RuntimeError("启动前联通性检查未通过")
     else:
         print("⚠️ 已跳过启动前 LLM/Embedding/搜索联通性检查")
+    if args.local_only:
+        print("🛡️ local-only 已生效：资料网络搜索被 SpiderSwarm 共享硬门禁止")
 
     db_service = DatabaseService(str(db_path))
     await db_service._init_db()
@@ -2119,29 +2204,10 @@ async def main():
             print(f"🔥 第 {iteration} 轮 | 议题: {topic}")
             print(f"{'='*60}")
 
-            # 加载历史教训并显示
+            # 先验证到期预测，再把最新结果和旧结论注入本轮。
             try:
                 t0 = datetime.now()
                 learning_engine = LearningEngine(str(db_path))
-                logger.info("[diag] generate_lessons_prompt begin")
-                lessons_prompt = await asyncio.wait_for(
-                    learning_engine.generate_lessons_prompt(), timeout=120
-                )
-                logger.info(f"[diag] generate_lessons_prompt done in {(datetime.now()-t0).total_seconds():.1f}s")
-
-                t0 = datetime.now()
-                logger.info("[diag] get_accuracy_stats begin")
-                stats = await asyncio.wait_for(
-                    learning_engine.get_accuracy_stats(), timeout=60
-                )
-                logger.info(f"[diag] get_accuracy_stats done in {(datetime.now()-t0).total_seconds():.1f}s")
-                if stats['total'] > 0:
-                    print(f"\n📈 历史预测胜率: {stats['accuracy']:.1%} ({stats['correct']}/{stats['total']})")
-                if lessons_prompt:
-                    print(f"📜 加载了 {lessons_prompt.count('教训') - 1} 条历史教训")
-
-                # 验证待验证决策
-                t0 = datetime.now()
                 logger.info("[diag] validate_pending begin")
                 recorder = DecisionRecorder(str(db_path))
                 validation_result = await asyncio.wait_for(
@@ -2157,12 +2223,37 @@ async def main():
                 await asyncio.wait_for(learning_engine.update_playbook(), timeout=180)
                 logger.info(f"[diag] update_playbook done in {(datetime.now()-t0).total_seconds():.1f}s")
 
+                t0 = datetime.now()
+                logger.info("[diag] generate_lessons_prompt begin")
+                lessons_prompt = await asyncio.wait_for(
+                    learning_engine.generate_lessons_prompt(), timeout=120
+                )
+                research_memory_prompt = await asyncio.wait_for(
+                    learning_engine.generate_research_memory_prompt(topic), timeout=120
+                )
+                logger.info(f"[diag] generate_lessons_prompt done in {(datetime.now()-t0).total_seconds():.1f}s")
+
+                t0 = datetime.now()
+                logger.info("[diag] get_accuracy_stats begin")
+                stats = await asyncio.wait_for(
+                    learning_engine.get_accuracy_stats(), timeout=60
+                )
+                logger.info(f"[diag] get_accuracy_stats done in {(datetime.now()-t0).total_seconds():.1f}s")
+                if stats['total'] > 0:
+                    print(f"\n📈 可判定历史预测胜率: {stats['accuracy']:.1%} ({stats['correct']}/{stats['total']})")
+                if lessons_prompt:
+                    print("📜 已加载历史预测教训与错误画像")
+                if research_memory_prompt:
+                    print("🧠 已加载同议题旧结论、预测期限和验证结果")
+
             except asyncio.TimeoutError as e:
                 logger.error(f"加载历史教训/验证超时: {e}")
                 lessons_prompt = ""
+                research_memory_prompt = ""
             except Exception as e:
                 logger.exception(f"加载历史教训/验证失败: {e}")
                 lessons_prompt = ""
+                research_memory_prompt = ""
 
             try:
                 # 阶段1：按需搜索（先检查本地数据是否足够）
@@ -2185,6 +2276,12 @@ async def main():
                     logger.warning(f"向量检索失败: {e}")
                     existing_docs = []
 
+                if args.local_only:
+                    print(
+                        f"\n📚 阶段1：local-only 使用本地数据 "
+                        f"({len(existing_docs)} 条相关文档)；禁止资料联网"
+                    )
+                    docs = existing_docs
                 # 强制定期搜索新数据（默认每轮刷新，避免本地缓存让每轮 token 过低）
                 # 避免一直用旧缓存导致空转
                 force_search_due = bool(force_search_interval and iteration % force_search_interval == 0)
@@ -2194,7 +2291,9 @@ async def main():
                     force_search_due
                 )
 
-                if should_force_search and not existing_docs:
+                if args.local_only:
+                    pass
+                elif should_force_search and not existing_docs:
                     print(f"\n📚 阶段1：本地数据不足，进行搜索补充...")
                     docs = await stage1_mass_search(llm, spiders, topic, query_count=search_query_count)
                 elif existing_docs and len(existing_docs) >= 10 and not force_search_due:
@@ -2272,8 +2371,11 @@ async def main():
                     if hasattr(simulation, "format_redeployment_learning_context")
                     else ""
                 )
+                historical_learning_context = "\n\n".join(
+                    part for part in (lessons_prompt, research_memory_prompt) if part
+                )
                 prompt_lessons = build_lessons_with_heuristic_context(
-                    lessons_prompt,
+                    historical_learning_context,
                     redeployment_context=redeployment_context,
                 )
 
@@ -2299,7 +2401,7 @@ async def main():
                     )
                 for proposal in proposals:
                     try:
-                        await db_service.add_proposal(proposal)
+                        proposal["proposal_id"] = await db_service.add_proposal(proposal)
                     except Exception as e:
                         logger.warning(f"保存提案失败: {e}")
 
@@ -2312,15 +2414,92 @@ async def main():
                     logger.error(f"阶段3失败: {e}", exc_info=True)
                     raise
 
+                # 投委会原始讨论是独立记忆，不依赖后续综合结论是否成功。
+                proposal_by_ticker = {
+                    str(item.get("ticker") or "").strip().upper(): item
+                    for item in proposals
+                }
+                for decision in decisions:
+                    ticker_key = str(decision.get("ticker") or "").strip().upper()
+                    proposal = proposal_by_ticker.get(ticker_key, {})
+                    try:
+                        from sovereign_hall.utils import generate_id
+                        await db_service.add_meeting_record(
+                            meeting_id=generate_id("meeting"),
+                            proposal_id=str(proposal.get("proposal_id") or ""),
+                            ticker=ticker_key,
+                            decision=str(decision.get("direction") or "hold"),
+                            discussion=str(decision.get("discussion_excerpt") or "")[:24000],
+                            vote_details={
+                                "summary": decision.get("vote_summary"),
+                                "margin": decision.get("vote_margin"),
+                                "vote_count": decision.get("vote_count"),
+                                "valid_vote_count": decision.get("parsed_vote_count"),
+                                "quorum_required": decision.get("vote_quorum_required"),
+                                "quorum_met": decision.get("vote_quorum_met"),
+                                "review_depth": decision.get("review_depth"),
+                            },
+                            action_items=[
+                                f"验证窗口: {int(decision.get('expected_days') or 30)}天",
+                                f"止损: {decision.get('stop_loss')}",
+                                f"止盈: {decision.get('take_profit')}",
+                            ],
+                        )
+                    except Exception as e:
+                        logger.warning("保存投委会会议记忆失败 %s: %s", ticker_key, e)
+
                 # 阶段4：综合结论
-                conclusion_data = await stage4_final_conclusion(llm, discussions, decisions, topic)
+                conclusion_data = await stage4_final_conclusion(
+                    llm,
+                    discussions,
+                    decisions,
+                    topic,
+                    memory_prompt=prompt_lessons,
+                )
 
                 # 保存结论（包含结构化数据）
+                primary_decision = decisions[0] if decisions else {}
                 await db_service.save_report_conclusion(
                     question=topic,
                     conclusion=conclusion_data.get('conclusion', ''),
                     ticker=conclusion_data.get('key_ticker', ''),
-                    confidence=conclusion_data.get('confidence', 0.5)
+                    position=float(primary_decision.get("target_position") or 0.0),
+                    stop_loss=float(primary_decision.get("stop_loss") or 0.0),
+                    take_profit=float(primary_decision.get("take_profit") or 0.0),
+                    holding_period=str(primary_decision.get("expected_days") or ""),
+                    confidence=conclusion_data.get('confidence', 0.5),
+                    key_points=json.dumps(
+                        {
+                            "direction": primary_decision.get("direction"),
+                            "thesis": primary_decision.get("thesis"),
+                            "vote_summary": primary_decision.get("vote_summary"),
+                            "vote_margin": primary_decision.get("vote_margin"),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    risks=json.dumps(
+                        primary_decision.get("risk_flags") or [],
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                )
+                await db_service.save_reflection_summary(
+                    question=topic,
+                    previous_conclusions=research_memory_prompt[:8000],
+                    reflection_text=(
+                        "本轮使用新检索资料经过独立分析、交叉质疑、反事实修正和投票后形成结论。"
+                    ),
+                    verification_results=json.dumps(
+                        {
+                            "decision_count": len(decisions),
+                            "proposal_count": len(proposals),
+                            "vote_quorum": primary_decision.get("vote_quorum_met"),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    adjusted_conclusion=conclusion_data.get('conclusion', '')[:12000],
+                    lessons_learned=lessons_prompt[:8000],
                 )
 
                 # 💰 每日投资模拟：只消费投委会裁决后的结构化决策

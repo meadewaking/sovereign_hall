@@ -70,6 +70,7 @@ class LearningEngine:
             async with db.execute("""
                 SELECT * FROM price_predictions
                 WHERE status = 'validated'
+                AND result IN ('correct', 'partial', 'wrong')
                 ORDER BY validated_at DESC, predicted_at DESC
                 LIMIT ?
             """, (limit,)) as cursor:
@@ -162,6 +163,87 @@ class LearningEngine:
 
         return prompt
 
+    async def generate_research_memory_prompt(
+        self,
+        topic: str,
+        conclusion_limit: int = 5,
+        prediction_limit: int = 12,
+    ) -> str:
+        """Bring prior conclusions and their prediction outcomes into the next loop.
+
+        Historical text is explicitly labelled as a falsifiable prior so fresh
+        network evidence remains authoritative.
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    """
+                    SELECT id, question, conclusion, ticker, position, stop_loss,
+                           take_profit, holding_period, confidence, created_at
+                    FROM report_conclusions
+                    WHERE question = ?
+                    ORDER BY datetime(created_at) DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (topic, conclusion_limit),
+                ) as cursor:
+                    conclusions = [dict(row) for row in await cursor.fetchall()]
+
+                tickers = list(dict.fromkeys(
+                    str(row.get("ticker") or "").strip().upper()
+                    for row in conclusions
+                    if str(row.get("ticker") or "").strip()
+                ))
+                predictions = []
+                if tickers:
+                    placeholders = ",".join("?" for _ in tickers)
+                    async with db.execute(
+                        f"""
+                        SELECT ticker, direction, confidence, expected_days, status,
+                               result, accuracy_score, predicted_at, validated_at,
+                               target_price, stop_loss
+                        FROM price_predictions
+                        WHERE ticker IN ({placeholders})
+                        ORDER BY datetime(predicted_at) DESC, rowid DESC
+                        LIMIT ?
+                        """,
+                        (*tickers, prediction_limit),
+                    ) as cursor:
+                        predictions = [dict(row) for row in await cursor.fetchall()]
+        except Exception as exc:
+            logger.warning("加载历史研究记忆失败: %s", exc)
+            return ""
+
+        if not conclusions and not predictions:
+            return ""
+
+        lines = [
+            "【同议题历史研究记忆】",
+            "以下内容是旧结论与旧预测结果，不是当前事实。必须用本轮联网资料重新验证，并明确维持、修正或推翻。",
+        ]
+        for index, row in enumerate(conclusions, 1):
+            conclusion = " ".join(str(row.get("conclusion") or "").split())
+            lines.append(
+                f"{index}. {row.get('created_at') or '未知时间'} | "
+                f"{row.get('ticker') or '无标的'} | 置信度={float(row.get('confidence') or 0):.0%} | "
+                f"期限={row.get('holding_period') or '未记录'} | {conclusion[:360]}"
+            )
+
+        if predictions:
+            lines.append("【关联预测验证】")
+            for row in predictions:
+                score = row.get("accuracy_score")
+                score_text = f"{float(score):.2f}" if score is not None else "N/A"
+                lines.append(
+                    f"- {row.get('ticker')} {row.get('direction')} | "
+                    f"{int(row.get('expected_days') or 30)}天 | "
+                    f"{row.get('status')}/{row.get('result')} | accuracy={score_text} | "
+                    f"预测于={row.get('predicted_at') or 'N/A'}"
+                )
+
+        return "\n".join(lines)
+
     @staticmethod
     def _confidence_bucket(confidence) -> str:
         value = float(confidence or 0.0)
@@ -192,6 +274,7 @@ class LearningEngine:
                     AVG(accuracy_score) as avg_accuracy
                 FROM price_predictions
                 WHERE status = 'validated'
+                AND result IN ('correct', 'partial', 'wrong')
             """) as cursor:
                 row = await cursor.fetchone()
                 if not row or row[0] == 0:

@@ -86,6 +86,7 @@ class ResearchDiscussionSystem:
         self.enable_search = enable_search
         self.enable_web = enable_web
         self.heuristic_prompt_context = format_heuristic_prompt_context()
+        self.learned_prediction_context = ""
 
     async def _get_db(self) -> DatabaseService:
         """获取数据库服务（延迟初始化）"""
@@ -103,6 +104,23 @@ class ResearchDiscussionSystem:
         print(f"{'='*70}\n")
 
         context = ResearchContext(question=question)
+
+        # Use validated autonomous-loop outcomes, not only raw documents and
+        # recent prose conclusions, when answering a user.
+        try:
+            from sovereign_hall.services.learning_engine import LearningEngine
+
+            db = await self._get_db()
+            learning_engine = LearningEngine(str(db.db_path))
+            self.learned_prediction_context = await learning_engine.generate_lessons_prompt()
+            if self.learned_prediction_context:
+                context.discussion_history.append(
+                    f"【已验证预测教训】\n{self.learned_prediction_context}"
+                )
+                print("   🎯 已加载自主循环的预测验证教训")
+        except Exception as exc:
+            self.learned_prediction_context = ""
+            logger.warning("加载预测验证教训失败: %s", exc)
 
         # 反思历史结论
         reflection_context = await self._reflect_on_history(question)
@@ -210,6 +228,12 @@ class ResearchDiscussionSystem:
         stop_loss = float(re.sub(r'%', '', stop_loss_match.group(1))) / 100 if stop_loss_match else 0
         take_profit = float(re.sub(r'%', '', take_profit_match.group(1))) / 100 if take_profit_match else 0
         confidence = float(re.sub(r'%', '', confidence_match.group(1))) / 100 if confidence_match else 0
+        from .decision_tracker import DecisionRecorder
+
+        expected_days = DecisionRecorder.normalize_expected_days(
+            90 if "半年" in question else None,
+            f"{question}\n{conclusion[:1000]}",
+        )
 
         db = await self._get_db()
         await db.save_report_conclusion(
@@ -219,19 +243,15 @@ class ResearchDiscussionSystem:
             position=position,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            holding_period=str(expected_days),
             confidence=confidence
         )
         print(f"   ✓ 结论已保存 (标的: {ticker or 'N/A'})")
 
         if ticker and confidence > 0 and take_profit > 0 and stop_loss > 0:
             try:
-                from .decision_tracker import DecisionRecorder
                 direction = "short" if any(word in conclusion for word in ["卖出", "做空", "看空"]) else "long"
                 recorder = DecisionRecorder()
-                expected_days = DecisionRecorder.normalize_expected_days(
-                    90 if "半年" in question else None,
-                    f"{question}\n{conclusion[:1000]}",
-                )
                 await recorder.record_decision(
                     ticker=ticker,
                     decision=direction,
@@ -264,6 +284,9 @@ class ResearchDiscussionSystem:
 
 【网络搜索结果（补充）】
 {web_context}
+
+【已验证预测教训】
+{self.learned_prediction_context or "暂无可判定历史预测"}
 """
 
         if is_risk_officer:

@@ -340,6 +340,7 @@ class DecisionRecorder:
                     AVG(accuracy_score) as avg_accuracy
                 FROM price_predictions
                 WHERE status = 'validated'
+                AND result IN ('correct', 'partial', 'wrong')
             """) as cursor:
                 row = await cursor.fetchone()
                 if not row or row[0] == 0:
@@ -545,11 +546,24 @@ class DecisionRecorder:
             result = await self.validate_single(record_id)
             results.append(result)
 
-        validated = sum(1 for r in results if r.get("result") != "unknown")
+        terminal_results = {"correct", "partial", "wrong"}
+        validated = sum(1 for r in results if r.get("result") in terminal_results)
         correct = sum(1 for r in results if r.get("result") == "correct")
+        failed = sum(1 for r in results if r.get("error") or r.get("result") not in terminal_results)
 
-        logger.info(f"批量验证完成: 验证{len(results)}条")
-        return {"validated": len(results), "correct": correct, "results": results}
+        logger.info(
+            "批量验证完成: 尝试%s条，成功%s条，失败/不可判定%s条",
+            len(results),
+            validated,
+            failed,
+        )
+        return {
+            "attempted": len(results),
+            "validated": validated,
+            "failed": failed,
+            "correct": correct,
+            "results": results,
+        }
 
 
 _recorder: Optional[DecisionRecorder] = None

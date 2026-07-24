@@ -61,7 +61,9 @@ from sovereign_hall.run_discussion import (
     build_lessons_with_heuristic_context,
     cli_args_can_run_without_instance_lock,
     filter_repeated_rejection_proposals,
+    extract_stage2_proposal_array,
     parse_committee_vote,
+    parse_args,
     preflight_committee_decisions,
     proposal_priority_score,
     select_next_topic,
@@ -89,6 +91,59 @@ def test_entry_imports():
     import sovereign_hall.check_db  # noqa: F401
     import sovereign_hall.research_interactive  # noqa: F401
     import sovereign_hall.run_discussion  # noqa: F401
+
+
+@pytest.mark.asyncio
+async def test_spider_local_only_hard_gate_blocks_network(monkeypatch):
+    spider = SpiderSwarm(network_enabled=False)
+    network_call = AsyncMock(side_effect=AssertionError("network search must not run"))
+    monkeypatch.setattr(spider, "_search_single_query", network_call)
+
+    docs = await spider.aggressive_search(["A股 最新消息"])
+
+    assert docs == []
+    network_call.assert_not_awaited()
+    await spider.close()
+
+
+def test_stage2_parser_recovers_json_after_verbose_reasoning():
+    response = """
+让我先分析材料。
+[1] 政策边际改善，但需要区分事实与推断。
+最终结果：
+[
+  {
+    "ticker": "600048",
+    "direction": "long",
+    "target_position": 0.1,
+    "confidence": 0.7,
+    "thesis": "事实: 销售改善；推断: 现金流修复"
+  }
+]
+以上是结论。
+"""
+
+    proposals, mode = extract_stage2_proposal_array(response)
+
+    assert mode == "embedded_array"
+    assert [proposal["ticker"] for proposal in proposals] == ["600048"]
+
+
+def test_stage2_parser_never_synthesizes_from_prose_only():
+    proposals, mode = extract_stage2_proposal_array(
+        "建议关注600048，但证据不足，本次不输出结构化提案。"
+    )
+
+    assert proposals == []
+    assert mode == "unparsed"
+
+
+def test_run_discussion_defaults_to_network_research():
+    args = parse_args([])
+
+    assert args.local_only is False
+    assert args.skip_preflight is False
+    assert parse_args(["--local-only"]).local_only is True
 
 
 def test_run_discussion_help_does_not_need_instance_lock():
@@ -1229,7 +1284,7 @@ async def test_dict_proposal_can_be_stored(tmp_path):
 
     long_thesis = "测试提案" + "完整论证" * 2000
 
-    await db.add_proposal({
+    proposal_id = await db.add_proposal({
         "ticker": "512880",
         "direction": "long",
         "target_position": 0.1,
@@ -1240,6 +1295,9 @@ async def test_dict_proposal_can_be_stored(tmp_path):
         "confidence": 0.6,
         "thesis": long_thesis,
         "sector": "半导体",
+        "holding_period_reason": "财报验证窗口",
+        "evidence": ["公告订单", "行业价格"],
+        "reject_if": "订单取消",
     })
 
     proposals = await db.get_proposals(limit=5)
@@ -1247,6 +1305,22 @@ async def test_dict_proposal_can_be_stored(tmp_path):
     assert proposals[0]["ticker"] == "512880"
     assert proposals[0]["thesis"] == long_thesis
     assert proposals[0]["created_at"]
+    assert json.loads(proposals[0]["evidence"]) == ["公告订单", "行业价格"]
+    assert proposals[0]["holding_period_reason"] == "财报验证窗口"
+    assert proposals[0]["reject_if"] == "订单取消"
+
+    await db.add_meeting_record(
+        meeting_id="meeting-test",
+        proposal_id=proposal_id,
+        ticker="512880",
+        decision="long",
+        discussion="四轮讨论摘要",
+        vote_details={"long": 4, "hold": 3},
+        action_items=["30天后验证"],
+    )
+    meetings = await db.get_meetings(limit=5)
+    assert meetings[0]["proposal_id"] == proposal_id
+    assert meetings[0]["discussion"] == "四轮讨论摘要"
     await db.close()
 
 
@@ -1667,6 +1741,23 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsy
     assert persisted["status"] == "blocked_no_approved_candidates"
     assert persisted["attempt_count"] == 2
     assert persisted["rejection_counts_total"]["committee_hold"] == 2
+    await restarted.record_committee_outcomes(
+        [{
+            "ticker": "600519",
+            "direction": "hold",
+            "confidence": 0.7,
+            "target_position": 0.0,
+            "vote_summary": {"long": 2.0, "short": 0.0, "hold": 5.5},
+            "vote_margin": 0.4118,
+            "vote_count": 7,
+            "parsed_vote_count": 7,
+            "invalid_vote_count": 0,
+            "vote_quorum_required": 5,
+            "vote_quorum_met": True,
+            "review_depth": "full",
+        }],
+        source="test",
+    )
     await db.close()
 
     import sovereign_hall.check_db as check_db
@@ -1676,6 +1767,8 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsy
     assert "逐标的重复拒绝记忆" in output
     assert "600519 / committee_hold x1" in output
     assert "重提要求: 必须给出新增本地可追溯证据" in output
+    assert "投委会票型审计" in output
+    assert "有效票=7/7" in output
 
 
 @pytest.mark.asyncio
@@ -3597,6 +3690,92 @@ async def test_learning_engine_generates_error_profiles(tmp_path):
     assert "600519" in prompt
 
 
+@pytest.mark.asyncio
+async def test_learning_engine_reinjects_same_topic_conclusions_and_prediction_results(tmp_path):
+    db_path = tmp_path / "test.db"
+    db = DatabaseService(str(db_path))
+    await db._init_db()
+    await db.init_report_tables()
+    await db.save_report_conclusion(
+        "半导体景气验证",
+        "旧结论：维持观望，等待库存改善。",
+        ticker="512880",
+        holding_period="30",
+        confidence=0.6,
+    )
+    await db._connection.execute(
+        """
+        INSERT INTO price_predictions (
+            id, ticker, direction, confidence, expected_days, status, result,
+            accuracy_score, predicted_at, validated_at
+        ) VALUES (
+            'memory-p1', '512880', 'long', 0.6, 30, 'validated', 'wrong',
+            0.0, '2026-06-01T10:00:00', '2026-07-01T10:00:00'
+        )
+        """
+    )
+    await db._connection.commit()
+
+    engine = LearningEngine(str(db_path))
+    memory = await engine.generate_research_memory_prompt("半导体景气验证")
+    stats = await engine.get_accuracy_stats()
+
+    assert "旧结论：维持观望" in memory
+    assert "512880 long" in memory
+    assert "30天" in memory
+    assert "validated/wrong" in memory
+    assert stats["total"] == 1
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_learning_stats_exclude_legacy_validated_unknown(tmp_path):
+    db_path = tmp_path / "test.db"
+    await ensure_prediction_tables(str(db_path))
+    conn = sqlite3.connect(db_path)
+    conn.executemany(
+        """
+        INSERT INTO price_predictions (
+            id, ticker, direction, status, result, accuracy_score, predicted_at
+        ) VALUES (?, ?, 'long', 'validated', ?, ?, datetime('now'))
+        """,
+        [
+            ("known", "600519", "correct", 1.0),
+            ("legacy-unknown", "000001", "unknown", 0.0),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    stats = await LearningEngine(str(db_path)).get_accuracy_stats()
+
+    assert stats["total"] == 1
+    assert stats["correct"] == 1
+    assert stats["accuracy"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_stage2_empty_model_output_does_not_inject_canned_ticker():
+    class EmptyProposalLLM:
+        async def chat(self, **kwargs):
+            return "[]"
+
+    doc = Document(
+        title="半导体行业库存跟踪",
+        content="这是足够长的本地测试资料，用于确认模型没有输出提案时系统不会注入预设ETF。" * 3,
+        url="https://example.com/evidence",
+        source="unit",
+    )
+
+    proposals = await stage2_deep_research(
+        EmptyProposalLLM(),
+        [doc],
+        "半导体景气验证",
+    )
+
+    assert proposals == []
+
+
 def test_committee_votes_can_defer_to_hold():
     decision = aggregate_committee_decision(
         {"confidence": 0.8, "target_position": 0.2},
@@ -3633,6 +3812,34 @@ def test_committee_aggregation_uses_custom_vote_weights():
     assert decision["direction"] == "short"
     assert decision["vote_summary"]["hold"] == pytest.approx(2.0)
     assert decision["vote_margin"] > 0
+
+
+def test_invalid_committee_votes_abstain_and_fail_quorum():
+    decision = aggregate_committee_decision(
+        {"confidence": 0.8, "target_position": 0.2},
+        [
+            '{"direction":"long","confidence":0.8,"position":0.1}',
+            "投票失败: timeout",
+            "无法解析该响应",
+        ],
+        vote_weights=[2.0, 1.5, 1.0],
+    )
+
+    assert decision["direction"] == "hold"
+    assert decision["vote_summary"]["long"] == pytest.approx(2.0)
+    assert decision["parsed_vote_count"] == 1
+    assert decision["invalid_vote_count"] == 2
+    assert decision["vote_quorum_required"] == 2
+    assert decision["vote_quorum_met"] is False
+
+    executable, rejected = preflight_committee_decisions(
+        [{"ticker": "600519", **decision}],
+        current_tickers=set(),
+        normalize_ticker=lambda ticker: ticker,
+    )
+    assert executable == []
+    assert rejected[0]["code"] == "committee_vote_quorum_failed"
+    assert "parsed_votes=1/3" in rejected[0]["reason"]
 
 
 def test_proposal_review_depth_tracks_priority():
