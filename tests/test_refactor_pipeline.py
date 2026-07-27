@@ -140,6 +140,61 @@ def test_stage2_parser_never_synthesizes_from_prose_only():
     assert mode == "unparsed"
 
 
+def test_stage2_parser_marks_model_empty_array_as_auditable_empty_result():
+    proposals, mode = extract_stage2_proposal_array("[]")
+
+    assert proposals == []
+    assert mode == "explicit_empty"
+
+
+@pytest.mark.asyncio
+async def test_stage2_repairs_reasoning_only_response_without_fallback_ticker():
+    class ReasoningThenRepairLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return (
+                    "分析过程：资料明确支持贵州茅台600519的现金流改善，"
+                    "并把它作为多头提案；事实来自本地财报摘要。"
+                )
+            return json.dumps([
+                {
+                    "ticker": "600519",
+                    "direction": "long",
+                    "target_position": 0.08,
+                    "stop_loss": 6.0,
+                    "take_profit": 12.0,
+                    "holding_period": 30,
+                    "holding_period_reason": "等待下一次月度经营数据验证",
+                    "confidence": 0.72,
+                    "thesis": "事实: 本地财报摘要显示现金流改善；推断: 估值有修复空间",
+                    "sector": "食品饮料",
+                    "evidence": ["本地财报摘要：经营现金流改善"],
+                    "resolved_rejection": "",
+                    "evidence_delta": "",
+                    "reject_if": "经营现金流重新恶化"
+                }
+            ], ensure_ascii=False)
+
+    doc = Document(
+        title="贵州茅台本地财报摘要",
+        content="本地财报摘要显示经营现金流改善，且资料明确标注股票代码600519。" * 3,
+        url="local://evidence/600519",
+        source="unit",
+    )
+    llm = ReasoningThenRepairLLM()
+
+    proposals = await stage2_deep_research(llm, [doc], "现金流验证")
+
+    assert [proposal["ticker"] for proposal in proposals] == ["600519"]
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["temperature"] == 0.0
+    assert llm.calls[1]["use_cache"] is False
+
+
 def test_run_discussion_defaults_to_network_research():
     args = parse_args([])
 
@@ -1685,8 +1740,24 @@ async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(mo
 async def test_closed_market_keeps_lifecycle_and_committee_audit_then_queues_without_fill(monkeypatch):
     import sovereign_hall.run_discussion as discussion_module
 
-    context = HeuristicRiskContext(None, "", None, 0.10, True, "test", [])
+    context = HeuristicRiskContext(
+        run_dir=PROJECT_ROOT,
+        policy_name="closed_session_preflight",
+        score=0.01,
+        max_position=0.10,
+        min_confidence=0.65,
+        min_signal_count=1,
+        overfit_risk=True,
+        warning="test",
+        failure_cases=[],
+        tape_update={"validation_status": "stale_tape"},
+    )
     monkeypatch.setattr(discussion_module, "load_latest_heuristic_context", lambda: context)
+    monkeypatch.setattr(
+        discussion_module,
+        "recent_prediction_observation_count",
+        lambda ticker: 1,
+    )
     simulation = type("FakeSimulation", (), {})()
     assets = {
         "valuation_complete": True,
@@ -1746,10 +1817,28 @@ async def test_closed_market_keeps_lifecycle_and_committee_audit_then_queues_wit
         decisions, source="run_discussion"
     )
     simulation.record_pending_decision.assert_awaited_once()
+    assert simulation.record_pending_decision.await_args.kwargs["target_position"] == pytest.approx(0.10)
     simulation.execute_trade.assert_not_awaited()
     simulation.resolve_trade_price.assert_not_awaited()
     simulation.record_redeployment_attempt.assert_awaited_once()
     assert simulation.record_redeployment_attempt.await_args.kwargs["pending_count"] == 1
+
+    # A low-confidence directional forecast must not become a deferred ruling
+    # merely because the market is closed. It remains auditable as an explicit
+    # heuristic veto and can never bypass the open-session entry gate.
+    simulation.record_pending_decision.reset_mock()
+    simulation.record_redeployment_attempt.reset_mock()
+    decisions[0]["confidence"] = 0.40
+
+    await run_committee_approved_simulation(simulation, market_data, None, decisions)
+
+    simulation.record_pending_decision.assert_not_awaited()
+    attempt = simulation.record_redeployment_attempt.await_args.kwargs
+    assert attempt["pending_count"] == 0
+    assert any(
+        rejection["code"] == "heuristic_entry_veto"
+        for rejection in attempt["rejections"]
+    )
 
 
 @pytest.mark.asyncio
@@ -4154,6 +4243,23 @@ def test_committee_aggregation_uses_custom_vote_weights():
     assert decision["direction"] == "short"
     assert decision["vote_summary"]["hold"] == pytest.approx(2.0)
     assert decision["vote_margin"] > 0
+
+
+def test_committee_aggregation_sizes_from_winning_direction_votes_only():
+    decision = aggregate_committee_decision(
+        {"confidence": 0.5, "target_position": 0.1},
+        [
+            '{"direction":"long","confidence":0.8,"position":0.10}',
+            '{"direction":"long","confidence":0.7,"position":0.08}',
+            '{"direction":"hold","confidence":0.99,"position":0}',
+        ],
+        vote_weights=[2.0, 1.5, 1.0],
+    )
+
+    assert decision["direction"] == "long"
+    assert decision["confidence"] == pytest.approx((0.8 * 2.0 + 0.7 * 1.5) / 3.5)
+    assert decision["target_position"] == pytest.approx((0.10 * 2.0 + 0.08 * 1.5) / 3.5)
+    assert decision["direction_support"] == pytest.approx(3.5 / 4.5, abs=1e-4)
 
 
 def test_invalid_committee_votes_abstain_and_fail_quorum():

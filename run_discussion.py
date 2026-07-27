@@ -98,6 +98,7 @@ def extract_stage2_proposal_array(text: str) -> tuple[List[Dict[str, Any]], str]
         proposals = [item for item in direct if isinstance(item, dict) and item.get("ticker")]
         if proposals:
             return proposals, "generic_parser"
+        return [], "explicit_empty"
 
     decoder = json.JSONDecoder()
     object_candidates: List[Dict[str, Any]] = []
@@ -831,6 +832,58 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 
         # 解析JSON
         proposals, parse_mode = extract_stage2_proposal_array(response)
+        if not proposals and parse_mode != "explicit_empty" and str(response or "").strip():
+            # Some reasoning models put a long analysis in ``reasoning_content``
+            # but omit the requested final JSON.  The LLM client necessarily
+            # returns that reasoning when normal content is empty.  Give the
+            # model one bounded format-repair pass over its own answer; never
+            # supply a fallback ticker or ask it to create new evidence.
+            logger.warning(
+                "[diag] stage2 primary response was %s; requesting evidence-preserving JSON repair",
+                parse_mode,
+            )
+            repair_prompt = f"""
+把下面“原始回答”中已经明确提出、且带有具体六位A股/ETF代码和证据的投资提案转换为合法JSON数组。
+
+硬约束：
+1. 只能转换原始回答已经明确提出的标的、方向、论点和证据；不得新增ticker、ETF或事实。
+2. 原始回答只有分析过程、举例、候选名单但没有明确提案，或证据不足时，输出 []。
+3. 每项必须包含 ticker、direction、target_position、stop_loss、take_profit、
+   holding_period、holding_period_reason、confidence、thesis、sector、evidence、
+   resolved_rejection、evidence_delta、reject_if。
+4. 只输出JSON数组，不要Markdown、解释或思考过程。
+
+原始回答：
+{str(response)[:20000]}
+"""
+            try:
+                repaired_response = await asyncio.wait_for(
+                    llm.chat(
+                        system=(
+                            "你是格式修复器，只能结构化已有提案，不能生成新提案或补造证据。"
+                            "没有明确且有证据的提案时只输出[]。"
+                        ),
+                        user=repair_prompt,
+                        temperature=0.0,
+                        max_tokens=5000,
+                        use_cache=False,
+                    ),
+                    timeout=300,
+                )
+                repaired, repair_mode = extract_stage2_proposal_array(repaired_response)
+                logger.info(
+                    "[diag] stage2 repair response len=%s, parsed=%s, mode=%s",
+                    len(repaired_response or ""),
+                    len(repaired),
+                    repair_mode,
+                )
+                if repaired:
+                    proposals = repaired
+                    parse_mode = f"repair:{repair_mode}"
+            except asyncio.TimeoutError:
+                logger.warning("[diag] stage2 JSON repair timed out")
+            except Exception as repair_error:
+                logger.warning("[diag] stage2 JSON repair failed: %s", repair_error)
         logger.info(
             "[diag] stage2 parsed type=%s, len=%s, mode=%s",
             type(proposals).__name__,
@@ -1128,25 +1181,46 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
     else:
         direction = "hold"
 
-    confidences = [
-        vote["confidence"] for vote in parsed
-        if vote.get("is_valid") and vote["confidence"] is not None
-    ]
-    positions = [
-        vote["position"] for vote in parsed
-        if vote.get("is_valid") and vote["position"] is not None
-    ]
-    confidence = sum(confidences) / len(confidences) if confidences else float(proposal.get("confidence", 0.5))
-    target_position = sum(positions) / len(positions) if positions else float(proposal.get("target_position", 0.1))
-    if direction == "hold":
-        target_position = 0.0
     total_weight = sum(
         weights[index] if index < len(weights) else 1.0
         for index, vote in enumerate(parsed)
         if vote.get("is_valid")
     )
+    selected_votes = [
+        (
+            vote,
+            weights[index] if index < len(weights) else 1.0,
+        )
+        for index, vote in enumerate(parsed)
+        if vote.get("is_valid") and vote.get("direction") == direction
+    ]
+    confidence_weight = sum(
+        weight for vote, weight in selected_votes
+        if vote.get("confidence") is not None
+    )
+    confidence = (
+        sum(float(vote["confidence"]) * weight for vote, weight in selected_votes
+            if vote.get("confidence") is not None)
+        / confidence_weight
+        if confidence_weight
+        else float(proposal.get("confidence", 0.5))
+    )
+    position_weight = sum(
+        weight for vote, weight in selected_votes
+        if vote.get("position") is not None
+    )
+    target_position = (
+        sum(float(vote["position"]) * weight for vote, weight in selected_votes
+            if vote.get("position") is not None)
+        / position_weight
+        if position_weight
+        else float(proposal.get("target_position", 0.1))
+    )
+    if direction == "hold":
+        target_position = 0.0
     sorted_scores = sorted(scores.values(), reverse=True)
     margin = (sorted_scores[0] - sorted_scores[1]) / total_weight if total_weight and len(sorted_scores) > 1 else 0.0
+    direction_support = scores.get(direction, 0.0) / total_weight if total_weight else 0.0
     risk_flags = []
     for vote in parsed:
         if not vote.get("is_valid"):
@@ -1159,6 +1233,7 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
         "target_position": max(0.0, min(1.0, target_position)),
         "vote_summary": scores,
         "vote_margin": round(margin, 4),
+        "direction_support": round(direction_support, 4),
         "vote_count": len(parsed),
         "parsed_vote_count": parsed_vote_count,
         "invalid_vote_count": len(parsed) - parsed_vote_count,
@@ -1882,12 +1957,62 @@ async def run_committee_approved_simulation(
                 and deployment_position_floor > target_position
             ):
                 target_position = deployment_position_floor
+
+            # A closed-session row is a deferred ruling, not a bypass around
+            # the same price-independent heuristic gates used while the market
+            # is open. Replay still fetches a fresh quote and re-runs every
+            # execution gate before it can create a simulated fill.
+            cap_reason = ""
+            if direction == "long":
+                total_assets_for_cap = float(assets.get("total_assets") or 0.0)
+                position_values = assets.get("position_values") or {}
+                current_position_value = float(position_values.get(ticker, 0.0) or 0.0)
+                current_position_pct = (
+                    current_position_value / total_assets_for_cap
+                    if total_assets_for_cap > 0
+                    else 0.0
+                )
+                current_gross_exposure = (
+                    sum(float(value or 0.0) for value in position_values.values())
+                    / total_assets_for_cap
+                    if total_assets_for_cap > 0
+                    else 0.0
+                )
+                signal_count = recent_prediction_observation_count(ticker)
+                target_position, cap_reason = apply_heuristic_risk_cap(
+                    ticker,
+                    target_position,
+                    confidence,
+                    signal_count=signal_count,
+                    current_position=current_position_pct,
+                    current_gross_exposure=current_gross_exposure,
+                    fresh_local_evidence=True,
+                    context=heuristic_context,
+                )
+                if target_position <= current_position_pct:
+                    reject(
+                        "heuristic_entry_veto",
+                        cap_reason or "heuristic风控未允许形成新增或扩仓待执行裁决",
+                        ticker,
+                    )
+                    print(
+                        f"   ⛔ {ticker}: heuristic预检否决，不形成待执行裁决；"
+                        f"{cap_reason or '目标仓位未增加'}"
+                    )
+                    continue
+
+            pending_reason = (
+                "投委会已通过heuristic预检；非交易时段不成交，"
+                "下一交易时段重新取实时行情并重过全部风控"
+            )
+            if cap_reason:
+                pending_reason += f"；{cap_reason}"
             pending_id = await simulation.record_pending_decision(
                 ticker=ticker,
                 direction=direction,
                 target_position=target_position,
                 confidence=confidence,
-                reason="投委会已通过预检；非交易时段不成交，下一交易时段重新取实时行情并重过全部风控",
+                reason=pending_reason,
                 defer_code="non_trading_day" if not trading_day else "market_closed",
                 source="run_discussion_preflight",
             )
