@@ -34,6 +34,9 @@ PRICE_PREDICTION_COLUMNS: dict[str, str] = {
     "validated_at": "TEXT",
     "entry_date": "TEXT",
     "discussion_context": "TEXT",
+    "quote_source": "TEXT",
+    "quote_fetched_at": "TEXT",
+    "actual_return": "REAL",
 }
 
 

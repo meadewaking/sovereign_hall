@@ -409,12 +409,7 @@ class InvestmentSimulation:
         *,
         source: str = "run_discussion",
     ) -> None:
-        """Append vote diagnostics for every committee outcome, including holds.
-
-        Price predictions intentionally contain only actionable long/short calls.
-        This separate audit preserves hold/quorum evidence without relabeling it
-        as a prediction or a simulated fill.
-        """
+        """Append vote diagnostics and prediction links for every outcome."""
         if not self.db_service or self.db_service._connection is None:
             return
         conn = self.db_service._connection
@@ -427,8 +422,8 @@ class InvestmentSimulation:
                     ticker, direction, confidence, target_position,
                     vote_summary, vote_margin, vote_count, parsed_vote_count,
                     invalid_vote_count, quorum_required, quorum_met,
-                    review_depth, source, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    review_depth, prediction_id, source, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._normalize_ticker(str(decision.get("ticker") or "")),
@@ -443,6 +438,7 @@ class InvestmentSimulation:
                     int(decision.get("vote_quorum_required") or 0),
                     1 if decision.get("vote_quorum_met") else 0,
                     str(decision.get("review_depth") or ""),
+                    str(decision.get("prediction_id") or "") or None,
                     str(source or "run_discussion"),
                     now,
                 ),
@@ -549,6 +545,7 @@ class InvestmentSimulation:
         *,
         candidate_count: int,
         trade_count: int,
+        pending_count: int = 0,
         blockers: List[str] | None = None,
         rejections: List[Dict[str, Any]] | None = None,
         source: str = "run_discussion",
@@ -581,6 +578,14 @@ class InvestmentSimulation:
                 blocker_code = "residual_operational_cash"
                 blocker_reason = "已完成部分再配置；" + ("；".join(blockers) or "余款受整手/手续费约束")
                 next_action = "下一轮继续消费剩余部署缺口"
+            elif pending_count > 0:
+                status = "pending_market_session"
+                blocker_code = "market_session_pending"
+                blocker_reason = (
+                    f"{pending_count}条裁决等待下一交易时段；"
+                    + ("；".join(blockers) or "成交前重新取实时行情并重过全部风控")
+                )
+                next_action = "下一交易时段先回放退出，再按实时行情、组合估值和每日5笔硬门回放买入"
             elif candidate_count <= 0:
                 status = "blocked_no_approved_candidates"
                 blocker_code = "missing_approved_candidates"
@@ -651,6 +656,22 @@ class InvestmentSimulation:
         now = now_dt.isoformat()
         expires_at = (now_dt + timedelta(days=self.pending_decision_max_age_days)).isoformat()
         try:
+            if existing_id is None:
+                normalized_ticker = self._normalize_ticker(ticker)
+                normalized_direction = str(direction or "hold").lower()
+                async with conn.execute(
+                    """
+                    SELECT id
+                    FROM simulation_pending_decisions
+                    WHERE ticker = ? AND direction = ?
+                      AND status IN ('pending_next_trading_session', 'replaying')
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (normalized_ticker, normalized_direction),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                existing_id = int(existing[0]) if existing else None
             if existing_id is not None:
                 cursor = await conn.execute(
                     """
@@ -1740,6 +1761,7 @@ class InvestmentSimulation:
                 quorum_required INTEGER NOT NULL,
                 quorum_met INTEGER NOT NULL,
                 review_depth TEXT,
+                prediction_id TEXT,
                 source TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
@@ -1756,6 +1778,13 @@ class InvestmentSimulation:
             "CREATE INDEX IF NOT EXISTS idx_simulation_pending_status "
             "ON simulation_pending_decisions(status, created_at)"
         )
+
+        async with conn.execute("PRAGMA table_info(simulation_committee_outcomes)") as cursor:
+            committee_columns = {row[1] for row in await cursor.fetchall()}
+        if "prediction_id" not in committee_columns:
+            await conn.execute(
+                "ALTER TABLE simulation_committee_outcomes ADD COLUMN prediction_id TEXT"
+            )
 
         async with conn.execute("PRAGMA table_info(simulation_pending_decisions)") as cursor:
             pending_columns = {row[1] for row in await cursor.fetchall()}

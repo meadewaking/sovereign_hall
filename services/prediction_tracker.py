@@ -45,7 +45,7 @@ class PricePrediction:
     current_price: float        # 预测时价格
     target_price: float         # 目标价格
     stop_loss: float           # 止损价格
-    direction: str             # "long" / "short"
+    direction: str             # "long" / "short" / "hold"
     confidence: float          # 置信度 0-1
     predicted_at: datetime
     expected_days: int         # 预期达成天数
@@ -96,9 +96,17 @@ class PredictionTracker:
         await self._ensure_tables()
 
         if current_price is None:
-            current_price = await get_market_data().get_current_price(ticker)
+            quote = await get_market_data().get_current_quote(ticker) or {}
+            current_price = quote.get("price")
+        else:
+            quote = {
+                "source": "provided_prediction_anchor",
+                "fetched_at": datetime.now().isoformat(),
+            }
         if current_price is None or current_price <= 0:
             raise ValueError(f"无法获取 {ticker} 的真实当前价格，拒绝创建不可验证预测")
+        if not quote.get("source") or not quote.get("fetched_at"):
+            raise ValueError(f"{ticker} 行情缺少source/fetched_at，拒绝创建不可审计预测")
         
         prediction_id = f"pred_{datetime.now().strftime('%Y%m%d%H%M%S')}_{ticker}"
         
@@ -119,14 +127,16 @@ class PredictionTracker:
             await db.execute("""
                 INSERT INTO price_predictions 
                 (id, conclusion_id, ticker, current_price, target_price, stop_loss,
-                 direction, confidence, predicted_at, expected_days, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 direction, confidence, predicted_at, expected_days, status, created_at,
+                 quote_source, quote_fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 prediction.id, prediction.conclusion_id, prediction.ticker,
                 prediction.current_price, prediction.target_price, prediction.stop_loss,
                 prediction.direction, prediction.confidence, 
                 prediction.predicted_at.isoformat(), prediction.expected_days,
-                prediction.status.value, prediction.created_at.isoformat()
+                prediction.status.value, prediction.created_at.isoformat(),
+                str(quote["source"]), str(quote["fetched_at"]),
             ))
             await db.commit()
         
@@ -211,7 +221,7 @@ class PredictionTracker:
                         prediction.actual_hit_type = "target"
                         prediction.accuracy_score = 1.0
                         break
-                else:
+                elif prediction.direction == "short":
                     if bar["high"] >= prediction.stop_loss:
                         prediction.status = PredictionStatus.VALIDATED
                         prediction.result = PredictionResult.WRONG
@@ -228,6 +238,33 @@ class PredictionTracker:
                         prediction.actual_hit_type = "target"
                         prediction.accuracy_score = 1.0
                         break
+                elif prediction.direction == "hold":
+                    crossed_up = bar["high"] >= prediction.target_price
+                    crossed_down = bar["low"] <= prediction.stop_loss
+                    if crossed_up and crossed_down:
+                        prediction.status = PredictionStatus.VALIDATED
+                        prediction.result = PredictionResult.PARTIAL
+                        prediction.actual_hit_price = current_price
+                        prediction.actual_hit_date = datetime.fromisoformat(bar["date"])
+                        prediction.actual_hit_type = "neutral_band_both_sides"
+                        prediction.accuracy_score = 0.5
+                        break
+                    if crossed_up:
+                        prediction.status = PredictionStatus.VALIDATED
+                        prediction.result = PredictionResult.WRONG
+                        prediction.actual_hit_price = prediction.target_price
+                        prediction.actual_hit_date = datetime.fromisoformat(bar["date"])
+                        prediction.actual_hit_type = "missed_upside"
+                        prediction.accuracy_score = 0.0
+                        break
+                    if crossed_down:
+                        prediction.status = PredictionStatus.VALIDATED
+                        prediction.result = PredictionResult.CORRECT
+                        prediction.actual_hit_price = prediction.stop_loss
+                        prediction.actual_hit_date = datetime.fromisoformat(bar["date"])
+                        prediction.actual_hit_type = "avoided_downside"
+                        prediction.accuracy_score = 1.0
+                        break
 
         is_expired = days_elapsed >= prediction.expected_days
 
@@ -242,7 +279,7 @@ class PredictionTracker:
                 else:
                     prediction.result = PredictionResult.WRONG
                     prediction.accuracy_score = 0.0
-            else:
+            elif prediction.direction == "short":
                 price_change = (prediction.current_price - current_price) / prediction.current_price
                 if price_change > 0.05:
                     prediction.result = PredictionResult.PARTIAL
@@ -250,9 +287,35 @@ class PredictionTracker:
                 else:
                     prediction.result = PredictionResult.WRONG
                     prediction.accuracy_score = 0.0
+            else:
+                price_change = (current_price - prediction.current_price) / prediction.current_price
+                if price_change >= 0.05:
+                    prediction.result = PredictionResult.WRONG
+                    prediction.accuracy_score = 0.0
+                    prediction.actual_hit_type = "missed_upside"
+                elif price_change <= -0.05:
+                    prediction.result = PredictionResult.CORRECT
+                    prediction.accuracy_score = 1.0
+                    prediction.actual_hit_type = "avoided_downside"
+                else:
+                    prediction.result = PredictionResult.CORRECT
+                    prediction.accuracy_score = 1.0
+                    prediction.actual_hit_type = "neutral_band_held"
         
         prediction.validated_at = datetime.now()
         
+        actual_reference_price = (
+            prediction.actual_hit_price
+            if prediction.actual_hit_price is not None
+            else current_price
+        )
+        actual_return = (
+            (float(actual_reference_price) - float(prediction.current_price))
+            / float(prediction.current_price)
+            if prediction.current_price
+            else None
+        )
+
         # 更新数据库
         await db.execute("""
             UPDATE price_predictions SET
@@ -264,7 +327,8 @@ class PredictionTracker:
                 max_price_reached = ?,
                 min_price_reached = ?,
                 accuracy_score = ?,
-                validated_at = ?
+                validated_at = ?,
+                actual_return = ?
             WHERE id = ?
         """, (
             prediction.status.value,
@@ -276,6 +340,7 @@ class PredictionTracker:
             prediction.min_price_reached,
             prediction.accuracy_score,
             prediction.validated_at.isoformat() if prediction.validated_at else None,
+            actual_return,
             prediction.id
         ))
         await db.commit()

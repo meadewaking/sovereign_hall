@@ -810,11 +810,10 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
     }}
 ]
 
-如果无法确定具体标的，可使用：159995(科技)、159928(消费)、159915(医药)、159990(周期)、512880(半导体)，但必须说明这是替代ETF而非个股机会。
-
 重要：必须排除黑名单中的标的！
 重要：holding_period 必须根据投资逻辑动态决定，范围3-180天，不要一律填30。
 重要：同一标的近期重复被拒绝时，缺少resolved_rejection、evidence_delta和evidence任一项都不得重提。
+重要：无法从资料确定具体标的时必须少输出或输出空数组，不得用预设ticker、模板ETF或常识猜测补位。
 """
 
     try:
@@ -1039,6 +1038,48 @@ def select_committee_proposals(proposals: List[Dict], limit: int = 3) -> List[Di
     return ranked[:limit]
 
 
+def build_balanced_vote_context(
+    proposal: Dict[str, Any],
+    round1_items: List[tuple[str, str]],
+    debate_items: List[tuple[str, str]],
+    revision_items: List[tuple[str, str]],
+    max_chars: int,
+) -> str:
+    """Keep every deliberation stage visible inside the bounded vote context."""
+    total_budget = max(1200, int(max_chars or 0))
+    thesis = str(proposal.get("thesis") or "")
+    proposal_text = (
+        f"【原提案】{proposal.get('ticker', '')} {proposal.get('direction', '')} | "
+        f"置信度={float(proposal.get('confidence') or 0.0):.0%} | "
+        f"目标仓位={float(proposal.get('target_position') or 0.0):.1%}\n"
+        f"{thesis}"
+    )
+    proposal_budget = min(max(400, total_budget // 8), 1000)
+    remaining = max(600, total_budget - proposal_budget - 12)
+    stage_specs = (
+        ("第一轮独立分析", round1_items, 0.40),
+        ("第二轮交叉质疑", debate_items, 0.30),
+        ("第三轮反事实修正", revision_items, 0.30),
+    )
+    sections = [proposal_text[:proposal_budget]]
+    for label, items, share in stage_specs:
+        if not items:
+            continue
+        stage_budget = max(200, int(remaining * share))
+        label_cost = len(label) + 4
+        item_label_cost = sum(len(str(name)) + 4 for name, _ in items)
+        per_item = max(
+            1,
+            (stage_budget - label_cost - item_label_cost - len(items)) // len(items),
+        )
+        rendered = [
+            f"[{name}] {str(result or '')[:per_item]}"
+            for name, result in items
+        ]
+        sections.append((f"【{label}】\n" + "\n".join(rendered))[:stage_budget])
+    return "\n\n".join(sections)[:total_budget]
+
+
 def build_structured_vote_prompt(ticker: str, role_view: str, context: str, learned_context: str) -> str:
     """Ask each committee role for a machine-readable vote."""
     return f"""
@@ -1060,6 +1101,9 @@ def build_structured_vote_prompt(ticker: str, role_view: str, context: str, lear
 
 约束：
 - 证据不足或反证更强时 direction 必须是 hold，position 必须是 0。
+- 模拟组合目标投资比例是100%，hold不是默认的“无风险”选项；必须同时衡量继续闲置资金的机会成本。
+- 若已有可追溯事实、可证伪逻辑、明确止损/期限且预期收益风险比不低于0.8，应在风险预算内投long/short，而不是因存在一般性风险自动hold。
+- 若投hold，key_evidence必须写清仍缺少的决定性证据或尚未消除的反证，invalid_if必须写下一次可转为long/short的具体条件。
 - confidence 用0到1小数，position 用0到1小数。
 """.strip()
 
@@ -1125,6 +1169,14 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
         ],
         "risk_flags": list(dict.fromkeys(risk_flags))[:8],
     }
+
+
+def committee_decision_is_predictable(decision: Dict) -> bool:
+    """Return whether a committee outcome can enter the validation loop."""
+    direction = str(decision.get("direction") or "hold").strip().lower()
+    if direction in {"long", "short"}:
+        return True
+    return direction == "hold" and bool(decision.get("vote_quorum_met"))
 
 
 def preflight_committee_decisions(
@@ -1443,10 +1495,12 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             # ============================================================
             print("   📊 第四轮：投票...")
 
-            full_context = (
-                f"【第一轮】{round1_summary[:vote_context_chars]}\n\n"
-                f"【第二轮】" + "\n".join([f"{n}: {r[:summary_chars]}" for n, r in zip(debate_names, round2_results)]) +
-                "\n\n【第三轮修正】" + "\n".join([f"{n}: {r[:summary_chars]}" for n, r in zip(revision_names, round3_results)])
+            full_context = build_balanced_vote_context(
+                proposal,
+                list(zip(task_names, round1_results)),
+                list(zip(debate_names, round2_results)),
+                list(zip(revision_names, round3_results)),
+                vote_context_chars,
             )
 
             vote_tasks = [
@@ -1464,7 +1518,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                 vote_tasks = [task for task in vote_tasks if task[1] in {"CIO综合视角", "风控视角", "量化视角"}]
 
             vote_prompts = [
-                build_structured_vote_prompt(ticker, role_view, full_context[:vote_context_chars], learned_context)
+                build_structured_vote_prompt(ticker, role_view, full_context, learned_context)
                 for _, role_view, _ in vote_tasks
             ]
 
@@ -1510,9 +1564,9 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
 
             # 记录到决策追踪器
             try:
-                if committee_decision.get("direction") in ("long", "short"):
+                if committee_decision_is_predictable(committee_decision):
                     recorder = DecisionRecorder()
-                    await recorder.record_decision(
+                    prediction_id = await recorder.record_decision(
                         ticker=ticker,
                         decision=committee_decision.get('direction'),
                         confidence=committee_decision.get('confidence', 0.5),
@@ -1528,9 +1582,16 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                         ),
                         expected_days=expected_days,
                     )
-                    print(f"      📊 决策已记录，{expected_days}天后验证")
+                    committee_decision["prediction_id"] = prediction_id
+                    if committee_decision.get("direction") == "hold":
+                        print(
+                            f"      📊 观望预测已记录（±5%中性带），"
+                            f"{expected_days}天后验证错失机会/避损"
+                        )
+                    else:
+                        print(f"      📊 决策已记录，{expected_days}天后验证")
                 else:
-                    print("      📊 投委会观望，跳过可验证价格预测记录")
+                    print("      📊 投票未达法定人数，不写入可验证预测")
             except Exception as e:
                 logger.warning(f"记录决策失败: {e}")
 
@@ -1668,24 +1729,16 @@ async def run_committee_approved_simulation(
         deployment_position_floor as calculate_deployment_position_floor,
     )
     from sovereign_hall.services.reward_policy import MAX_DAILY_TRADES
-    if not await market_data.is_trading_day():
-        print("\n💰 当前非交易日，跳过每日投资模拟交易")
-        assets = await simulation.calculate_assets()
-        if hasattr(simulation, "record_redeployment_attempt"):
-            await simulation.record_redeployment_attempt(
-                assets,
-                candidate_count=0,
-                trade_count=0,
-                blockers=["当前非交易日；只能查看实时行情，不能模拟成交"],
-            )
-        reflection = await simulation.daily_reflection(llm)
-        if reflection:
-            print(f"\n📝 每日投资反思:")
-            print(reflection[:500] + "...")
-        await simulation.save_snapshot(reflection)
-        return
+    trading_day = await market_data.is_trading_day()
+    market_open = bool(trading_day)
+    if trading_day and hasattr(market_data, "is_market_open"):
+        market_open = bool(await market_data.is_market_open())
+    market_session_open = bool(trading_day and market_open)
 
-    print(f"\n💰 根据投委会裁决执行每日投资模拟...")
+    if market_session_open:
+        print(f"\n💰 根据投委会裁决执行每日投资模拟...")
+    else:
+        print("\n💰 当前非交易时段：继续逐仓复核、持久化投委会结果并形成待执行裁决，不模拟成交")
     history_reflection = await simulation.get_recent_reflection(limit=2)
     assets = await simulation.calculate_assets()
     heuristic_context = load_latest_heuristic_context()
@@ -1808,6 +1861,67 @@ async def run_committee_approved_simulation(
             assets['total_assets'],
             len(deployable_new_longs),
         )
+
+    if not market_session_open:
+        pending_count = 0
+        for decision in trade_candidates[:5]:
+            ticker = simulation._normalize_ticker(decision.get("ticker"))
+            direction = str(decision.get("direction") or "hold").lower()
+            target_position = float(decision.get("target_position") or 0.0)
+            confidence = float(decision.get("confidence") or 0.0)
+            if direction == "long" and not assets.get("valuation_complete"):
+                reject(
+                    "valuation_incomplete",
+                    "组合实时估值不完整，禁止形成新增/扩仓待执行裁决",
+                    ticker,
+                )
+                continue
+            if (
+                direction == "long"
+                and ticker not in current_ticker_codes
+                and deployment_position_floor > target_position
+            ):
+                target_position = deployment_position_floor
+            pending_id = await simulation.record_pending_decision(
+                ticker=ticker,
+                direction=direction,
+                target_position=target_position,
+                confidence=confidence,
+                reason="投委会已通过预检；非交易时段不成交，下一交易时段重新取实时行情并重过全部风控",
+                defer_code="non_trading_day" if not trading_day else "market_closed",
+                source="run_discussion_preflight",
+            )
+            if pending_id is not None:
+                pending_count += 1
+                print(f"   🗂️ {ticker}: 裁决 #{pending_id} 已排队，未记录成交价")
+
+        closed_reason = (
+            "当前非交易日；投委会结果与逐仓复核已持久化，可执行裁决仅排队"
+            if not trading_day
+            else "当前不在A股交易时段；投委会结果与逐仓复核已持久化，可执行裁决仅排队"
+        )
+        redeployment_blockers.append(closed_reason)
+        final_assets = await simulation.calculate_assets()
+        if hasattr(simulation, "record_redeployment_attempt"):
+            state = await simulation.record_redeployment_attempt(
+                final_assets,
+                candidate_count=len(deployable_new_longs),
+                trade_count=0,
+                pending_count=pending_count,
+                blockers=redeployment_blockers,
+                rejections=redeployment_rejections,
+            )
+            if state and final_assets.get("deployment_gap"):
+                print(
+                    f"   🧾 再配置队列: {state.get('status')} | "
+                    f"gap={state.get('deployment_gap')} | blocker={state.get('blocker_code')}"
+                )
+        reflection = await simulation.daily_reflection(llm)
+        if reflection:
+            print(f"\n📝 每日投资反思:")
+            print(reflection[:500] + "...")
+        await simulation.save_snapshot(reflection)
+        return
 
     if trade_candidates:
         bounded_candidates = trade_candidates[:5]

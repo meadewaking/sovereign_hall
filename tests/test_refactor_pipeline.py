@@ -56,10 +56,12 @@ from sovereign_hall.utils import format_cost_breakdown, format_token, format_tok
 from sovereign_hall.run_discussion import (
     TOPIC_POOL,
     aggregate_committee_decision,
+    build_balanced_vote_context,
     choose_review_depth,
     build_proposal_thesis,
     build_lessons_with_heuristic_context,
     cli_args_can_run_without_instance_lock,
+    committee_decision_is_predictable,
     filter_repeated_rejection_proposals,
     extract_stage2_proposal_array,
     parse_committee_vote,
@@ -149,6 +151,36 @@ def test_run_discussion_defaults_to_network_research():
 def test_run_discussion_help_does_not_need_instance_lock():
     assert cli_args_can_run_without_instance_lock(["--help"]) is True
     assert cli_args_can_run_without_instance_lock(["--once"]) is False
+
+
+def test_vote_context_balances_all_deliberation_stages():
+    context = build_balanced_vote_context(
+        {
+            "ticker": "600519",
+            "direction": "long",
+            "confidence": 0.7,
+            "target_position": 0.1,
+            "thesis": "事实: 可验证",
+        },
+        [(f"risk-{index}", "R" * 500) for index in range(12)]
+        + [("opportunity-tail", "OPPORTUNITY_EVIDENCE")],
+        [("cross-examination-tail", "COUNTERARGUMENT")],
+        [("counterfactual-tail", "REVISION_EVIDENCE")],
+        2400,
+    )
+
+    assert len(context) <= 2400
+    assert "opportunity-tail" in context
+    assert "cross-examination-tail" in context
+    assert "counterfactual-tail" in context
+    assert "OPPORTUNITY_EVIDENCE" in context
+
+
+def test_stage2_prompt_has_no_preset_ticker_fallback():
+    source = inspect.getsource(stage2_deep_research)
+
+    assert "不得用预设ticker、模板ETF" in source
+    assert "159995(科技)" not in source
 
 
 def test_capital_reward_prioritizes_net_return_and_penalizes_long_idle_cash():
@@ -1650,6 +1682,77 @@ async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(mo
 
 
 @pytest.mark.asyncio
+async def test_closed_market_keeps_lifecycle_and_committee_audit_then_queues_without_fill(monkeypatch):
+    import sovereign_hall.run_discussion as discussion_module
+
+    context = HeuristicRiskContext(None, "", None, 0.10, True, "test", [])
+    monkeypatch.setattr(discussion_module, "load_latest_heuristic_context", lambda: context)
+    simulation = type("FakeSimulation", (), {})()
+    assets = {
+        "valuation_complete": True,
+        "total_assets": 10_000.0,
+        "cash": 10_000.0,
+        "positions_value": 0.0,
+        "positions": {},
+        "position_values": {},
+        "invested_ratio": 0.0,
+        "deployment_gap": 10_000.0,
+        "target_invested_ratio": 1.0,
+        "missing_price_tickers": [],
+    }
+    simulation.calculate_assets = AsyncMock(return_value=assets)
+    simulation.get_recent_reflection = AsyncMock(return_value="")
+    simulation.review_open_positions = AsyncMock(return_value=[])
+    simulation.replay_pending_decisions = AsyncMock(
+        return_value={"status": "waiting_market_open", "pending_before": 0}
+    )
+    simulation.record_committee_outcomes = AsyncMock()
+    simulation.count_trades_on_date = AsyncMock(return_value=0)
+    simulation.record_pending_decision = AsyncMock(return_value=41)
+    simulation.record_redeployment_attempt = AsyncMock(return_value={
+        "status": "pending_market_session",
+        "deployment_gap": 10_000.0,
+        "blocker_code": "market_session_pending",
+    })
+    simulation.daily_reflection = AsyncMock(return_value="")
+    simulation.save_snapshot = AsyncMock()
+    simulation.execute_trade = AsyncMock()
+    simulation.resolve_trade_price = AsyncMock()
+    simulation.positions = {}
+    simulation.last_trade_records = {}
+    simulation.max_daily_trades = MAX_DAILY_TRADES
+    simulation._normalize_ticker = lambda ticker: ticker
+    market_data = type(
+        "FakeMarket",
+        (),
+        {
+            "is_trading_day": AsyncMock(return_value=True),
+            "is_market_open": AsyncMock(return_value=False),
+        },
+    )()
+    decisions = [{
+        "ticker": "600519",
+        "direction": "long",
+        "confidence": 0.8,
+        "target_position": 0.1,
+        "vote_summary": {"long": 6.0, "hold": 2.5, "short": 0.0},
+        "vote_quorum_met": True,
+    }]
+
+    await run_committee_approved_simulation(simulation, market_data, None, decisions)
+
+    simulation.review_open_positions.assert_awaited_once()
+    simulation.record_committee_outcomes.assert_awaited_once_with(
+        decisions, source="run_discussion"
+    )
+    simulation.record_pending_decision.assert_awaited_once()
+    simulation.execute_trade.assert_not_awaited()
+    simulation.resolve_trade_price.assert_not_awaited()
+    simulation.record_redeployment_attempt.assert_awaited_once()
+    assert simulation.record_redeployment_attempt.await_args.kwargs["pending_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsys):
     db = DatabaseService(str(tmp_path / "test.db"))
     await db._init_db()
@@ -1755,6 +1858,7 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsy
             "vote_quorum_required": 5,
             "vote_quorum_met": True,
             "review_depth": "full",
+            "prediction_id": "hold-prediction-1",
         }],
         source="test",
     )
@@ -1769,6 +1873,58 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsy
     assert "重提要求: 必须给出新增本地可追溯证据" in output
     assert "投委会票型审计" in output
     assert "有效票=7/7" in output
+    assert "可验证反馈链接: 1/1；其中hold=1/1" in output
+
+
+def test_check_db_detects_meetings_newer_than_committee_execution_audit(tmp_path):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "audit_gap.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE simulation_committee_outcomes (
+            id INTEGER PRIMARY KEY,
+            ticker TEXT,
+            direction TEXT,
+            vote_summary TEXT,
+            vote_margin REAL,
+            vote_count INTEGER,
+            parsed_vote_count INTEGER,
+            invalid_vote_count INTEGER,
+            quorum_required INTEGER,
+            quorum_met INTEGER,
+            review_depth TEXT,
+            prediction_id TEXT,
+            created_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE TABLE meetings (id TEXT, created_at TEXT)"
+    )
+    conn.execute(
+        """
+        INSERT INTO simulation_committee_outcomes VALUES
+        (1, '600519', 'hold', '{}', 1, 7, 7, 0, 5, 1, 'full', NULL, '2026-07-24T10:00:00')
+        """
+    )
+    conn.executemany(
+        "INSERT INTO meetings VALUES (?, ?)",
+        [
+            ("old", "2026-07-24T09:00:00"),
+            ("new-1", "2026-07-25T09:00:00"),
+            ("new-2", "2026-07-26T09:00:00"),
+        ],
+    )
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+
+    diagnostics = check_db.committee_outcome_diagnostics(conn)
+    conn.close()
+
+    assert diagnostics["newer_meeting_count"] == 2
+    assert diagnostics["latest_meeting_at"] == "2026-07-26T09:00:00"
 
 
 @pytest.mark.asyncio
@@ -3166,6 +3322,42 @@ async def test_daily_limit_persists_price_free_pending_decision(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_pending_decision_refreshes_same_ticker_direction_without_duplicate(tmp_path):
+    db = DatabaseService(str(tmp_path / "pending_dedupe.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+
+    first_id = await sim.record_pending_decision(
+        ticker="600519",
+        direction="long",
+        target_position=0.10,
+        reason="first committee ruling",
+        defer_code="market_closed",
+    )
+    second_id = await sim.record_pending_decision(
+        ticker="600519",
+        direction="long",
+        target_position=0.08,
+        reason="newer committee ruling",
+        defer_code="non_trading_day",
+    )
+    rows = await (await db._connection.execute(
+        "SELECT id, target_position, reason, defer_code FROM simulation_pending_decisions"
+    )).fetchall()
+    await db.close()
+
+    assert second_id == first_id
+    assert len(rows) == 1
+    assert tuple(rows[0]) == (
+        first_id,
+        0.08,
+        "newer committee ruling",
+        "non_trading_day",
+    )
+
+
+@pytest.mark.asyncio
 async def test_market_closed_persists_exit_without_filling(tmp_path, monkeypatch):
     db = DatabaseService(str(tmp_path / "closed.db"))
     await db._init_db()
@@ -3653,7 +3845,14 @@ async def test_prediction_schema_migrates_existing_table(tmp_path):
     ).fetchone()
     conn.close()
 
-    assert {"entry_date", "discussion_context", "expected_days"}.issubset(columns)
+    assert {
+        "entry_date",
+        "discussion_context",
+        "expected_days",
+        "quote_source",
+        "quote_fetched_at",
+        "actual_return",
+    }.issubset(columns)
     assert daily_prices_exists is not None
 
 
@@ -3784,6 +3983,149 @@ def test_committee_votes_can_defer_to_hold():
 
     assert decision["direction"] == "hold"
     assert decision["target_position"] == 0.0
+    assert committee_decision_is_predictable(decision) is True
+
+
+def test_quorum_failure_hold_is_not_a_prediction():
+    assert committee_decision_is_predictable({
+        "direction": "hold",
+        "vote_quorum_met": False,
+    }) is False
+
+
+@pytest.mark.asyncio
+async def test_hold_prediction_records_quote_lineage_and_missed_upside(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    recorder = DecisionRecorder(str(db_path))
+    decision_id = await recorder.record_decision(
+        ticker="600519",
+        decision="hold",
+        confidence=0.7,
+        target_price=0.15,
+        stop_loss=0.05,
+        entry_price=10.0,
+        expected_days=7,
+    )
+
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {
+            "get_current_price": AsyncMock(return_value=10.7),
+            "get_ohlc": AsyncMock(return_value=[
+                {
+                    "date": "2026-07-25",
+                    "open": 10.0,
+                    "high": 10.6,
+                    "low": 9.9,
+                    "close": 10.5,
+                },
+            ]),
+        },
+    )()
+    monkeypatch.setattr(
+        "sovereign_hall.services.market_data.get_market_data",
+        lambda: fake_market,
+    )
+
+    result = await recorder.validate_single(decision_id)
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        """
+        SELECT target_price, stop_loss, quote_source, quote_fetched_at,
+               result, actual_hit_type, actual_return
+        FROM price_predictions WHERE id = ?
+        """,
+        (decision_id,),
+    ).fetchone()
+    conn.close()
+
+    assert row[0] == pytest.approx(10.5)
+    assert row[1] == pytest.approx(9.5)
+    assert row[2] == "provided_prediction_anchor"
+    assert row[3]
+    assert row[4] == "wrong"
+    assert row[5] == "missed_upside"
+    assert row[6] == pytest.approx(0.05)
+    assert result["actual_return"] == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_prediction_fetches_and_persists_realtime_quote_metadata(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {
+            "get_current_quote": AsyncMock(return_value={
+                "ticker": "600519",
+                "price": 10.0,
+                "source": "test_realtime_quote",
+                "fetched_at": "2026-07-25T10:00:00",
+            }),
+        },
+    )()
+    monkeypatch.setattr(
+        "sovereign_hall.services.market_data.get_market_data",
+        lambda: fake_market,
+    )
+
+    decision_id = await DecisionRecorder(str(db_path)).record_decision(
+        ticker="600519",
+        decision="hold",
+        confidence=0.7,
+        target_price=0.15,
+        stop_loss=0.05,
+        expected_days=7,
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        """
+        SELECT current_price, quote_source, quote_fetched_at
+        FROM price_predictions WHERE id = ?
+        """,
+        (decision_id,),
+    ).fetchone()
+    conn.close()
+
+    assert row == (10.0, "test_realtime_quote", "2026-07-25T10:00:00")
+    fake_market.get_current_quote.assert_awaited_once_with("600519")
+
+
+def test_hold_feedback_does_not_enter_offline_long_allocator():
+    evaluator = load_script_module(
+        "run_heuristic_cycle_hold_feedback_module",
+        "scripts/run_heuristic_cycle.py",
+    )
+    frame = evaluator.pd.DataFrame([
+        {
+            "date": "2026-07-24",
+            "ticker": "600519",
+            "direction": "long",
+            "current_price": 10.0,
+            "target_price": 11.0,
+            "stop_loss": 9.5,
+            "confidence": 0.8,
+            "expected_days": 30,
+        },
+        {
+            "date": "2026-07-24",
+            "ticker": "600519",
+            "direction": "hold",
+            "current_price": 10.0,
+            "target_price": 10.5,
+            "stop_loss": 9.5,
+            "confidence": 0.1,
+            "expected_days": 30,
+        },
+    ])
+
+    daily = evaluator.build_daily_tape(frame)
+
+    assert len(daily) == 1
+    assert daily.iloc[0]["close_observations"] == 1
+    assert daily.iloc[0]["confidence"] == pytest.approx(0.8)
 
 
 def test_committee_vote_accepts_structured_json():

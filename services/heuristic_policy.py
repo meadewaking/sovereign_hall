@@ -1782,7 +1782,9 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
     if checklist:
         lines.append(f"   {checklist}")
     if ctx.price_source:
-        lines.append(f"   价格数据: {ctx.price_source}")
+        lines.append(
+            f"   离线回测价格数据（禁止用于当前估值/模拟成交）: {ctx.price_source}"
+        )
     if ctx.price_source_unvalidated:
         lines.append("   数据质量风险: daily_prices缺失，收益评估只作本地风控约束，禁止据此扩大仓位")
     coverage_note = format_price_coverage_note(ctx)

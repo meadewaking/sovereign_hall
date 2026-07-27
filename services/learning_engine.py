@@ -319,7 +319,17 @@ class LearningEngine:
             result = record['result']
             context = (record.get('discussion_context') or '')[:200]
 
-            lesson = f"高置信度决策但实际错误，需更谨慎评估" if result == 'wrong' else f"部分正确但未达到目标，需要更好的入场时机"
+            direction = str(record.get("direction") or "").lower()
+            if direction == "hold" and result == "wrong":
+                lesson = "观望后价格突破5%中性带，形成可量化错失机会；复核证据门槛是否过严"
+            elif direction == "hold":
+                lesson = "观望窗口内路径不稳定；复核中性带、期限与反证条件"
+            else:
+                lesson = (
+                    "高置信度决策但实际错误，需更谨慎评估"
+                    if result == "wrong"
+                    else "部分正确但未达到目标，需要更好的入场时机"
+                )
 
             async with aiosqlite.connect(self.db_path) as db:
                 existing = None

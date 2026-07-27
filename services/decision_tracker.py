@@ -48,6 +48,7 @@ class DecisionRecorder:
 
     MIN_EXPECTED_DAYS = 3
     MAX_EXPECTED_DAYS = 180
+    HOLD_NEUTRAL_BAND = 0.05
 
     def __init__(self, db_path: str = None):
         from ..core import DATA_DIR
@@ -97,9 +98,23 @@ class DecisionRecorder:
         from .market_data import get_market_data
 
         market = get_market_data()
-        current_price = entry_price or await market.get_current_price(ticker)
+        if entry_price is None:
+            quote = await market.get_current_quote(ticker) or {}
+            current_price = quote.get("price")
+        else:
+            current_price = entry_price
+            quote = {
+                "ticker": ticker,
+                "price": current_price,
+                "source": "provided_prediction_anchor",
+                "fetched_at": datetime.now().isoformat(),
+            }
         if current_price is None or current_price <= 0:
             raise ValueError(f"无法获取 {ticker} 的真实入场价格，拒绝记录不可验证决策")
+        quote_source = str(quote.get("source") or "").strip()
+        quote_fetched_at = str(quote.get("fetched_at") or "").strip()
+        if not quote_source or not quote_fetched_at:
+            raise ValueError(f"{ticker} 行情缺少source/fetched_at，拒绝记录不可审计决策")
 
         target_price, stop_loss = self._normalize_price_targets(
             decision=decision,
@@ -139,8 +154,8 @@ class DecisionRecorder:
                     id, ticker, current_price, target_price, stop_loss, direction,
                     confidence, predicted_at, expected_days,
                     discussion_context, status, result, accuracy_score,
-                    created_at, entry_date
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, entry_date, quote_source, quote_fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.id,
                 record.ticker,
@@ -157,6 +172,8 @@ class DecisionRecorder:
                 record.accuracy_score,
                 record.created_at,
                 record.entry_date,
+                quote_source,
+                quote_fetched_at,
             ))
             await db.commit()
 
@@ -219,6 +236,12 @@ class DecisionRecorder:
     ) -> tuple[float, float]:
         """Convert percent-style targets into absolute prices when needed."""
         direction = (decision or "").lower()
+        if direction in ("hold", "neutral", "watch", "观望"):
+            band = self.HOLD_NEUTRAL_BAND
+            return (
+                round(entry_price * (1 + band), 4),
+                round(entry_price * (1 - band), 4),
+            )
 
         # Stage-2 proposals often emit take_profit=15.0 and stop_loss=5.0 to
         # mean +15% / -5%. Detect that paired shape before treating values as
@@ -406,6 +429,7 @@ class DecisionRecorder:
 
     async def validate_single(self, record_id: str) -> Dict:
         """验证单个决策"""
+        await self._ensure_tables()
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM price_predictions WHERE id = ?", (record_id,)) as cursor:
@@ -470,6 +494,30 @@ class DecisionRecorder:
                         hit_date = bar["date"]
                         hit_type = "target"
                         break
+                elif decision in ("hold", "neutral", "watch"):
+                    crossed_up = bar["high"] >= target
+                    crossed_down = bar["low"] <= stop
+                    if crossed_up and crossed_down:
+                        result = "partial"
+                        accuracy = 0.5
+                        hit_price = current_price
+                        hit_date = bar["date"]
+                        hit_type = "neutral_band_both_sides"
+                        break
+                    if crossed_up:
+                        result = "wrong"
+                        accuracy = 0.0
+                        hit_price = target
+                        hit_date = bar["date"]
+                        hit_type = "missed_upside"
+                        break
+                    if crossed_down:
+                        result = "correct"
+                        accuracy = 1.0
+                        hit_price = stop
+                        hit_date = bar["date"]
+                        hit_type = "avoided_downside"
+                        break
 
         if result == "unknown" and decision in ("buy", "long"):
             if current_price >= target:
@@ -496,6 +544,26 @@ class DecisionRecorder:
             else:
                 profit_pct = (entry - current_price) / entry
                 accuracy = max(0.0, min(1.0, profit_pct / 0.1))
+        elif result == "unknown" and decision in ("hold", "neutral", "watch"):
+            price_change = (current_price - entry) / entry
+            if price_change >= self.HOLD_NEUTRAL_BAND:
+                result = "wrong"
+                accuracy = 0.0
+                hit_type = "missed_upside"
+            elif price_change <= -self.HOLD_NEUTRAL_BAND:
+                result = "correct"
+                accuracy = 1.0
+                hit_type = "avoided_downside"
+            else:
+                result = "correct"
+                accuracy = 1.0
+                hit_type = "neutral_band_held"
+
+        actual_return = (
+            (float(hit_price) - float(entry)) / float(entry)
+            if entry and hit_price is not None
+            else None
+        )
 
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
@@ -508,7 +576,8 @@ class DecisionRecorder:
                     actual_hit_date = ?,
                     actual_hit_type = ?,
                     max_price_reached = ?,
-                    min_price_reached = ?
+                    min_price_reached = ?,
+                    actual_return = ?
                 WHERE id = ?
             """, (
                 result,
@@ -519,12 +588,18 @@ class DecisionRecorder:
                 hit_type,
                 max_price,
                 min_price,
+                actual_return,
                 record_id,
             ))
             await db.commit()
 
         logger.info(f"决策验证: {record['ticker']} {result}")
-        return {"result": result, "accuracy": accuracy, "current_price": current_price}
+        return {
+            "result": result,
+            "accuracy": accuracy,
+            "current_price": current_price,
+            "actual_return": actual_return,
+        }
 
     async def validate_pending(self, max_count: int = 50) -> Dict:
         """批量验证待验证的决策"""

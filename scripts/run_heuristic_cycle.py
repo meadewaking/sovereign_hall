@@ -312,6 +312,12 @@ def build_daily_tape(predictions: pd.DataFrame, price_history: pd.DataFrame | No
         return predictions
 
     df = predictions.copy()
+    # Hold outcomes are validation observations, not executable long signals.
+    # Excluding them prevents opportunity-cost feedback from changing allocator
+    # evidence counts or confidence.
+    df = df[df["direction"].eq("long")].copy()
+    if df.empty:
+        return df
     plausible_long = (
         (df["direction"] == "long")
         & (df["target_price"] > df["current_price"])
@@ -2054,17 +2060,44 @@ def write_readme(
         if best_signal_count > 1
         else "and the default local observation floor"
     )
+    def comparable_score_text(
+        label: str,
+        score: float | None,
+        metrics_path: Path | None,
+    ) -> str:
+        if score is None or metrics_path is None:
+            return f"No {label} heuristic_cycle best was found."
+        prior = read_json(metrics_path)
+        current_period = (
+            str(best_metrics.get("sample_start") or ""),
+            str(best_metrics.get("sample_end") or ""),
+        )
+        prior_period = (
+            str(prior.get("sample_start") or ""),
+            str(prior.get("sample_end") or ""),
+        )
+        delta = best_metrics["score"] - score
+        if current_period != prior_period:
+            return (
+                f"{label.capitalize()} score {score:.6f} from {metrics_path}; "
+                f"raw delta {delta:+.6f} is not a clean policy comparison because "
+                f"the evaluation period changed from {prior_period[0]}..{prior_period[1]} "
+                f"to {current_period[0]}..{current_period[1]}."
+            )
+        return (
+            f"{label.capitalize()} score {score:.6f} from {metrics_path}; "
+            f"same-period delta {delta:+.6f}."
+        )
+
     comparison = "No previous heuristic_cycle best was found."
     if previous_score is not None:
-        comparison = (
-            f"Previous best score {previous_score:.6f} from {previous_path}; "
-            f"delta {best_metrics['score'] - previous_score:+.6f}."
-        )
+        comparison = comparable_score_text("historical best", previous_score, previous_path)
     latest_comparison = "No immediate prior completed run was found."
     if previous_latest_score is not None:
-        latest_comparison = (
-            f"Immediate prior run score {previous_latest_score:.6f} from {previous_latest_run}; "
-            f"delta {best_metrics['score'] - previous_latest_score:+.6f}."
+        latest_comparison = comparable_score_text(
+            "immediate prior run",
+            previous_latest_score,
+            previous_latest_run / "best_metrics.json" if previous_latest_run else None,
         )
     def diagnostic_reason(trial_name: str) -> str:
         if "validated_daily_price_only" in trial_name:

@@ -272,6 +272,8 @@ def build_daily_tape(
 ) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in predictions:
+        if str(row.get("direction") or "").lower() != "long":
+            continue
         grouped.setdefault((row["date"], row["ticker"]), []).append(row)
     asof_prices = build_asof_price_history(price_history)
 
@@ -1545,8 +1547,29 @@ def write_readme(
     command: str,
 ) -> None:
     comparison = "No previous heuristic_cycle best was found."
-    if previous_score is not None:
-        comparison = f"Previous best score {previous_score:.6f} from {previous_path}; delta {best_metrics['score'] - previous_score:+.6f}."
+    if previous_score is not None and previous_path is not None:
+        previous_metrics = read_json(previous_path)
+        current_period = (
+            str(best_metrics.get("sample_start") or ""),
+            str(best_metrics.get("sample_end") or ""),
+        )
+        previous_period = (
+            str(previous_metrics.get("sample_start") or ""),
+            str(previous_metrics.get("sample_end") or ""),
+        )
+        delta = best_metrics["score"] - previous_score
+        if current_period == previous_period:
+            comparison = (
+                f"Previous best score {previous_score:.6f} from {previous_path}; "
+                f"same-period delta {delta:+.6f}."
+            )
+        else:
+            comparison = (
+                f"Previous best score {previous_score:.6f} from {previous_path}; "
+                f"raw delta {delta:+.6f} is not a clean policy comparison because "
+                f"the evaluation period changed from {previous_period[0]}..{previous_period[1]} "
+                f"to {current_period[0]}..{current_period[1]}."
+            )
     failed_lines = "\n".join(f"- {trial['trial_name']}: score={trial['score']:.6f}, notes={trial['notes']}" for trial in trials if trial["trial_name"] != best_name)
     sleeve_lines = []
     for sleeve_name, row in sleeve_diagnostics.get("sleeves", {}).items():

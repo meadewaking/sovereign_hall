@@ -814,6 +814,11 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
         "total": 0,
         "direction_counts": {},
         "quorum_failure_count": 0,
+        "prediction_linked_count": 0,
+        "hold_prediction_linked_count": 0,
+        "latest_outcome_at": None,
+        "latest_meeting_at": None,
+        "newer_meeting_count": 0,
         "recent": [],
     }
     try:
@@ -824,6 +829,10 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
         diagnostics["available"] = bool(table)
         if not table:
             return diagnostics
+        columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(simulation_committee_outcomes)")
+        }
         diagnostics["total"] = int(
             conn.execute("SELECT COUNT(*) FROM simulation_committee_outcomes").fetchone()[0]
         )
@@ -834,18 +843,53 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
                 "GROUP BY direction"
             ).fetchall()
         }
+        latest_outcome = conn.execute(
+            "SELECT MAX(created_at) FROM simulation_committee_outcomes"
+        ).fetchone()
+        diagnostics["latest_outcome_at"] = latest_outcome[0] if latest_outcome else None
+        meetings_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meetings'"
+        ).fetchone()
+        if meetings_table:
+            latest_meeting = conn.execute(
+                "SELECT MAX(created_at) FROM meetings"
+            ).fetchone()
+            diagnostics["latest_meeting_at"] = latest_meeting[0] if latest_meeting else None
+            if diagnostics["latest_outcome_at"]:
+                diagnostics["newer_meeting_count"] = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM meetings "
+                        "WHERE datetime(created_at) > datetime(?)",
+                        (diagnostics["latest_outcome_at"],),
+                    ).fetchone()[0]
+                )
         diagnostics["quorum_failure_count"] = int(
             conn.execute(
                 "SELECT COUNT(*) FROM simulation_committee_outcomes WHERE quorum_met = 0"
             ).fetchone()[0]
         )
+        if "prediction_id" in columns:
+            diagnostics["prediction_linked_count"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM simulation_committee_outcomes "
+                    "WHERE prediction_id IS NOT NULL AND trim(prediction_id) <> ''"
+                ).fetchone()[0]
+            )
+            diagnostics["hold_prediction_linked_count"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM simulation_committee_outcomes "
+                    "WHERE direction = 'hold' AND prediction_id IS NOT NULL "
+                    "AND trim(prediction_id) <> ''"
+                ).fetchone()[0]
+            )
+        prediction_select = "prediction_id," if "prediction_id" in columns else "NULL AS prediction_id,"
         diagnostics["recent"] = [
             dict(row)
             for row in conn.execute(
-                """
+                f"""
                 SELECT ticker, direction, vote_summary, vote_margin, vote_count,
                        parsed_vote_count, invalid_vote_count, quorum_required,
-                       quorum_met, review_depth, created_at
+                       quorum_met, review_depth, {prediction_select} created_at
                 FROM simulation_committee_outcomes
                 ORDER BY datetime(created_at) DESC, id DESC
                 LIMIT ?
@@ -1208,6 +1252,33 @@ def show_investment_status(db_path):
             f"hold={counts.get('hold', 0)} | "
             f"法定人数失败={committee_diagnostics['quorum_failure_count']}"
         )
+        print(
+            "   可验证反馈链接: "
+            f"{committee_diagnostics['prediction_linked_count']}/"
+            f"{committee_diagnostics['total']}；其中hold="
+            f"{committee_diagnostics['hold_prediction_linked_count']}/"
+            f"{counts.get('hold', 0)}"
+        )
+        if committee_diagnostics.get("newer_meeting_count"):
+            print(
+                "   ⚠️ 执行闭环断点: "
+                f"{committee_diagnostics['newer_meeting_count']}场会议晚于最近一次票型审计"
+                f"({committee_diagnostics.get('latest_outcome_at')})；"
+                "当前常驻run_discussion未加载最新闭市持久化路径。"
+            )
+            print(
+                "   最小修复动作: 在当前轮安全结束后重启 "
+                "`python -m sovereign_hall.run_discussion`；新版本会在闭市时继续写票型/预测链接、"
+                "逐仓复核并把可执行裁决无价格排队。"
+            )
+        if (
+            counts.get("hold", 0)
+            and committee_diagnostics["hold_prediction_linked_count"] == 0
+        ):
+            print(
+                "   迁移边界: 历史hold缺少当时实时价格锚点，不补造；"
+                "新hold将以±5%中性带、期限和prediction_id进入验证/回灌"
+            )
         for outcome in committee_diagnostics["recent"]:
             try:
                 summary = json.loads(outcome.get("vote_summary") or "{}")
@@ -1219,6 +1290,7 @@ def show_investment_status(db_path):
                 f"有效票={int(outcome.get('parsed_vote_count') or 0)}/"
                 f"{int(outcome.get('vote_count') or 0)} "
                 f"(门槛{int(outcome.get('quorum_required') or 0)}) | "
+                f"prediction={outcome.get('prediction_id') or '未链接'} | "
                 f"{outcome.get('created_at')}"
             )
     elif committee_diagnostics["available"]:
@@ -1338,7 +1410,7 @@ def show_stats(db_path):
             if proposal_missing_time:
                 print(
                     f"      - 历史提案缺时标: {proposal_missing_time:,} 条（保留NULL，不伪造时间；"
-                    "新提案将在重启后的讨论进程中显式写入created_at）"
+                    "新提案写入路径已显式记录created_at）"
                 )
         except sqlite3.Error as exc:
             print(f"      - 提案时间链路: 无法读取 ({exc})")
@@ -1389,6 +1461,41 @@ def show_stats(db_path):
                 next_due = c.fetchone()[0]
                 print(f"      - 当前到期可验证: {due_count:,} 条")
                 print(f"      - 下一批到期时间: {next_due or 'N/A'}")
+                prediction_columns = {
+                    str(row[1]) for row in c.execute("PRAGMA table_info(price_predictions)")
+                }
+                c.execute(
+                    """
+                    SELECT
+                        COUNT(*),
+                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status IN ('validated', 'expired')
+                                  AND result IN ('correct', 'partial', 'wrong')
+                                 THEN 1 ELSE 0 END)
+                    FROM price_predictions
+                    WHERE lower(COALESCE(direction, '')) = 'hold'
+                    """
+                )
+                hold_total, hold_pending, hold_judgeable = c.fetchone()
+                print(
+                    f"      - 观望机会成本反馈: total={int(hold_total or 0)}, "
+                    f"pending={int(hold_pending or 0)}, "
+                    f"judgeable={int(hold_judgeable or 0)}"
+                )
+                if {"quote_source", "quote_fetched_at"}.issubset(prediction_columns):
+                    c.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM price_predictions
+                        WHERE quote_source IS NOT NULL AND trim(quote_source) <> ''
+                          AND quote_fetched_at IS NOT NULL AND trim(quote_fetched_at) <> ''
+                        """
+                    )
+                    traceable_quotes = int(c.fetchone()[0] or 0)
+                    print(
+                        f"      - 可审计预测行情锚点: {traceable_quotes:,}/"
+                        f"{total_predictions:,} 条（legacy空值保留，不伪造）"
+                    )
             else:
                 print("      - 暂无可信预测记录")
         except Exception as e:
