@@ -113,6 +113,7 @@ research:
   search_results_per_query: 10
   force_search_interval: 1
   stage2_max_docs: 30
+  wiki_ingest_max_docs_per_round: 5
   stage2_doc_chars: 1200
   stage2_context_chars: 24000
   agent_search_max_docs: 10

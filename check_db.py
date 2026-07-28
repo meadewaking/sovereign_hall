@@ -101,6 +101,23 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _decode_text_list(value: Any) -> list[str]:
+    """Decode a persisted JSON string list without inventing legacy feedback."""
+    if value in (None, ""):
+        return []
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = [value]
+    if isinstance(parsed, str):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
 def _read_backfill_plan_rows(plan_path: str, limit: int) -> dict[str, dict[str, Any]]:
     if not plan_path:
         return {}
@@ -816,6 +833,8 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
         "quorum_failure_count": 0,
         "prediction_linked_count": 0,
         "hold_prediction_linked_count": 0,
+        "hold_evidence_gap_count": 0,
+        "hold_reconsider_count": 0,
         "latest_outcome_at": None,
         "latest_meeting_at": None,
         "newer_meeting_count": 0,
@@ -882,14 +901,41 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
                     "AND trim(prediction_id) <> ''"
                 ).fetchone()[0]
             )
+        if "evidence_gaps" in columns:
+            diagnostics["hold_evidence_gap_count"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM simulation_committee_outcomes "
+                    "WHERE direction = 'hold' "
+                    "AND trim(COALESCE(evidence_gaps, '')) NOT IN ('', '[]', 'null')"
+                ).fetchone()[0]
+            )
+        if "reconsider_if" in columns:
+            diagnostics["hold_reconsider_count"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM simulation_committee_outcomes "
+                    "WHERE direction = 'hold' "
+                    "AND trim(COALESCE(reconsider_if, '')) NOT IN ('', '[]', 'null')"
+                ).fetchone()[0]
+            )
         prediction_select = "prediction_id," if "prediction_id" in columns else "NULL AS prediction_id,"
+        evidence_select = (
+            "evidence_gaps,"
+            if "evidence_gaps" in columns
+            else "NULL AS evidence_gaps,"
+        )
+        reconsider_select = (
+            "reconsider_if,"
+            if "reconsider_if" in columns
+            else "NULL AS reconsider_if,"
+        )
         diagnostics["recent"] = [
             dict(row)
             for row in conn.execute(
                 f"""
                 SELECT ticker, direction, vote_summary, vote_margin, vote_count,
                        parsed_vote_count, invalid_vote_count, quorum_required,
-                       quorum_met, review_depth, {prediction_select} created_at
+                       quorum_met, review_depth, {prediction_select}
+                       {evidence_select} {reconsider_select} created_at
                 FROM simulation_committee_outcomes
                 ORDER BY datetime(created_at) DESC, id DESC
                 LIMIT ?
@@ -1259,6 +1305,22 @@ def show_investment_status(db_path):
             f"{committee_diagnostics['hold_prediction_linked_count']}/"
             f"{counts.get('hold', 0)}"
         )
+        if counts.get("hold", 0):
+            print(
+                "   HOLD补证闭环: "
+                f"明确证据缺口={committee_diagnostics['hold_evidence_gap_count']}/"
+                f"{counts.get('hold', 0)}；"
+                f"明确重审条件={committee_diagnostics['hold_reconsider_count']}/"
+                f"{counts.get('hold', 0)}"
+            )
+            if (
+                committee_diagnostics["hold_evidence_gap_count"] == 0
+                or committee_diagnostics["hold_reconsider_count"] == 0
+            ):
+                print(
+                    "   迁移边界: 旧HOLD不反推缺失字段；新投票会把补证缺口和重审条件"
+                    "持久化并回灌下一轮研究"
+                )
         if committee_diagnostics.get("newer_meeting_count"):
             print(
                 "   ⚠️ 执行闭环断点: "
@@ -1293,6 +1355,12 @@ def show_investment_status(db_path):
                 f"prediction={outcome.get('prediction_id') or '未链接'} | "
                 f"{outcome.get('created_at')}"
             )
+            evidence_gaps = _decode_text_list(outcome.get("evidence_gaps"))
+            reconsider_if = _decode_text_list(outcome.get("reconsider_if"))
+            if evidence_gaps:
+                print(f"        补证缺口: {'；'.join(evidence_gaps[:3])}")
+            if reconsider_if:
+                print(f"        重审条件: {'；'.join(reconsider_if[:3])}")
     elif committee_diagnostics["available"]:
         print(
             "   0 条（迁移前观望裁决不反推票型；重启 run_discussion 后，"

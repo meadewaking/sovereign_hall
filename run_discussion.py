@@ -532,6 +532,52 @@ def select_next_topic(completed_topics: set, recent_topics=None) -> Optional[str
     return None
 
 
+def prioritize_deployment_research(
+    topic: str,
+    assets: Optional[Dict[str, Any]] = None,
+    redeployment_state: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Turn a sector topic into a candidate-comparison task when cash is stranded.
+
+    This changes only the research objective.  It never inserts a ticker,
+    relaxes the evidence/committee/realtime-price gates, or treats operational
+    cash as a risk position.
+    """
+    assets = assets or {}
+    if not assets.get("valuation_complete"):
+        return topic
+
+    total_assets = float(assets.get("total_assets") or 0.0)
+    deployment_gap = float(assets.get("deployment_gap") or 0.0)
+    invested_ratio = float(assets.get("invested_ratio") or 0.0)
+    positions = assets.get("positions") or {}
+    if total_assets <= 0:
+        return topic
+
+    material_gap = max(1.0, total_assets * 0.20)
+    if deployment_gap < material_gap or invested_ratio >= 0.80:
+        return topic
+
+    state = redeployment_state or {}
+    status = str(state.get("status") or "")
+    if status == "blocked_valuation_incomplete":
+        return topic
+
+    book_state = "空仓" if not positions else f"低投入{invested_ratio:.0%}"
+    return f"{topic}｜{book_state}资金部署候选证据比较"
+
+
+def bounded_sync_index_batch(documents: List[Any], limit: int) -> List[Any]:
+    """Bound synchronous wiki indexing without dropping SQLite persistence.
+
+    The complete search result is persisted to ``documents`` first.  The wiki
+    can lazily migrate the rest from SQLite on later searches, so indexing an
+    evidence-sized batch here keeps the research-to-committee path responsive.
+    """
+    bounded_limit = max(int(limit or 0), 0)
+    return list(documents or [])[:bounded_limit] if bounded_limit else []
+
+
 def dedupe_proposals(proposals: List[Dict]) -> List[Dict]:
     """同一轮内按标的和方向去重，保留置信度最高的提案。"""
     from sovereign_hall.services.market_data import MarketDataService
@@ -654,7 +700,15 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
     print("="*60)
 
     # 清理议题关键词
-    topic_keyword = topic.replace("分析", "").replace("研究", "").replace("投资机会", "").replace("行业", "").strip()
+    topic_keyword = (
+        topic.split("｜", 1)[0]
+        .replace("分析", "")
+        .replace("研究", "")
+        .replace("投资机会", "")
+        .replace("行业", "")
+        .strip()
+    )
+    deployment_research = "资金部署候选证据比较" in topic
 
     # 构建更丰富的种子词
     seeds = {
@@ -671,12 +725,28 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
         f"{topic_keyword} 研报",
         f"{topic_keyword} 龙头",
     ]
+    if deployment_research:
+        extra_queries = [
+            f"{topic_keyword} 集采结果 中标企业",
+            f"{topic_keyword} 上市公司 营收 毛利率",
+            f"{topic_keyword} 龙头 财报 现金流",
+            f"{topic_keyword} 候选公司 估值对比",
+            f"{topic_keyword} 机构调研 订单份额",
+            f"{topic_keyword} 业绩催化 验证时间",
+            f"{topic_keyword} 风险 失效条件",
+            f"{topic_keyword} 资金流向",
+            *extra_queries,
+        ]
 
     # 生成搜索词
     from sovereign_hall.services.spider_service import SearchQueryGenerator
 
     query_gen = SearchQueryGenerator(llm)
-    queries = await query_gen.generate_queries(count=query_count, seeds=seeds, topic=topic)
+    queries = await query_gen.generate_queries(
+        count=query_count,
+        seeds=seeds,
+        topic=topic_keyword,
+    )
 
     print(f"\n生成 {len(queries)} 个搜索词")
     print(f"示例: {queries[:5]}")
@@ -968,13 +1038,20 @@ def parse_committee_vote(text: str) -> Dict:
         risk_flags = parsed_json.get("risk_flags") or parsed_json.get("risks") or []
         if isinstance(risk_flags, str):
             risk_flags = [risk_flags]
+        key_evidence = parsed_json.get("key_evidence") or parsed_json.get("evidence") or []
+        if isinstance(key_evidence, str):
+            key_evidence = [key_evidence]
         return {
             "direction": direction,
             "confidence": confidence,
             "position": position,
             "risk_flags": [str(flag)[:80] for flag in risk_flags[:5]] if isinstance(risk_flags, list) else [],
-            "invalid_if": str(parsed_json.get("invalid_if") or parsed_json.get("reject_if") or "")[:200],
-            "key_evidence": parsed_json.get("key_evidence") or parsed_json.get("evidence") or [],
+            "invalid_if": str(parsed_json.get("invalid_if") or parsed_json.get("reject_if") or "")[:240],
+            "key_evidence": (
+                [str(item)[:240] for item in key_evidence[:5] if str(item).strip()]
+                if isinstance(key_evidence, list)
+                else []
+            ),
             "is_valid": is_valid,
             "parse_mode": "structured_json" if is_valid else "invalid_json_direction",
         }
@@ -986,6 +1063,8 @@ def parse_committee_vote(text: str) -> Dict:
             "confidence": None,
             "position": None,
             "risk_flags": [],
+            "invalid_if": "",
+            "key_evidence": [],
             "is_valid": False,
             "parse_mode": "empty",
         }
@@ -1018,6 +1097,8 @@ def parse_committee_vote(text: str) -> Dict:
         "confidence": confidence,
         "position": position,
         "risk_flags": [],
+        "invalid_if": "",
+        "key_evidence": [],
         "is_valid": bool(has_sell or has_hold or has_buy),
         "parse_mode": "natural_language" if (has_sell or has_hold or has_buy) else "unparsed",
     }
@@ -1226,6 +1307,17 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
         if not vote.get("is_valid"):
             continue
         risk_flags.extend(vote.get("risk_flags") or [])
+    selected_key_evidence = list(dict.fromkeys(
+        str(item).strip()
+        for vote, _weight in selected_votes
+        for item in (vote.get("key_evidence") or [])
+        if str(item).strip()
+    ))[:8]
+    reconsider_if = list(dict.fromkeys(
+        str(vote.get("invalid_if") or "").strip()
+        for vote, _weight in selected_votes
+        if str(vote.get("invalid_if") or "").strip()
+    ))[:8]
 
     return {
         "direction": direction,
@@ -1243,6 +1335,12 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
             str(vote.get("parse_mode") or "unknown") for vote in parsed
         ],
         "risk_flags": list(dict.fromkeys(risk_flags))[:8],
+        "decision_evidence": selected_key_evidence,
+        # The vote prompt defines HOLD key_evidence as the exact missing
+        # decisive evidence. Preserve it so the next research round can target
+        # the gap instead of replaying generic risk prose.
+        "evidence_gaps": selected_key_evidence if direction == "hold" else [],
+        "reconsider_if": reconsider_if,
     }
 
 
@@ -1277,6 +1375,20 @@ def preflight_committee_decisions(
         direction = str(decision.get("direction") or "hold").strip().lower()
         risk_flags = [str(item) for item in (decision.get("risk_flags") or []) if str(item).strip()]
         suffix = f"；risk_flags={','.join(risk_flags[:3])}" if risk_flags else ""
+        evidence_gaps = [
+            str(item).strip()
+            for item in (decision.get("evidence_gaps") or [])
+            if str(item).strip()
+        ]
+        reconsider_if = [
+            str(item).strip()
+            for item in (decision.get("reconsider_if") or [])
+            if str(item).strip()
+        ]
+        if evidence_gaps:
+            suffix += f"；evidence_gaps={','.join(evidence_gaps[:3])}"
+        if reconsider_if:
+            suffix += f"；reconsider_if={','.join(reconsider_if[:3])}"
         vote_summary = decision.get("vote_summary")
         vote_count = int(decision.get("vote_count") or 0)
         parsed_vote_count = int(decision.get("parsed_vote_count") or vote_count)
@@ -1653,7 +1765,9 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                             f"审议深度: {review_depth}; priority_score={priority_score:.2f}; "
                             f"vote_margin={committee_decision.get('vote_margin', 0):.2f}; "
                             f"vote_summary={committee_decision.get('vote_summary')}; "
-                            f"risk_flags={committee_decision.get('risk_flags', [])}"
+                            f"risk_flags={committee_decision.get('risk_flags', [])}; "
+                            f"evidence_gaps={committee_decision.get('evidence_gaps', [])}; "
+                            f"reconsider_if={committee_decision.get('reconsider_if', [])}"
                         ),
                         expected_days=expected_days,
                     )
@@ -2337,6 +2451,13 @@ async def main():
     validation_batch_size = int(system_config.get("validation_batch_size", 100) or 100)
     topic_cooldown_hours = int(system_config.get("topic_cooldown_hours", DEFAULT_TOPIC_COOLDOWN_HOURS) or 0)
     search_query_count = int(research_config.get("search_query_count", 30) or 30)
+    wiki_ingest_max_docs = int(
+        research_config.get(
+            "wiki_ingest_max_docs_per_round",
+            research_config.get("stage2_max_docs", 30),
+        )
+        or 0
+    )
     force_search_interval = int(research_config.get("force_search_interval", 1) or 0)
     if args.local_only:
         force_search_interval = 0
@@ -2428,12 +2549,23 @@ async def main():
 
             # 选择议题
             recent_topics = load_recent_topics(db_path, topic_cooldown_hours)
-            topic = select_next_topic(completed_topics, recent_topics=recent_topics)
-            if topic is None:
+            base_topic = select_next_topic(completed_topics, recent_topics=recent_topics)
+            if base_topic is None:
                 wait_seconds = min(3600, max(300, topic_cooldown_hours * 60))
                 print(f"\n💤 所有议题都在 {topic_cooldown_hours} 小时冷却期内，休息 {wait_seconds} 秒")
                 await asyncio.sleep(wait_seconds)
                 continue
+            try:
+                research_assets = await simulation.calculate_assets()
+                redeployment_state = await simulation.get_redeployment_state()
+                topic = prioritize_deployment_research(
+                    base_topic,
+                    research_assets,
+                    redeployment_state,
+                )
+            except Exception as exc:
+                logger.warning("读取资金部署状态失败，保持原研究议题: %s", exc)
+                topic = base_topic
 
             iteration += 1
             round_start = datetime.now()
@@ -2442,6 +2574,11 @@ async def main():
             print(f"\n{'='*60}")
             print(f"🔥 第 {iteration} 轮 | 议题: {topic}")
             print(f"{'='*60}")
+            if topic != base_topic:
+                print(
+                    "🎯 资金部署优先：当前存在重大操作性现金缺口，"
+                    "本轮先比较可部署候选；不降低证据、投票、实时行情或交易时段门槛"
+                )
 
             # 先验证到期预测，再把最新结果和旧结论注入本轮。
             try:
@@ -2468,7 +2605,7 @@ async def main():
                     learning_engine.generate_lessons_prompt(), timeout=120
                 )
                 research_memory_prompt = await asyncio.wait_for(
-                    learning_engine.generate_research_memory_prompt(topic), timeout=120
+                    learning_engine.generate_research_memory_prompt(base_topic), timeout=120
                 )
                 logger.info(f"[diag] generate_lessons_prompt done in {(datetime.now()-t0).total_seconds():.1f}s")
 
@@ -2588,10 +2725,19 @@ async def main():
                             logger.warning(f"保存文档失败: {e}")
 
                     # 批量添加到 VectorDB（带 embedding）
-                    logger.info(f"[diag] add_documents_batch begin: count={len(external_docs)}")
+                    wiki_docs = bounded_sync_index_batch(
+                        external_docs,
+                        wiki_ingest_max_docs,
+                    )
+                    deferred_wiki_docs = len(external_docs) - len(wiki_docs)
+                    logger.info(
+                        "[diag] add_documents_batch begin: sync=%s deferred_to_sqlite_lazy_migration=%s",
+                        len(wiki_docs),
+                        deferred_wiki_docs,
+                    )
                     try:
                         vector_saved = await asyncio.wait_for(
-                            vector_db.add_documents_batch(external_docs, llm_client=llm),
+                            vector_db.add_documents_batch(wiki_docs, llm_client=llm),
                             timeout=600,
                         )
                     except asyncio.TimeoutError:
@@ -2601,9 +2747,12 @@ async def main():
                         logger.error(f"[diag] add_documents_batch failed: {e}")
                         vector_saved = 0
                     logger.info(f"[diag] save_docs done in {(datetime.now()-t0).total_seconds():.1f}s, "
-                                f"DB={saved_docs}, Wiki={vector_saved}")
+                                f"DB={saved_docs}, Wiki={vector_saved}, WikiDeferred={deferred_wiki_docs}")
 
-                    print(f"   ✅ 文档已保存 (DB: {saved_docs}, Wiki: {vector_saved}, 跳过本地派生: {skipped_docs})")
+                    print(
+                        f"   ✅ 文档已保存 (DB新增: {saved_docs}, Wiki同步: {vector_saved}, "
+                        f"Wiki延后懒迁移: {deferred_wiki_docs}, 跳过本地派生: {skipped_docs})"
+                    )
 
                 redeployment_context = (
                     await simulation.format_redeployment_learning_context()
@@ -2677,11 +2826,23 @@ async def main():
                                 "quorum_required": decision.get("vote_quorum_required"),
                                 "quorum_met": decision.get("vote_quorum_met"),
                                 "review_depth": decision.get("review_depth"),
+                                "evidence_gaps": decision.get("evidence_gaps") or [],
+                                "reconsider_if": decision.get("reconsider_if") or [],
                             },
                             action_items=[
                                 f"验证窗口: {int(decision.get('expected_days') or 30)}天",
                                 f"止损: {decision.get('stop_loss')}",
                                 f"止盈: {decision.get('take_profit')}",
+                                *(
+                                    ["补证: " + "；".join(decision.get("evidence_gaps") or [])]
+                                    if decision.get("evidence_gaps")
+                                    else []
+                                ),
+                                *(
+                                    ["重审条件: " + "；".join(decision.get("reconsider_if") or [])]
+                                    if decision.get("reconsider_if")
+                                    else []
+                                ),
                             ],
                         )
                     except Exception as e:
@@ -2699,7 +2860,7 @@ async def main():
                 # 保存结论（包含结构化数据）
                 primary_decision = decisions[0] if decisions else {}
                 await db_service.save_report_conclusion(
-                    question=topic,
+                    question=base_topic,
                     conclusion=conclusion_data.get('conclusion', ''),
                     ticker=conclusion_data.get('key_ticker', ''),
                     position=float(primary_decision.get("target_position") or 0.0),
@@ -2713,6 +2874,7 @@ async def main():
                             "thesis": primary_decision.get("thesis"),
                             "vote_summary": primary_decision.get("vote_summary"),
                             "vote_margin": primary_decision.get("vote_margin"),
+                            "research_objective": topic,
                         },
                         ensure_ascii=False,
                         default=str,
@@ -2724,7 +2886,7 @@ async def main():
                     ),
                 )
                 await db_service.save_reflection_summary(
-                    question=topic,
+                    question=base_topic,
                     previous_conclusions=research_memory_prompt[:8000],
                     reflection_text=(
                         "本轮使用新检索资料经过独立分析、交叉质疑、反事实修正和投票后形成结论。"
@@ -2751,7 +2913,7 @@ async def main():
                 )
 
                 # 更新已完成议题
-                completed_topics.add(topic)
+                completed_topics.add(base_topic)
                 save_completed_topics(completed_topics)
 
                 # 打印结论
@@ -2788,7 +2950,7 @@ async def main():
 
             # 更新持久化统计
             persistence.increment_rounds()
-            persistence.add_topic(topic)
+            persistence.add_topic(base_topic)
             persistence.add_time(round_time)
             persistence.increment_proposals(len(proposals))
 

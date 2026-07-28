@@ -422,8 +422,9 @@ class InvestmentSimulation:
                     ticker, direction, confidence, target_position,
                     vote_summary, vote_margin, vote_count, parsed_vote_count,
                     invalid_vote_count, quorum_required, quorum_met,
-                    review_depth, prediction_id, source, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    review_depth, prediction_id, evidence_gaps, reconsider_if,
+                    source, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._normalize_ticker(str(decision.get("ticker") or "")),
@@ -439,6 +440,14 @@ class InvestmentSimulation:
                     1 if decision.get("vote_quorum_met") else 0,
                     str(decision.get("review_depth") or ""),
                     str(decision.get("prediction_id") or "") or None,
+                    json.dumps(
+                        decision.get("evidence_gaps") or [],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        decision.get("reconsider_if") or [],
+                        ensure_ascii=False,
+                    ),
                     str(source or "run_discussion"),
                     now,
                 ),
@@ -1762,6 +1771,8 @@ class InvestmentSimulation:
                 quorum_met INTEGER NOT NULL,
                 review_depth TEXT,
                 prediction_id TEXT,
+                evidence_gaps TEXT NOT NULL DEFAULT '[]',
+                reconsider_if TEXT NOT NULL DEFAULT '[]',
                 source TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
@@ -1781,10 +1792,17 @@ class InvestmentSimulation:
 
         async with conn.execute("PRAGMA table_info(simulation_committee_outcomes)") as cursor:
             committee_columns = {row[1] for row in await cursor.fetchall()}
-        if "prediction_id" not in committee_columns:
-            await conn.execute(
-                "ALTER TABLE simulation_committee_outcomes ADD COLUMN prediction_id TEXT"
-            )
+        committee_migrations = {
+            "prediction_id": "TEXT",
+            "evidence_gaps": "TEXT NOT NULL DEFAULT '[]'",
+            "reconsider_if": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        for column, definition in committee_migrations.items():
+            if column not in committee_columns:
+                await conn.execute(
+                    f"ALTER TABLE simulation_committee_outcomes "
+                    f"ADD COLUMN {column} {definition}"
+                )
 
         async with conn.execute("PRAGMA table_info(simulation_pending_decisions)") as cursor:
             pending_columns = {row[1] for row in await cursor.fetchall()}

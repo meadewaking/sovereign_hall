@@ -1050,6 +1050,10 @@ class WikiKnowledgeBase:
             self.ingestor.ingest_document(doc)
             self.documents[doc.id] = doc
             added += 1
+            # Ingestion performs synchronous filesystem/cache work. Yield after
+            # each durable source so asyncio timeouts and Ctrl+C remain
+            # effective even when a caller accidentally submits a large batch.
+            await asyncio.sleep(0)
         if added:
             self.store.rebuild_index()
         return added

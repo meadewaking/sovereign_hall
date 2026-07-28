@@ -3,6 +3,7 @@ import sqlite3
 import json
 import inspect
 import importlib.util
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -60,6 +61,7 @@ from sovereign_hall.run_discussion import (
     choose_review_depth,
     build_proposal_thesis,
     build_lessons_with_heuristic_context,
+    bounded_sync_index_batch,
     cli_args_can_run_without_instance_lock,
     committee_decision_is_predictable,
     filter_repeated_rejection_proposals,
@@ -68,6 +70,7 @@ from sovereign_hall.run_discussion import (
     parse_args,
     preflight_committee_decisions,
     proposal_priority_score,
+    prioritize_deployment_research,
     select_next_topic,
     stage2_deep_research,
     stage3_ic_discussion,
@@ -361,7 +364,13 @@ def test_price_readiness_accepts_near_complete_history_when_latest_date_is_cover
 def test_committee_preflight_records_every_non_executable_decision():
     executable, rejected = preflight_committee_decisions(
         [
-            {"ticker": "600519.SH", "direction": "hold", "risk_flags": ["证据不足"]},
+            {
+                "ticker": "600519.SH",
+                "direction": "hold",
+                "risk_flags": ["证据不足"],
+                "evidence_gaps": ["缺少可核验订单增速"],
+                "reconsider_if": ["订单增速连续两期为正"],
+            },
             {"ticker": "", "direction": "long", "target_position": 0.1},
             {"ticker": "600050", "direction": "short"},
             {"ticker": "推荐标的代码", "direction": "hold"},
@@ -379,6 +388,8 @@ def test_committee_preflight_records_every_non_executable_decision():
         "short_without_position",
     }
     assert "证据不足" in rejected[0]["reason"]
+    assert "evidence_gaps=缺少可核验订单增速" in rejected[0]["reason"]
+    assert "reconsider_if=订单增速连续两期为正" in rejected[0]["reason"]
 
 
 def test_rejection_feedback_keeps_audit_but_removes_obsolete_price_claims():
@@ -1948,6 +1959,8 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsy
             "vote_quorum_met": True,
             "review_depth": "full",
             "prediction_id": "hold-prediction-1",
+            "evidence_gaps": ["缺少可核验订单增速"],
+            "reconsider_if": ["订单增速连续两期为正"],
         }],
         source="test",
     )
@@ -1963,6 +1976,9 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsy
     assert "投委会票型审计" in output
     assert "有效票=7/7" in output
     assert "可验证反馈链接: 1/1；其中hold=1/1" in output
+    assert "HOLD补证闭环: 明确证据缺口=1/1；明确重审条件=1/1" in output
+    assert "补证缺口: 缺少可核验订单增速" in output
+    assert "重审条件: 订单增速连续两期为正" in output
 
 
 def test_check_db_detects_meetings_newer_than_committee_execution_audit(tmp_path):
@@ -2034,12 +2050,15 @@ async def test_simulation_position_schema_migrates_lifecycle_columns(tmp_path):
     await sim.init_tables()
     async with conn.execute("PRAGMA table_info(simulation_positions)") as cursor:
         columns = {row[1] for row in await cursor.fetchall()}
+    async with conn.execute("PRAGMA table_info(simulation_committee_outcomes)") as cursor:
+        committee_columns = {row[1] for row in await cursor.fetchall()}
     await db.close()
 
     assert {
         "opened_at", "peak_price", "last_mark_price", "last_mark_at",
         "last_mark_source", "last_reviewed_at", "review_status", "review_reason",
     } <= columns
+    assert {"evidence_gaps", "reconsider_if"} <= committee_columns
 
 
 def test_heuristic_risk_cap_uses_latest_policy_as_constraint(tmp_path):
@@ -3834,6 +3853,45 @@ async def test_simulation_trade_refuses_local_prediction_without_realtime_quote(
 
 
 @pytest.mark.asyncio
+async def test_simulation_incomplete_portfolio_valuation_blocks_new_buy(monkeypatch):
+    sim = InvestmentSimulation()
+    sim.cash = 9_000.0
+    sim.positions = {"000001": {"shares": 100, "avg_cost": 10.0}}
+    sim.resolve_trade_price = AsyncMock(return_value=(20.0, "test_realtime_quote"))
+    sim._estimate_trade_assets = AsyncMock(
+        return_value=({}, 9_000.0, ["000001"])
+    )
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {
+            "is_trading_day": AsyncMock(return_value=True),
+            "is_market_open": AsyncMock(return_value=True),
+        },
+    )()
+    monkeypatch.setattr(
+        "sovereign_hall.services.market_data.get_market_data",
+        lambda: fake_market,
+    )
+
+    result = await sim.execute_trade(
+        ticker="600519",
+        direction="long",
+        target_position=0.1,
+        current_price=999.0,
+        confidence=0.8,
+        risk_cap_already_applied=True,
+    )
+
+    assert result["success"] is False
+    assert result["action"] == "hold"
+    assert "组合实时估值不完整" in result["reason"]
+    assert "000001" in result["reason"]
+    assert "600519" not in sim.positions
+    sim.resolve_trade_price.assert_awaited_once_with("600519")
+
+
+@pytest.mark.asyncio
 async def test_prediction_tracker_waits_for_window(tmp_path):
     db_path = tmp_path / "test.db"
     tracker = PredictionTracker(str(db_path))
@@ -4220,13 +4278,44 @@ def test_hold_feedback_does_not_enter_offline_long_allocator():
 def test_committee_vote_accepts_structured_json():
     vote = parse_committee_vote(
         '{"direction":"long","confidence":0.62,"position":0.08,'
-        '"risk_flags":["估值偏高"],"invalid_if":"跌破支撑"}'
+        '"key_evidence":["订单增长"],"risk_flags":["估值偏高"],'
+        '"invalid_if":"跌破支撑"}'
     )
 
     assert vote["direction"] == "long"
     assert vote["confidence"] == pytest.approx(0.62)
     assert vote["position"] == pytest.approx(0.08)
     assert vote["risk_flags"] == ["估值偏高"]
+    assert vote["key_evidence"] == ["订单增长"]
+    assert vote["invalid_if"] == "跌破支撑"
+
+
+def test_committee_hold_aggregation_preserves_evidence_work_queue():
+    decision = aggregate_committee_decision(
+        {"confidence": 0.7, "target_position": 0.1},
+        [
+            '{"direction":"hold","confidence":0.4,"position":0,'
+            '"key_evidence":["缺少现金流与利润匹配数据"],'
+            '"invalid_if":"经营现金流连续两期覆盖净利润"}',
+            '{"direction":"hold","confidence":0.3,"position":0,'
+            '"key_evidence":"缺少订单来源明细",'
+            '"invalid_if":"订单明细可追溯且集中度下降"}',
+            '{"direction":"long","confidence":0.8,"position":0.1,'
+            '"key_evidence":["收入增长"],"invalid_if":"收入转负"}',
+        ],
+        vote_weights=[2.0, 1.5, 1.0],
+    )
+
+    assert decision["direction"] == "hold"
+    assert decision["evidence_gaps"] == [
+        "缺少现金流与利润匹配数据",
+        "缺少订单来源明细",
+    ]
+    assert decision["reconsider_if"] == [
+        "经营现金流连续两期覆盖净利润",
+        "订单明细可追溯且集中度下降",
+    ]
+    assert "收入增长" not in decision["evidence_gaps"]
 
 
 def test_committee_aggregation_uses_custom_vote_weights():
@@ -4325,6 +4414,74 @@ def test_topic_selection_falls_back_to_oldest_recent_when_pool_saturated(monkeyp
 
     assert topic == TOPIC_POOL[0]
     assert completed == set()
+
+
+def test_empty_book_prioritizes_candidate_comparison_without_preset_ticker():
+    base_topic = "中药配方颗粒集采"
+    prioritized = prioritize_deployment_research(
+        base_topic,
+        {
+            "valuation_complete": True,
+            "total_assets": 9727.22,
+            "invested_ratio": 0.0,
+            "deployment_gap": 9727.22,
+            "positions": {},
+        },
+        {
+            "status": "blocked_no_approved_candidates",
+            "blocker_code": "missing_approved_candidates",
+        },
+    )
+
+    assert prioritized.startswith(base_topic)
+    assert "空仓资金部署候选证据比较" in prioritized
+    assert not re.search(r"\b[03615]\d{5}\b", prioritized)
+
+
+def test_sync_wiki_index_batch_is_bounded_while_source_batch_is_preserved():
+    source_documents = [{"id": index} for index in range(227)]
+
+    sync_documents = bounded_sync_index_batch(source_documents, 30)
+
+    assert len(source_documents) == 227
+    assert len(sync_documents) == 30
+    assert sync_documents == source_documents[:30]
+
+
+def test_materially_invested_book_keeps_normal_research_topic():
+    base_topic = "AI算力产业链投资机会"
+
+    prioritized = prioritize_deployment_research(
+        base_topic,
+        {
+            "valuation_complete": True,
+            "total_assets": 10_000.0,
+            "invested_ratio": 0.85,
+            "deployment_gap": 1_500.0,
+            "positions": {"600519": {"shares": 100}},
+        },
+        {},
+    )
+
+    assert prioritized == base_topic
+
+
+def test_incomplete_realtime_valuation_does_not_claim_deployment_priority():
+    base_topic = "家电以旧换新政策效果"
+
+    prioritized = prioritize_deployment_research(
+        base_topic,
+        {
+            "valuation_complete": False,
+            "total_assets": None,
+            "invested_ratio": None,
+            "deployment_gap": None,
+            "positions": {"600690": {"shares": 100}},
+        },
+        {"status": "blocked_valuation_incomplete"},
+    )
+
+    assert prioritized == base_topic
 
 
 def test_persistence_preserves_token_breakdown(tmp_path, monkeypatch):
