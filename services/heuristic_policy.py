@@ -14,7 +14,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .reward_policy import MAX_DAILY_TRADES, REWARD_FORMULA
+from .reward_policy import MAX_DAILY_TRADES
+from .simulation_performance import (
+    PERFORMANCE_FORMULA,
+    PERFORMANCE_STANDARD,
+    load_persisted_simulation_performance,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +92,9 @@ class HeuristicRiskContext:
     evaluation_engine: str = ""
     evaluation_warning: str = ""
     evaluator_health: dict[str, Any] = field(default_factory=dict)
+    simulation_performance: dict[str, Any] = field(default_factory=dict)
+    offline_diagnostic_policy: str = ""
+    offline_diagnostic_score: float | None = None
 
     @property
     def available(self) -> bool:
@@ -1161,7 +1169,7 @@ def latest_heuristic_run(runs_root: Path = RUNS_ROOT) -> Path | None:
     return sorted(candidates)[-1].parent
 
 
-def load_latest_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskContext:
+def _load_legacy_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskContext:
     run_dir = latest_heuristic_run(runs_root)
     if run_dir is None:
         return HeuristicRiskContext(None, "", None, 0.10, True, "暂无本地 heuristic cycle 结果", [])
@@ -1360,6 +1368,90 @@ def load_latest_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskC
         evaluation_engine=evaluation_engine,
         evaluation_warning=evaluation_warning,
         evaluator_health=evaluator_health if isinstance(evaluator_health, dict) else {},
+    )
+
+
+def load_latest_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskContext:
+    """Load the live-account policy context.
+
+    Offline cycle artifacts remain inspectable, but they cannot supply the
+    active score, policy, position caps, or ticker vetoes.
+    """
+    from sovereign_hall.core.config import get_config
+
+    run_dir = latest_heuristic_run(runs_root)
+    simulation_config = get_config().get("simulation", {})
+    max_position = float(simulation_config.get("max_single_position", 0.10) or 0.10)
+    max_gross = float(simulation_config.get("max_gross", 1.0) or 1.0)
+    min_confidence = float(
+        simulation_config.get("min_committee_confidence", 0.65) or 0.65
+    )
+    min_risk_reward = float(
+        simulation_config.get("min_risk_reward", 0.8) or 0.8
+    )
+    min_holding_days = int(simulation_config.get("min_holding_days", 10) or 10)
+    no_trade_failure_days = int(
+        simulation_config.get("no_trade_failure_days", 3) or 3
+    )
+    minimum_healthy_invested_ratio = float(
+        simulation_config.get("minimum_healthy_invested_ratio", 0.80) or 0.80
+    )
+    performance = load_persisted_simulation_performance(
+        DEFAULT_DB_PATH,
+        no_trade_failure_days=no_trade_failure_days,
+        minimum_healthy_invested_ratio=minimum_healthy_invested_ratio,
+    )
+
+    offline_policy = ""
+    offline_score = None
+    if run_dir is not None:
+        offline_metrics = _read_json(run_dir / "offline_diagnostic_best_metrics.json")
+        if not offline_metrics:
+            offline_metrics = _read_json(run_dir / "best_metrics.json")
+        raw_offline_score = offline_metrics.get("score")
+        if raw_offline_score is not None:
+            try:
+                offline_score = float(raw_offline_score)
+            except (TypeError, ValueError):
+                offline_score = None
+        for snapshot_name in (
+            "offline_diagnostic_policy_snapshot.py",
+            "policy_snapshot.py",
+        ):
+            snapshot = run_dir / snapshot_name
+            if not snapshot.exists():
+                continue
+            match = re.search(
+                r"'name': '([^']+)'",
+                snapshot.read_text(encoding="utf-8"),
+            )
+            offline_policy = match.group(1) if match else snapshot.stem
+            break
+
+    health_status = str(performance.get("health_status") or "valuation_incomplete")
+    failure_reasons = list(performance.get("failure_reasons") or [])
+    warning = "；".join(failure_reasons) or health_status
+    score = performance.get("score")
+    score = float(score) if score is not None else None
+    return HeuristicRiskContext(
+        run_dir=run_dir,
+        policy_name="simulation_live_policy_v1",
+        score=score,
+        max_position=max_position,
+        min_signal_count=1,
+        min_confidence=min_confidence,
+        min_risk_reward=min_risk_reward,
+        min_holding_days=min_holding_days,
+        max_gross=max_gross,
+        universe="committee_evidence_candidates",
+        overfit_risk=False,
+        warning=warning,
+        failure_cases=[],
+        failure_ticker_scale=0.5,
+        simulation_failures=load_active_simulation_risk_memory(),
+        simulation_performance=performance,
+        offline_diagnostic_policy=offline_policy,
+        offline_diagnostic_score=offline_score,
     )
 
 
@@ -1911,3 +2003,263 @@ def format_sleeve_diagnostics(context: HeuristicRiskContext) -> str:
         state = "pass" if row.get("promotable") else ("cap/warning" if key == "etf" else "warning")
         parts.append(f"{key} {state} score={float(score):.6f} 3x={float(stress):.6f}")
     return "; ".join(parts)
+
+
+def _format_live_return(value: Any) -> str:
+    try:
+        return f"{float(value):+.2%}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None) -> str:
+    """Inject only live-account performance and static execution constraints."""
+    ctx = context or load_latest_heuristic_context()
+    if not ctx.available:
+        return ""
+    performance = ctx.simulation_performance or {}
+    live_return = performance.get("net_total_return", ctx.score)
+    health_status = str(
+        performance.get("health_status") or "valuation_incomplete"
+    )
+    latest_trade = performance.get("latest_trade_at") or "无"
+    invested_ratio = performance.get("current_invested_ratio")
+    invested_text = (
+        f"{float(invested_ratio):.1%}" if invested_ratio is not None else "N/A"
+    )
+    lines = [
+        "【模拟账户唯一绩效与本地Heuristic风控约束】",
+        f"- 唯一绩效标准: {PERFORMANCE_STANDARD}；{PERFORMANCE_FORMULA}。",
+        (
+            f"- 实时模拟账户累计净收益={_format_live_return(live_return)}；"
+            f"系统健康={health_status}；投入率={invested_text}；最近成交={latest_trade}。"
+        ),
+        "- 离线回测、样本外分数、Sharpe和leaderboard仅用于发现失败模式；不得作为best、score、策略晋升、扩仓或继续空仓的依据。",
+        "- 离线诊断内容不得编造成外部市场事实。",
+        (
+            f"- 当前生效的是静态执行安全边界，不是离线收益best："
+            f"单标的上限={ctx.max_position:.1%}，组合目标投入=100%，"
+            f"置信度>={float(ctx.min_confidence or 0.0):.0%}，"
+            f"每交易日最多{MAX_DAILY_TRADES}笔模拟成交。"
+        ),
+        "- 资金规则: 组合目标投入比例为100%，禁止战略现金；未部署资金必须记录证据、行情、整手或执行阻塞。",
+        "- 买入、卖出、止损、止盈与调仓均须在交易时段重新获取实时行情；旧价、成本价和回测价格不得兜底。",
+        "- 没有证据时必须记录空结果与具体阻塞原因，不能伪造候选或成交。",
+    ]
+    checklist = format_policy_checklist(ctx)
+    if checklist:
+        lines.append(checklist)
+    if ctx.min_signal_count > 1:
+        lines.append(f"- 本地信号观察门槛={ctx.min_signal_count}条。")
+    if ctx.evaluation_engine:
+        lines.append(
+            f"- 离线诊断评估引擎: {ctx.evaluation_engine}；"
+            f"{ctx.evaluation_warning or '仅作诊断'}"
+        )
+    evaluator_note = format_evaluator_health_note(ctx)
+    if evaluator_note:
+        lines.append(f"- 离线诊断评估器复核: {evaluator_note}。")
+    if ctx.price_source_unvalidated:
+        lines.append(
+            f"- 离线诊断数据质量风险: daily_prices缺失，"
+            f"price_source={ctx.price_source}，禁止放大仓位。"
+        )
+    coverage_note = format_price_coverage_note(ctx)
+    if coverage_note:
+        coverage_cap = weak_price_coverage_position_cap(ctx)
+        cap_text = (
+            f"；弱价格覆盖历史证据复用上限: {coverage_cap:.1%}"
+            f"；弱覆盖模拟买入上限={coverage_cap:.1%}"
+            if coverage_cap is not None
+            else ""
+        )
+        lines.append(f"- 离线诊断价格覆盖: {coverage_note}{cap_text}。")
+    tape_note = format_tape_update_note(ctx)
+    if tape_note:
+        lines.append(f"- 离线诊断本地tape: {tape_note}。")
+    readiness_note = format_price_readiness_note(ctx)
+    if readiness_note:
+        readiness_cap = price_readiness_position_cap(ctx)
+        cap_text = (
+            f"；daily_prices阻塞历史证据复用上限: {readiness_cap:.1%}"
+            f"；daily_prices阻塞模拟买入上限={readiness_cap:.1%}"
+            if readiness_cap is not None
+            else ""
+        )
+        lines.append(f"- 离线诊断daily_prices补齐: {readiness_note}{cap_text}。")
+        lines.append("- daily_prices补齐是本地数据质量任务，不是实时市场事实。")
+        readiness_queue = format_price_readiness_backfill_queue(ctx)
+        if readiness_queue:
+            lines.append(f"- daily_prices优先补齐队列: {readiness_queue}。")
+        readiness_plan = format_price_readiness_backfill_plan(ctx)
+        if readiness_plan:
+            lines.append(f"- daily_prices补齐计划: {readiness_plan}。")
+    readiness_stall_note = format_price_readiness_stall_note(ctx)
+    if readiness_stall_note:
+        stall_cap = price_readiness_stall_position_cap(ctx)
+        cap_text = (
+            f"；连续阻塞模拟买入上限={stall_cap:.2%}"
+            if stall_cap is not None
+            else ""
+        )
+        lines.append(
+            f"- 离线诊断daily_prices连续阻塞: {readiness_stall_note}{cap_text}。"
+        )
+        lines.append("- 连续阻塞时不得新增leaderboard分支。")
+    sleeve_text = format_sleeve_diagnostics(ctx)
+    if sleeve_text:
+        lines.append(f"- 离线诊断{sleeve_text}。")
+    if ctx.out_of_sample_score is not None or ctx.cost_stress_score is not None:
+        oos = (
+            "N/A"
+            if ctx.out_of_sample_score is None
+            else f"{ctx.out_of_sample_score:.6f}"
+        )
+        stress = (
+            "N/A"
+            if ctx.cost_stress_score is None
+            else f"{ctx.cost_stress_score:.6f}"
+        )
+        lines.append(f"- 验证分数（离线诊断）: 样本外score={oos}; 3x滑点score={stress}。")
+    if health_status == "system_failure_no_live_deployment":
+        lines.append(
+            "- 系统故障优先级: 当前长期低投入且无新成交不是正常观望；本轮必须追踪并修复“联网研究→证据提案→投委会→实时行情→模拟成交”断点，未成交时持久化准确故障码和下一步。"
+        )
+    if ctx.simulation_failures:
+        tickers = ", ".join(row["ticker"] for row in ctx.simulation_failures[:6])
+        lines.append(
+            f"- 已实现模拟亏损风险记忆: {tickers}；只能约束对应标的，不能冻结全账户。"
+        )
+    if ctx.offline_diagnostic_policy:
+        lines.append(
+            f"- 最近离线诊断artifact: {ctx.offline_diagnostic_policy}（非生效策略、非best、不得用于绩效声明）。"
+        )
+    failure_tickers = sorted(recent_failure_tickers(ctx))
+    if failure_tickers:
+        lines.append(
+            "- 离线失败样本标的（诊断约束，非市场事实）: "
+            + ", ".join(failure_tickers)
+            + f"；限制到{ctx.max_position * ctx.failure_ticker_scale:.1%}或观望"
+        )
+    if ctx.failure_cases:
+        lines.append("- 离线诊断失败模式:")
+        for case in ctx.failure_cases[-3:]:
+            lines.append(
+                f"  * {case.get('case_type', 'case')} "
+                f"{case.get('time_range', '')}: "
+                f"{str(case.get('suspected_reason') or '')[:90]}"
+            )
+    return "\n".join(lines)
+
+
+def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
+    """Show the live simulated account as the sole performance authority."""
+    ctx = context or load_latest_heuristic_context()
+    if not ctx.available:
+        return "\n🧭 Heuristic 学习状态: 暂无本地运行结果\n"
+    performance = ctx.simulation_performance or {}
+    live_return = performance.get("net_total_return", ctx.score)
+    score_text = (
+        f"{float(live_return):.6f}" if live_return is not None else "N/A"
+    )
+    invested_ratio = performance.get("current_invested_ratio")
+    invested_text = (
+        f"{float(invested_ratio):.1%}" if invested_ratio is not None else "N/A"
+    )
+    lines = [
+        "\n🧭 Heuristic / 模拟账户绩效状态",
+        "=" * 60,
+        f"   最新run: {ctx.run_dir}",
+        f"   唯一绩效标准: {PERFORMANCE_STANDARD}",
+        (
+            f"   实时模拟账户累计净收益: {_format_live_return(live_return)} | "
+            f"score: {score_text}"
+        ),
+        (
+            "   系统健康: "
+            f"{performance.get('health_status', 'valuation_incomplete')} | "
+            f"投入率: {invested_text} | "
+            f"累计成交: {int(performance.get('trade_count') or 0)} | "
+            f"最近成交: {performance.get('latest_trade_at') or '无'}"
+        ),
+        f"   当前执行安全策略: {ctx.policy_name} | 单标的上限: {ctx.max_position:.1%}",
+        f"   本地信号观察门槛: >={ctx.min_signal_count} 条同日预测观察",
+        f"   诊断: {ctx.warning}",
+        "   离线回测: 仅诊断失败模式；不产生best/score，不得晋升为模拟交易策略",
+    ]
+    if ctx.evaluation_engine:
+        lines.append(f"   评估引擎: {ctx.evaluation_engine}（离线诊断）")
+    if ctx.evaluation_warning:
+        lines.append(f"   评估提示: {ctx.evaluation_warning}")
+    evaluator_note = format_evaluator_health_note(ctx)
+    if evaluator_note:
+        lines.append(f"   评估器复核: {evaluator_note}")
+    if ctx.price_source_unvalidated:
+        lines.append("   数据质量风险: daily_prices缺失，离线结果不得用于放大仓位")
+    coverage_note = format_price_coverage_note(ctx)
+    if coverage_note:
+        lines.append(f"   价格覆盖（离线诊断）: {coverage_note}")
+    coverage_cap = weak_price_coverage_position_cap(ctx)
+    if coverage_cap is not None:
+        lines.append(f"   弱价格覆盖历史证据复用上限: {coverage_cap:.1%}")
+    tape_note = format_tape_update_note(ctx)
+    if tape_note:
+        lines.append(f"   本地tape验证（离线诊断）: {tape_note}")
+    tape_cap = thin_tape_update_position_cap(ctx)
+    if tape_cap is not None:
+        lines.append(f"   薄样本历史证据复用上限: {tape_cap:.1%}")
+    if ctx.stale_tape_entry_veto:
+        lines.append("   陈旧tape复用否决: 已启用")
+    readiness_note = format_price_readiness_note(ctx)
+    if readiness_note:
+        lines.append(f"   daily_prices补齐: {readiness_note}")
+    readiness_cap = price_readiness_position_cap(ctx)
+    if readiness_cap is not None:
+        lines.append(f"   daily_prices阻塞历史证据复用上限: {readiness_cap:.1%}")
+    readiness_queue = format_price_readiness_backfill_queue(ctx)
+    if readiness_queue:
+        lines.append(f"   daily_prices优先补齐队列: {readiness_queue}")
+    readiness_plan = format_price_readiness_backfill_plan(ctx)
+    if readiness_plan:
+        lines.append(f"   daily_prices补齐计划: {readiness_plan}")
+    readiness_stall_note = format_price_readiness_stall_note(ctx)
+    if readiness_stall_note:
+        lines.append(f"   daily_prices连续阻塞: {readiness_stall_note}")
+    sleeve_text = format_sleeve_diagnostics(ctx)
+    if sleeve_text:
+        lines.append(f"   {sleeve_text}（离线诊断）")
+    if ctx.out_of_sample_score is not None or ctx.cost_stress_score is not None:
+        oos = (
+            "N/A"
+            if ctx.out_of_sample_score is None
+            else f"{ctx.out_of_sample_score:.6f}"
+        )
+        stress = (
+            "N/A"
+            if ctx.cost_stress_score is None
+            else f"{ctx.cost_stress_score:.6f}"
+        )
+        lines.append(f"   验证分数（离线诊断）: 样本外 {oos} | 3x滑点 {stress}")
+    if ctx.offline_diagnostic_policy:
+        offline_score = (
+            "N/A"
+            if ctx.offline_diagnostic_score is None
+            else f"{ctx.offline_diagnostic_score:.6f}"
+        )
+        lines.append(
+            "   离线诊断artifact（非生效）: "
+            f"{ctx.offline_diagnostic_policy} | diagnostic_score={offline_score}"
+        )
+    if performance.get("health_status") == "system_failure_no_live_deployment":
+        lines.append(
+            "   ❌ 系统异常: 长期低投入且无新模拟成交；必须优先修复研究到成交链路，不能用回测收益覆盖"
+        )
+    if ctx.failure_cases:
+        lines.append("   最近 failure cases（离线诊断）:")
+        for case in ctx.failure_cases[-3:]:
+            lines.append(
+                f"      - {case.get('case_type', 'case')} "
+                f"{case.get('time_range', '')}: "
+                f"{str(case.get('suspected_reason') or '')[:70]}"
+            )
+    return "\n".join(lines) + "\n"

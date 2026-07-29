@@ -9,6 +9,7 @@ writes the same artifact names as the primary evaluator.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import math
@@ -35,6 +36,10 @@ from sovereign_hall.services.reward_policy import (
     limit_rebalance_actions,
     longest_high_cash_streak,
     score_capital_reward,
+)
+from sovereign_hall.services.simulation_performance import (
+    PERFORMANCE_STANDARD,
+    collect_simulation_performance,
 )
 
 
@@ -1764,6 +1769,140 @@ Flag: {"suspected overfit risk" if checks.get("overfit_risk") else "no severe sp
     path.write_text(text, encoding="utf-8")
 
 
+def write_live_policy_snapshot(path: Path) -> None:
+    path.write_text(
+        '''"""Active policy uses live simulated-account performance only."""
+
+POLICY = {
+    "name": "simulation_live_policy_v1",
+    "performance_standard": "simulation_account_realtime_v1",
+    "offline_backtest_promotion_allowed": False,
+    "config_source": "config.yaml:simulation",
+}
+''',
+        encoding="utf-8",
+    )
+
+
+def write_live_readme(
+    path: Path,
+    *,
+    run_started: str,
+    db_path: Path,
+    metrics: dict[str, Any],
+    offline_name: str,
+    offline_metrics: dict[str, Any],
+    sample_count: int,
+    command: str,
+    portfolio_lifecycle: dict[str, Any],
+) -> None:
+    live_return = metrics.get("net_total_return")
+    return_text = "N/A" if live_return is None else f"{float(live_return):+.4%}"
+    score_text = "N/A" if metrics.get("score") is None else f"{float(metrics['score']):+.6f}"
+    invested = metrics.get("current_invested_ratio")
+    invested_text = "N/A" if invested is None else f"{float(invested):.2%}"
+    gap = metrics.get("deployment_gap")
+    gap_text = "N/A" if gap is None else f"{float(gap):.2f}"
+    failure_lines = "\n".join(
+        f"- {reason}" for reason in metrics.get("failure_reasons", [])
+    ) or "- None."
+    offline_return = offline_metrics.get(
+        "net_total_return", offline_metrics.get("total_return")
+    )
+    offline_return_text = (
+        "N/A" if offline_return is None else f"{float(offline_return):+.4%}"
+    )
+    path.write_text(
+        f"""# Heuristic Learning Cycle — Live Simulation Authority
+
+## Run
+- Run time: {run_started}
+- Data source: `{db_path}`
+- Performance standard: `{PERFORMANCE_STANDARD}`
+- Best policy: `N/A` — offline promotion is disabled
+- Authoritative simulated-account score: {score_text}
+- Cumulative realtime-valued net return: {return_text}
+- Health: `{metrics.get('health_status', 'valuation_incomplete')}`
+- New live fills: {int(metrics.get('trades_since_window_start') or 0)}
+- Iteration improvement: `N/A` without new live fills
+
+## System Failure Review
+{failure_lines}
+- Invested ratio: {invested_text}; deployment gap: {gap_text}
+- Cumulative fills: {int(metrics.get('trade_count') or 0)}
+- Latest fill: {metrics.get('latest_trade_at') or 'none'}
+- Empty/underdeployed without recent fills is a system failure, not normal observation.
+
+## Offline Diagnostics — Non-authoritative
+- `{offline_name}` diagnostic return={offline_return_text}; samples={sample_count}
+- Offline OOS, costs, Sharpe and leaderboard results cannot create best/score,
+  promote a policy, expand positions, or justify an empty live account.
+
+## User Entry Impact
+- `check_db` shows only the realtime simulated-account return as score.
+- `run_discussion` records empty-book/no-decision as
+  `system_failure_no_live_deployment`; zero fills means improvement=N/A.
+- `research_interactive` receives the same live-only performance context.
+- Per-position lifecycle review ran: yes; positions reviewed=
+  {int(portfolio_lifecycle.get('position_count') or 0)}; status=
+  `{portfolio_lifecycle.get('status', 'unknown')}`.
+- Exit triggers/blockers: see `portfolio_lifecycle_review.json`; no historical
+  or cost price was used as a current quote fallback.
+- Current invested ratio is
+  {invested_text}, deployment gap is {gap_text}, and undeployed cash is a
+  deployment blocker rather than risk cash.
+- Exit cash reallocation: no exit in this cycle; undeployed cash is not risk cash.
+
+## Reproduce
+```bash
+python -m sovereign_hall.check_db
+{command}
+```
+
+## Next 3 Directions
+- Run one bounded discussion in trading hours; require a realtime fill or exact rejection.
+- Repair the earliest persisted research-to-fill pipeline break.
+- Add cycle-to-cycle live fill/NAV attribution before any improvement claim.
+""",
+        encoding="utf-8",
+    )
+
+
+def build_persisted_lifecycle_review(db_path: Path) -> dict[str, Any]:
+    """Audit position lifecycle without using stale prices as current marks."""
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        positions = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT ticker, shares, avg_cost, opened_at, last_reviewed_at,
+                       review_status, review_reason
+                FROM simulation_positions
+                ORDER BY ticker
+                """
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        positions = []
+    conn.close()
+    return {
+        "reviewed_at": datetime.now().isoformat(timespec="seconds"),
+        "position_count": len(positions),
+        "positions": positions,
+        "valuation_rule": (
+            "No historical/cost-price fallback. Non-empty books require the "
+            "realtime portfolio lifecycle entry before any action."
+        ),
+        "status": (
+            "empty_book_system_failure_reviewed"
+            if not positions
+            else "realtime_review_required"
+        ),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a local heuristic learning cycle without pandas/numpy.")
     parser.add_argument("--db", default="data/sovereign_hall.db", help="SQLite database path")
@@ -1777,9 +1916,13 @@ def main() -> int:
     db_path = (project_root / args.db).resolve()
     runs_root = (project_root / args.runs_root).resolve()
     run_started = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_started_at = datetime.now().isoformat(timespec="seconds")
     run_id = args.timestamp or run_started
     run_dir = runs_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
+    live_metrics = asyncio.run(
+        collect_simulation_performance(db_path, window_start=run_started_at)
+    )
 
     previous_run = latest_completed_run(runs_root)
     previous_score, previous_path = previous_best_score(runs_root)
@@ -1838,7 +1981,13 @@ def main() -> int:
                 "score_breakdown": metrics.get("score_breakdown", {}),
                 "cost_assumption": metrics["cost_assumption"],
                 "score": metrics["score"],
-                "notes": "standard-library fallback local delayed daily signal simulation; no external market data",
+                "evaluation_role": "offline_diagnostic_only",
+                "authoritative_performance": False,
+                "promotion_eligible": False,
+                "notes": (
+                    "stdlib offline diagnostic only; cannot create "
+                    "best/score/promotion"
+                ),
             }
         )
 
@@ -1887,7 +2036,10 @@ def main() -> int:
             "score_breakdown": simplified_result["metrics"].get("score_breakdown", {}),
             "cost_assumption": simplified_result["metrics"]["cost_assumption"],
             "score": simplified_result["metrics"]["score"],
-            "notes": "simplification stage: removed excess anomaly tuning",
+            "evaluation_role": "offline_diagnostic_only",
+            "authoritative_performance": False,
+            "promotion_eligible": False,
+            "notes": "offline diagnostic simplification only",
         }
     )
 
@@ -1907,6 +2059,7 @@ def main() -> int:
         pending_price_readiness=price_readiness,
     )
     failures = analyze_failures(best_result, daily, best_policy)
+    portfolio_lifecycle = build_persisted_lifecycle_review(db_path)
     source_counts = price_coverage.get("daily_signal_price_source_counts", {})
     price_source = (
         "daily_prices"
@@ -1930,11 +2083,24 @@ def main() -> int:
 
     write_csv(run_dir / "daily_signal_tape.csv", daily)
     write_csv(run_dir / "daily_price_backfill_plan.csv", backfill_plan_rows)
-    write_csv(run_dir / "equity_curve_best.csv", best_result["curve"])
-    write_csv(run_dir / "trades_best.csv", best_result["trades"])
-    write_json(run_dir / "baseline_metrics.json", results["baseline_default_policy"]["metrics"])
-    write_json(run_dir / "best_metrics.json", best_result["metrics"])
-    write_json(run_dir / "overfit_checks.json", checks)
+    write_csv(run_dir / "offline_diagnostic_equity_curve.csv", best_result["curve"])
+    write_csv(run_dir / "offline_diagnostic_trades.csv", best_result["trades"])
+    write_json(
+        run_dir / "offline_diagnostic_baseline_metrics.json",
+        results["baseline_default_policy"]["metrics"],
+    )
+    write_json(
+        run_dir / "offline_diagnostic_best_metrics.json",
+        {
+            **best_result["metrics"],
+            "evaluation_role": "offline_diagnostic_only",
+            "authoritative_performance": False,
+            "promotion_eligible": False,
+        },
+    )
+    write_json(run_dir / "simulation_account_metrics.json", live_metrics)
+    write_json(run_dir / "best_metrics.json", live_metrics)
+    write_json(run_dir / "offline_diagnostic_overfit_checks.json", checks)
     write_json(run_dir / "project_context.json", project_context)
     write_json(run_dir / "daily_price_backfill_plan.json", backfill_plan_summary)
     write_json(run_dir / "sleeve_diagnostics.json", sleeve_diagnostics)
@@ -1942,8 +2108,43 @@ def main() -> int:
     write_json(run_dir / "price_readiness.json", price_readiness)
     write_json(run_dir / "price_readiness_stall.json", price_readiness_stall)
     write_json(run_dir / "tape_update.json", tape_update)
+    write_json(run_dir / "portfolio_lifecycle_review.json", portfolio_lifecycle)
     write_jsonl(run_dir / "trials.jsonl", trials)
-    write_jsonl(run_dir / "failure_cases.jsonl", failures)
+    write_jsonl(run_dir / "offline_diagnostic_failure_cases.jsonl", failures)
+    write_jsonl(
+        run_dir / "failure_cases.jsonl",
+        [
+            {
+                "case_type": live_metrics.get("health_status"),
+                "time_range": (
+                    f"{live_metrics.get('latest_trade_at') or 'no_fill'}.."
+                    f"{live_metrics.get('measured_at')}"
+                ),
+                "market_state": {
+                    "performance_standard": PERFORMANCE_STANDARD,
+                    "valuation_complete": live_metrics.get("valuation_complete"),
+                },
+                "signals": {
+                    "trades_since_iteration_start": live_metrics.get(
+                        "trades_since_window_start"
+                    ),
+                    "cumulative_trade_count": live_metrics.get("trade_count"),
+                },
+                "positions": {
+                    "invested_ratio": live_metrics.get("current_invested_ratio"),
+                    "deployment_gap": live_metrics.get("deployment_gap"),
+                },
+                "result": {
+                    "simulated_account_net_return": live_metrics.get(
+                        "net_total_return"
+                    ),
+                    "score": live_metrics.get("score"),
+                },
+                "suspected_reason": "研究到模拟成交链路未产生近期成交",
+                "repair_direction": "追踪首个真实终止拒绝码并修复，禁止以离线收益替代",
+            }
+        ],
+    )
     write_csv(
         run_dir / "summary.csv",
         [
@@ -1955,33 +2156,54 @@ def main() -> int:
                 "sharpe": trial["sharpe"],
                 "turnover": trial["turnover"],
                 "trade_count": trial["trade_count"],
+                "evaluation_role": trial["evaluation_role"],
+                "authoritative_performance": trial["authoritative_performance"],
+                "promotion_eligible": trial["promotion_eligible"],
             }
             for trial in trials
         ],
-        ["trial_name", "score", "annualized_return", "max_drawdown", "sharpe", "turnover", "trade_count"],
+        [
+            "trial_name",
+            "score",
+            "annualized_return",
+            "max_drawdown",
+            "sharpe",
+            "turnover",
+            "trade_count",
+            "evaluation_role",
+            "authoritative_performance",
+            "promotion_eligible",
+        ],
     )
     write_plot(run_dir / "sample_efficiency.png")
-    write_policy_snapshot(run_dir / "policy_snapshot.py", best_policy, costs)
-    write_readme(
-        run_dir / "README.md",
-        run_started,
-        db_path,
-        len(predictions),
-        best_name,
-        best_result["metrics"],
-        previous_score,
-        previous_path,
-        trials,
-        checks,
-        sleeve_diagnostics,
-        price_coverage,
-        price_readiness,
-        price_readiness_stall,
-        tape_update,
-        f"/usr/bin/python3 scripts/run_heuristic_cycle_stdlib.py --db {args.db}",
+    write_policy_snapshot(
+        run_dir / "offline_diagnostic_policy_snapshot.py", best_policy, costs
     )
-    (runs_root / "LATEST").write_text(str(run_dir), encoding="utf-8")
-    print(str(run_dir))
+    write_live_policy_snapshot(run_dir / "policy_snapshot.py")
+    write_live_readme(
+        run_dir / "README.md",
+        run_started=run_started_at,
+        db_path=db_path,
+        metrics=live_metrics,
+        offline_name=best_name,
+        offline_metrics=best_result["metrics"],
+        sample_count=len(predictions),
+        command=f"/usr/bin/python3 scripts/run_heuristic_cycle_stdlib.py --db {args.db}",
+        portfolio_lifecycle=portfolio_lifecycle,
+    )
+    (runs_root / "LATEST").write_text(str(run_dir) + "\n", encoding="utf-8")
+    print(f"run_dir={run_dir}")
+    print("best_policy=N/A (offline promotion disabled)")
+    print(
+        "simulation_account_score="
+        + (
+            "N/A"
+            if live_metrics.get("score") is None
+            else f"{float(live_metrics['score']):.6f}"
+        )
+    )
+    print(f"health_status={live_metrics.get('health_status')}")
+    print(f"offline_diagnostic_policy={best_name}")
     return 0
 
 

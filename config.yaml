@@ -52,6 +52,14 @@ simulation:
   stop_loss_pct: -0.08  # 逐仓强制复核默认止损
   take_profit_pct: 0.15  # 逐仓强制复核默认止盈
   max_holding_days: 30  # 超期持仓必须退出并重新配置，而不是无限冻结
+  max_single_position: 0.10  # 真实模拟账户的静态安全上限；不得由离线回测收益放大
+  max_gross: 1.0  # 目标100%部署且禁止杠杆
+  min_committee_confidence: 0.65  # 当前轮投委会证据门槛
+  min_risk_reward: 0.8
+  min_holding_days: 10
+  performance_standard: "simulation_account_realtime_v1"
+  no_trade_failure_days: 3  # 低投入且连续无成交达到该天数即为系统故障
+  minimum_healthy_invested_ratio: 0.80
   min_unit: 100  # 最小买卖单位：一手=100股
   trading_fee: 0.0003  # 佣金万三
   stamp_duty: 0.001  # 印花税千一（卖出时）
@@ -114,6 +122,7 @@ research:
   force_search_interval: 1
   stage2_max_docs: 30
   wiki_ingest_max_docs_per_round: 5
+  deployment_deep_fetch_max_docs: 6
   stage2_doc_chars: 1200
   stage2_context_chars: 24000
   agent_search_max_docs: 10
@@ -127,6 +136,20 @@ research:
   committee_vote_max_tokens: 7500
   committee_summary_chars: 1200
   committee_vote_context_chars: 6000
+  # Independent deadlines preserve completed roles; timeout is an audited
+  # absence, never a synthetic HOLD vote.
+  committee_round1_role_timeout_seconds: 240
+  committee_round2_role_timeout_seconds: 180
+  committee_revision_role_timeout_seconds: 120
+  committee_vote_role_timeout_seconds: 90
+  # 空仓部署议题若首轮在法定人数下全体HOLD，对证据最强的一个提案做
+  # CIO/风控/量化三角色独立复核。仅高置信、高方向支持的复核可改变HOLD；
+  # 这不是强制交易，也不降低证据、实时行情或交易时段门槛。
+  committee_deadlock_review_enabled: true
+  committee_deadlock_min_confidence: 0.65
+  committee_deadlock_min_direction_support: 0.60
+  committee_deadlock_max_per_round: 1
+  committee_deadlock_role_timeout_seconds: 90
   conclusion_discussion_context_chars: 24000
 
 # 投委会配置

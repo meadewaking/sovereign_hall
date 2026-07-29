@@ -323,6 +323,35 @@ class InvestmentSimulation:
 
     async def format_redeployment_learning_context(self, limit: int = 5) -> str:
         """Build a local-only feedback block for research and committee agents."""
+        performance = await self.get_performance_metrics()
+        performance_return = performance.get("net_total_return")
+        return_text = (
+            "N/A"
+            if performance_return is None
+            else f"{float(performance_return):+.2%}"
+        )
+        performance_lines = [
+            "【模拟账户唯一绩效与系统健康】",
+            (
+                f"- 唯一绩效=实时模拟账户净值收益{return_text}；"
+                f"累计成交={int(performance.get('trade_count') or 0)}；"
+                f"最近成交={performance.get('latest_trade_at') or '无'}；"
+                f"当前投入率="
+                + (
+                    "N/A"
+                    if performance.get("current_invested_ratio") is None
+                    else f"{float(performance['current_invested_ratio']):.1%}"
+                )
+            ),
+            "- 离线回测收益、Sharpe和leaderboard只可诊断，不能证明系统有效、不能产生best、不能放大仓位。",
+        ]
+        if performance.get("health_status") == "system_failure_no_live_deployment":
+            performance_lines.extend([
+                "- 状态=SYSTEM FAILURE：长期低投入/无成交。空仓不是成功的风险控制，也不是正常观望。",
+                "- 本轮最高优先级是打通研究->有证据提案->投委会方向票->实时报价->模拟成交；"
+                "若仍无成交，必须持久化精确断点，不能用离线回测收益交差。",
+            ])
+
         # Temporary execution blockers (closed market, daily capacity, missing
         # quote, cooldown) belong to the replay path and must not become a
         # research blacklist.  Only evidence-related vetoes are fed back to
@@ -337,12 +366,15 @@ class InvestmentSimulation:
             superseded_count = sum(
                 len(row.get("superseded_reason_fragments") or []) for row in all_rows
             )
-            return (
+            rejection_text = (
                 "【模拟再配置逐标的拒绝记忆】\n"
                 f"- {superseded_count}条瞬态旧理由已被当前实时估值/成交边界推翻，"
                 "保留审计但不再注入提案或投票prompt；本轮必须重新形成证据。"
                 if superseded_count
                 else ""
+            )
+            return "\n\n".join(
+                part for part in ("\n".join(performance_lines), rejection_text) if part
             )
         lines = [
             "【模拟再配置逐标的拒绝记忆】",
@@ -366,7 +398,7 @@ class InvestmentSimulation:
             "- 协作规则: 不得原样重提上述候选；再次提交必须指出新增的本地可追溯证据、"
             "它具体消除了哪条最近拒绝原因及失效条件，否则输出hold/空提案。"
         )
-        return "\n".join(lines)
+        return "\n\n".join(("\n".join(performance_lines), "\n".join(lines)))
 
     async def _record_candidate_rejections(
         self,
@@ -423,8 +455,9 @@ class InvestmentSimulation:
                     vote_summary, vote_margin, vote_count, parsed_vote_count,
                     invalid_vote_count, quorum_required, quorum_met,
                     review_depth, prediction_id, evidence_gaps, reconsider_if,
-                    source, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    individual_votes, stage_execution_audit, deadlock_review,
+                    initial_committee_decision, source, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._normalize_ticker(str(decision.get("ticker") or "")),
@@ -446,6 +479,22 @@ class InvestmentSimulation:
                     ),
                     json.dumps(
                         decision.get("reconsider_if") or [],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        decision.get("individual_votes") or [],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        decision.get("stage_execution_audit") or [],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        decision.get("deadlock_review") or {},
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        decision.get("initial_committee_decision") or {},
                         ensure_ascii=False,
                     ),
                     str(source or "run_discussion"),
@@ -1478,6 +1527,80 @@ class InvestmentSimulation:
             'valuation_rule': 'realtime quotes only; no local/prediction/cost fallback',
         }
 
+    async def get_performance_metrics(
+        self,
+        *,
+        window_start: str | None = None,
+    ) -> Dict[str, Any]:
+        """Return the only valid reward: realtime simulated-account return."""
+        from .simulation_performance import build_simulation_performance
+
+        assets = await self.calculate_assets()
+        if not self.db_service or self.db_service._connection is None:
+            return build_simulation_performance(
+                initial_capital=self.initial_capital,
+                assets=assets,
+                trade_count=0,
+                recorded_fees=0.0,
+                latest_trade_at=None,
+                window_start=window_start,
+                no_trade_failure_days=int(
+                    self.config.get("no_trade_failure_days", 3) or 3
+                ),
+                minimum_healthy_invested_ratio=float(
+                    self.config.get("minimum_healthy_invested_ratio", 0.80)
+                    or 0.80
+                ),
+            )
+
+        conn = self.db_service._connection
+        async with conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(fee), 0), MAX(traded_at) "
+            "FROM simulation_trades"
+        ) as cursor:
+            trade_row = await cursor.fetchone()
+        if window_start:
+            async with conn.execute(
+                "SELECT COUNT(*) FROM simulation_trades "
+                "WHERE datetime(traded_at) > datetime(?)",
+                (window_start,),
+            ) as cursor:
+                window_row = await cursor.fetchone()
+            trades_since = int(window_row[0] if window_row else 0)
+        else:
+            trades_since = 0
+        async with conn.execute(
+            """
+            SELECT s.total_assets, s.cash, s.positions_value,
+                   s.snapshot_date, s.created_at
+            FROM simulation_snapshots s
+            JOIN (
+                SELECT snapshot_date, MAX(id) AS max_id
+                FROM simulation_snapshots
+                GROUP BY snapshot_date
+            ) latest ON latest.max_id = s.id
+            ORDER BY date(s.snapshot_date), s.id
+            """
+        ) as cursor:
+            snapshot_rows = [dict(row) async for row in cursor]
+        return build_simulation_performance(
+            initial_capital=self.initial_capital,
+            assets=assets,
+            trade_count=int(trade_row[0] if trade_row else 0),
+            recorded_fees=float(trade_row[1] if trade_row else 0.0),
+            latest_trade_at=trade_row[2] if trade_row else None,
+            snapshot_rows=snapshot_rows,
+            trades_since_window_start=trades_since,
+            window_start=window_start,
+            no_trade_failure_days=int(
+                self.config.get("no_trade_failure_days", 3) or 3
+            ),
+            minimum_healthy_invested_ratio=float(
+                self.config.get("minimum_healthy_invested_ratio", 0.80)
+                or 0.80
+            ),
+        )
+
     async def daily_reflection(self, llm: LLMClient = None) -> str:
         """
         每日反思
@@ -1529,7 +1652,10 @@ class InvestmentSimulation:
 3. 策略是否有效：只写证据，不写泛泛总结
 4. 下一步建议：买入/卖出/观望、仓位变化、触发条件
 
-请用中文回答；没有新交易时不要重复历史反思，但可以充分展开会改变下一步操作的风险、反证和触发条件。
+唯一绩效标准是本模拟账户按实时行情计算的净值收益。离线回测收益不得用于证明策略有效。
+若账户低投入且连续3天以上无成交，必须明确判定为系统部署故障；不得把“保持空仓/继续观望”
+写成正常或低风险结果。仍不得伪造候选、行情或成交，必须给出修复研究->投委会->实时报价->模拟成交
+链路的下一步动作。没有新交易时不要重复历史反思。
 """
 
         try:
@@ -1773,6 +1899,10 @@ class InvestmentSimulation:
                 prediction_id TEXT,
                 evidence_gaps TEXT NOT NULL DEFAULT '[]',
                 reconsider_if TEXT NOT NULL DEFAULT '[]',
+                individual_votes TEXT NOT NULL DEFAULT '[]',
+                stage_execution_audit TEXT NOT NULL DEFAULT '[]',
+                deadlock_review TEXT NOT NULL DEFAULT '{}',
+                initial_committee_decision TEXT NOT NULL DEFAULT '{}',
                 source TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
@@ -1796,6 +1926,10 @@ class InvestmentSimulation:
             "prediction_id": "TEXT",
             "evidence_gaps": "TEXT NOT NULL DEFAULT '[]'",
             "reconsider_if": "TEXT NOT NULL DEFAULT '[]'",
+            "individual_votes": "TEXT NOT NULL DEFAULT '[]'",
+            "stage_execution_audit": "TEXT NOT NULL DEFAULT '[]'",
+            "deadlock_review": "TEXT NOT NULL DEFAULT '{}'",
+            "initial_committee_decision": "TEXT NOT NULL DEFAULT '{}'",
         }
         for column, definition in committee_migrations.items():
             if column not in committee_columns:

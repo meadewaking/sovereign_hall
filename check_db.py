@@ -14,12 +14,18 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from sovereign_hall.core.config import get_config
 from sovereign_hall.services.heuristic_policy import (
     prepare_candidate_rejection_feedback,
     sanitize_candidate_rejection_reason,
 )
 from sovereign_hall.services.portfolio_policy import deployment_status, review_position
-from sovereign_hall.services.reward_policy import MAX_DAILY_TRADES, REWARD_FORMULA
+from sovereign_hall.services.reward_policy import MAX_DAILY_TRADES
+from sovereign_hall.services.simulation_performance import (
+    PERFORMANCE_FORMULA,
+    PERFORMANCE_STANDARD,
+    build_simulation_performance,
+)
 
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root.parent))
@@ -835,6 +841,12 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
         "hold_prediction_linked_count": 0,
         "hold_evidence_gap_count": 0,
         "hold_reconsider_count": 0,
+        "individual_vote_audit_count": 0,
+        "stage_execution_audit_count": 0,
+        "timed_out_committee_task_count": 0,
+        "errored_committee_task_count": 0,
+        "deadlock_review_count": 0,
+        "deadlock_review_adopted_count": 0,
         "latest_outcome_at": None,
         "latest_meeting_at": None,
         "newer_meeting_count": 0,
@@ -917,6 +929,50 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
                     "AND trim(COALESCE(reconsider_if, '')) NOT IN ('', '[]', 'null')"
                 ).fetchone()[0]
             )
+        if "individual_votes" in columns:
+            diagnostics["individual_vote_audit_count"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM simulation_committee_outcomes "
+                    "WHERE trim(COALESCE(individual_votes, '')) NOT IN ('', '[]', 'null')"
+                ).fetchone()[0]
+            )
+        if "stage_execution_audit" in columns:
+            stage_rows = conn.execute(
+                "SELECT stage_execution_audit FROM simulation_committee_outcomes "
+                "WHERE trim(COALESCE(stage_execution_audit, '')) "
+                "NOT IN ('', '[]', 'null')"
+            ).fetchall()
+            diagnostics["stage_execution_audit_count"] = len(stage_rows)
+            for row in stage_rows:
+                try:
+                    stages = json.loads(row[0] or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(stages, list):
+                    continue
+                diagnostics["timed_out_committee_task_count"] += sum(
+                    int(stage.get("timeout_count") or 0)
+                    for stage in stages
+                    if isinstance(stage, dict)
+                )
+                diagnostics["errored_committee_task_count"] += sum(
+                    int(stage.get("error_count") or 0)
+                    for stage in stages
+                    if isinstance(stage, dict)
+                )
+        if "deadlock_review" in columns:
+            deadlock_rows = conn.execute(
+                "SELECT deadlock_review FROM simulation_committee_outcomes "
+                "WHERE trim(COALESCE(deadlock_review, '')) NOT IN ('', '{}', 'null')"
+            ).fetchall()
+            diagnostics["deadlock_review_count"] = len(deadlock_rows)
+            for row in deadlock_rows:
+                try:
+                    audit = json.loads(row[0] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(audit, dict) and audit.get("adopted"):
+                    diagnostics["deadlock_review_adopted_count"] += 1
         prediction_select = "prediction_id," if "prediction_id" in columns else "NULL AS prediction_id,"
         evidence_select = (
             "evidence_gaps,"
@@ -928,6 +984,21 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
             if "reconsider_if" in columns
             else "NULL AS reconsider_if,"
         )
+        individual_select = (
+            "individual_votes,"
+            if "individual_votes" in columns
+            else "NULL AS individual_votes,"
+        )
+        stage_audit_select = (
+            "stage_execution_audit,"
+            if "stage_execution_audit" in columns
+            else "NULL AS stage_execution_audit,"
+        )
+        deadlock_select = (
+            "deadlock_review,"
+            if "deadlock_review" in columns
+            else "NULL AS deadlock_review,"
+        )
         diagnostics["recent"] = [
             dict(row)
             for row in conn.execute(
@@ -935,12 +1006,80 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
                 SELECT ticker, direction, vote_summary, vote_margin, vote_count,
                        parsed_vote_count, invalid_vote_count, quorum_required,
                        quorum_met, review_depth, {prediction_select}
-                       {evidence_select} {reconsider_select} created_at
+                       {evidence_select} {reconsider_select}
+                       {individual_select} {stage_audit_select}
+                       {deadlock_select} created_at
                 FROM simulation_committee_outcomes
                 ORDER BY datetime(created_at) DESC, id DESC
                 LIMIT ?
                 """,
                 (limit,),
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        return diagnostics
+    return diagnostics
+
+
+def research_stage_diagnostics(conn, stage: str = "stage2", limit: int = 5):
+    """Expose proposal-extraction terminal states from the durable learning loop."""
+    diagnostics = {
+        "available": False,
+        "total": 0,
+        "status_counts": {},
+        "candidate_bearing_empty_count": 0,
+        "recovered_count": 0,
+        "recent": [],
+    }
+    try:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='research_stage_diagnostics'"
+        ).fetchone()
+        diagnostics["available"] = bool(table)
+        if not table:
+            return diagnostics
+        diagnostics["total"] = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM research_stage_diagnostics WHERE stage = ?",
+                (stage,),
+            ).fetchone()[0]
+        )
+        diagnostics["status_counts"] = {
+            str(status): int(count)
+            for status, count in conn.execute(
+                "SELECT status, COUNT(*) FROM research_stage_diagnostics "
+                "WHERE stage = ? GROUP BY status",
+                (stage,),
+            ).fetchall()
+        }
+        diagnostics["candidate_bearing_empty_count"] = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM research_stage_diagnostics
+                WHERE stage = ?
+                  AND status LIKE 'empty%'
+                  AND trim(COALESCE(detected_tickers, '')) NOT IN ('', '[]', 'null')
+                """,
+                (stage,),
+            ).fetchone()[0]
+        )
+        diagnostics["recovered_count"] = int(
+            diagnostics["status_counts"].get("proposals_recovered", 0)
+        )
+        diagnostics["recent"] = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT topic, status, parse_mode, repair_modes,
+                       detected_tickers, reason, created_at
+                FROM research_stage_diagnostics
+                WHERE stage = ?
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (stage, max(0, int(limit))),
             ).fetchall()
         ]
     except sqlite3.Error:
@@ -968,6 +1107,10 @@ def show_investment_status(db_path):
         print("   (空仓)")
         print("\n   📜 最近交易:")
         print("   (无交易记录)")
+        print(f"\n   唯一绩效标准: {PERFORMANCE_STANDARD}")
+        print("   模拟账户累计净收益: +0.00% | score=+0.000000")
+        print("   离线回测: 仅诊断，不参与best/score/策略晋升")
+        print("   ❌ 系统异常: 模拟交易表尚未初始化且无任何模拟成交")
         conn.close()
         return
 
@@ -1026,8 +1169,33 @@ def show_investment_status(db_path):
     except sqlite3.Error:
         trades_today = 0
     try:
-        from sovereign_hall.core.config import get_config
-
+        c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(fee), 0), MAX(traded_at) "
+            "FROM simulation_trades"
+        )
+        trade_summary = c.fetchone()
+    except sqlite3.Error:
+        trade_summary = (0, 0.0, None)
+    try:
+        snapshot_rows = [
+            dict(row)
+            for row in c.execute(
+                """
+                SELECT s.total_assets, s.cash, s.positions_value,
+                       s.snapshot_date, s.created_at
+                FROM simulation_snapshots s
+                JOIN (
+                    SELECT snapshot_date, MAX(id) AS max_id
+                    FROM simulation_snapshots
+                    GROUP BY snapshot_date
+                ) latest ON latest.max_id = s.id
+                ORDER BY date(s.snapshot_date), s.id
+                """
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        snapshot_rows = []
+    try:
         max_daily_trades = int(
             get_config().get("simulation", {}).get("max_daily_trades", MAX_DAILY_TRADES)
         )
@@ -1092,6 +1260,7 @@ def show_investment_status(db_path):
     pending_decisions = pending_diagnostics["pending_rows"]
     pending_decision_total = pending_diagnostics["unresolved_count"]
     committee_diagnostics = committee_outcome_diagnostics(conn)
+    stage2_diagnostics = research_stage_diagnostics(conn)
 
     tickers = [pos[0] for pos in positions]
     conn.close()
@@ -1156,6 +1325,40 @@ def show_investment_status(db_path):
     total_value = cash + known_position_value if valuation_complete else None
     profit = total_value - initial_capital if total_value is not None else None
     profit_pct = (profit / initial_capital) * 100 if profit is not None else None
+    deployment = (
+        deployment_status(cash, total_value, 1.0)
+        if total_value is not None
+        else None
+    )
+    performance = build_simulation_performance(
+        initial_capital=initial_capital,
+        assets={
+            "valuation_complete": valuation_complete,
+            "total_assets": total_value,
+            "cash": cash,
+            "positions_value": known_position_value,
+            "invested_ratio": (
+                deployment["invested_ratio"] if deployment is not None else None
+            ),
+            "deployment_gap": (
+                deployment["deployment_gap"] if deployment is not None else None
+            ),
+            "missing_price_tickers": missing_realtime_tickers,
+        },
+        trade_count=int(trade_summary[0] if trade_summary else 0),
+        recorded_fees=float(trade_summary[1] if trade_summary else 0.0),
+        latest_trade_at=trade_summary[2] if trade_summary else None,
+        snapshot_rows=snapshot_rows,
+        no_trade_failure_days=int(
+            get_config().get("simulation", {}).get("no_trade_failure_days", 3) or 3
+        ),
+        minimum_healthy_invested_ratio=float(
+            get_config()
+            .get("simulation", {})
+            .get("minimum_healthy_invested_ratio", 0.80)
+            or 0.80
+        ),
+    )
 
     print("\n" + "="*60)
     print("📊 投资模拟状态")
@@ -1197,11 +1400,31 @@ def show_investment_status(db_path):
         )
     else:
         print("   最近裁决结果: 尚无已解决裁决")
-    print(f"   Reward: {REWARD_FORMULA}")
+    score_text = (
+        "N/A"
+        if performance["score"] is None
+        else f"{float(performance['score']):+.6f}"
+    )
+    return_text = (
+        "N/A"
+        if performance["net_total_return"] is None
+        else f"{float(performance['net_total_return']):+.2%}"
+    )
+    print(f"   唯一绩效标准: {PERFORMANCE_STANDARD}")
+    print(
+        f"   模拟账户累计净收益: {return_text} | score={score_text} "
+        f"| health={performance['health_status']}"
+    )
+    print(f"   口径: {PERFORMANCE_FORMULA}")
+    print("   离线回测: 仅诊断，不参与best/score/策略晋升")
+    if performance["health_status"] == "system_failure_no_live_deployment":
+        print(
+            "   ❌ 系统异常: 长期低投入且无新模拟成交；"
+            "必须修复研究→提案→投委会→实时行情→模拟成交链路"
+        )
     if total_value is None:
         print("   资金部署: N/A / 目标100.0%（实时估值不完整，禁止据此调仓）")
     else:
-        deployment = deployment_status(cash, total_value, 1.0)
         print(
             f"   资金部署: {deployment['invested_ratio']:.1%} / 目标100.0%；"
             f"待部署 {deployment['deployment_gap']:.2f} 元"
@@ -1289,6 +1512,43 @@ def show_investment_status(db_path):
     else:
         print("   (无待处理再配置状态)")
 
+    print("\n   🧪 研究→提案结构化审计:")
+    if stage2_diagnostics["available"] and stage2_diagnostics["total"]:
+        print(
+            f"   累计阶段2终态={stage2_diagnostics['total']} | "
+            f"修复后恢复提案={stage2_diagnostics['recovered_count']} | "
+            f"候选文本仍为空={stage2_diagnostics['candidate_bearing_empty_count']}"
+        )
+        print(
+            "   状态分布: "
+            + ", ".join(
+                f"{status}={count}"
+                for status, count in sorted(
+                    stage2_diagnostics["status_counts"].items()
+                )
+            )
+        )
+        for row in stage2_diagnostics["recent"]:
+            tickers = _decode_text_list(row.get("detected_tickers"))
+            repair_modes = _decode_text_list(row.get("repair_modes"))
+            print(
+                f"      - {row.get('status')} | parse={row.get('parse_mode') or 'none'} | "
+                f"ticker={','.join(tickers) or 'none'} | "
+                f"repair={','.join(repair_modes) or 'none'} | "
+                f"{row.get('created_at')}"
+            )
+            if row.get("reason"):
+                print(f"        原因: {str(row.get('reason'))[:300]}")
+        if stage2_diagnostics["candidate_bearing_empty_count"]:
+            print(
+                "   自动修复路径: 下一轮会回灌这些解析终态，并对原回答已出现且"
+                "原资料独立支持的ticker做一次证据审计；仍不合格则保持[]。"
+            )
+    elif stage2_diagnostics["available"]:
+        print("   0 条；下一轮 run_discussion 会开始追加保存每次阶段2终态")
+    else:
+        print("   尚未初始化；下一次 run_discussion 初始化后会创建追加式诊断表")
+
     print("\n   🗳️ 投委会票型审计:")
     if committee_diagnostics["available"] and committee_diagnostics["total"]:
         counts = committee_diagnostics["direction_counts"]
@@ -1304,6 +1564,26 @@ def show_investment_status(db_path):
             f"{committee_diagnostics['total']}；其中hold="
             f"{committee_diagnostics['hold_prediction_linked_count']}/"
             f"{counts.get('hold', 0)}"
+        )
+        print(
+            "   逐角色票型审计: "
+            f"{committee_diagnostics['individual_vote_audit_count']}/"
+            f"{committee_diagnostics['total']}；新裁决记录角色、方向和有效权重，"
+            "旧裁决不反推"
+        )
+        print(
+            "   阶段执行审计: "
+            f"{committee_diagnostics['stage_execution_audit_count']}/"
+            f"{committee_diagnostics['total']}；"
+            f"累计超时任务={committee_diagnostics['timed_out_committee_task_count']}，"
+            f"错误任务={committee_diagnostics['errored_committee_task_count']}；"
+            "缺席不计作HOLD且仍须满足原法定人数"
+        )
+        print(
+            "   空仓部署死锁复核: "
+            f"触发={committee_diagnostics['deadlock_review_count']}，"
+            f"通过={committee_diagnostics['deadlock_review_adopted_count']}；"
+            "只允许高置信、高方向支持且法定人数满足的复核改变HOLD"
         )
         if counts.get("hold", 0):
             print(
@@ -1357,6 +1637,54 @@ def show_investment_status(db_path):
             )
             evidence_gaps = _decode_text_list(outcome.get("evidence_gaps"))
             reconsider_if = _decode_text_list(outcome.get("reconsider_if"))
+            try:
+                individual_votes = json.loads(outcome.get("individual_votes") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                individual_votes = []
+            if individual_votes:
+                compact_votes = []
+                for vote in individual_votes[:7]:
+                    if not isinstance(vote, dict):
+                        continue
+                    compact_votes.append(
+                        f"{vote.get('role', '?')}={vote.get('direction', '?')}"
+                        f"@{float(vote.get('effective_weight') or 0):.2f}"
+                    )
+                if compact_votes:
+                    print(f"        角色票: {', '.join(compact_votes)}")
+            try:
+                stage_audit = json.loads(outcome.get("stage_execution_audit") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                stage_audit = []
+            absent_stages = []
+            if isinstance(stage_audit, list):
+                for stage in stage_audit:
+                    if not isinstance(stage, dict):
+                        continue
+                    timeout_count = int(stage.get("timeout_count") or 0)
+                    error_count = int(stage.get("error_count") or 0)
+                    if timeout_count or error_count:
+                        absent_stages.append(
+                            f"{stage.get('stage', '?')}: "
+                            f"timeout={timeout_count}, error={error_count}, "
+                            f"absent={stage.get('absent_labels') or []}"
+                        )
+            if absent_stages:
+                print(f"        阶段角色缺席: {'；'.join(absent_stages[:4])}")
+            try:
+                deadlock_review = json.loads(
+                    outcome.get("deadlock_review") or "{}"
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                deadlock_review = {}
+            if deadlock_review:
+                print(
+                    "        死锁复核: "
+                    f"adopted={bool(deadlock_review.get('adopted'))} | "
+                    f"direction={deadlock_review.get('review_direction')} | "
+                    f"confidence={float(deadlock_review.get('review_confidence') or 0):.1%} | "
+                    f"support={float(deadlock_review.get('review_direction_support') or 0):.1%}"
+                )
             if evidence_gaps:
                 print(f"        补证缺口: {'；'.join(evidence_gaps[:3])}")
             if reconsider_if:

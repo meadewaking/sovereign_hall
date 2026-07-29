@@ -251,6 +251,37 @@ async def test_database_skips_wiki_feedback_and_duplicate_urls(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_database_skips_cross_key_duplicate_without_unique_hash_error(tmp_path):
+    db = DatabaseService(str(tmp_path / "cross_key_dedupe.db"))
+    await db._init_db()
+    short = Document(
+        title="公司资料短版",
+        content="公司订单改善，现金流待验证。" * 6,
+        url="https://example.com/company-a",
+        source="duckduckgo",
+    )
+    canonical_content = "公司公告显示订单同比增长，经营现金流同步改善。" * 10
+    canonical = Document(
+        title="公司资料完整版",
+        content=canonical_content,
+        url="https://example.com/company-b",
+        source="duckduckgo",
+    )
+    url_refresh_with_duplicate_content = Document(
+        title="公司资料刷新",
+        content=canonical_content,
+        url="https://example.com/company-a",
+        source="duckduckgo",
+    )
+
+    assert await db.add_document(short) is True
+    assert await db.add_document(canonical) is True
+    assert await db.add_document(url_refresh_with_duplicate_content) is False
+    assert await db.count_documents() == 2
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_vector_database_adapter_uses_wiki_backend(tmp_path, sample_doc):
     vector_db = VectorDatabase(wiki_root=str(tmp_path / "knowledge"), embedding_enabled=False)
     await vector_db.initialize()

@@ -308,6 +308,25 @@ class DatabaseService:
                 )
             """)
 
+        # Stage-level diagnostics are first-class learning memory.  In
+        # particular, candidate-bearing prose that failed JSON extraction must
+        # not disappear as a generic "0 proposals" warning.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS research_stage_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL,
+                parse_mode TEXT,
+                repair_modes TEXT,
+                detected_tickers TEXT,
+                raw_excerpt TEXT,
+                reason TEXT,
+                source TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
         await ensure_prediction_schema(conn)
 
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_sector ON documents(sector)")
@@ -327,6 +346,11 @@ class DatabaseService:
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_meetings_proposal ON meetings(proposal_id)")
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_playbook_ticker ON playbook(ticker)")
+        await self._create_index_if_possible(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_research_stage_diagnostics_created "
+            "ON research_stage_diagnostics(stage, created_at DESC)",
+        )
 
         await conn.commit()
         self._initialized = True
@@ -423,6 +447,27 @@ class DatabaseService:
 
         if existing:
             if len(content) > int(existing["content_len"] or 0):
+                # The matching URL/id row and matching content-hash row can be
+                # different legacy records.  Updating the former to the
+                # latter's hash would violate the unique index and turn an
+                # ordinary duplicate into a noisy per-round warning.
+                async with conn.execute(
+                    """
+                    SELECT id
+                    FROM documents
+                    WHERE content_hash = ? AND id <> ?
+                    LIMIT 1
+                    """,
+                    (content_hash, existing["id"]),
+                ) as cursor:
+                    hash_owner = await cursor.fetchone()
+                if hash_owner:
+                    logger.debug(
+                        "Skipped cross-key duplicate document: existing_id=%s hash_owner=%s",
+                        existing["id"],
+                        hash_owner["id"],
+                    )
+                    return False
                 await conn.execute(
                     """
                     UPDATE documents
@@ -790,6 +835,67 @@ class DatabaseService:
         async with conn.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
+
+    async def record_research_stage_diagnostic(
+        self,
+        *,
+        topic: str,
+        stage: str,
+        status: str,
+        parse_mode: str = "",
+        repair_modes: Optional[List[str]] = None,
+        detected_tickers: Optional[List[str]] = None,
+        raw_excerpt: str = "",
+        reason: str = "",
+        source: str = "run_discussion",
+    ) -> int:
+        """Persist an exact pipeline terminal state for next-round learning."""
+        await self._ensure_initialized()
+        conn = await self._get_connection()
+        cursor = await conn.execute(
+            """
+            INSERT INTO research_stage_diagnostics (
+                topic, stage, status, parse_mode, repair_modes,
+                detected_tickers, raw_excerpt, reason, source, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(topic or ""),
+                str(stage or ""),
+                str(status or ""),
+                str(parse_mode or ""),
+                json.dumps(repair_modes or [], ensure_ascii=False),
+                json.dumps(detected_tickers or [], ensure_ascii=False),
+                str(raw_excerpt or "")[:8000],
+                str(reason or "")[:2000],
+                str(source or "run_discussion"),
+                datetime.now().isoformat(),
+            ),
+        )
+        await conn.commit()
+        return int(cursor.lastrowid)
+
+    async def get_recent_research_stage_diagnostics(
+        self,
+        *,
+        stage: str = "stage2",
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Load recent diagnostics without interpreting them as market facts."""
+        await self._ensure_initialized()
+        conn = await self._get_connection()
+        async with conn.execute(
+            """
+            SELECT *
+            FROM research_stage_diagnostics
+            WHERE stage = ?
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT ?
+            """,
+            (str(stage), max(0, int(limit))),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
 
     async def clear_old_checkpoints(self, keep: int = 5):
         """清理旧检查点"""

@@ -16,7 +16,7 @@ import json
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Any, Callable, List, Dict, Optional
+from typing import Any, Awaitable, Callable, List, Dict, Optional
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -81,6 +81,19 @@ def _safe_parse_json(text: str, default=None):
     return safe_parse_json(text, default)
 
 
+def _is_literal_empty_stage2_response(text: str) -> bool:
+    """Return true only when the model answer itself is an empty JSON array."""
+    stripped = str(text or "").strip()
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*(\[\s*\])\s*```",
+        stripped,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced:
+        stripped = fenced.group(1)
+    return bool(re.fullmatch(r"\[\s*\]", stripped, flags=re.DOTALL))
+
+
 def extract_stage2_proposal_array(text: str) -> tuple[List[Dict[str, Any]], str]:
     """Recover a proposal array embedded after verbose model reasoning.
 
@@ -93,12 +106,15 @@ def extract_stage2_proposal_array(text: str) -> tuple[List[Dict[str, Any]], str]
     if not text or not isinstance(text, str):
         return [], "empty"
 
+    saw_empty_array = False
     direct = _safe_parse_json(text, None)
     if isinstance(direct, list):
         proposals = [item for item in direct if isinstance(item, dict) and item.get("ticker")]
         if proposals:
             return proposals, "generic_parser"
-        return [], "explicit_empty"
+        saw_empty_array = True
+        if _is_literal_empty_stage2_response(text):
+            return [], "explicit_empty"
 
     decoder = json.JSONDecoder()
     object_candidates: List[Dict[str, Any]] = []
@@ -114,6 +130,8 @@ def extract_stage2_proposal_array(text: str) -> tuple[List[Dict[str, Any]], str]
             proposals = [item for item in value if isinstance(item, dict) and item.get("ticker")]
             if proposals:
                 return proposals, "embedded_array"
+            if not value:
+                saw_empty_array = True
         elif isinstance(value, dict) and value.get("ticker"):
             identity = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
             if identity not in seen_objects:
@@ -122,7 +140,171 @@ def extract_stage2_proposal_array(text: str) -> tuple[List[Dict[str, Any]], str]
 
     if object_candidates:
         return object_candidates, "embedded_objects"
+    if saw_empty_array and re.search(
+        r"(?<!\d)(?:[013568]\d{5})(?:\.(?:SH|SZ|BJ))?(?!\d)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        # A trailing ``[]`` must not erase an evidence-bearing candidate in the
+        # model's own prose.  Mark it ambiguous so stage 2 gets one bounded,
+        # evidence-preserving format repair pass.  The repair prompt may still
+        # return [] and is forbidden from introducing a new ticker or fact.
+        return [], "ambiguous_empty_with_candidate_text"
     return [], "unparsed"
+
+
+STAGE2_TICKER_RE = re.compile(
+    r"(?<!\d)(?:"
+    r"(?:000|001|002|003|300|301)\d{3}|"
+    r"(?:600|601|603|605|688)\d{3}|"
+    r"(?:159|510|512|513|515|516|517|518|520|560|561|562|563|588)\d{3}"
+    r")(?:\.(?:SH|SZ))?(?!\d)",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_stage2_candidate_windows(
+    text: str,
+    *,
+    radius: int = 600,
+    limit: int = 8,
+) -> List[Dict[str, str]]:
+    """Return auditable prose windows around tickers already present.
+
+    These windows are diagnostic inputs for a bounded adjudication pass.  They
+    are deliberately not converted into proposals: a ticker mention alone is
+    not evidence and must never become a simulated-trade candidate.
+    """
+    source = str(text or "")
+    windows: List[Dict[str, str]] = []
+    seen = set()
+    for match in STAGE2_TICKER_RE.finditer(source):
+        ticker = match.group(0).split(".", 1)[0].upper()
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        start = max(0, match.start() - max(0, int(radius)))
+        end = min(len(source), match.end() + max(0, int(radius)))
+        windows.append({
+            "ticker": ticker,
+            "excerpt": source[start:end].strip(),
+        })
+        if len(windows) >= max(0, int(limit)):
+            break
+    return windows
+
+
+def format_stage2_diagnostic_context(rows: List[Dict[str, Any]]) -> str:
+    """Turn recent stage-2 failures into falsifiable next-round memory."""
+    if not rows:
+        return ""
+    lines = [
+        "【最近阶段2结构化失败/恢复记忆】",
+        "以下是管线审计记录，不是当前市场事实；只能在本轮新资料独立支持时重提标的。",
+    ]
+    for row in rows[:5]:
+        tickers = row.get("detected_tickers") or []
+        if isinstance(tickers, str):
+            try:
+                tickers = json.loads(tickers)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                tickers = [tickers]
+        repair_modes = row.get("repair_modes") or []
+        if isinstance(repair_modes, str):
+            try:
+                repair_modes = json.loads(repair_modes)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                repair_modes = [repair_modes]
+        lines.append(
+            f"- {row.get('created_at') or 'unknown'} status={row.get('status') or 'unknown'} "
+            f"parse={row.get('parse_mode') or 'unknown'} "
+            f"repair={','.join(str(item) for item in repair_modes) or 'none'} "
+            f"tickers={','.join(str(item) for item in tickers) or 'none'}；"
+            f"{str(row.get('reason') or '')[:300]}"
+        )
+    lines.append(
+        "本轮若资料重新出现上述标的，必须输出合法JSON并保留证据/否决条件；"
+        "若证据仍不足则保持[]，不得把这段审计记忆当作推荐。"
+    )
+    return "\n".join(lines)
+
+
+def stage2_document_evidence_score(doc: Any) -> float:
+    """Rank existing documents for concrete, auditable proposal extraction."""
+    title = str(getattr(doc, "title", "") or "")
+    content = str(getattr(doc, "content", "") or "")
+    text = f"{title}\n{content}"
+    score = min(len(content), 1200) / 1200.0
+    ticker_count = len({match.group(0).split(".", 1)[0] for match in STAGE2_TICKER_RE.finditer(text)})
+    score += min(ticker_count, 3) * 4.0
+    if re.search(r"\d+(?:\.\d+)?%|同比|环比|亿元|订单|毛利率|净利润|现金流", text):
+        score += 2.0
+    if re.search(r"公告|财报|年报|季报|业绩预告|机构调研|中标|集采", text):
+        score += 2.0
+    if re.search(r"telegram|full animation|免费下载|钓鱼链接|配资", text, flags=re.IGNORECASE):
+        score -= 8.0
+    return score
+
+
+def rank_stage2_documents(docs: list) -> list:
+    """Stable evidence-first ordering; no document or candidate is invented."""
+    return [
+        doc
+        for _, doc in sorted(
+            enumerate(docs),
+            key=lambda pair: (-stage2_document_evidence_score(pair[1]), pair[0]),
+        )
+    ]
+
+
+def build_deployment_evidence_queries(docs: list, ticker_limit: int = 3) -> List[str]:
+    """Derive follow-up queries only from ticker codes already present in sources."""
+    ticker_scores: Dict[str, float] = {}
+    ticker_order: Dict[str, int] = {}
+    for doc_index, doc in enumerate(docs):
+        text = (
+            f"{getattr(doc, 'title', '') or ''}\n"
+            f"{getattr(doc, 'content', '') or ''}"
+        )
+        for match in STAGE2_TICKER_RE.finditer(text):
+            ticker = match.group(0).split(".", 1)[0]
+            ticker_order.setdefault(ticker, doc_index)
+            ticker_scores[ticker] = ticker_scores.get(ticker, 0.0) + stage2_document_evidence_score(doc)
+    ranked = sorted(
+        ticker_scores,
+        key=lambda ticker: (-ticker_scores[ticker], ticker_order[ticker], ticker),
+    )[:max(0, int(ticker_limit))]
+    queries: List[str] = []
+    for ticker in ranked:
+        queries.extend([
+            f"{ticker} 公告 财报 现金流",
+            f"{ticker} 机构调研 订单 业绩",
+        ])
+    return queries
+
+
+def merge_documents_prefer_richer(primary: list, additions: list) -> list:
+    """Merge by URL/id and retain the longer fetched body for the same source."""
+    merged = list(primary)
+    key_to_index: Dict[str, int] = {}
+    for index, doc in enumerate(merged):
+        key = getattr(doc, "url", "") or getattr(doc, "id", "") or getattr(doc, "doc_id", "")
+        if key:
+            key_to_index[key] = index
+    for doc in additions:
+        key = getattr(doc, "url", "") or getattr(doc, "id", "") or getattr(doc, "doc_id", "")
+        if not key:
+            continue
+        existing_index = key_to_index.get(key)
+        if existing_index is None:
+            key_to_index[key] = len(merged)
+            merged.append(doc)
+            continue
+        existing_content = str(getattr(merged[existing_index], "content", "") or "")
+        new_content = str(getattr(doc, "content", "") or "")
+        if len(new_content) > len(existing_content):
+            merged[existing_index] = doc
+    return merged
 
 
 def _numeric_stat(stats: Dict[str, Any], *keys: str) -> float:
@@ -693,6 +875,9 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
 
     research_config = get_config().get("research", {})
     max_results_per_query = int(research_config.get("search_results_per_query", 10) or 10)
+    deployment_deep_fetch_max_docs = int(
+        research_config.get("deployment_deep_fetch_max_docs", 6) or 6
+    )
 
     logger.info(f"========== 阶段1：海量信息搜索 - 议题: {topic} ==========")
     print("\n" + "="*60)
@@ -765,6 +950,35 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
         all_queries,
         max_results_per_query=max_results_per_query,
     )
+    if deployment_research and raw_docs:
+        evidence_queries = build_deployment_evidence_queries(raw_docs)
+        if evidence_queries:
+            logger.info(
+                "阶段1：从已抓取资料中的明确代码派生 %s 个证据补强查询（无预设ticker）",
+                len(evidence_queries),
+            )
+            evidence_docs = await spiders.aggressive_search(
+                evidence_queries,
+                max_results_per_query=max_results_per_query,
+            )
+            raw_docs = merge_documents_prefer_richer(raw_docs, evidence_docs)
+            deep_candidates = [
+                doc
+                for doc in rank_stage2_documents(evidence_docs)
+                if str(getattr(doc, "url", "") or "").startswith(("http://", "https://"))
+            ][:max(0, deployment_deep_fetch_max_docs)]
+            if deep_candidates:
+                deep_docs = await spiders.parallel_fetch(
+                    [getattr(doc, "url", "") for doc in deep_candidates],
+                    extract_full_text=True,
+                    max_concurrent=3,
+                )
+                raw_docs = merge_documents_prefer_richer(raw_docs, deep_docs)
+                logger.info(
+                    "阶段1：证据补强全文抓取 %s/%s 篇；失败保留原始摘要，不伪造正文",
+                    len(deep_docs),
+                    len(deep_candidates),
+                )
 
     print(f"\n抓取 {len(raw_docs)} 篇文档")
     return raw_docs
@@ -781,10 +995,42 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
     stage2_max_docs = int(research_config.get("stage2_max_docs", 30) or 30)
     stage2_doc_chars = int(research_config.get("stage2_doc_chars", 1200) or 1200)
     stage2_context_chars = int(research_config.get("stage2_context_chars", 24000) or 24000)
+    diagnostic_repair_modes: List[str] = []
+    detected_candidate_windows: List[Dict[str, str]] = []
+
+    async def record_stage2_diagnostic(
+        status: str,
+        *,
+        parse_mode: str = "",
+        raw_excerpt: str = "",
+        reason: str = "",
+    ) -> None:
+        if not db_service or not hasattr(db_service, "record_research_stage_diagnostic"):
+            return
+        try:
+            await db_service.record_research_stage_diagnostic(
+                topic=topic,
+                stage="stage2",
+                status=status,
+                parse_mode=parse_mode,
+                repair_modes=diagnostic_repair_modes,
+                detected_tickers=[
+                    item["ticker"] for item in detected_candidate_windows
+                ],
+                raw_excerpt=raw_excerpt,
+                reason=reason,
+                source="run_discussion.stage2_deep_research",
+            )
+        except Exception as diagnostic_error:
+            logger.warning("[diag] stage2 diagnostic persistence failed: %s", diagnostic_error)
 
     if not docs:
         print("\n⚠️ 没有文档，跳过深度研究")
         logger.warning("阶段2：没有文档，跳过深度研究")
+        await record_stage2_diagnostic(
+            "empty_no_documents",
+            reason="阶段1没有返回任何文档；没有候选可进入投委会",
+        )
         return []
 
     logger.info("========== 阶段2：深度研报生成 ==========")
@@ -827,11 +1073,17 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
             attrs = {k: type(getattr(sample, k, None)).__name__ for k in ('content', 'title', 'url', 'doc_id')}
             logger.warning(f"[diag] stage2 docs have no content. sample attrs={attrs}")
             logger.warning(f"[diag] sample doc repr: {repr(sample)[:300]}")
+        await record_stage2_diagnostic(
+            "empty_no_valid_documents",
+            reason=f"阶段1返回{len(docs)}篇文档，但正文超过50字符的有效文档为0",
+        )
         return []
 
     AgentCls = _get_agent()
 
-    # 构建文档摘要
+    # 构建文档摘要。联网返回顺序受查询完成顺序影响；先按“明确代码 +
+    # 可核查经营数据”排序，避免有限上下文被泛行业摘要或垃圾页占满。
+    valid_docs = rank_stage2_documents(valid_docs)
     doc_contents = []
     for doc in valid_docs[:stage2_max_docs]:
         content = getattr(doc, 'content', '') or ''
@@ -902,7 +1154,15 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
 
         # 解析JSON
         proposals, parse_mode = extract_stage2_proposal_array(response)
-        if not proposals and parse_mode != "explicit_empty" and str(response or "").strip():
+        detected_candidate_windows = extract_stage2_candidate_windows(response)
+        if (
+            not proposals
+            and str(response or "").strip()
+            and (
+                parse_mode != "explicit_empty"
+                or bool(detected_candidate_windows)
+            )
+        ):
             # Some reasoning models put a long analysis in ``reasoning_content``
             # but omit the requested final JSON.  The LLM client necessarily
             # returns that reasoning when normal content is empty.  Give the
@@ -941,6 +1201,16 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
                     timeout=300,
                 )
                 repaired, repair_mode = extract_stage2_proposal_array(repaired_response)
+                diagnostic_repair_modes.append(f"format:{repair_mode}")
+                primary_tickers = {
+                    item["ticker"] for item in detected_candidate_windows
+                }
+                repaired = [
+                    item
+                    for item in repaired
+                    if str(item.get("ticker") or "").split(".", 1)[0].upper()
+                    in primary_tickers
+                ]
                 logger.info(
                     "[diag] stage2 repair response len=%s, parsed=%s, mode=%s",
                     len(repaired_response or ""),
@@ -954,6 +1224,86 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
                 logger.warning("[diag] stage2 JSON repair timed out")
             except Exception as repair_error:
                 logger.warning("[diag] stage2 JSON repair failed: %s", repair_error)
+
+        if not proposals and detected_candidate_windows:
+            # A second, narrowly scoped pass adjudicates only ticker mentions
+            # already present in the primary answer against the original
+            # source excerpts.  It cannot introduce a ticker, source or fact.
+            candidate_tickers = {
+                item["ticker"] for item in detected_candidate_windows
+            }
+            source_excerpts = [
+                item
+                for item in doc_contents
+                if any(ticker in item for ticker in candidate_tickers)
+            ][:12]
+            adjudication_prompt = f"""
+审计下面的“候选窗口”，判断它们是否已经被“原始资料”支持为明确、可证伪的投资提案。
+
+允许的ticker（只可从此集合选择）：
+{json.dumps(sorted(candidate_tickers), ensure_ascii=False)}
+
+硬约束：
+1. 不得新增ticker、ETF、来源或事实；不允许仅凭候选名单/举例生成提案。
+2. 每个保留项必须在原始资料中找到至少两条具体证据，并给出明确long或short方向。
+3. 证据不足、只有行业常识、无法区分事实与推断时必须舍弃该项。
+4. 每项必须包含 ticker、direction、target_position、stop_loss、take_profit、
+   holding_period、holding_period_reason、confidence、thesis、sector、evidence、
+   resolved_rejection、evidence_delta、reject_if。
+5. 只输出合法JSON数组；没有合格项输出[]。
+
+候选窗口：
+{json.dumps(detected_candidate_windows, ensure_ascii=False)[:12000]}
+
+原始资料摘录：
+{chr(10).join(source_excerpts)[:14000] if source_excerpts else "没有包含候选ticker的原始资料，因此必须输出[]"}
+"""
+            try:
+                adjudicated_response = await asyncio.wait_for(
+                    llm.chat(
+                        system=(
+                            "你是证据审计器。只允许结构化原回答和原资料共同支持的提案；"
+                            "不得补造候选或事实。"
+                        ),
+                        user=adjudication_prompt,
+                        temperature=0.0,
+                        max_tokens=5000,
+                        use_cache=False,
+                    ),
+                    timeout=300,
+                )
+                adjudicated, adjudication_mode = extract_stage2_proposal_array(
+                    adjudicated_response
+                )
+                diagnostic_repair_modes.append(
+                    f"candidate_adjudication:{adjudication_mode}"
+                )
+                adjudicated = [
+                    item
+                    for item in adjudicated
+                    if str(item.get("ticker") or "").split(".", 1)[0].upper()
+                    in candidate_tickers
+                ]
+                logger.info(
+                    "[diag] stage2 candidate adjudication len=%s, parsed=%s, mode=%s",
+                    len(adjudicated_response or ""),
+                    len(adjudicated),
+                    adjudication_mode,
+                )
+                if adjudicated:
+                    proposals = adjudicated
+                    parse_mode = f"candidate_adjudication:{adjudication_mode}"
+            except asyncio.TimeoutError:
+                diagnostic_repair_modes.append("candidate_adjudication:timeout")
+                logger.warning("[diag] stage2 candidate adjudication timed out")
+            except Exception as adjudication_error:
+                diagnostic_repair_modes.append(
+                    f"candidate_adjudication:error:{type(adjudication_error).__name__}"
+                )
+                logger.warning(
+                    "[diag] stage2 candidate adjudication failed: %s",
+                    adjudication_error,
+                )
         logger.info(
             "[diag] stage2 parsed type=%s, len=%s, mode=%s",
             type(proposals).__name__,
@@ -965,32 +1315,58 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         cleaned = []
         from sovereign_hall.services.market_data import MarketDataService
 
+        cleaning_rejections: Dict[str, int] = {}
+
+        def reject_cleaning(code: str) -> None:
+            cleaning_rejections[code] = cleaning_rejections.get(code, 0) + 1
+
         for p in proposals:
             if not isinstance(p, dict):
+                reject_cleaning("not_object")
                 continue
             ticker = str(p.get('ticker', '')).strip().upper()
+            direction = str(p.get("direction") or "").strip().lower()
+            evidence = [
+                str(item)[:240]
+                for item in (p.get("evidence") or [])[:8]
+                if str(item).strip()
+            ]
+            thesis = build_proposal_thesis(p)
+            if direction not in {"long", "short"}:
+                reject_cleaning("missing_explicit_direction")
+                continue
+            if not evidence or not str(thesis).strip():
+                reject_cleaning("insufficient_structured_evidence")
+                continue
             if MarketDataService.is_supported_ticker(ticker):
                 # 过滤黑名单中的标的
                 if blacklist and ticker in blacklist:
                     logger.warning(f"Filtered blacklisted ticker: {ticker}")
+                    reject_cleaning("blacklist")
                     continue
-                cleaned_proposal = {
-                    'ticker': ticker,
-                    'direction': p.get('direction', 'long'),
-                    'target_position': float(p.get('target_position', 0.1)),
-                    'stop_loss': float(p.get('stop_loss', 5.0)),
-                    'take_profit': float(p.get('take_profit', 15.0)),
-                    'confidence': float(p.get('confidence', 0.6)),
-                    'thesis': build_proposal_thesis(p),
-                    'sector': p.get('sector', '未知'),
-                    'holding_period_reason': p.get('holding_period_reason', '')[:200],
-                    'evidence': [str(item)[:240] for item in (p.get('evidence') or [])[:8]],
-                    'resolved_rejection': str(p.get('resolved_rejection') or '')[:300],
-                    'evidence_delta': str(p.get('evidence_delta') or '')[:500],
-                    'reject_if': str(p.get('reject_if') or '')[:500],
-                }
+                try:
+                    cleaned_proposal = {
+                        'ticker': ticker,
+                        'direction': direction,
+                        'target_position': float(p.get('target_position', 0.1)),
+                        'stop_loss': float(p.get('stop_loss', 5.0)),
+                        'take_profit': float(p.get('take_profit', 15.0)),
+                        'confidence': float(p.get('confidence', 0.6)),
+                        'thesis': thesis,
+                        'sector': p.get('sector', '未知'),
+                        'holding_period_reason': str(p.get('holding_period_reason') or '')[:200],
+                        'evidence': evidence,
+                        'resolved_rejection': str(p.get('resolved_rejection') or '')[:300],
+                        'evidence_delta': str(p.get('evidence_delta') or '')[:500],
+                        'reject_if': str(p.get('reject_if') or '')[:500],
+                    }
+                except (TypeError, ValueError):
+                    reject_cleaning("invalid_numeric_field")
+                    continue
                 cleaned_proposal['holding_period'] = normalize_proposal_holding_period(cleaned_proposal | {'holding_period': p.get('holding_period')}, topic)
                 cleaned.append(cleaned_proposal)
+            else:
+                reject_cleaning("unsupported_ticker")
 
         logger.info(f"[diag] stage2 cleaned={len(cleaned)} (after blacklist filter)")
         if not cleaned:
@@ -1001,13 +1377,34 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
         if not cleaned:
             print("   ⚠️ 本轮没有得到有证据支持的提案；不注入预设标的")
 
+        await record_stage2_diagnostic(
+            (
+                "proposals_recovered"
+                if cleaned and diagnostic_repair_modes
+                else ("proposals_ready" if cleaned else "empty_after_adjudication")
+            ),
+            parse_mode=parse_mode,
+            raw_excerpt=str(response or "")[:8000],
+            reason=(
+                f"cleaned={len(cleaned)}; "
+                f"cleaning_rejections={json.dumps(cleaning_rejections, ensure_ascii=False)}"
+            ),
+        )
         return cleaned
 
     except asyncio.TimeoutError:
         print(f"   ⏰ 超时")
+        await record_stage2_diagnostic(
+            "timeout",
+            reason="阶段2主LLM调用超过600秒",
+        )
         return []
     except Exception as e:
         print(f"   ❌ 错误: {str(e)[:80]}")
+        await record_stage2_diagnostic(
+            "error",
+            reason=f"{type(e).__name__}: {str(e)[:1000]}",
+        )
         return []
 
 
@@ -1028,13 +1425,17 @@ def parse_committee_vote(text: str) -> Dict:
                 "long", "buy", "买入", "看多", "做多",
                 "short", "sell", "卖出", "看空", "做空",
                 "hold", "defer", "neutral", "观望", "暂缓", "不建议", "反对", "拒绝",
+                "abstain", "弃权", "超出能力圈",
             )
         )
         direction = normalize_vote_direction(
             raw_direction
         )
         confidence = parse_ratio_value(parsed_json.get("confidence"))
-        position = parse_ratio_value(parsed_json.get("position") or parsed_json.get("target_position"))
+        position_value = parsed_json.get("position")
+        if position_value in (None, ""):
+            position_value = parsed_json.get("target_position")
+        position = parse_ratio_value(position_value)
         risk_flags = parsed_json.get("risk_flags") or parsed_json.get("risks") or []
         if isinstance(risk_flags, str):
             risk_flags = [risk_flags]
@@ -1069,11 +1470,14 @@ def parse_committee_vote(text: str) -> Dict:
             "parse_mode": "empty",
         }
 
+    has_abstain = any(word in value for word in ("abstain", "弃权", "超出能力圈"))
     has_sell = any(word in value for word in ("卖出", "看空", "做空", "short", "sell"))
     has_hold = any(word in value for word in ("观望", "暂缓", "不建议", "反对", "拒绝", "hold", "defer"))
     has_buy = any(word in value for word in ("买入", "看多", "做多", "long", "buy"))
 
-    if has_sell:
+    if has_abstain:
+        direction = "abstain"
+    elif has_sell:
         direction = "short"
     elif has_hold and not has_buy:
         direction = "hold"
@@ -1099,19 +1503,74 @@ def parse_committee_vote(text: str) -> Dict:
         "risk_flags": [],
         "invalid_if": "",
         "key_evidence": [],
-        "is_valid": bool(has_sell or has_hold or has_buy),
-        "parse_mode": "natural_language" if (has_sell or has_hold or has_buy) else "unparsed",
+        "is_valid": bool(has_abstain or has_sell or has_hold or has_buy),
+        "parse_mode": (
+            "natural_language"
+            if (has_abstain or has_sell or has_hold or has_buy)
+            else "unparsed"
+        ),
     }
 
 
 def normalize_vote_direction(value: Any) -> str:
     """Normalize structured or natural-language vote direction."""
     text = str(value or "").strip().lower()
+    if any(word in text for word in ("abstain", "弃权", "超出能力圈")):
+        return "abstain"
     if any(word in text for word in ("short", "sell", "卖出", "看空", "做空")):
         return "short"
     if any(word in text for word in ("long", "buy", "买入", "看多", "做多")):
         return "long"
     return "hold"
+
+
+def committee_role_weight(
+    role: Any,
+    sector: str,
+    topic: str,
+    base_weight: float,
+) -> float:
+    """Reduce out-of-domain analyst votes without silencing their critique."""
+    role_value = str(getattr(role, "value", role) or "").lower()
+    if role_value not in {"tmt_analyst", "consumer_analyst", "cycle_analyst"}:
+        return float(base_weight)
+
+    context = f"{sector or ''} {topic or ''}".lower()
+    domain_keywords = {
+        "tmt_analyst": (
+            "ai", "tmt", "科技", "半导体", "芯片", "软件", "云计算",
+            "计算机", "通信", "电子", "互联网", "智能化", "机器人",
+        ),
+        "consumer_analyst": (
+            "消费", "食品", "饮料", "白酒", "乳制品", "餐饮", "家电",
+            "免税", "零售", "医药", "医疗", "器械", "服务", "旅游",
+        ),
+        "cycle_analyst": (
+            "周期", "有色", "金属", "化工", "煤炭", "钢铁", "地产",
+            "工程机械", "汽车", "电池", "新能源", "光伏", "制造", "材料",
+        ),
+    }
+    matched_roles = {
+        domain_role
+        for domain_role, keywords in domain_keywords.items()
+        if any(keyword in context for keyword in keywords)
+    }
+    if role_value in matched_roles:
+        return float(base_weight)
+    if matched_roles:
+        return round(float(base_weight) * 0.25, 4)
+    return round(float(base_weight) * 0.50, 4)
+
+
+COMMITTEE_DECISION_BOUNDARIES = """
+【委员会口径硬约束】
+- daily_prices、历史prediction价格、artifact价格只用于历史评估；当前模拟成交会在执行时重新取实时行情。因此历史日线覆盖不足不能单独构成当前买入/卖出的否决理由。
+- 历史同类预测胜率只作为置信度先验，不能单独把有当前可追溯证据、可证伪逻辑、明确止损和期限的提案否决为HOLD。
+- 当议题标记“空仓资金部署”时，当前组合没有行业相关性或已有科技仓位；不得虚构存量暴露作为否决理由。
+- 必须区分“事实反证”与“尚未取得数据”。前者可投HOLD/SHORT；后者写入补证队列，但不能伪称事实已经证伪。
+- 非本角色能力圈且没有独立新增证据时投abstain，不得用HOLD代替弃权。abstain参与出席法定人数，但不计入方向票。
+- 风险控制优先使用标的筛选、分散、仓位上限、止损止盈和期限，不得把长期现金当默认风险资产。
+""".strip()
 
 
 def parse_ratio_value(value: Any) -> Optional[float]:
@@ -1225,7 +1684,7 @@ def build_structured_vote_prompt(ticker: str, role_view: str, context: str, lear
 
 只输出JSON对象，不要Markdown，不要解释。字段：
 {{
-  "direction": "long/short/hold",
+  "direction": "long/short/hold/abstain",
   "confidence": 0.0,
   "position": 0.0,
   "key_evidence": ["最关键证据1", "最关键证据2"],
@@ -1235,18 +1694,100 @@ def build_structured_vote_prompt(ticker: str, role_view: str, context: str, lear
 
 约束：
 - 证据不足或反证更强时 direction 必须是 hold，position 必须是 0。
+- 若该标的超出本角色能力圈且没有独立新增证据，direction 必须是 abstain，position 必须是 0；不得用hold代替弃权。
 - 模拟组合目标投资比例是100%，hold不是默认的“无风险”选项；必须同时衡量继续闲置资金的机会成本。
 - 若已有可追溯事实、可证伪逻辑、明确止损/期限且预期收益风险比不低于0.8，应在风险预算内投long/short，而不是因存在一般性风险自动hold。
 - 若投hold，key_evidence必须写清仍缺少的决定性证据或尚未消除的反证，invalid_if必须写下一次可转为long/short的具体条件。
 - confidence 用0到1小数，position 用0到1小数。
+{COMMITTEE_DECISION_BOUNDARIES}
 """.strip()
 
 
-def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_weights: Optional[List[float]] = None) -> Dict:
+async def collect_committee_results(
+    tasks: List[tuple[str, Awaitable[str]]],
+    *,
+    timeout_seconds: float,
+    stage: str,
+) -> tuple[List[str], Dict[str, Any]]:
+    """Collect concurrent committee work with an independent task deadline.
+
+    Completed results survive a slow peer. Timed-out/error roles become
+    explicit, non-directional absences and therefore cannot count as HOLD.
+    """
+    timeout = max(0.001, float(timeout_seconds))
+
+    async def run_one(label: str, awaitable: Awaitable[str]) -> tuple[str, Dict[str, Any]]:
+        started = asyncio.get_running_loop().time()
+        status = "completed"
+        error = ""
+        try:
+            value = await asyncio.wait_for(awaitable, timeout=timeout)
+            result = str(value or "")
+        except asyncio.TimeoutError:
+            status = "timeout"
+            error = f"timeout_after_{timeout:g}s"
+            result = (
+                f"[committee_task_absent] stage={stage} role={label} "
+                f"reason=timeout timeout_seconds={timeout:g}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            status = "error"
+            error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            result = (
+                f"[committee_task_absent] stage={stage} role={label} "
+                f"reason=error error_type={type(exc).__name__}"
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+        return result, {
+            "label": str(label),
+            "status": status,
+            "elapsed_seconds": round(elapsed, 3),
+            "error": error,
+        }
+
+    collected = await asyncio.gather(*[
+        run_one(label, awaitable) for label, awaitable in tasks
+    ])
+    results = [item[0] for item in collected]
+    task_audit = [item[1] for item in collected]
+    audit = {
+        "stage": str(stage),
+        "timeout_seconds": timeout,
+        "task_count": len(task_audit),
+        "completed_count": sum(item["status"] == "completed" for item in task_audit),
+        "timeout_count": sum(item["status"] == "timeout" for item in task_audit),
+        "error_count": sum(item["status"] == "error" for item in task_audit),
+        "absent_labels": [
+            item["label"] for item in task_audit if item["status"] != "completed"
+        ],
+        "tasks": task_audit,
+    }
+    if audit["timeout_count"] or audit["error_count"]:
+        logger.warning(
+            "Committee stage %s preserved %s/%s results; timeout=%s error=%s absent=%s",
+            stage,
+            audit["completed_count"],
+            audit["task_count"],
+            audit["timeout_count"],
+            audit["error_count"],
+            audit["absent_labels"],
+        )
+    return results, audit
+
+
+def aggregate_committee_decision(
+    proposal: Dict,
+    vote_results: List[str],
+    vote_weights: Optional[List[float]] = None,
+    vote_labels: Optional[List[str]] = None,
+) -> Dict:
     """Aggregate loose text votes into the decision used by downstream systems."""
     parsed = [parse_committee_vote(vote) for vote in vote_results]
     weights = vote_weights or [2.0, 1.0, 1.0, 1.0, 1.0, 1.5, 1.0]
-    scores = {"long": 0.0, "short": 0.0, "hold": 0.0}
+    labels = vote_labels or [f"vote_{index + 1}" for index in range(len(parsed))]
+    scores = {"long": 0.0, "short": 0.0, "hold": 0.0, "abstain": 0.0}
     for index, vote in enumerate(parsed):
         if not vote.get("is_valid"):
             continue
@@ -1254,7 +1795,14 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
 
     parsed_vote_count = sum(bool(vote.get("is_valid")) for vote in parsed)
     quorum_required = max(2, (len(parsed) * 3 + 4) // 5) if parsed else 2
-    quorum_met = parsed_vote_count >= quorum_required
+    participation_quorum_met = parsed_vote_count >= quorum_required
+    directional_vote_count = sum(
+        bool(vote.get("is_valid")) and vote.get("direction") != "abstain"
+        for vote in parsed
+    )
+    directional_quorum_required = min(3, quorum_required)
+    directional_quorum_met = directional_vote_count >= directional_quorum_required
+    quorum_met = participation_quorum_met and directional_quorum_met
     if quorum_met and scores["long"] > scores["short"] and scores["long"] > scores["hold"]:
         direction = "long"
     elif quorum_met and scores["short"] > scores["long"] and scores["short"] > scores["hold"]:
@@ -1265,7 +1813,7 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
     total_weight = sum(
         weights[index] if index < len(weights) else 1.0
         for index, vote in enumerate(parsed)
-        if vote.get("is_valid")
+        if vote.get("is_valid") and vote.get("direction") != "abstain"
     )
     selected_votes = [
         (
@@ -1331,8 +1879,28 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
         "invalid_vote_count": len(parsed) - parsed_vote_count,
         "vote_quorum_required": quorum_required,
         "vote_quorum_met": quorum_met,
+        "participation_quorum_met": participation_quorum_met,
+        "directional_vote_count": directional_vote_count,
+        "directional_quorum_required": directional_quorum_required,
+        "directional_quorum_met": directional_quorum_met,
         "vote_parse_modes": [
             str(vote.get("parse_mode") or "unknown") for vote in parsed
+        ],
+        "individual_votes": [
+            {
+                "role": labels[index] if index < len(labels) else f"vote_{index + 1}",
+                "direction": vote.get("direction"),
+                "confidence": vote.get("confidence"),
+                "position": vote.get("position"),
+                "effective_weight": (
+                    weights[index] if index < len(weights) else 1.0
+                ),
+                "is_valid": bool(vote.get("is_valid")),
+                "parse_mode": str(vote.get("parse_mode") or "unknown"),
+                "key_evidence": vote.get("key_evidence") or [],
+                "invalid_if": vote.get("invalid_if") or "",
+            }
+            for index, vote in enumerate(parsed)
         ],
         "risk_flags": list(dict.fromkeys(risk_flags))[:8],
         "decision_evidence": selected_key_evidence,
@@ -1342,6 +1910,128 @@ def aggregate_committee_decision(proposal: Dict, vote_results: List[str], vote_w
         "evidence_gaps": selected_key_evidence if direction == "hold" else [],
         "reconsider_if": reconsider_if,
     }
+
+
+def committee_deadlock_requires_review(
+    decision: Dict[str, Any],
+    proposal: Dict[str, Any],
+    topic: str,
+) -> bool:
+    """Identify an auditable deployment deadlock without approving a trade."""
+    evidence = [
+        item for item in (proposal.get("evidence") or [])
+        if str(item).strip()
+    ]
+    return bool(
+        "空仓资金部署" in str(topic or "")
+        and str(decision.get("direction") or "").lower() == "hold"
+        and bool(decision.get("vote_quorum_met"))
+        and str(proposal.get("direction") or "").lower() in {"long", "short"}
+        and len(evidence) >= 2
+        and str(proposal.get("thesis") or "").strip()
+    )
+
+
+def merge_committee_deadlock_review(
+    original: Dict[str, Any],
+    review: Dict[str, Any],
+    *,
+    min_confidence: float = 0.65,
+    min_direction_support: float = 0.60,
+) -> Dict[str, Any]:
+    """Adopt only a strong, quorate core-committee directional re-review."""
+    original_copy = dict(original)
+    direction = str(review.get("direction") or "hold").lower()
+    qualifies = bool(
+        direction in {"long", "short"}
+        and review.get("vote_quorum_met")
+        and float(review.get("confidence") or 0.0) >= float(min_confidence)
+        and float(review.get("direction_support") or 0.0)
+        >= float(min_direction_support)
+        and float(review.get("target_position") or 0.0) > 0
+    )
+    audit = {
+        "triggered": True,
+        "adopted": qualifies,
+        "min_confidence": float(min_confidence),
+        "min_direction_support": float(min_direction_support),
+        "original_direction": str(original.get("direction") or "hold"),
+        "original_vote_summary": original.get("vote_summary") or {},
+        "review_direction": direction,
+        "review_confidence": float(review.get("confidence") or 0.0),
+        "review_direction_support": float(
+            review.get("direction_support") or 0.0
+        ),
+        "review_vote_summary": review.get("vote_summary") or {},
+        "review_quorum_met": bool(review.get("vote_quorum_met")),
+        "review_individual_votes": review.get("individual_votes") or [],
+    }
+    if not qualifies:
+        original_copy["deadlock_review"] = audit
+        return original_copy
+
+    adopted = dict(review)
+    adopted["deadlock_review"] = audit
+    adopted["initial_committee_decision"] = {
+        key: original.get(key)
+        for key in (
+            "direction",
+            "confidence",
+            "target_position",
+            "vote_summary",
+            "vote_margin",
+            "direction_support",
+            "individual_votes",
+            "evidence_gaps",
+            "reconsider_if",
+        )
+    }
+    adopted["risk_flags"] = list(dict.fromkeys(
+        list(original.get("risk_flags") or [])
+        + list(review.get("risk_flags") or [])
+    ))[:8]
+    return adopted
+
+
+def build_deployment_deadlock_review_prompt(
+    ticker: str,
+    role_view: str,
+    proposal: Dict[str, Any],
+    original_decision: Dict[str, Any],
+    context: str,
+) -> str:
+    """Build a narrow second review that cannot lower the evidence bar."""
+    return f"""
+空仓资金部署议题中，第一轮投委会对 {ticker} 形成HOLD。请从{role_view}独立复核：
+这是“事实反证成立”，还是“把一般风险/待补数据误当成否决”造成的部署死锁。
+
+原提案（不得添加新事实）：
+{json.dumps(proposal, ensure_ascii=False, default=str)[:7000]}
+
+第一轮裁决：
+{json.dumps(original_decision, ensure_ascii=False, default=str)[:5000]}
+
+已有讨论摘要：
+{context[:5000]}
+
+只输出JSON对象：
+{{
+  "direction": "long/short/hold/abstain",
+  "confidence": 0.0,
+  "position": 0.0,
+  "key_evidence": ["最关键证据1", "最关键证据2"],
+  "risk_flags": ["主要风险1", "主要风险2"],
+  "invalid_if": "推翻判断的具体条件"
+}}
+
+硬约束：
+- 不降低证据门槛，不因为“必须部署”而买入；事实证据不足仍投HOLD。
+- 不得把缺少历史日线、一般波动风险或尚未取得的数据写成已经发生的事实反证。
+- 只有原提案已有至少两条可追溯证据、明确止损/期限且风险收益比可接受时，才可在仓位纪律内投long/short。
+- HOLD必须指出决定性证据缺口；超出能力圈必须abstain。
+- 这是模拟投资裁决，禁止真实下单。
+{COMMITTEE_DECISION_BOUNDARIES}
+""".strip()
 
 
 def committee_decision_is_predictable(decision: Dict) -> bool:
@@ -1393,10 +2083,20 @@ def preflight_committee_decisions(
         vote_count = int(decision.get("vote_count") or 0)
         parsed_vote_count = int(decision.get("parsed_vote_count") or vote_count)
         invalid_vote_count = int(decision.get("invalid_vote_count") or 0)
+        directional_vote_count = int(
+            decision.get("directional_vote_count") or parsed_vote_count
+        )
+        directional_quorum_required = int(
+            decision.get("directional_quorum_required")
+            or decision.get("vote_quorum_required")
+            or 0
+        )
         vote_margin = float(decision.get("vote_margin") or 0.0)
         vote_audit = (
             f"；vote_summary={vote_summary}；vote_margin={vote_margin:.4f}；"
-            f"parsed_votes={parsed_vote_count}/{vote_count}；invalid_votes={invalid_vote_count}"
+            f"parsed_votes={parsed_vote_count}/{vote_count}；"
+            f"directional_votes={directional_vote_count}/{directional_quorum_required}；"
+            f"invalid_votes={invalid_vote_count}"
             if vote_summary is not None or vote_count
             else ""
         )
@@ -1426,7 +2126,9 @@ def preflight_committee_decisions(
                     if quorum_met
                     else (
                         "投委会有效票不足法定人数"
-                        f"({parsed_vote_count}/{int(decision.get('vote_quorum_required') or 0)})"
+                        f"(出席{parsed_vote_count}/"
+                        f"{int(decision.get('vote_quorum_required') or 0)}，"
+                        f"方向票{directional_vote_count}/{directional_quorum_required})"
                     )
                 ) + suffix,
             })
@@ -1495,6 +2197,34 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
     vote_max_tokens = int(research_config.get("committee_vote_max_tokens", 5000) or 5000)
     summary_chars = int(research_config.get("committee_summary_chars", 1200) or 1200)
     vote_context_chars = int(research_config.get("committee_vote_context_chars", 6000) or 6000)
+    round1_role_timeout = float(
+        research_config.get("committee_round1_role_timeout_seconds", 240) or 240
+    )
+    round2_role_timeout = float(
+        research_config.get("committee_round2_role_timeout_seconds", 180) or 180
+    )
+    revision_role_timeout = float(
+        research_config.get("committee_revision_role_timeout_seconds", 120) or 120
+    )
+    vote_role_timeout = float(
+        research_config.get("committee_vote_role_timeout_seconds", 90) or 90
+    )
+    deadlock_review_enabled = bool(
+        research_config.get("committee_deadlock_review_enabled", True)
+    )
+    deadlock_review_min_confidence = float(
+        research_config.get("committee_deadlock_min_confidence", 0.65) or 0.65
+    )
+    deadlock_review_min_support = float(
+        research_config.get("committee_deadlock_min_direction_support", 0.60)
+        or 0.60
+    )
+    deadlock_review_limit = int(
+        research_config.get("committee_deadlock_max_per_round", 1) or 1
+    )
+    deadlock_review_timeout = float(
+        research_config.get("committee_deadlock_role_timeout_seconds", 90) or 90
+    )
 
     logger.info("========== 阶段3：投委会审议 ==========")
     print("\n" + "="*60)
@@ -1514,6 +2244,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
 
     all_discussions = []
     final_decisions = []
+    deadlock_reviews_used = 0
 
     # 每轮优先讨论最高价值提案，但默认扩大审议面并保持深度辩论。
     committee_proposals = select_committee_proposals(proposals, limit=committee_proposal_limit)
@@ -1534,9 +2265,11 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             "不限制必要展开，但每条都必须承担不同验证角度；"
             "必须给出正反两面推理、至少两个可证伪条件、仓位纪律、观察指标；"
             "结论必须含买入/卖出/观望、置信度和否决条件。"
+            f"\n\n{COMMITTEE_DECISION_BOUNDARIES}"
         )
 
         print(f"\n### 提案 {i+1}: {ticker} ({proposal.get('direction')}) | 置信度: {proposal.get('confidence', 0):.0%} | 深度: {review_depth} | score={priority_score:.2f}")
+        stage_execution_audit: List[Dict[str, Any]] = []
 
         # ============================================================
         # 第一轮：14路并发分析
@@ -1574,26 +2307,35 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             round1_tasks = [task for task in round1_tasks if task[1] in light_names]
 
         try:
-            round1_results = await asyncio.wait_for(
-                asyncio.gather(*[
-                    agent.think_with_search(
-                        task=task,
-                        search_queries=queries,
-                        context=thesis,
-                        temperature=0.8,
-                        max_tokens=round1_max_tokens
+            round1_results, round1_audit = await collect_committee_results(
+                [
+                    (
+                        name,
+                        agent.think_with_search(
+                            task=task,
+                            search_queries=queries,
+                            context=thesis,
+                            temperature=0.8,
+                            max_tokens=round1_max_tokens,
+                        ),
                     )
                     for agent, name, task, queries in round1_tasks
-                ]),
-                timeout=1200
+                ],
+                timeout_seconds=round1_role_timeout,
+                stage="round1_independent_analysis",
             )
+            stage_execution_audit.append(round1_audit)
 
             task_names = [name for _, name, _, _ in round1_tasks]
             all_discussions.append(f"\n{'='*50}\n【{ticker}】第一轮分析\n{'='*50}")
             for name, result in zip(task_names, round1_results):
                 all_discussions.append(f"\n[{name}]\n{result[:summary_chars]}")
 
-            print(f"      ✅ 第一轮完成")
+            print(
+                f"      ✅ 第一轮完成 "
+                f"({round1_audit['completed_count']}/{round1_audit['task_count']}完成，"
+                f"超时{round1_audit['timeout_count']}，错误{round1_audit['error_count']})"
+            )
 
             round1_summary = "\n".join([f"{name}: {r[:summary_chars]}" for name, r in zip(task_names, round1_results)])
 
@@ -1619,26 +2361,35 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             round2_results = []
             if debate_tasks:
                 print(f"   📝 第二轮：深度辩论 ({len(debate_tasks)}路)...")
-                round2_results = await asyncio.wait_for(
-                    asyncio.gather(*[
-                        agent.think_with_search(
-                            task=task,
-                            search_queries=queries,
-                            context=round1_summary[:vote_context_chars],
-                            temperature=0.7,
-                            max_tokens=round2_max_tokens
+                round2_results, round2_audit = await collect_committee_results(
+                    [
+                        (
+                            name,
+                            agent.think_with_search(
+                                task=task,
+                                search_queries=queries,
+                                context=round1_summary[:vote_context_chars],
+                                temperature=0.7,
+                                max_tokens=round2_max_tokens,
+                            ),
                         )
                         for agent, name, task, queries in debate_tasks
-                    ]),
-                    timeout=900
+                    ],
+                    timeout_seconds=round2_role_timeout,
+                    stage="round2_cross_challenge",
                 )
+                stage_execution_audit.append(round2_audit)
 
                 debate_names = [name for _, name, _, _ in debate_tasks]
                 all_discussions.append(f"\n{'='*50}\n【{ticker}】第二轮辩论\n{'='*50}")
                 for name, result in zip(debate_names, round2_results):
                     all_discussions.append(f"\n[{name}]\n{result[:summary_chars]}")
 
-                print(f"      ✅ 第二轮完成")
+                print(
+                    f"      ✅ 第二轮完成 "
+                    f"({round2_audit['completed_count']}/{round2_audit['task_count']}完成，"
+                    f"超时{round2_audit['timeout_count']}，错误{round2_audit['error_count']})"
+                )
             else:
                 print("   📝 第二轮：轻量提案，跳过深度辩论")
 
@@ -1660,22 +2411,31 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                 (agents[AgentRole.CONSUMER_ANALYST], "需求-验证框架", "复核需求侧证据、渠道库存、价格敏感性和消费场景变化，给出验证路径。"),
                 (agents[AgentRole.CYCLE_ANALYST], "周期-拐点复核", "复核周期拐点、库存、产能、价格传导和盈利弹性，给出反转/失败条件。"),
             ]
-            round3_results = await asyncio.wait_for(
-                asyncio.gather(*[
-                    agent.think(
-                        task=f"{task}\n\n提案：{ticker}\n核心观点：{thesis}\n\n讨论材料：\n{revision_context[:vote_context_chars]}{analysis_format}",
-                        temperature=0.6,
-                        max_tokens=revision_max_tokens,
+            revision_results, revision_audit = await collect_committee_results(
+                [
+                    (
+                        name,
+                        agent.think(
+                            task=f"{task}\n\n提案：{ticker}\n核心观点：{thesis}\n\n讨论材料：\n{revision_context[:vote_context_chars]}{analysis_format}",
+                            temperature=0.6,
+                            max_tokens=revision_max_tokens,
+                        ),
                     )
                     for agent, name, task in revision_tasks
-                ]),
-                timeout=900,
+                ],
+                timeout_seconds=revision_role_timeout,
+                stage="round3_counterfactual_revision",
             )
+            stage_execution_audit.append(revision_audit)
             revision_names = [name for _, name, _ in revision_tasks]
             all_discussions.append(f"\n{'='*50}\n【{ticker}】第三轮修正复盘\n{'='*50}")
-            for name, result in zip(revision_names, round3_results):
+            for name, result in zip(revision_names, revision_results):
                 all_discussions.append(f"\n[{name}]\n{result[:summary_chars]}")
-            print("      ✅ 第三轮完成")
+            print(
+                f"      ✅ 第三轮完成 "
+                f"({revision_audit['completed_count']}/{revision_audit['task_count']}完成，"
+                f"超时{revision_audit['timeout_count']}，错误{revision_audit['error_count']})"
+            )
 
             # ============================================================
             # 第四轮：投票裁决
@@ -1686,57 +2446,155 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                 proposal,
                 list(zip(task_names, round1_results)),
                 list(zip(debate_names, round2_results)),
-                list(zip(revision_names, round3_results)),
+                list(zip(revision_names, revision_results)),
                 vote_context_chars,
             )
 
             vote_tasks = [
-                (agents[AgentRole.CIO], "CIO综合视角", 2.0),
-                (agents[AgentRole.TMT_ANALYST], "TMT行业视角", 1.0),
-                (agents[AgentRole.CONSUMER_ANALYST], "消费行业视角", 1.0),
-                (agents[AgentRole.CYCLE_ANALYST], "周期行业视角", 1.0),
-                (agents[AgentRole.MACRO_STRATEGIST], "宏观策略视角", 1.0),
-                (agents[AgentRole.RISK_OFFICER], "风控视角", 1.5),
-                (agents[AgentRole.QUANT_RESEARCHER], "量化视角", 1.0),
+                (agents[AgentRole.CIO], AgentRole.CIO, "CIO综合视角", 2.0),
+                (agents[AgentRole.TMT_ANALYST], AgentRole.TMT_ANALYST, "TMT行业视角", 1.0),
+                (agents[AgentRole.CONSUMER_ANALYST], AgentRole.CONSUMER_ANALYST, "消费行业视角", 1.0),
+                (agents[AgentRole.CYCLE_ANALYST], AgentRole.CYCLE_ANALYST, "周期行业视角", 1.0),
+                (agents[AgentRole.MACRO_STRATEGIST], AgentRole.MACRO_STRATEGIST, "宏观策略视角", 1.0),
+                (agents[AgentRole.RISK_OFFICER], AgentRole.RISK_OFFICER, "风控视角", 1.5),
+                (agents[AgentRole.QUANT_RESEARCHER], AgentRole.QUANT_RESEARCHER, "量化视角", 1.0),
             ]
             if not committee_full_discussion and review_depth == "focused":
-                vote_tasks = [task for task in vote_tasks if task[1] in {"CIO综合视角", "宏观策略视角", "风控视角", "量化视角"}]
+                vote_tasks = [task for task in vote_tasks if task[2] in {"CIO综合视角", "宏观策略视角", "风控视角", "量化视角"}]
             elif not committee_full_discussion and review_depth == "light":
-                vote_tasks = [task for task in vote_tasks if task[1] in {"CIO综合视角", "风控视角", "量化视角"}]
+                vote_tasks = [task for task in vote_tasks if task[2] in {"CIO综合视角", "风控视角", "量化视角"}]
 
             vote_prompts = [
                 build_structured_vote_prompt(ticker, role_view, full_context, learned_context)
-                for _, role_view, _ in vote_tasks
+                for _, _, role_view, _ in vote_tasks
             ]
 
-            # 第四轮投票 - 增加错误处理和日志
+            # 第四轮投票：逐角色超时，缺席不伪装成HOLD。
             print("      🔄 等待投票结果...")
-            try:
-                round3_results = await asyncio.wait_for(
-                    asyncio.gather(*[
-                        agent.think(task=prompt, temperature=0.4, max_tokens=vote_max_tokens)
-                        for agent, prompt in zip([a for a, _, _ in vote_tasks], vote_prompts)
-                    ]),
-                    timeout=600
-                )
-            except Exception as e:
-                logger.error(f"第四轮投票失败: {e}")
-                print(f"      ⚠️ 投票出错: {e}")
-                # 返回空结果继续
-                round3_results = [f"投票失败: {str(e)[:100]}" for _ in vote_tasks]
-
-            vote_names = [name for _, name, _ in vote_tasks]
-            vote_weights = [weight for _, _, weight in vote_tasks]
+            vote_names = [name for _, _, name, _ in vote_tasks]
+            vote_results, vote_audit = await collect_committee_results(
+                [
+                    (
+                        name,
+                        agent.think(
+                            task=prompt,
+                            temperature=0.4,
+                            max_tokens=vote_max_tokens,
+                        ),
+                    )
+                    for (agent, _, name, _), prompt in zip(vote_tasks, vote_prompts)
+                ],
+                timeout_seconds=vote_role_timeout,
+                stage="round4_vote",
+            )
+            stage_execution_audit.append(vote_audit)
+            vote_weights = [
+                committee_role_weight(role, sector, topic, weight)
+                for _, role, _, weight in vote_tasks
+            ]
             all_discussions.append(f"\n{'='*50}\n【{ticker}】第四轮投票\n{'='*50}")
-            for name, result in zip(vote_names, round3_results):
+            for name, result in zip(vote_names, vote_results):
                 all_discussions.append(f"\n[{name}]\n{result[:summary_chars]}")
 
-            committee_decision = aggregate_committee_decision(proposal, round3_results, vote_weights=vote_weights)
+            committee_decision = aggregate_committee_decision(
+                proposal,
+                vote_results,
+                vote_weights=vote_weights,
+                vote_labels=vote_names,
+            )
+            if (
+                deadlock_review_enabled
+                and deadlock_reviews_used < max(0, deadlock_review_limit)
+                and committee_deadlock_requires_review(
+                    committee_decision,
+                    proposal,
+                    topic,
+                )
+            ):
+                deadlock_reviews_used += 1
+                print(
+                    "      🔁 触发空仓部署死锁复核：核心三角色独立判断，"
+                    "不降低证据门槛"
+                )
+                review_specs = [
+                    (
+                        agents[AgentRole.CIO],
+                        "CIO部署与机会成本视角",
+                        2.0,
+                    ),
+                    (
+                        agents[AgentRole.RISK_OFFICER],
+                        "风控事实反证视角",
+                        1.5,
+                    ),
+                    (
+                        agents[AgentRole.QUANT_RESEARCHER],
+                        "量化可执行性视角",
+                        1.0,
+                    ),
+                ]
+                review_names = [item[1] for item in review_specs]
+                review_results, review_audit = await collect_committee_results(
+                    [
+                        (
+                            role_view,
+                            agent.think(
+                                task=build_deployment_deadlock_review_prompt(
+                                    ticker,
+                                    role_view,
+                                    proposal,
+                                    committee_decision,
+                                    full_context,
+                                ),
+                                temperature=0.2,
+                                max_tokens=vote_max_tokens,
+                            ),
+                        )
+                        for agent, role_view, _weight in review_specs
+                    ],
+                    timeout_seconds=deadlock_review_timeout,
+                    stage="deployment_deadlock_review",
+                )
+                stage_execution_audit.append(review_audit)
+                review_decision = aggregate_committee_decision(
+                    proposal,
+                    review_results,
+                    vote_weights=[item[2] for item in review_specs],
+                    vote_labels=review_names,
+                )
+                committee_decision = merge_committee_deadlock_review(
+                    committee_decision,
+                    review_decision,
+                    min_confidence=deadlock_review_min_confidence,
+                    min_direction_support=deadlock_review_min_support,
+                )
+                all_discussions.append(
+                    f"\n{'='*50}\n【{ticker}】空仓部署死锁复核\n{'='*50}"
+                )
+                for name, result in zip(review_names, review_results):
+                    all_discussions.append(f"\n[{name}]\n{result[:summary_chars]}")
+                deadlock_audit = committee_decision.get("deadlock_review") or {}
+                logger.info(
+                    "Deployment deadlock review ticker=%s adopted=%s "
+                    "direction=%s confidence=%.3f support=%.3f",
+                    ticker,
+                    deadlock_audit.get("adopted"),
+                    deadlock_audit.get("review_direction"),
+                    float(deadlock_audit.get("review_confidence") or 0.0),
+                    float(deadlock_audit.get("review_direction_support") or 0.0),
+                )
+                if deadlock_audit.get("adopted"):
+                    print(
+                        f"      ✅ 死锁复核通过: {committee_decision.get('direction')} "
+                        f"| confidence={float(committee_decision.get('confidence') or 0):.0%}"
+                    )
+                else:
+                    print("      ➖ 死锁复核未通过，保留HOLD并记录具体缺口")
             expected_days = normalize_proposal_holding_period(proposal, topic)
             committee_decision.update({
                 'ticker': ticker,
                 'thesis': thesis,
-                'cio_vote': round3_results[0][:200],
+                'cio_vote': vote_results[0][:200],
                 'review_depth': review_depth,
                 'priority_score': priority_score,
                 'target_price': proposal.get('take_profit', 15.0),
@@ -1746,6 +2604,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                 'holding_period_reason': proposal.get('holding_period_reason', ''),
                 'sector': sector,
                 'discussion_excerpt': full_context[:24000],
+                'stage_execution_audit': stage_execution_audit,
             })
             final_decisions.append(committee_decision)
 
@@ -1765,6 +2624,7 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                             f"审议深度: {review_depth}; priority_score={priority_score:.2f}; "
                             f"vote_margin={committee_decision.get('vote_margin', 0):.2f}; "
                             f"vote_summary={committee_decision.get('vote_summary')}; "
+                            f"individual_votes={committee_decision.get('individual_votes', [])}; "
                             f"risk_flags={committee_decision.get('risk_flags', [])}; "
                             f"evidence_gaps={committee_decision.get('evidence_gaps', [])}; "
                             f"reconsider_if={committee_decision.get('reconsider_if', [])}"
@@ -1784,7 +2644,13 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
             except Exception as e:
                 logger.warning(f"记录决策失败: {e}")
 
-            print(f"      ✅ 投票完成")
+            print(
+                f"      ✅ 投票完成 "
+                f"({vote_audit['completed_count']}/{vote_audit['task_count']}完成，"
+                f"超时{vote_audit['timeout_count']}，错误{vote_audit['error_count']}；"
+                f"有效票{committee_decision['parsed_vote_count']}/"
+                f"{committee_decision['vote_count']})"
+            )
 
         except asyncio.TimeoutError:
             print(f"      ⏰ 讨论超时，跳过")
@@ -1930,6 +2796,24 @@ async def run_committee_approved_simulation(
         print("\n💰 当前非交易时段：继续逐仓复核、持久化投委会结果并形成待执行裁决，不模拟成交")
     history_reflection = await simulation.get_recent_reflection(limit=2)
     assets = await simulation.calculate_assets()
+    performance = (
+        await simulation.get_performance_metrics()
+        if hasattr(simulation, "get_performance_metrics")
+        else {}
+    )
+    logger.info(
+        "SIMULATION_PIPELINE_BEGIN decisions=%s trading_day=%s market_open=%s "
+        "market_session_open=%s valuation_complete=%s invested_ratio=%s "
+        "net_total_return=%s health=%s",
+        len(decisions),
+        trading_day,
+        market_open,
+        market_session_open,
+        assets.get("valuation_complete"),
+        assets.get("invested_ratio"),
+        performance.get("net_total_return"),
+        performance.get("health_status"),
+    )
     heuristic_context = load_latest_heuristic_context()
     if assets.get("valuation_complete"):
         print(f"   当前资产: {assets['total_assets']:.2f}元 | 现金: {assets['cash']:.2f}元 | 持仓: {assets['positions_value']:.2f}元（实时现价）")
@@ -1940,14 +2824,34 @@ async def run_committee_approved_simulation(
             f"{', '.join(assets.get('missing_price_tickers', []))}"
         )
     if heuristic_context.available:
-        print(
-            f"   Heuristic风控: {heuristic_context.policy_name} "
-            f"score={heuristic_context.score if heuristic_context.score is not None else 'N/A'} | "
-            f"单标的上限{heuristic_context.max_position:.0%} | {heuristic_context.warning}"
+        live_return = performance.get("net_total_return")
+        live_return_text = (
+            "N/A" if live_return is None else f"{float(live_return):+.2%}"
         )
+        print(
+            f"   模拟账户唯一绩效: 累计净收益={live_return_text} | "
+            f"health={performance.get('health_status', 'valuation_incomplete')} | "
+            f"当前执行安全策略={heuristic_context.policy_name} | "
+            f"单标的上限{heuristic_context.max_position:.0%}"
+        )
+        print("   离线回测仅作诊断，不产生best/score，也不能替代模拟成交")
 
     print("   🔎 先执行全部现有持仓的强制生命周期复核...")
     position_reviews = await simulation.review_open_positions()
+    logger.info(
+        "SIMULATION_LIFECYCLE_REVIEW positions=%s outcomes=%s",
+        len(position_reviews),
+        {
+            action: sum(
+                str(item.get("action") or "unknown") == action
+                for item in position_reviews
+            )
+            for action in sorted({
+                str(item.get("action") or "unknown")
+                for item in position_reviews
+            })
+        },
+    )
     for review in position_reviews:
         action = review.get("action", "unknown")
         ticker = review.get("ticker", "")
@@ -2025,6 +2929,12 @@ async def run_committee_approved_simulation(
         redeployment_rejections.append(item)
         label = f"{ticker}: " if ticker else ""
         redeployment_blockers.append(f"[{code}] {label}{reason}")
+        logger.warning(
+            "SIMULATION_TERMINAL_REJECTION code=%s ticker=%s reason=%s",
+            code,
+            ticker or "-",
+            str(reason or "")[:1000],
+        )
 
     if redeployment_rejections:
         counts: Dict[str, int] = {}
@@ -2036,6 +2946,16 @@ async def run_committee_approved_simulation(
         print(
             "   🧪 投委会裁决预检否决: "
             + ", ".join(f"{code}={count}" for code, count in sorted(counts.items()))
+        )
+        logger.warning(
+            "SIMULATION_PREFLIGHT_REJECTIONS candidates=%s counts=%s",
+            len(trade_candidates),
+            json.dumps(counts, ensure_ascii=False, sort_keys=True),
+        )
+    else:
+        logger.info(
+            "SIMULATION_PREFLIGHT_REJECTIONS candidates=%s counts={}",
+            len(trade_candidates),
         )
     deployable_new_longs = [
         decision for decision in trade_candidates
@@ -2133,6 +3053,16 @@ async def run_committee_approved_simulation(
             if pending_id is not None:
                 pending_count += 1
                 print(f"   🗂️ {ticker}: 裁决 #{pending_id} 已排队，未记录成交价")
+                logger.info(
+                    "SIMULATION_PENDING_DECISION id=%s ticker=%s direction=%s "
+                    "target_position=%.6f confidence=%.6f defer_code=%s",
+                    pending_id,
+                    ticker,
+                    direction,
+                    target_position,
+                    confidence,
+                    "non_trading_day" if not trading_day else "market_closed",
+                )
 
         closed_reason = (
             "当前非交易日；投委会结果与逐仓复核已持久化，可执行裁决仅排队"
@@ -2160,6 +3090,14 @@ async def run_committee_approved_simulation(
             print(f"\n📝 每日投资反思:")
             print(reflection[:500] + "...")
         await simulation.save_snapshot(reflection)
+        logger.info(
+            "SIMULATION_PIPELINE_END fills=0 pending=%s candidates=%s "
+            "valuation_complete=%s invested_ratio=%s terminal=market_closed",
+            pending_count,
+            len(trade_candidates),
+            final_assets.get("valuation_complete"),
+            final_assets.get("invested_ratio"),
+        )
         return
 
     if trade_candidates:
@@ -2310,9 +3248,27 @@ async def run_committee_approved_simulation(
             elif result.get('action') == 'buy':
                 print(f"   📈 买入 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
                 trade_count += 1
+                logger.info(
+                    "SIMULATION_FILL action=buy ticker=%s shares=%s price=%.6f "
+                    "source=%s reason=%s",
+                    ticker,
+                    result.get("shares"),
+                    float(result.get("price") or 0.0),
+                    result.get("price_source") or price_source or "realtime_quote",
+                    str(trade_reason)[:1000],
+                )
             elif result.get('action') == 'sell':
                 print(f"   📉 卖出 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
                 trade_count += 1
+                logger.info(
+                    "SIMULATION_FILL action=sell ticker=%s shares=%s price=%.6f "
+                    "source=%s reason=%s",
+                    ticker,
+                    result.get("shares"),
+                    float(result.get("price") or 0.0),
+                    result.get("price_source") or price_source or "realtime_quote",
+                    str(trade_reason)[:1000],
+                )
             elif result.get('action') == 'hold' and result.get('reason'):
                 reason = result.get('reason')
                 code = "lot_size_or_cash" if any(
@@ -2333,8 +3289,21 @@ async def run_committee_approved_simulation(
             print(f"      - {ticker}: {pos['shares']}股 @ 成本{pos['avg_cost']:.2f} (持有{days_held}天)")
     else:
         if not redeployment_rejections:
-            reject("no_committee_decisions", "投委会没有返回任何结构化裁决")
-        print(f"   💤 投委会无新交易裁决且空仓，保持观望")
+            reject(
+                "system_failure_no_live_deployment",
+                "模拟账户空仓且投委会没有返回任何结构化裁决；研究到成交链路未闭合",
+            )
+        print(
+            "   ❌ 系统异常：模拟账户空仓且无可执行裁决；"
+            "本轮未产生成交，不能解释为正常观望或用离线收益覆盖"
+        )
+        logger.error(
+            "SIMULATION_PIPELINE_FAILURE code=system_failure_no_live_deployment "
+            "decisions=%s candidates=%s rejections=%s",
+            len(decisions),
+            len(trade_candidates),
+            json.dumps(redeployment_rejections, ensure_ascii=False)[:4000],
+        )
 
     final_assets = await simulation.calculate_assets()
     if hasattr(simulation, "record_redeployment_attempt"):
@@ -2357,6 +3326,34 @@ async def run_committee_approved_simulation(
             f"   📊 交易后: 现金 {final_assets['cash']:.2f}元 | 当前资产N/A；"
             f"缺少实时现价: {', '.join(final_assets.get('missing_price_tickers', []))}"
         )
+    final_performance = (
+        await simulation.get_performance_metrics()
+        if hasattr(simulation, "get_performance_metrics")
+        else {}
+    )
+    final_return = final_performance.get("net_total_return")
+    final_return_text = (
+        "N/A" if final_return is None else f"{float(final_return):+.2%}"
+    )
+    print(
+        "   唯一绩效结算: "
+        f"模拟账户累计净收益={final_return_text} | "
+        f"本轮新增成交={trade_count} | "
+        f"health={final_performance.get('health_status', 'valuation_incomplete')}"
+    )
+    if trade_count == 0:
+        print("   本轮绩效改进=N/A（没有新增模拟成交，不允许声明策略收益改进）")
+    logger.info(
+        "SIMULATION_PIPELINE_END fills=%s candidates=%s rejections=%s "
+        "valuation_complete=%s invested_ratio=%s net_total_return=%s health=%s",
+        trade_count,
+        len(trade_candidates),
+        len(redeployment_rejections),
+        final_assets.get("valuation_complete"),
+        final_assets.get("invested_ratio"),
+        final_performance.get("net_total_return"),
+        final_performance.get("health_status"),
+    )
 
     reflection = await simulation.daily_reflection(llm)
     if reflection:
@@ -2762,6 +3759,29 @@ async def main():
                 historical_learning_context = "\n\n".join(
                     part for part in (lessons_prompt, research_memory_prompt) if part
                 )
+                stage2_diagnostic_context = ""
+                if hasattr(db_service, "get_recent_research_stage_diagnostics"):
+                    try:
+                        stage2_diagnostic_context = format_stage2_diagnostic_context(
+                            await db_service.get_recent_research_stage_diagnostics(
+                                stage="stage2",
+                                limit=5,
+                            )
+                        )
+                    except Exception as diagnostic_error:
+                        logger.warning(
+                            "读取阶段2诊断记忆失败，不阻塞联网研究: %s",
+                            diagnostic_error,
+                        )
+                if stage2_diagnostic_context:
+                    historical_learning_context = "\n\n".join(
+                        part
+                        for part in (
+                            historical_learning_context,
+                            stage2_diagnostic_context,
+                        )
+                        if part
+                    )
                 prompt_lessons = build_lessons_with_heuristic_context(
                     historical_learning_context,
                     redeployment_context=redeployment_context,
@@ -2826,8 +3846,16 @@ async def main():
                                 "quorum_required": decision.get("vote_quorum_required"),
                                 "quorum_met": decision.get("vote_quorum_met"),
                                 "review_depth": decision.get("review_depth"),
+                                "individual_votes": decision.get("individual_votes") or [],
+                                "directional_vote_count": decision.get("directional_vote_count"),
+                                "directional_quorum_required": decision.get("directional_quorum_required"),
+                                "directional_quorum_met": decision.get("directional_quorum_met"),
                                 "evidence_gaps": decision.get("evidence_gaps") or [],
                                 "reconsider_if": decision.get("reconsider_if") or [],
+                                "deadlock_review": decision.get("deadlock_review") or {},
+                                "initial_committee_decision": (
+                                    decision.get("initial_committee_decision") or {}
+                                ),
                             },
                             action_items=[
                                 f"验证窗口: {int(decision.get('expected_days') or 30)}天",

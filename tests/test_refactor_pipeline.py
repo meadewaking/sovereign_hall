@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import sqlite3
 import json
@@ -29,6 +30,10 @@ from sovereign_hall.services.reward_policy import (
     idle_cash_exposure_penalty,
     limit_rebalance_actions,
 )
+from sovereign_hall.services.simulation_performance import (
+    PERFORMANCE_STANDARD,
+    build_simulation_performance,
+)
 from sovereign_hall.services.heuristic_policy import (
     HeuristicRiskContext,
     apply_heuristic_risk_cap,
@@ -47,7 +52,7 @@ from sovereign_hall.services.heuristic_policy import (
 )
 from sovereign_hall.services.market_data import MarketDataService
 from sovereign_hall.services.llm_client import LLMClient
-from sovereign_hall.services.spider_service import SpiderSwarm
+from sovereign_hall.services.spider_service import SearchQueryGenerator, SpiderSwarm
 from sovereign_hall.services.learning_engine import LearningEngine
 from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
 from sovereign_hall.services.prediction_tracker import PredictionTracker
@@ -64,13 +69,22 @@ from sovereign_hall.run_discussion import (
     bounded_sync_index_batch,
     cli_args_can_run_without_instance_lock,
     committee_decision_is_predictable,
+    committee_deadlock_requires_review,
+    committee_role_weight,
+    collect_committee_results,
+    build_deployment_evidence_queries,
     filter_repeated_rejection_proposals,
+    extract_stage2_candidate_windows,
     extract_stage2_proposal_array,
+    format_stage2_diagnostic_context,
+    merge_committee_deadlock_review,
     parse_committee_vote,
     parse_args,
     preflight_committee_decisions,
+    merge_documents_prefer_richer,
     proposal_priority_score,
     prioritize_deployment_research,
+    rank_stage2_documents,
     select_next_topic,
     stage2_deep_research,
     stage3_ic_discussion,
@@ -96,6 +110,49 @@ def test_entry_imports():
     import sovereign_hall.check_db  # noqa: F401
     import sovereign_hall.research_interactive  # noqa: F401
     import sovereign_hall.run_discussion  # noqa: F401
+
+
+def test_simulation_account_return_is_the_only_authoritative_score():
+    metrics = build_simulation_performance(
+        initial_capital=10000.0,
+        assets={
+            "valuation_complete": True,
+            "total_assets": 9727.22,
+            "cash": 9727.22,
+            "positions_value": 0.0,
+            "invested_ratio": 0.0,
+            "deployment_gap": 9727.22,
+        },
+        trade_count=28,
+        recorded_fees=12.34,
+        latest_trade_at="2026-07-14T09:57:44",
+        now=datetime.fromisoformat("2026-07-29T15:00:00"),
+    )
+
+    assert metrics["performance_standard"] == PERFORMANCE_STANDARD
+    assert metrics["score"] == pytest.approx(-0.027278)
+    assert metrics["net_total_return"] == metrics["score"]
+    assert metrics["offline_backtest_promotion_allowed"] is False
+    assert metrics["health_status"] == "system_failure_no_live_deployment"
+
+
+def test_incomplete_realtime_valuation_never_falls_back_to_offline_return():
+    metrics = build_simulation_performance(
+        initial_capital=10000.0,
+        assets={
+            "valuation_complete": False,
+            "cash": 5000.0,
+            "missing_price_tickers": ["600519"],
+        },
+        trade_count=1,
+        recorded_fees=1.0,
+        latest_trade_at="2026-07-29T09:45:00",
+    )
+
+    assert metrics["score"] is None
+    assert metrics["net_total_return"] is None
+    assert metrics["health_status"] == "valuation_incomplete"
+    assert metrics["missing_price_tickers"] == ["600519"]
 
 
 @pytest.mark.asyncio
@@ -150,6 +207,123 @@ def test_stage2_parser_marks_model_empty_array_as_auditable_empty_result():
     assert mode == "explicit_empty"
 
 
+def test_stage2_document_ranking_prioritizes_code_and_auditable_operating_fact():
+    generic = Document(
+        title="行业展望",
+        content="消费电子复苏趋势讨论。" * 30,
+        source="unit",
+    )
+    concrete = Document(
+        title="公司公告",
+        content="证券代码301387，公告显示净利润同比增长25%，经营现金流改善。",
+        source="unit",
+    )
+
+    ranked = rank_stage2_documents([generic, concrete])
+
+    assert ranked[0] is concrete
+
+
+def test_deployment_followup_queries_only_use_tickers_observed_in_documents():
+    docs = [
+        Document(
+            title="行业异动",
+            content="光大同创（301387）上涨，公告显示净利润同比增长25%。",
+            source="unit",
+        ),
+        Document(
+            title="无代码观点",
+            content="建议关注某龙头，但资料没有证券代码。",
+            source="unit",
+        ),
+    ]
+
+    queries = build_deployment_evidence_queries(docs)
+
+    assert queries == [
+        "301387 公告 财报 现金流",
+        "301387 机构调研 订单 业绩",
+    ]
+    assert all("推荐标的" not in query for query in queries)
+
+
+def test_document_merge_replaces_snippet_with_same_url_full_text():
+    snippet = Document(
+        title="公司公告摘要",
+        content="证券代码600519，现金流改善。",
+        url="https://example.com/notice",
+        source="duckduckgo",
+    )
+    full = Document(
+        title="公司公告全文",
+        content="证券代码600519，经营活动现金流同比改善，公告列示原因。" * 20,
+        url="https://example.com/notice",
+        source="example.com",
+    )
+
+    merged = merge_documents_prefer_richer([snippet], [full])
+
+    assert merged == [full]
+
+
+def test_search_query_generator_rejects_punctuation_only_placeholder():
+    generator = SearchQueryGenerator(AsyncMock())
+
+    assert generator._is_valid_query("...", topic="消费电子复苏前景") is False
+    assert generator._is_valid_query("消费电子 财报", topic="消费电子复苏前景") is True
+
+
+@pytest.mark.asyncio
+async def test_search_query_generator_repairs_reasoning_without_inventing_ticker():
+    class ReasoningQueryLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return (
+                    "可检索对象包括中国中免601888和海南机场600515。"
+                    "建议查询中国中免601888财报、海南机场600515现金流。"
+                )
+            return json.dumps(
+                ["中国中免601888财报", "海南机场600515现金流"],
+                ensure_ascii=False,
+            )
+
+    llm = ReasoningQueryLLM()
+    generator = SearchQueryGenerator(llm)
+
+    queries = await generator.generate_queries(
+        count=5,
+        seeds={"macro": [], "sector": ["免税店"], "stocks": []},
+        topic="免税店竞争格局",
+    )
+
+    assert queries == ["中国中免601888财报", "海南机场600515现金流"]
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["temperature"] == 0.0
+    assert llm.calls[1]["use_cache"] is False
+
+
+def test_stage2_parser_does_not_let_trailing_empty_array_erase_candidate_text():
+    proposals, mode = extract_stage2_proposal_array(
+        "资料支持德赛西威002920作为多头提案，订单证据充分。\n最终输出：[]"
+    )
+
+    assert proposals == []
+    assert mode == "ambiguous_empty_with_candidate_text"
+
+
+def test_stage2_candidate_windows_only_capture_tickers_already_in_response():
+    windows = extract_stage2_candidate_windows(
+        "先讨论行业，再评估600515的订单证据；没有提及其他标的。"
+    )
+
+    assert [item["ticker"] for item in windows] == ["600515"]
+    assert "600515" in windows[0]["excerpt"]
+
+
 @pytest.mark.asyncio
 async def test_stage2_repairs_reasoning_only_response_without_fallback_ticker():
     class ReasoningThenRepairLLM:
@@ -196,6 +370,220 @@ async def test_stage2_repairs_reasoning_only_response_without_fallback_ticker():
     assert len(llm.calls) == 2
     assert llm.calls[1]["temperature"] == 0.0
     assert llm.calls[1]["use_cache"] is False
+
+
+@pytest.mark.asyncio
+async def test_stage2_repairs_candidate_text_even_when_response_ends_with_empty_array():
+    class CandidateThenEmptyLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return (
+                    "资料明确支持德赛西威002920作为多头提案，"
+                    "事实为本地订单摘要显示新增订单，方向为long。\n[]"
+                )
+            return json.dumps([
+                {
+                    "ticker": "002920",
+                    "direction": "long",
+                    "target_position": 0.1,
+                    "stop_loss": 6.0,
+                    "take_profit": 12.0,
+                    "holding_period": 30,
+                    "holding_period_reason": "等待月度订单验证",
+                    "confidence": 0.7,
+                    "thesis": "事实: 本地订单摘要显示新增订单；推断: 收入有望改善",
+                    "sector": "汽车电子",
+                    "evidence": ["本地订单摘要：新增订单"],
+                    "resolved_rejection": "",
+                    "evidence_delta": "",
+                    "reject_if": "新增订单未转化为收入"
+                }
+            ], ensure_ascii=False)
+
+    doc = Document(
+        title="德赛西威本地订单摘要",
+        content="本地订单摘要显示新增订单，资料明确标注股票代码002920。" * 3,
+        url="local://evidence/002920",
+        source="unit",
+    )
+    llm = CandidateThenEmptyLLM()
+
+    proposals = await stage2_deep_research(llm, [doc], "订单验证")
+
+    assert [proposal["ticker"] for proposal in proposals] == ["002920"]
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_stage2_adjudicates_candidate_after_format_repair_stays_empty():
+    class CandidateRepairAdjudicationLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return (
+                    "原资料中的600515具有订单增长与现金流改善两条证据，"
+                    "可作为long候选，但最终格式错误。\n[]"
+                )
+            if len(self.calls) == 2:
+                return "[]"
+            return json.dumps([
+                {
+                    "ticker": "600515",
+                    "direction": "long",
+                    "target_position": 0.08,
+                    "stop_loss": 6.0,
+                    "take_profit": 12.0,
+                    "holding_period": 30,
+                    "holding_period_reason": "等待下一月订单验证",
+                    "confidence": 0.7,
+                    "thesis": "事实: 订单增长且现金流改善；推断: 盈利质量提升",
+                    "sector": "交通服务",
+                    "evidence": ["公司公告：订单增长", "公司公告：现金流改善"],
+                    "resolved_rejection": "",
+                    "evidence_delta": "本轮公司公告补充两条经营证据",
+                    "reject_if": "订单取消或现金流重新恶化",
+                }
+            ], ensure_ascii=False)
+
+    db = AsyncMock()
+    db.get_blacklist.return_value = []
+    doc = Document(
+        title="600515公司公告",
+        content=(
+            "证券代码600515，公司公告披露新增订单增长；"
+            "经营活动现金流同比改善，数据可追溯。"
+        ) * 3,
+        url="https://example.com/600515",
+        source="unit",
+    )
+    llm = CandidateRepairAdjudicationLLM()
+
+    proposals = await stage2_deep_research(
+        llm,
+        [doc],
+        "空仓资金部署候选证据比较",
+        db_service=db,
+    )
+
+    assert [proposal["ticker"] for proposal in proposals] == ["600515"]
+    assert len(llm.calls) == 3
+    diagnostic = db.record_research_stage_diagnostic.await_args.kwargs
+    assert diagnostic["status"] == "proposals_recovered"
+    assert diagnostic["detected_tickers"] == ["600515"]
+    assert diagnostic["repair_modes"] == [
+        "format:explicit_empty",
+        "candidate_adjudication:generic_parser",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stage2_format_repair_cannot_introduce_unseen_ticker():
+    class InventingRepairLLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return "资料不足，只有泛行业分析，结构化输出缺失。"
+            return json.dumps([{
+                "ticker": "600519",
+                "direction": "long",
+                "target_position": 0.1,
+                "stop_loss": 5,
+                "take_profit": 10,
+                "holding_period": 30,
+                "confidence": 0.8,
+                "thesis": "格式修复器自行新增的标的",
+                "evidence": ["不存在的证据"],
+            }], ensure_ascii=False)
+
+    doc = Document(
+        title="无标的行业摘要",
+        content="这是一段没有证券代码、没有具体公司事实的泛行业资料。" * 4,
+        url="https://example.com/industry",
+        source="unit",
+    )
+    llm = InventingRepairLLM()
+
+    proposals = await stage2_deep_research(llm, [doc], "行业分析")
+
+    assert proposals == []
+    assert llm.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_stage2_persists_candidate_bearing_empty_for_next_round(tmp_path):
+    class StillEmptyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return "600515只是待核实候选，资料不足，不能形成提案。\n[]"
+            return "[]"
+
+    db = DatabaseService(str(tmp_path / "stage2.db"))
+    await db._init_db()
+    doc = Document(
+        title="600515待核实摘要",
+        content="证券代码600515出现在摘要中，但没有两条独立经营证据。" * 4,
+        url="https://example.com/unverified-600515",
+        source="unit",
+    )
+
+    proposals = await stage2_deep_research(
+        StillEmptyLLM(),
+        [doc],
+        "空仓资金部署候选证据比较",
+        db_service=db,
+    )
+    diagnostics = await db.get_recent_research_stage_diagnostics(limit=1)
+    await db.close()
+
+    assert proposals == []
+    assert diagnostics[0]["status"] == "empty_after_adjudication"
+    assert json.loads(diagnostics[0]["detected_tickers"]) == ["600515"]
+    context = format_stage2_diagnostic_context(diagnostics)
+    assert "不是当前市场事实" in context
+    assert "600515" in context
+
+
+@pytest.mark.asyncio
+async def test_check_db_reports_persisted_stage2_candidate_loss(tmp_path):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "stage2_audit.db"
+    db = DatabaseService(str(db_path))
+    await db._init_db()
+    await db.record_research_stage_diagnostic(
+        topic="空仓资金部署候选证据比较",
+        stage="stage2",
+        status="empty_after_adjudication",
+        parse_mode="ambiguous_empty_with_candidate_text",
+        repair_modes=["format:explicit_empty"],
+        detected_tickers=["600515"],
+        reason="format repair stayed empty",
+    )
+    await db.close()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    diagnostics = check_db.research_stage_diagnostics(conn)
+    conn.close()
+
+    assert diagnostics["available"] is True
+    assert diagnostics["total"] == 1
+    assert diagnostics["candidate_bearing_empty_count"] == 1
+    assert json.loads(diagnostics["recent"][0]["detected_tickers"]) == ["600515"]
 
 
 def test_run_discussion_defaults_to_network_research():
@@ -1961,6 +2349,26 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsy
             "prediction_id": "hold-prediction-1",
             "evidence_gaps": ["缺少可核验订单增速"],
             "reconsider_if": ["订单增速连续两期为正"],
+            "individual_votes": [{
+                "role": "CIO综合视角",
+                "direction": "hold",
+                "effective_weight": 2.0,
+            }],
+            "stage_execution_audit": [{
+                "stage": "round4_vote",
+                "task_count": 7,
+                "completed_count": 6,
+                "timeout_count": 1,
+                "error_count": 0,
+                "absent_labels": ["消费行业视角"],
+            }],
+            "deadlock_review": {
+                "triggered": True,
+                "adopted": False,
+                "review_direction": "hold",
+                "review_confidence": 0.6,
+                "review_direction_support": 1.0,
+            },
         }],
         source="test",
     )
@@ -1976,7 +2384,12 @@ async def test_redeployment_queue_recovers_and_persists_attempts(tmp_path, capsy
     assert "投委会票型审计" in output
     assert "有效票=7/7" in output
     assert "可验证反馈链接: 1/1；其中hold=1/1" in output
+    assert "逐角色票型审计: 1/1" in output
+    assert "阶段执行审计: 1/1；累计超时任务=1，错误任务=0" in output
+    assert "空仓部署死锁复核: 触发=1，通过=0" in output
+    assert "死锁复核: adopted=False" in output
     assert "HOLD补证闭环: 明确证据缺口=1/1；明确重审条件=1/1" in output
+    assert "角色票: CIO综合视角=hold@2.00" in output
     assert "补证缺口: 缺少可核验订单增速" in output
     assert "重审条件: 订单增速连续两期为正" in output
 
@@ -2058,7 +2471,11 @@ async def test_simulation_position_schema_migrates_lifecycle_columns(tmp_path):
         "opened_at", "peak_price", "last_mark_price", "last_mark_at",
         "last_mark_source", "last_reviewed_at", "review_status", "review_reason",
     } <= columns
-    assert {"evidence_gaps", "reconsider_if"} <= committee_columns
+    assert {
+        "evidence_gaps", "reconsider_if", "individual_votes",
+        "stage_execution_audit", "deadlock_review",
+        "initial_committee_decision",
+    } <= committee_columns
 
 
 def test_heuristic_risk_cap_uses_latest_policy_as_constraint(tmp_path):
@@ -4133,6 +4550,67 @@ def test_committee_votes_can_defer_to_hold():
     assert committee_decision_is_predictable(decision) is True
 
 
+def test_deployment_deadlock_review_can_adopt_only_strong_quorate_direction():
+    proposal = {
+        "ticker": "600515",
+        "direction": "long",
+        "target_position": 0.08,
+        "confidence": 0.7,
+        "thesis": "事实: 订单增长且现金流改善；推断: 盈利质量提升",
+        "evidence": ["公告订单数据", "公告现金流数据"],
+    }
+    original = aggregate_committee_decision(
+        proposal,
+        [
+            '{"direction":"hold","confidence":0.4,"position":0}',
+            '{"direction":"hold","confidence":0.4,"position":0}',
+            '{"direction":"hold","confidence":0.4,"position":0}',
+        ],
+        vote_weights=[2.0, 1.5, 1.0],
+    )
+    review = aggregate_committee_decision(
+        proposal,
+        [
+            '{"direction":"long","confidence":0.72,"position":0.08}',
+            '{"direction":"long","confidence":0.68,"position":0.06}',
+            '{"direction":"long","confidence":0.70,"position":0.07}',
+        ],
+        vote_weights=[2.0, 1.5, 1.0],
+    )
+
+    assert committee_deadlock_requires_review(
+        original,
+        proposal,
+        "空仓资金部署候选证据比较",
+    )
+    merged = merge_committee_deadlock_review(original, review)
+
+    assert merged["direction"] == "long"
+    assert merged["deadlock_review"]["adopted"] is True
+    assert merged["initial_committee_decision"]["direction"] == "hold"
+
+
+def test_deployment_deadlock_review_preserves_hold_when_confidence_is_low():
+    original = {
+        "direction": "hold",
+        "confidence": 0.4,
+        "target_position": 0.0,
+        "vote_summary": {"hold": 4.5},
+    }
+    weak_review = {
+        "direction": "long",
+        "confidence": 0.64,
+        "target_position": 0.08,
+        "direction_support": 1.0,
+        "vote_quorum_met": True,
+    }
+
+    merged = merge_committee_deadlock_review(original, weak_review)
+
+    assert merged["direction"] == "hold"
+    assert merged["deadlock_review"]["adopted"] is False
+
+
 def test_quorum_failure_hold_is_not_a_prediction():
     assert committee_decision_is_predictable({
         "direction": "hold",
@@ -4288,6 +4766,85 @@ def test_committee_vote_accepts_structured_json():
     assert vote["risk_flags"] == ["估值偏高"]
     assert vote["key_evidence"] == ["订单增长"]
     assert vote["invalid_if"] == "跌破支撑"
+
+
+def test_committee_vote_accepts_auditable_abstention():
+    vote = parse_committee_vote(
+        '{"direction":"abstain","confidence":0.2,"position":0,'
+        '"key_evidence":["超出消费分析能力圈"],'
+        '"invalid_if":"取得独立消费需求证据"}'
+    )
+
+    assert vote["is_valid"] is True
+    assert vote["direction"] == "abstain"
+    assert vote["position"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_committee_task_timeouts_preserve_completed_results_and_audit_absence():
+    async def completed_vote():
+        await asyncio.sleep(0)
+        return '{"direction":"long","confidence":0.8,"position":0.1}'
+
+    async def slow_vote():
+        await asyncio.sleep(0.05)
+        return '{"direction":"hold","confidence":0.8,"position":0}'
+
+    results, audit = await collect_committee_results(
+        [
+            ("CIO综合视角", completed_vote()),
+            ("消费行业视角", slow_vote()),
+        ],
+        timeout_seconds=0.01,
+        stage="round4_vote",
+    )
+
+    assert parse_committee_vote(results[0])["direction"] == "long"
+    assert parse_committee_vote(results[0])["is_valid"] is True
+    assert parse_committee_vote(results[1])["is_valid"] is False
+    assert "[committee_task_absent]" in results[1]
+    assert audit["completed_count"] == 1
+    assert audit["timeout_count"] == 1
+    assert audit["absent_labels"] == ["消费行业视角"]
+
+
+def test_committee_domain_weight_reduces_out_of_domain_hold_pressure():
+    assert committee_role_weight(
+        AgentRole.TMT_ANALYST, "半导体设备", "国产替代", 1.0
+    ) == pytest.approx(1.0)
+    assert committee_role_weight(
+        AgentRole.CONSUMER_ANALYST, "半导体设备", "国产替代", 1.0
+    ) == pytest.approx(0.25)
+    assert committee_role_weight(
+        AgentRole.RISK_OFFICER, "半导体设备", "国产替代", 1.5
+    ) == pytest.approx(1.5)
+
+
+def test_committee_abstentions_keep_quorum_without_counting_as_hold():
+    decision = aggregate_committee_decision(
+        {"confidence": 0.7, "target_position": 0.08},
+        [
+            '{"direction":"long","confidence":0.75,"position":0.08}',
+            '{"direction":"long","confidence":0.70,"position":0.06}',
+            '{"direction":"abstain","confidence":0.2,"position":0}',
+            '{"direction":"abstain","confidence":0.2,"position":0}',
+            '{"direction":"hold","confidence":0.4,"position":0}',
+            '{"direction":"hold","confidence":0.5,"position":0}',
+            '{"direction":"long","confidence":0.68,"position":0.05}',
+        ],
+        vote_weights=[2.0, 1.0, 0.25, 0.25, 1.0, 1.5, 1.0],
+        vote_labels=["CIO", "TMT", "消费", "周期", "宏观", "风控", "量化"],
+    )
+
+    assert decision["direction"] == "long"
+    assert decision["vote_summary"]["long"] == pytest.approx(4.0)
+    assert decision["vote_summary"]["hold"] == pytest.approx(2.5)
+    assert decision["vote_summary"]["abstain"] == pytest.approx(0.5)
+    assert decision["parsed_vote_count"] == 7
+    assert decision["directional_vote_count"] == 5
+    assert decision["vote_quorum_met"] is True
+    assert decision["individual_votes"][2]["role"] == "消费"
+    assert decision["individual_votes"][2]["direction"] == "abstain"
 
 
 def test_committee_hold_aggregation_preserves_evidence_work_queue():

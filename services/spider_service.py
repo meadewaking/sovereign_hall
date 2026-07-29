@@ -1117,6 +1117,27 @@ class SearchQueryGenerator:
         MAX_RETRIES = 3  # 最大重试次数
         seeds = seeds or self.DEFAULT_SEEDS
 
+        def parse_query_list(raw_response: str) -> List[str]:
+            parsed = safe_parse_json(raw_response, [])
+            if not parsed:
+                try:
+                    import ast
+                    parsed = ast.literal_eval(raw_response)
+                except Exception as exc:
+                    logger.debug("解析查询词列表失败: %s", exc)
+                    parsed = []
+            if not parsed:
+                matches = re.findall(r'"([^"]+)"', raw_response)
+                parsed = matches[:30] if matches else []
+            if not isinstance(parsed, list):
+                return []
+            return [
+                str(query).strip()
+                for query in parsed
+                if isinstance(query, str)
+                and self._is_valid_query(query, topic=topic_str)
+            ]
+
         topic_str = topic or "当前A股投资机会"
         prompt = f"""
 针对议题「{topic_str}」，生成{count}个具体的搜索引擎查询词，用于发现相关投资机会。
@@ -1171,29 +1192,36 @@ class SearchQueryGenerator:
             if not response or response == "null" or response == "None" or response == "[]":
                 raise ValueError(f"Empty response after strip: '{response[:100]}'")
 
-            # 解析JSON，增加更宽松的处理
-            queries = safe_parse_json(response, [])
-
-            # 如果解析失败，尝试直接用 eval 或 ast.literal_eval
+            queries = parse_query_list(response)
             if not queries:
-                try:
-                    import ast
-                    queries = ast.literal_eval(response)
-                    if not isinstance(queries, list):
-                        queries = []
-                except Exception as exc:
-                    logger.debug("解析查询词列表失败: %s", exc)
+                # Reasoning models sometimes list explicit company/code search
+                # ideas in prose but omit the requested final array.  One
+                # bounded repair may structure only those existing ideas.
+                repair_response = await self.llm.chat(
+                    system=(
+                        "你是搜索词格式修复器。只能整理原回答已有查询词、公司和代码，"
+                        "不得新增公司、ticker、事实或泛化兜底词。"
+                    ),
+                    user=f"""
+将下面原回答中已经明确写出的搜索词整理为合法JSON字符串数组。
+只保留与「{topic_str}」直接相关、可检索的词。
+不得新增原回答没有的公司、证券代码或事件；没有明确搜索词时输出[]。
+只输出JSON数组。
 
-            # 如果还是失败，尝试提取所有引号内的内容
-            if not queries:
-                import re
-                # 提取引号内的中文或英文词
-                matches = re.findall(r'"([^"]+)"', response)
-                if matches:
-                    queries = matches[:30]
+原回答：
+{response[:12000]}
+""",
+                    temperature=0.0,
+                    max_tokens=2000,
+                    use_cache=False,
+                )
+                queries = parse_query_list(str(repair_response or "").strip())
+                logger.info(
+                    "Query JSON repair: response_len=%s parsed=%s",
+                    len(repair_response or ""),
+                    len(queries),
+                )
 
-            # 后处理：过滤占位符/泛词
-            queries = [q for q in queries if self._is_valid_query(str(q), topic=topic_str)]
             # 去重（保序）
             seen = set()
             deduped = []
@@ -1256,6 +1284,8 @@ class SearchQueryGenerator:
         """校验查询词是否有效：非空、非占位符、非纯泛词。"""
         q = (query or "").strip()
         if not q or len(q) < 2:
+            return False
+        if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", q):
             return False
         low = q.lower()
         # 占位符直接过滤

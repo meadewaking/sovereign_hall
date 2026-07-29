@@ -10,7 +10,7 @@ Sovereign Hall 模拟一个买方投研机构：自动选择议题、检索资�
 
 系统的主循环是：持续联网检索新资料，结合数据库中的旧结论、预测期限和真实验证结果，由多 agent 独立分析、交叉质疑、反事实修正并投票，最后把资料、提案、会议、结论、预测、模拟交易和反思写回数据库。下一次讨论必须把这些历史结果作为“待重新验证的先验”带回讨论，而不是把旧结论当成当前事实。
 
-Heuristic Learning 是维护系统的 coding agent 使用的非梯度优化方法。它读取可复现实验和模拟账户结果，以扣除真实模拟成本后的总资金收益为主要 reward，同时约束回撤、成本、换手和资金部署。Heuristic Learning coding agent 不得通过外部网页搜索替代本地实验；这项限制不约束交易系统本身。`run_discussion` 和 `research_interactive` 默认可以联网研究。
+Heuristic Learning 是维护系统的 coding agent 使用的非梯度优化方法。唯一有效的 reward/score 是按受控实时行情估值后的模拟账户累计净收益；佣金、卖出印花税和滑点已经通过真实模拟成交写入现金与净值。离线回测、OOS、Sharpe 和 leaderboard 只用于诊断失败模式，不能产生 best、不能晋升策略、不能替代模拟账户没有成交的事实。Heuristic Learning coding agent 不得通过外部网页搜索替代本地实验；这项限制不约束交易系统本身。`run_discussion` 和 `research_interactive` 默认可以联网研究。
 
 系统只允许模拟交易，禁止实盘和真实下单接口。
 
@@ -18,10 +18,11 @@ Heuristic Learning 是维护系统的 coding agent 使用的非梯度优化方�
 
 - 主数据库：`data/sovereign_hall.db`
 - 当前数据库规模：约 7.4 万篇文档、7,551 条研究结论、5,502 条价格预测、13,880 条投资提案
-- 最新启发式学习运行：`runs/heuristic_cycle/20260724_143322`
-- 当前保留策略：`full_deployment_diversified_hold10`
-- 当前 `capital_return_v2` score：0.055596；净总收益 11.2538%，最大回撤 -4.2430%
-- 注意：样本外结果仍为负，当前策略只作为风险约束和研究参考，不作为实盘策略。
+- 唯一绩效标准：`simulation_account_realtime_v1`
+- 当前模拟账户资产：9,727.22 元；累计净收益 / score：-2.73%
+- 当前持仓：空仓；投入率 0%；最近模拟成交：2026-07-14
+- 当前健康状态：`system_failure_no_live_deployment`。长期空仓且无近期成交是研究到模拟执行链路故障，不能用离线回测收益覆盖。
+- 当前执行安全策略：`simulation_live_policy_v1`，静态边界来自 `config.yaml`；不存在由离线收益选出的生效 best policy。
 
 ## 快速开始
 
@@ -49,7 +50,7 @@ python -m sovereign_hall.run_discussion --once
 # 使用持续学习后的系统回答用户问题
 python -m sovereign_hall.research_interactive
 
-# 离线启发式学习循环，读取本地 price_predictions 并生成 run artifacts
+# Heuristic Learning：唯一绩效仍来自实时模拟账户；离线结果只作诊断
 python scripts/run_heuristic_cycle.py --db data/sovereign_hall.db
 ```
 
@@ -60,6 +61,13 @@ python scripts/run_heuristic_cycle.py --db data/sovereign_hall.db
 ### 1. 自动研究与投委会
 
 `run_discussion.py` 会从议题池中选择议题，联网拉取并保存研究材料，再从有明确证据的资料中抽取投资提案，最后让多智能体团队进行四轮分析、质疑、修正和投票。模型没有给出有证据支持的提案时，本轮保持空结果，不再注入预设 ETF 或虚构候选。
+
+阶段2的每次终态会追加保存到 `research_stage_diagnostics`。若模型回答里出现
+具体ticker但JSON提案丢失，系统先做一次格式修复，再只针对原回答已出现且原始
+资料独立支持的ticker做一次证据审计；仍不合格就保持空数组，并把原因回灌下一轮。
+空仓部署议题出现法定人数HOLD时，证据最强的一个提案可进入一次CIO/风控/量化
+死锁复核，但只有高置信、高方向支持的复核才能改变HOLD，不会为了制造交易降低
+证据门槛。
 
 默认角色包括：
 
@@ -105,8 +113,11 @@ python scripts/run_heuristic_cycle.py --db data/sovereign_hall.db
 - 最小交易单位：100 股
 - 佣金：0.03%
 - 印花税：0.10%，卖出时收取
-- 非交易日不交易
-- 无真实价格时拒绝交易
+- 每个交易日买入、卖出、止损、止盈、超期退出和调仓合计最多5笔
+- 非交易日或非A股实际交易时段只记录待执行裁决，不伪造成交
+- 每次模拟成交前重新获取受控实时行情；调用方价格、成本价、历史日线和预测价
+  均不能绕过实时重取
+- 任一持仓实时行情缺失时组合估值为N/A，并禁止新增或扩大仓位
 
 相关表：
 
@@ -115,17 +126,17 @@ python scripts/run_heuristic_cycle.py --db data/sovereign_hall.db
 - `simulation_snapshots`
 - `system_stats`
 
-### 5. 离线启发式学习循环
+### 5. Heuristic Learning 与离线诊断
 
-`scripts/run_heuristic_cycle.py` 是 coding agent 的离线评估入口。它读取本地 SQLite 数据和可复现实验产物，不使用网页资料搜索，也不下单；这不改变产品运行入口默认联网研究的行为。
+`scripts/run_heuristic_cycle.py` 是 coding agent 的本地迭代入口。它先读取实时估值后的模拟账户作为唯一绩效，再读取本地 SQLite 数据做可复现的离线诊断；不使用网页资料搜索，也不下单。这不改变产品运行入口默认联网研究的行为。
 
 它会：
 
 1. 读取 `price_predictions`
 2. 构建按日聚合的信号带
-3. 测试多组可解释策略
-4. 计算收益、回撤、Sharpe、Sortino、胜率、换手和交易成本
-5. 输出失败案例、过拟合检查、最优策略快照和图表
+3. 把模拟账户实时净值收益写入 `simulation_account_metrics.json` 和兼容的 `best_metrics.json`
+4. 测试少量可解释规则，但全部标记为 `offline_diagnostic_only`、`promotion_eligible=false`
+5. 输出系统失败案例、离线诊断、入口影响和回归结果；没有新增模拟成交时，best 与本轮改善均为 N/A
 
 输出目录示例：
 
@@ -134,13 +145,17 @@ runs/heuristic_cycle/20260724_143322/
 ├── README.md
 ├── summary.csv
 ├── trials.jsonl
-├── baseline_metrics.json
+├── simulation_account_metrics.json
 ├── best_metrics.json
-├── overfit_checks.json
 ├── failure_cases.jsonl
+├── offline_diagnostic_baseline_metrics.json
+├── offline_diagnostic_best_metrics.json
+├── offline_diagnostic_overfit_checks.json
+├── offline_diagnostic_failure_cases.jsonl
 ├── daily_signal_tape.csv
-├── equity_curve_best.csv
-├── trades_best.csv
+├── offline_diagnostic_equity_curve.csv
+├── offline_diagnostic_trades.csv
+├── offline_diagnostic_policy_snapshot.py
 ├── policy_snapshot.py
 └── sample_efficiency.png
 ```

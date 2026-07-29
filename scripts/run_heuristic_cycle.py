@@ -9,6 +9,7 @@ variants, and writes all artifacts to a timestamped run directory.
 from __future__ import annotations
 
 import argparse
+import asyncio
 from bisect import bisect_right
 import csv
 import json
@@ -95,6 +96,10 @@ from sovereign_hall.services.reward_policy import (
     limit_rebalance_actions,
     longest_high_cash_streak,
     score_capital_reward,
+)
+from sovereign_hall.services.simulation_performance import (
+    PERFORMANCE_STANDARD,
+    collect_simulation_performance,
 )
 
 
@@ -2544,6 +2549,131 @@ def make_plot(path: Path, trials: list[dict[str, Any]]) -> None:
     )
 
 
+def write_live_policy_snapshot(path: Path) -> None:
+    path.write_text(
+        '''"""Active simulation policy: performance authority is the live account.
+
+Offline trial parameters are intentionally absent.  Static limits are loaded
+from config.yaml and every fill must pass realtime quote, market-hours,
+portfolio valuation, evidence, and daily transaction gates.
+"""
+
+POLICY = {
+    "name": "simulation_live_policy_v1",
+    "performance_standard": "simulation_account_realtime_v1",
+    "offline_backtest_promotion_allowed": False,
+    "config_source": "config.yaml:simulation",
+}
+''',
+        encoding="utf-8",
+    )
+
+
+def write_live_performance_readme(
+    path: Path,
+    *,
+    run_started: str,
+    metrics: dict[str, Any],
+    offline_policy_name: str,
+    offline_metrics: dict[str, Any],
+    sample_count: int,
+    db_path: Path,
+    command: str,
+    portfolio_lifecycle: dict[str, Any],
+) -> None:
+    live_return = metrics.get("net_total_return")
+    return_text = "N/A" if live_return is None else f"{float(live_return):+.4%}"
+    score_text = "N/A" if metrics.get("score") is None else f"{float(metrics['score']):+.6f}"
+    invested = metrics.get("current_invested_ratio")
+    invested_text = "N/A" if invested is None else f"{float(invested):.2%}"
+    gap = metrics.get("deployment_gap")
+    gap_text = "N/A" if gap is None else f"{float(gap):.2f}"
+    offline_return = offline_metrics.get("net_total_return", offline_metrics.get("total_return"))
+    offline_return_text = (
+        "N/A" if offline_return is None else f"{float(offline_return):+.4%}"
+    )
+    failures = metrics.get("failure_reasons") or []
+    failure_lines = "\n".join(f"- {item}" for item in failures) or "- None."
+    position_count = int(portfolio_lifecycle.get("position_count") or 0)
+    text = f"""# Heuristic Learning Cycle — Live Simulation Authority
+
+## Run
+- Run time: {run_started}
+- Data source: `{db_path}`
+- Performance standard: `{PERFORMANCE_STANDARD}`
+- Best policy: `N/A` — no policy may be selected from offline returns
+- Authoritative score: {score_text}
+- Simulated-account cumulative net return: {return_text}
+- Health: `{metrics.get('health_status', 'valuation_incomplete')}`
+- New live fills in this iteration: {int(metrics.get('trades_since_window_start') or 0)}
+- Iteration performance improvement: `N/A` unless new live fills exist
+
+## Decision
+The only valid reward is realtime-valued simulated-account return. Offline
+backtests, OOS splits, Sharpe, Sortino, and leaderboard scores are diagnostic
+tools only. They cannot create a best policy, claim an improvement, alter the
+authoritative score, or justify an empty simulated account.
+
+## System Failure Review
+{failure_lines}
+- Current invested ratio: {invested_text}
+- Deployment gap: {gap_text}
+- Cumulative simulated fills: {int(metrics.get('trade_count') or 0)}
+- Latest fill: {metrics.get('latest_trade_at') or 'none'}
+- Position lifecycle review count: {position_count}
+- Empty/underdeployed account with no recent fill is a system pipeline failure,
+  not successful risk control and not normal observation.
+
+## What Changed
+- `check_db` now displays the realtime simulated-account net return as the sole score.
+- `run_discussion` labels empty-book/no-decision outcomes as
+  `system_failure_no_live_deployment` and reports zero-fill improvement as N/A.
+- Heuristic prompt/status context uses static execution safety limits from
+  `config.yaml`; offline artifacts no longer supply active caps or ticker vetoes.
+- The learning cycle writes authoritative live metrics separately and namespaces
+  every backtest result as offline diagnostic only.
+
+## Offline Diagnostics — Non-authoritative
+- Diagnostic policy: `{offline_policy_name}`
+- Diagnostic-only return: {offline_return_text}
+- Samples consumed: {sample_count} prediction rows
+- Files: `offline_diagnostic_best_metrics.json`,
+  `offline_diagnostic_failure_cases.jsonl`,
+  `offline_diagnostic_overfit_checks.json`,
+  `offline_diagnostic_policy_snapshot.py`
+- These values are invalid for performance comparison or policy promotion.
+
+## User Entry Impact
+- `python -m sovereign_hall.check_db`: shows the unique live score and the
+  deployment failure state.
+- `python -m sovereign_hall.run_discussion`: consumes the failure state in agent
+  context and records the exact research/committee/execution blocker when no fill occurs.
+- `python -m sovereign_hall.research_interactive`: states that offline returns are
+  diagnostic only and exposes the live account health.
+- Per-position review ran: yes; positions reviewed={position_count}.
+- Exit triggers/blockers: see `portfolio_lifecycle_review.json`; no historical or
+  cost price was used as a current quote fallback.
+- Current invested ratio={invested_text}; deployment gap={gap_text}.
+- Exit cash reallocation: no exit in this cycle; undeployed cash reason is a
+  system deployment blocker, not strategic risk cash.
+
+## Reproduce
+```bash
+python -m sovereign_hall.check_db
+{command}
+```
+
+## Next 3 Directions
+- Run one bounded `run_discussion` during an A-share trading session and require
+  either a realtime-priced simulated fill or an exact terminal rejection code.
+- Trace the most frequent proposal/committee rejection from research evidence
+  through persisted vote records; repair the first local pipeline break.
+- Add a cycle-to-cycle live NAV/fill attribution report so only fills after the
+  prior cycle can support a performance-improvement claim.
+"""
+    path.write_text(text, encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a local heuristic learning cycle.")
     parser.add_argument("--db", default="data/sovereign_hall.db", help="SQLite database path")
@@ -2557,9 +2687,16 @@ def main() -> int:
     db_path = (project_root / args.db).resolve()
     runs_root = (project_root / args.runs_root).resolve()
     run_started = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_started_at = datetime.now().isoformat(timespec="seconds")
     run_id = args.timestamp or run_started
     run_dir = runs_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
+    live_metrics = asyncio.run(
+        collect_simulation_performance(
+            db_path,
+            window_start=run_started_at,
+        )
+    )
 
     previous_latest_run = latest_completed_run(runs_root)
     previous_latest_score = completed_run_best_score(previous_latest_run)
@@ -3151,7 +3288,13 @@ def main() -> int:
             "score_breakdown": metrics.get("score_breakdown", {}),
             "cost_assumption": metrics["cost_assumption"],
             "score": metrics["score"],
-            "notes": "local delayed daily signal simulation; no external market data",
+            "evaluation_role": "offline_diagnostic_only",
+            "authoritative_performance": False,
+            "promotion_eligible": False,
+            "notes": (
+                "offline diagnostic only; cannot create best/score/promotion or "
+                "substitute for simulated-account return"
+            ),
         }
         trial_rows.append(row)
         append_jsonl(trials_path, [row])
@@ -3210,7 +3353,13 @@ def main() -> int:
             "score_breakdown": simplified_metrics.get("score_breakdown", {}),
             "cost_assumption": simplified_metrics["cost_assumption"],
             "score": simplified_metrics["score"],
-            "notes": "simplification stage: removed volatility scaling and excess anomaly tuning",
+            "evaluation_role": "offline_diagnostic_only",
+            "authoritative_performance": False,
+            "promotion_eligible": False,
+            "notes": (
+                "offline diagnostic simplification only; removed volatility "
+                "scaling and excess anomaly tuning"
+            ),
         }
         trial_rows.append(simplify_row)
         append_jsonl(trials_path, [simplify_row])
@@ -3222,7 +3371,7 @@ def main() -> int:
             results[simplified.name] = simplified_result
 
     best_result = results[best_trial["trial_name"]]
-    best_metrics = best_result["metrics"]
+    offline_best_metrics = best_result["metrics"]
 
     summary_path = run_dir / "summary.csv"
     with summary_path.open("w", newline="", encoding="utf-8") as handle:
@@ -3231,16 +3380,66 @@ def main() -> int:
         for row in trial_rows:
             writer.writerow(row)
 
-    write_json(run_dir / "baseline_metrics.json", results["baseline_default_policy"]["metrics"])
-    write_json(run_dir / "best_metrics.json", best_metrics)
-    best_result["curve"].to_csv(run_dir / "equity_curve_best.csv", index=False)
-    pd.DataFrame(best_result["trades"]).to_csv(run_dir / "trades_best.csv", index=False)
+    write_json(
+        run_dir / "offline_diagnostic_baseline_metrics.json",
+        results["baseline_default_policy"]["metrics"],
+    )
+    write_json(
+        run_dir / "offline_diagnostic_best_metrics.json",
+        {
+            **offline_best_metrics,
+            "evaluation_role": "offline_diagnostic_only",
+            "authoritative_performance": False,
+            "promotion_eligible": False,
+        },
+    )
+    write_json(run_dir / "simulation_account_metrics.json", live_metrics)
+    write_json(run_dir / "best_metrics.json", live_metrics)
+    best_result["curve"].to_csv(
+        run_dir / "offline_diagnostic_equity_curve.csv", index=False
+    )
+    pd.DataFrame(best_result["trades"]).to_csv(
+        run_dir / "offline_diagnostic_trades.csv", index=False
+    )
 
     failures = analyze_failures(best_result, daily, best_policy)
-    append_jsonl(run_dir / "failure_cases.jsonl", failures)
+    append_jsonl(run_dir / "offline_diagnostic_failure_cases.jsonl", failures)
+    live_failure = {
+        "case_type": live_metrics.get("health_status"),
+        "time_range": (
+            f"{live_metrics.get('latest_trade_at') or 'no_fill'}.."
+            f"{live_metrics.get('measured_at')}"
+        ),
+        "market_state": {
+            "performance_standard": PERFORMANCE_STANDARD,
+            "valuation_complete": live_metrics.get("valuation_complete"),
+        },
+        "signals": {
+            "trades_since_iteration_start": live_metrics.get(
+                "trades_since_window_start"
+            ),
+            "cumulative_trade_count": live_metrics.get("trade_count"),
+        },
+        "positions": {
+            "invested_ratio": live_metrics.get("current_invested_ratio"),
+            "deployment_gap": live_metrics.get("deployment_gap"),
+        },
+        "result": {
+            "simulated_account_net_return": live_metrics.get("net_total_return"),
+            "score": live_metrics.get("score"),
+        },
+        "suspected_reason": (
+            "研究、证据提案、投委会、实时行情或模拟执行链路未产生近期成交"
+        ),
+        "repair_direction": (
+            "运行真实入口并持久化首个精确终止拒绝码；修复最早断点，"
+            "不得用离线回测收益替代"
+        ),
+    }
+    append_jsonl(run_dir / "failure_cases.jsonl", [live_failure])
 
     checks = split_checks(daily, best_policy, costs, price_history)
-    write_json(run_dir / "overfit_checks.json", checks)
+    write_json(run_dir / "offline_diagnostic_overfit_checks.json", checks)
     sleeve_diagnostics = build_sleeve_diagnostics(daily, policies, results, costs, price_history)
     write_json(run_dir / "sleeve_diagnostics.json", sleeve_diagnostics)
     price_coverage = build_price_coverage_report(daily, price_history, best_result)
@@ -3264,7 +3463,10 @@ def main() -> int:
     write_json(run_dir / "tape_update.json", tape_update)
     portfolio_lifecycle = build_portfolio_lifecycle_report(db_path)
     write_json(run_dir / "portfolio_lifecycle_review.json", portfolio_lifecycle)
-    write_policy_snapshot(run_dir / "policy_snapshot.py", best_policy, costs)
+    write_policy_snapshot(
+        run_dir / "offline_diagnostic_policy_snapshot.py", best_policy, costs
+    )
+    write_live_policy_snapshot(run_dir / "policy_snapshot.py")
     make_plot(run_dir / "sample_efficiency.png", trial_rows)
 
     code_context = {
@@ -3307,34 +3509,32 @@ def main() -> int:
         "portfolio_lifecycle": portfolio_lifecycle,
     }
     write_json(run_dir / "project_context.json", code_context)
-    write_readme(
+    write_live_performance_readme(
         run_dir / "README.md",
-        run_started,
-        best_trial["trial_name"],
-        best_metrics,
-        previous_score,
-        previous_path,
-        trial_rows,
-        checks,
-        len(predictions),
-        db_path,
-        f"python scripts/run_heuristic_cycle.py --db {args.db}",
-        recent_failure_tickers=recent_failure_tickers,
-        sleeve_diagnostics=sleeve_diagnostics,
-        price_coverage=price_coverage,
-        price_readiness=price_readiness,
-        price_readiness_stall=price_readiness_stall,
-        tape_update=tape_update,
+        run_started=run_started_at,
+        metrics=live_metrics,
+        offline_policy_name=best_trial["trial_name"],
+        offline_metrics=offline_best_metrics,
+        sample_count=len(predictions),
+        db_path=db_path,
+        command=f"python scripts/run_heuristic_cycle.py --db {args.db}",
         portfolio_lifecycle=portfolio_lifecycle,
-        previous_latest_run=previous_latest_run,
-        previous_latest_score=previous_latest_score,
     )
 
     latest = runs_root / "LATEST"
     latest.write_text(str(run_dir) + "\n", encoding="utf-8")
     print(f"run_dir={run_dir}")
-    print(f"best_policy={best_trial['trial_name']}")
-    print(f"best_score={best_metrics['score']:.6f}")
+    print("best_policy=N/A (offline promotion disabled)")
+    print(
+        "simulation_account_score="
+        + (
+            "N/A"
+            if live_metrics.get("score") is None
+            else f"{float(live_metrics['score']):.6f}"
+        )
+    )
+    print(f"health_status={live_metrics.get('health_status')}")
+    print(f"offline_diagnostic_policy={best_trial['trial_name']}")
     return 0
 
 
