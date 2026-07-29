@@ -91,6 +91,8 @@ class DecisionRecorder:
         entry_price: float = None,
         discussion_context: str = "",
         expected_days: int = 30,
+        round_id: str | None = None,
+        decision_id: str | None = None,
     ) -> str:
         """记录一次决策"""
         await self._ensure_tables()
@@ -124,15 +126,17 @@ class DecisionRecorder:
         )
         expected_days = self.normalize_expected_days(expected_days, discussion_context)
 
-        recent_id = await self._find_recent_duplicate(
-            ticker=ticker,
-            decision=decision,
-            confidence=confidence,
-            current_price=float(current_price),
-            target_price=target_price,
-            stop_loss=stop_loss,
-            expected_days=expected_days,
-        )
+        recent_id = None
+        if not round_id:
+            recent_id = await self._find_recent_duplicate(
+                ticker=ticker,
+                decision=decision,
+                confidence=confidence,
+                current_price=float(current_price),
+                target_price=target_price,
+                stop_loss=stop_loss,
+                expected_days=expected_days,
+            )
         if recent_id:
             logger.info(f"跳过重复决策: {ticker} {decision}，复用记录 {recent_id}")
             return recent_id
@@ -154,8 +158,9 @@ class DecisionRecorder:
                     id, ticker, current_price, target_price, stop_loss, direction,
                     confidence, predicted_at, expected_days,
                     discussion_context, status, result, accuracy_score,
-                    created_at, entry_date, quote_source, quote_fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, entry_date, quote_source, quote_fetched_at,
+                    round_id, decision_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.id,
                 record.ticker,
@@ -174,6 +179,8 @@ class DecisionRecorder:
                 record.entry_date,
                 quote_source,
                 quote_fetched_at,
+                round_id,
+                decision_id,
             ))
             await db.commit()
 

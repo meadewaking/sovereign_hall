@@ -98,7 +98,9 @@ class HeuristicRiskContext:
 
     @property
     def available(self) -> bool:
-        return self.run_dir is not None and bool(self.policy_name)
+        # The live execution policy must not disappear when no offline
+        # heuristic-cycle artifact exists. ``run_dir`` is diagnostics lineage.
+        return bool(self.policy_name)
 
     @property
     def thin_cost_stress_margin(self) -> bool:
@@ -1477,7 +1479,22 @@ def apply_heuristic_risk_cap(
     if not ctx.available:
         return target_position, None
 
-    capped = min(max(target_position, 0.0), ctx.max_position)
+    from sovereign_hall.domain.portfolio import (
+        ExecutionPolicyLimits,
+        cap_target_position,
+    )
+
+    capped, _ = cap_target_position(
+        target_position,
+        current_position=float(current_position or 0.0),
+        current_gross_exposure=float(current_gross_exposure or 0.0),
+        limits=ExecutionPolicyLimits(
+            max_single_position=float(ctx.max_position),
+            # Offline policies may have tested a smaller gross cap, but live
+            # simulation has a fixed 100% deployment invariant.
+            max_gross=SIMULATION_TARGET_INVESTED_RATIO,
+        ),
+    )
     minimum_confidence = float(ctx.min_confidence or 0.0)
     required_signal_count = max(1, int(ctx.min_signal_count or 1))
     qualified_fresh_evidence = bool(
@@ -1749,7 +1766,9 @@ def failure_ticker_constraints(context: HeuristicRiskContext | None = None) -> l
     return rows
 
 
-def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None) -> str:
+def _format_legacy_offline_prompt_context(
+    context: HeuristicRiskContext | None = None,
+) -> str:
     """Return a compact local-only risk block for research and committee prompts."""
     ctx = context or load_latest_heuristic_context()
     if not ctx.available:
@@ -1847,7 +1866,9 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
     return "\n".join(lines)
 
 
-def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
+def _format_legacy_offline_status(
+    context: HeuristicRiskContext | None = None,
+) -> str:
     ctx = context or load_latest_heuristic_context()
     if not ctx.available:
         return "\n🧭 Heuristic 学习状态: 暂无本地运行结果\n"

@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..core import DATA_DIR
+from ..infrastructure.sqlite.migrations import apply_architecture_migrations
+from ..infrastructure.sqlite.unit_of_work import SQLiteUnitOfWork
 from .prediction_store import ensure_prediction_schema
 
 logger = logging.getLogger(__name__)
@@ -93,13 +95,26 @@ class DatabaseService:
     """SQLite数据库服务（异步版本）"""
 
     _instance = None
+    _instances: Dict[str, "DatabaseService"] = {}
 
     @classmethod
     async def get_instance(cls, db_path: str = None) -> "DatabaseService":
-        """获取单例实例"""
+        """Return one service per resolved database path.
+
+        The previous process-wide singleton could silently return a connection
+        to the wrong database in tests, imports, and consultation sessions.
+        """
+        resolved = str(Path(db_path or (DATA_DIR / "sovereign_hall.db")).resolve())
         if cls._instance is None:
-            cls._instance = cls(db_path)
-        return cls._instance
+            # Preserve the historical reset hook while clearing path-scoped
+            # instances when callers deliberately reset ``_instance``.
+            cls._instances = {}
+        instance = cls._instances.get(resolved)
+        if instance is None:
+            instance = cls(resolved)
+            cls._instances[resolved] = instance
+        cls._instance = instance
+        return instance
 
     def __init__(self, db_path: str = None):
         if db_path is None:
@@ -115,6 +130,9 @@ class DatabaseService:
         if self._connection is None:
             self._connection = await aiosqlite.connect(str(self.db_path))
             self._connection.row_factory = aiosqlite.Row
+            await self._connection.execute("PRAGMA foreign_keys = ON")
+            await self._connection.execute("PRAGMA busy_timeout = 5000")
+            await self._connection.execute("PRAGMA journal_mode = WAL")
         return self._connection
 
     async def _get_existing_tables(self, conn) -> set:
@@ -170,6 +188,48 @@ class DatabaseService:
                 (next_id, row[0]),
             )
             next_id += 1
+
+    async def _ensure_report_conclusion_id_key(self, conn):
+        """Make the legacy conclusion id a valid SQLite foreign-key parent.
+
+        A partial unique index does not qualify as a parent key in SQLite.
+        Older databases therefore reported ``foreign key mismatch`` as soon as
+        foreign-key enforcement was enabled, even though all non-null ids were
+        unique. SQLite's ordinary UNIQUE index already permits multiple NULLs;
+        ids are backfilled first, then the legacy partial index is replaced.
+        """
+        await self._backfill_report_conclusion_ids(conn)
+        async with conn.execute(
+            """
+            SELECT id, COUNT(*)
+            FROM report_conclusions
+            GROUP BY id
+            HAVING id IS NULL OR COUNT(*) > 1
+            LIMIT 1
+            """
+        ) as cursor:
+            invalid = await cursor.fetchone()
+        if invalid:
+            raise RuntimeError(
+                "report_conclusions.id cannot become a foreign-key parent: "
+                f"invalid id={invalid[0]!r}, count={invalid[1]}"
+            )
+        async with conn.execute(
+            "PRAGMA index_list('report_conclusions')"
+        ) as cursor:
+            indexes = await cursor.fetchall()
+        for index in indexes:
+            if (
+                str(index[1]) == "ux_report_conclusions_id"
+                and int(index[2]) == 1
+                and int(index[4]) == 0
+            ):
+                return
+        await conn.execute("DROP INDEX IF EXISTS ux_report_conclusions_id")
+        await conn.execute(
+            "CREATE UNIQUE INDEX ux_report_conclusions_id "
+            "ON report_conclusions(id)"
+        )
 
     async def _init_db(self):
         """初始化数据库表"""
@@ -327,7 +387,44 @@ class DatabaseService:
             )
         """)
 
+        # Prediction rows declare a foreign key to report conclusions.  Create
+        # the parent table in the base schema before enabling prediction writes;
+        # relying on disabled SQLite foreign keys previously hid this ordering
+        # defect in fresh databases.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS report_conclusions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT,
+                conclusion TEXT,
+                ticker TEXT,
+                position REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                holding_period TEXT,
+                confidence REAL,
+                key_points TEXT,
+                risks TEXT,
+                created_at TEXT,
+                learned_at TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS reflection_summary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT,
+                previous_conclusions TEXT,
+                reflection_text TEXT,
+                verification_results TEXT,
+                adjusted_conclusion TEXT,
+                lessons_learned TEXT,
+                created_at TEXT,
+                learned_at TEXT
+            )
+        """)
+        await self._ensure_report_conclusion_id_key(conn)
+
         await ensure_prediction_schema(conn)
+        await apply_architecture_migrations(conn)
 
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_sector ON documents(sector)")
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_url ON documents(url)")
@@ -376,7 +473,7 @@ class DatabaseService:
 
     # ===================== 文档操作 =====================
 
-    async def add_document(self, doc: Any) -> bool:
+    async def add_document(self, doc: Any, *, round_id: str | None = None) -> bool:
         """添加文档"""
         if isinstance(doc, dict):
             from ..core import Document
@@ -462,6 +559,13 @@ class DatabaseService:
                 ) as cursor:
                     hash_owner = await cursor.fetchone()
                 if hash_owner:
+                    await self._link_round_document(
+                        conn,
+                        round_id,
+                        str(hash_owner["id"]),
+                    )
+                    if round_id:
+                        await conn.commit()
                     logger.debug(
                         "Skipped cross-key duplicate document: existing_id=%s hash_owner=%s",
                         existing["id"],
@@ -478,17 +582,42 @@ class DatabaseService:
                     """,
                     values[1:] + (existing["id"],),
                 )
+                await self._link_round_document(conn, round_id, str(existing["id"]))
                 await conn.commit()
                 return True
+            await self._link_round_document(conn, round_id, str(existing["id"]))
+            if round_id:
+                await conn.commit()
             return False
 
         await conn.execute("""
             INSERT INTO documents
-            (id, title, content, url, source, sector, keywords, publish_time, embedding, content_hash, crawled_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """, values)
+            (id, title, content, url, source, sector, keywords, publish_time,
+             embedding, content_hash, crawled_at, round_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+        """, values + (round_id,))
+        await self._link_round_document(conn, round_id, str(doc_id))
         await conn.commit()
         return True
+
+    async def _link_round_document(
+        self,
+        conn,
+        round_id: str | None,
+        document_id: str,
+        *,
+        usage: str = "source",
+    ) -> None:
+        if not round_id:
+            return
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO round_documents(
+                round_id, document_id, usage, linked_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (round_id, document_id, usage, datetime.now().isoformat()),
+        )
 
     async def get_document(self, doc_id: str) -> Optional[Dict]:
         """获取文档"""
@@ -535,7 +664,7 @@ class DatabaseService:
 
     # ===================== 提案操作 =====================
 
-    async def add_proposal(self, proposal: Any):
+    async def add_proposal(self, proposal: Any, *, round_id: str | None = None):
         """添加提案"""
         if isinstance(proposal, dict):
             class _Proposal:
@@ -561,6 +690,7 @@ class DatabaseService:
         # otherwise stamp only the new row.  Historical NULLs are deliberately
         # not backfilled because their true creation time is unknowable.
         created_at = pget("created_at") or datetime.now().isoformat()
+        round_id = round_id or pget("round_id")
         proposal_id = pget('proposal_id') or pget('id')
         conn = await self._get_connection()
         await conn.execute("""
@@ -568,8 +698,8 @@ class DatabaseService:
             (proposal_id, ticker, direction, target_position, entry_price, stop_loss,
              take_profit, holding_period, confidence, thesis, analyst_role, sector, status,
              created_at, holding_period_reason, evidence, resolved_rejection,
-             evidence_delta, reject_if)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             evidence_delta, reject_if, round_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             proposal_id,
             pget('ticker', ''),
@@ -590,6 +720,7 @@ class DatabaseService:
             pget('resolved_rejection', None),
             pget('evidence_delta', None),
             pget('reject_if', None),
+            round_id,
         ))
         await conn.commit()
         return proposal_id
@@ -647,14 +778,16 @@ class DatabaseService:
         discussion: str,
         vote_details: Dict[str, Any],
         action_items: List[str],
+        round_id: str | None = None,
     ) -> str:
         """Persist one committee deliberation without requiring a domain object."""
         conn = await self._get_connection()
         await conn.execute(
             """
             INSERT INTO meetings
-            (id, proposal_id, ticker, decision, discussion, vote_details, action_items)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (id, proposal_id, ticker, decision, discussion, vote_details,
+             action_items, round_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 meeting_id,
@@ -664,6 +797,7 @@ class DatabaseService:
                 discussion,
                 json.dumps(vote_details, ensure_ascii=False, default=str),
                 json.dumps(action_items, ensure_ascii=False, default=str),
+                round_id,
             ),
         )
         await conn.commit()
@@ -848,6 +982,7 @@ class DatabaseService:
         raw_excerpt: str = "",
         reason: str = "",
         source: str = "run_discussion",
+        round_id: str | None = None,
     ) -> int:
         """Persist an exact pipeline terminal state for next-round learning."""
         await self._ensure_initialized()
@@ -856,8 +991,9 @@ class DatabaseService:
             """
             INSERT INTO research_stage_diagnostics (
                 topic, stage, status, parse_mode, repair_modes,
-                detected_tickers, raw_excerpt, reason, source, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                detected_tickers, raw_excerpt, reason, source, created_at,
+                round_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(topic or ""),
@@ -870,6 +1006,7 @@ class DatabaseService:
                 str(reason or "")[:2000],
                 str(source or "run_discussion"),
                 datetime.now().isoformat(),
+                round_id,
             ),
         )
         await conn.commit()
@@ -914,15 +1051,11 @@ class DatabaseService:
             await conn.commit()
 
     @asynccontextmanager
-    async def transaction(self):
-        """事务上下文"""
+    async def transaction(self, *, immediate: bool = False):
+        """Canonical transaction boundary for atomic application writes."""
         conn = await self._get_connection()
-        try:
-            yield conn
-            await conn.commit()
-        except Exception:
-            await conn.rollback()
-            raise
+        async with SQLiteUnitOfWork(conn).transaction(immediate=immediate) as active:
+            yield active
 
     async def close(self):
         """关闭连接"""
@@ -930,6 +1063,10 @@ class DatabaseService:
             await self._connection.close()
             self._connection = None
             logger.info("Database connection closed")
+        resolved = str(self.db_path.resolve())
+        type(self)._instances.pop(resolved, None)
+        if type(self)._instance is self:
+            type(self)._instance = None
 
     # ===================== 报告结论存储 =====================
 
@@ -965,7 +1102,9 @@ class DatabaseService:
 
         await self._add_column_if_missing(conn, "report_conclusions", "learned_at", "TEXT")
         await self._add_column_if_missing(conn, "reflection_summary", "learned_at", "TEXT")
-        await self._backfill_report_conclusion_ids(conn)
+        await self._add_column_if_missing(conn, "report_conclusions", "round_id", "TEXT")
+        await self._add_column_if_missing(conn, "reflection_summary", "round_id", "TEXT")
+        await self._ensure_report_conclusion_id_key(conn)
 
         await conn.commit()
 
@@ -973,17 +1112,19 @@ class DatabaseService:
                                       position: float = 0, stop_loss: float = 0,
                                       take_profit: float = 0, holding_period: str = "",
                                       confidence: float = 0, key_points: str = "",
-                                      risks: str = ""):
+                                      risks: str = "", round_id: str | None = None):
         """保存报告结论"""
         conn = await self._get_connection()
         conclusion_id = await self._next_integer_id(conn, "report_conclusions", "id")
         await conn.execute('''INSERT INTO report_conclusions
             (id, question, conclusion, ticker, position, stop_loss, take_profit,
-             holding_period, confidence, key_points, risks, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+             holding_period, confidence, key_points, risks, created_at, round_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (conclusion_id, question, conclusion, ticker, position, stop_loss, take_profit,
-             holding_period, confidence, key_points, risks, datetime.now().isoformat()))
+             holding_period, confidence, key_points, risks, datetime.now().isoformat(),
+             round_id))
         await conn.commit()
+        return conclusion_id
 
     async def get_recent_conclusions(self, limit: int = 5) -> List[Dict]:
         """获取最近N次结论"""
@@ -997,15 +1138,16 @@ class DatabaseService:
 
     async def save_reflection_summary(self, question: str, previous_conclusions: str,
                                        reflection_text: str, verification_results: str = "",
-                                       adjusted_conclusion: str = "", lessons_learned: str = ""):
+                                       adjusted_conclusion: str = "", lessons_learned: str = "",
+                                       round_id: str | None = None):
         """保存反思总结"""
         conn = await self._get_connection()
         await conn.execute('''INSERT INTO reflection_summary
             (question, previous_conclusions, reflection_text, verification_results,
-             adjusted_conclusion, lessons_learned, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+             adjusted_conclusion, lessons_learned, created_at, round_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
             (question, previous_conclusions, reflection_text, verification_results,
-             adjusted_conclusion, lessons_learned, datetime.now().isoformat()))
+             adjusted_conclusion, lessons_learned, datetime.now().isoformat(), round_id))
         await conn.commit()
 
     async def get_recent_reflections(self, limit: int = 10) -> List[Dict]:

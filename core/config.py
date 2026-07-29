@@ -5,6 +5,7 @@
 
 import os
 import json
+import copy
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 from dataclasses import dataclass, field
@@ -31,6 +32,8 @@ class Config:
         return cls._instance
 
     def __init__(self):
+        if not hasattr(self, "_loaded_files"):
+            self._loaded_files: set[Path] = set()
         if not self._config:
             self.load_defaults()
 
@@ -209,6 +212,33 @@ class Config:
                 'similarity_threshold': 0.7,
             },
 
+            # 模拟投资硬边界。config.yaml may override economic parameters,
+            # but runtime validation protects the product invariants.
+            'simulation': {
+                'enabled': True,
+                'initial_capital': 10000,
+                'target_invested_ratio': 1.0,
+                'realtime_quotes_required': True,
+                'trade_during_market_hours_only': True,
+                'max_realtime_quote_age_seconds': 120,
+                'max_trade_price_age_days': 3,
+                'stop_loss_pct': -0.08,
+                'take_profit_pct': 0.15,
+                'max_holding_days': 30,
+                'max_single_position': 0.10,
+                'max_gross': 1.0,
+                'min_committee_confidence': 0.65,
+                'min_risk_reward': 0.8,
+                'min_holding_days': 10,
+                'minimum_healthy_invested_ratio': 0.80,
+                'no_trade_failure_days': 3,
+                'min_unit': 100,
+                'trading_fee': 0.0003,
+                'stamp_duty': 0.001,
+                'slippage_rate': 0.0005,
+                'max_daily_trades': 5,
+            },
+
             # 监控配置
             'monitoring': {
                 'enabled': True,
@@ -278,12 +308,20 @@ class Config:
             },
         }
 
-    def load_from_file(self, filepath: Union[str, Path]):
-        """从文件加载配置"""
-        filepath = Path(filepath)
+    def load_from_file(self, filepath: Union[str, Path], *, force: bool = False):
+        """Load one configuration file at most once.
+
+        Re-merging the same YAML file used to duplicate list-valued settings
+        every time an LLM client was constructed.  Configuration is process
+        state, so a resolved file path is now idempotent unless a caller
+        explicitly requests a reload.
+        """
+        filepath = Path(filepath).expanduser().resolve()
         if not filepath.exists():
             logger.warning(f"Config file not found: {filepath}")
             return False
+        if filepath in self._loaded_files and not force:
+            return True
 
         try:
             if filepath.suffix == '.yaml' or filepath.suffix == '.yml':
@@ -297,9 +335,9 @@ class Config:
                 return False
 
             if file_config:
-                # 深度合并配置
                 self._merge_config(self._config, file_config)
 
+            self._loaded_files.add(filepath)
             logger.info(f"Loaded config from: {filepath}")
             return True
         except Exception as e:
@@ -307,18 +345,47 @@ class Config:
             return False
 
     def _merge_config(self, base: Dict, update: Dict):
-        """深度合并配置"""
+        """Deep-merge mappings while treating lists as complete values."""
         for key, value in update.items():
             if key in base:
                 if isinstance(base[key], dict) and isinstance(value, dict):
                     self._merge_config(base[key], value)
                 elif isinstance(base[key], list) and isinstance(value, list):
-                    # 列表值：合并而非覆盖
-                    base[key] = base[key] + value
+                    base[key] = copy.deepcopy(value)
                 else:
-                    base[key] = value
+                    base[key] = copy.deepcopy(value)
             else:
-                base[key] = value
+                base[key] = copy.deepcopy(value)
+
+    def validate_runtime_invariants(self) -> list[str]:
+        """Return configuration errors that would weaken product invariants."""
+        errors: list[str] = []
+        simulation = self.get("simulation", {}) or {}
+        if not bool(simulation.get("realtime_quotes_required", True)):
+            errors.append("simulation.realtime_quotes_required must remain true")
+        if not bool(simulation.get("trade_during_market_hours_only", True)):
+            errors.append("simulation.trade_during_market_hours_only must remain true")
+        if int(simulation.get("max_daily_trades", 5) or 0) != 5:
+            errors.append("simulation.max_daily_trades must equal the shared hard limit 5")
+        target = float(simulation.get("target_invested_ratio", 1.0) or 0.0)
+        if target != 1.0:
+            errors.append("simulation.target_invested_ratio must equal 1.0")
+        if float(simulation.get("max_gross", 1.0) or 0.0) > 1.0:
+            errors.append("simulation.max_gross cannot exceed 1.0")
+        if float(simulation.get("trading_fee", 0.0) or 0.0) <= 0:
+            errors.append("simulation.trading_fee must be positive")
+        if float(simulation.get("stamp_duty", 0.0) or 0.0) <= 0:
+            errors.append("simulation.stamp_duty must be positive")
+        if float(simulation.get("slippage_rate", 0.0) or 0.0) <= 0:
+            errors.append("simulation.slippage_rate must be positive")
+        quote_age = int(
+            simulation.get("max_realtime_quote_age_seconds", 120) or 0
+        )
+        if not 0 < quote_age <= 300:
+            errors.append(
+                "simulation.max_realtime_quote_age_seconds must be in 1..300"
+            )
+        return errors
 
     def get(self, key: str, default: Any = None) -> Any:
         """获取配置值，支持点号分隔的路径"""
@@ -439,20 +506,15 @@ config = Config()
 
 
 def get_config() -> Config:
-    """获取全局配置实例，确保加载config.yaml"""
+    """Return the process configuration with one idempotent YAML load."""
     global config
-    if not hasattr(config, '_yaml_loaded'):
-        import os
-        from pathlib import Path
-        # 尝试从项目根目录加载config.yaml
-        possible_paths = [
-            Path(__file__).parent.parent.parent / "config.yaml",
-            Path.cwd() / "config.yaml",
-            Path(__file__).parent.parent / "config.yaml",
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                config.load_from_file(path)
-                config._yaml_loaded = True
-                break
+    possible_paths = [
+        Path(__file__).parent.parent.parent / "config.yaml",
+        Path.cwd() / "config.yaml",
+        Path(__file__).parent.parent / "config.yaml",
+    ]
+    for path in possible_paths:
+        if path.exists():
+            config.load_from_file(path)
+            break
     return config

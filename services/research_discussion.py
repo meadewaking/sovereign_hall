@@ -87,6 +87,7 @@ class ResearchDiscussionSystem:
         self.enable_web = enable_web
         self.heuristic_prompt_context = format_heuristic_prompt_context()
         self.learned_prediction_context = ""
+        self.pipeline_memory_context = ""
 
     async def _get_db(self) -> DatabaseService:
         """获取数据库服务（延迟初始化）"""
@@ -111,6 +112,17 @@ class ResearchDiscussionSystem:
             from sovereign_hall.services.learning_engine import LearningEngine
 
             db = await self._get_db()
+            from sovereign_hall.application.get_system_status import (
+                format_system_status,
+                get_system_status,
+            )
+
+            self.pipeline_memory_context = format_system_status(
+                await get_system_status(db)
+            )
+            context.discussion_history.append(
+                f"【主循环持久化状态】\n{self.pipeline_memory_context}"
+            )
             learning_engine = LearningEngine(str(db.db_path))
             self.learned_prediction_context = await learning_engine.generate_lessons_prompt()
             if self.learned_prediction_context:
@@ -120,6 +132,7 @@ class ResearchDiscussionSystem:
                 print("   🎯 已加载自主循环的预测验证教训")
         except Exception as exc:
             self.learned_prediction_context = ""
+            self.pipeline_memory_context = ""
             logger.warning("加载预测验证教训失败: %s", exc)
 
         # 反思历史结论
@@ -654,6 +667,9 @@ class ResearchDiscussionSystem:
 
 {self.heuristic_prompt_context}
 
+【自主研究主循环的最新持久化状态】
+{self.pipeline_memory_context or "暂无可用主循环状态"}
+
 【历史反思参考】
 {reflection_text if reflection_text else "无"}
 
@@ -689,6 +705,20 @@ daily_prices缺失只表示历史回测可信度不足，不是当前市场事�
 """
         response = await self.cio.think(prompt, max_tokens=8000)
         return extract_actual_response(response, max_length=20000)
+
+    async def close(self) -> None:
+        """Close all resources owned by the interactive use case."""
+        for resource in (self.spider, self.llm, self.vector_db):
+            close = getattr(resource, "close", None)
+            if close is not None:
+                try:
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as exc:
+                    logger.debug("关闭交互研究资源失败: %s", exc)
+        if self.db_service is not None:
+            await self.db_service.close()
 
 
 async def print_report(context: ResearchContext):

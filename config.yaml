@@ -48,6 +48,7 @@ simulation:
   target_invested_ratio: 1.0  # 模拟资金全部属于投资组合，不因风险偏好保留战略现金
   realtime_quotes_required: true  # 当前估值、盈亏、持仓复核和模拟成交只允许实时行情
   trade_during_market_hours_only: true  # 闭市行情仅查看，不执行模拟成交
+  max_realtime_quote_age_seconds: 120  # 当前估值与成交报价最大允许年龄；超时即N/A/拒绝
   max_trade_price_age_days: 3  # 实时行情时间戳异常时的防御性上限
   stop_loss_pct: -0.08  # 逐仓强制复核默认止损
   take_profit_pct: 0.15  # 逐仓强制复核默认止盈
@@ -63,6 +64,7 @@ simulation:
   min_unit: 100  # 最小买卖单位：一手=100股
   trading_fee: 0.0003  # 佣金万三
   stamp_duty: 0.001  # 印花税千一（卖出时）
+  slippage_rate: 0.0005  # 买卖双边模拟滑点，计入现金与净收益
   max_daily_trades: 5  # 每个交易日最多5笔模拟成交；逐仓退出和投委会交易共用该额度
 
 # 向量数据库

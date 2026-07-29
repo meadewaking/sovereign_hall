@@ -14,6 +14,22 @@ Heuristic Learning 是维护系统的 coding agent 使用的非梯度优化方�
 
 系统只允许模拟交易，禁止实盘和真实下单接口。
 
+## 架构
+
+当前采用渐进式模块化单体，而不是大爆炸重写：
+
+- `application/`：三个入口复用的用例与编排
+- `domain/`：研究轮次状态机和纯组合执行约束
+- `ports/`：事务与受控实时行情契约
+- `infrastructure/sqlite/`：前向迁移与原子工作单元
+- `services/`：保留并逐步收窄的研究、行情和兼容服务
+
+每轮研究由持久化 `ResearchRound` 和有序事件描述；每次新模拟操作先
+创建不含成交价的 `ExecutionIntent`，成交时重新获取受控实时行情，并在一个
+事务内写入报价、成交、费用台账、现金、持仓、待执行状态和日内成交限额。
+完整设计、迁移边界与剩余风险见
+[`docs/architecture_refactor_20260729.md`](docs/architecture_refactor_20260729.md)。
+
 ## 当前状态
 
 - 主数据库：`data/sovereign_hall.db`
@@ -173,6 +189,19 @@ sovereign_hall/
 ├── check_db.py
 ├── run_discussion.py
 ├── research_interactive.py
+├── application/
+│   ├── run_research_round.py
+│   ├── execute_simulation_cycle.py
+│   ├── get_system_status.py
+│   └── answer_research_question.py
+├── domain/
+│   ├── research/
+│   └── portfolio/
+├── ports/
+│   ├── unit_of_work.py
+│   └── quote_provider.py
+├── infrastructure/
+│   └── sqlite/
 ├── scripts/
 │   └── run_heuristic_cycle.py
 ├── agents/
@@ -200,7 +229,8 @@ sovereign_hall/
 │   ├── db_viewer.py
 │   └── db_inspector.py
 ├── tests/
-│   └── test_refactor_pipeline.py
+│   ├── test_refactor_pipeline.py
+│   └── test_architecture_refactor.py
 ├── data/
 │   ├── sovereign_hall.db
 │   ├── logs/
@@ -239,6 +269,9 @@ simulation:
   min_unit: 100
   trading_fee: 0.0003
   stamp_duty: 0.001
+  slippage_rate: 0.0005
+  max_daily_trades: 5
+  max_realtime_quote_age_seconds: 120
 
 system:
   daily_token_budget: 100000000
@@ -273,17 +306,21 @@ investment_committee:
 | `simulation_positions` | 当前模拟持仓 |
 | `simulation_trades` | 模拟交易流水 |
 | `simulation_snapshots` | 模拟账户快照 |
+| `research_rounds` / `round_events` | 研究轮次状态与有序事件 |
+| `execution_intents` | 不含调用方成交价的模拟执行意图 |
+| `quote_snapshots` | 成交所用实时行情及来源时间 |
+| `simulation_ledger_entries` | 成交现金与费用台账 |
 | `system_stats` | 系统状态和模拟现金等键值数据 |
 | `blacklist` | 需要规避的标的或模式 |
 | `playbook` | 机构经验库 |
 
 ## 测试与验证
 
-从项目目录运行测试时，需要让 Python 能找到父级包路径：
+项目已在 `pyproject.toml` 中固定测试包路径。从项目目录运行：
 
 ```bash
 cd /Users/wangziming/PycharmProjects/PythonProject/sovereign_hall
-PYTHONPATH=.. pytest tests/test_refactor_pipeline.py
+pytest -q
 ```
 
 快速检查离线学习脚本：
@@ -299,6 +336,6 @@ python scripts/run_heuristic_cycle.py --db data/sovereign_hall.db --timestamp ma
 - 这是研究系统，不是交易系统。
 - LLM 输出会被结构化和验证，但仍可能产生错误推理。
 - 离线回测基于本地预测带，不能代表未来收益。
-- 当前最优启发式策略在成本压力测试下存在过拟合风险。
+- 当前没有可由离线诊断晋升的 best policy；本轮零新增模拟成交时改善为 N/A。
 - 爬虫配置较保守，默认启用代理并降低频率，避免请求过密。
 - 数据库和 `runs/` 产物可能很大，提交代码前应确认是否需要纳入版本管理。

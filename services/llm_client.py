@@ -63,14 +63,6 @@ class LLMClient:
         """
         config = get_config()
 
-        # 从config.yaml加载配置
-        import os
-        from pathlib import Path
-        project_root = Path(__file__).parent.parent.parent
-        config_file = project_root / "config.yaml"
-        if os.path.exists(config_file):
-            config.load_from_file(config_file)
-
         llm_config = config.get_llm_config()
 
         self.model = model or llm_config.get('model', 'claude-sonnet-4-5')

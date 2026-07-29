@@ -59,11 +59,37 @@ def get_realtime_prices(tickers: list) -> dict:
                     "source": "realtime_quote",
                     "fetched_at": datetime.now().isoformat(),
                 } if price else None
-            if quote and quote.get("price"):
+            if is_fresh_realtime_quote(quote):
                 prices[ticker] = quote
         return prices
 
     return asyncio.run(fetch())
+
+
+def is_fresh_realtime_quote(quote: Any) -> bool:
+    """Apply the same freshness gate as simulated execution."""
+    if not isinstance(quote, dict):
+        return False
+    try:
+        price = float(quote.get("price") or 0.0)
+        fetched = datetime.fromisoformat(
+            str(quote.get("fetched_at") or "").replace("Z", "+00:00")
+        )
+        now = datetime.now(fetched.tzinfo) if fetched.tzinfo else datetime.now()
+        age = (now - fetched).total_seconds()
+        maximum = int(
+            get_config()
+            .get("simulation", {})
+            .get("max_realtime_quote_age_seconds", 120)
+            or 120
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        price > 0
+        and bool(str(quote.get("source") or "").strip())
+        and -60 <= age <= maximum
+    )
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -1721,6 +1747,70 @@ def show_investment_status(db_path):
         print("   (无交易记录)")
 
 
+def show_canonical_pipeline_status(db_path: Path) -> None:
+    """Display the same durable round read model used by interactive research."""
+    import asyncio
+
+    async def load_status():
+        from sovereign_hall.application.get_system_status import (
+            format_system_status,
+            get_system_status,
+        )
+        from sovereign_hall.services.database import DatabaseService
+
+        db = DatabaseService(str(db_path))
+        try:
+            await db._init_db()
+            status = await get_system_status(db)
+            return status, format_system_status(status)
+        finally:
+            await db.close()
+
+    print("\n" + "=" * 60)
+    print("🔗 主循环持久化与成交链路")
+    print("=" * 60)
+    try:
+        status, formatted = asyncio.run(load_status())
+    except Exception as exc:
+        print(f"   状态读取失败: {exc}")
+        return
+    print(f"   {formatted}")
+    latest = status.get("latest_round")
+    if not latest:
+        print(
+            "   下一动作: 运行 python -m sovereign_hall.run_discussion；"
+            "成功启动后每轮必须留下 research_round 与 round_events。"
+        )
+        return
+    health = status.get("pipeline_health")
+    if health == "failed":
+        print(
+            "   ❌ 最近一轮失败；先查看 terminal_reason 和 round_events，"
+            "不得用离线回测收益替代。"
+        )
+    elif health == "incomplete":
+        print(
+            "   ⚠️ 最近一轮没有完成；可能被中断或仍在运行，"
+            "以 round_events 的最后阶段继续排查。"
+        )
+    elif health == "completed_no_evidence":
+        print(
+            "   ⚠️ 本轮资料未形成满足证据门槛的提案；"
+            "空结果已审计，未伪造候选。"
+        )
+    elif health == "completed_execution_rejected":
+        print(
+            "   ⚠️ 已形成裁决但未成交；查看 execution_intents 的 resolution，"
+            "这是需要修复或补证的真实阻塞。"
+        )
+    elif health == "completed_pending_market":
+        print(
+            "   🗂️ 裁决等待交易时段；开市后会重新取得实时行情并重过全部硬门。"
+        )
+    else:
+        print("   ✅ 最近一轮已完成，资料、裁决和模拟执行结果可按 round_id 追溯。")
+
+
 def show_stats(db_path):
     """显示数据库统计"""
     print("\n" + "="*60)
@@ -1729,6 +1819,7 @@ def show_stats(db_path):
 
     # 先显示投资状态
     show_investment_status(db_path)
+    show_canonical_pipeline_status(Path(db_path))
     try:
         from sovereign_hall.services.heuristic_policy import (
             format_heuristic_status,

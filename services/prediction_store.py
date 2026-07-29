@@ -37,6 +37,8 @@ PRICE_PREDICTION_COLUMNS: dict[str, str] = {
     "quote_source": "TEXT",
     "quote_fetched_at": "TEXT",
     "actual_return": "REAL",
+    "round_id": "TEXT",
+    "decision_id": "TEXT",
 }
 
 

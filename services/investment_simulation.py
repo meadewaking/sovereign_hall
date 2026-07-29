@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -14,6 +15,14 @@ from typing import Any, Dict, List, Optional
 import aiosqlite
 
 from ..core import DATA_DIR
+from ..application.execute_simulation_cycle import (
+    AtomicSimulationExecutor,
+    DailyTradeLimitReached,
+    TradeCommitRequest,
+)
+from ..domain.common.ids import new_id
+from ..domain.portfolio.models import ExecutionIntent
+from ..infrastructure.sqlite.migrations import apply_architecture_migrations
 from ..services.llm_client import LLMClient
 from ..services.heuristic_policy import (
     SIMULATION_RISK_LOSS_THRESHOLD,
@@ -30,11 +39,23 @@ from ..services.reward_policy import MAX_DAILY_TRADES
 logger = logging.getLogger(__name__)
 
 
+def _execution_defer_code(reason: Any) -> str:
+    text = str(reason or "")
+    if "非交易日" in text:
+        return "non_trading_day"
+    if "硬上限" in text or "5 笔" in text:
+        return "daily_trade_limit"
+    if "交易时段" in text or "闭市" in text:
+        return "market_closed"
+    return "execution_deferred"
+
+
 class InvestmentSimulation:
     """投资模拟器"""
 
-    def __init__(self, db_service=None):
+    def __init__(self, db_service=None, quote_provider=None):
         self.db_service = db_service
+        self.quote_provider = quote_provider
         self.config = self._load_config()
 
         # 模拟参数
@@ -42,12 +63,16 @@ class InvestmentSimulation:
         self.min_unit = self.config.get('min_unit', 100)  # 一手=100股
         self.trading_fee = self.config.get('trading_fee', 0.0003)  # 佣金万三
         self.stamp_duty = self.config.get('stamp_duty', 0.001)  # 印花税千一
+        self.slippage_rate = float(self.config.get('slippage_rate', 0.0005))
         self.target_invested_ratio = float(self.config.get('target_invested_ratio', 1.0))
         self.realtime_quotes_required = bool(self.config.get('realtime_quotes_required', True))
         self.trade_during_market_hours_only = bool(
             self.config.get('trade_during_market_hours_only', True)
         )
         self.max_trade_price_age_days = int(self.config.get('max_trade_price_age_days', 3))
+        self.max_realtime_quote_age_seconds = int(
+            self.config.get("max_realtime_quote_age_seconds", 120)
+        )
         self.stop_loss_pct = float(self.config.get('stop_loss_pct', -0.08))
         self.take_profit_pct = float(self.config.get('take_profit_pct', 0.15))
         self.max_holding_days = int(self.config.get('max_holding_days', 30))
@@ -67,15 +92,24 @@ class InvestmentSimulation:
         self.risk_memory_loss_threshold = SIMULATION_RISK_LOSS_THRESHOLD
         self.risk_memory_days = SIMULATION_RISK_MEMORY_DAYS
 
+    def _market_data_service(self):
+        if self.quote_provider is not None:
+            return self.quote_provider
+        from .market_data import get_market_data
+
+        return get_market_data()
+
     def _load_config(self) -> Dict:
         """加载配置"""
         try:
             from ..core.config import get_config
             config = get_config()
+            invariant_errors = config.validate_runtime_invariants()
+            if invariant_errors:
+                raise ValueError("; ".join(invariant_errors))
             return config.get('simulation', {})
         except Exception as exc:
-            logger.warning("加载投资模拟配置失败，使用默认参数: %s", exc)
-            return {}
+            raise RuntimeError(f"invalid simulation configuration: {exc}") from exc
 
     async def initialize(self):
         """初始化，从数据库加载上次状态"""
@@ -131,7 +165,8 @@ class InvestmentSimulation:
             await self._load_trade_records_for_cooldown()
             await self._bootstrap_redeployment_state()
         except Exception as e:
-            logger.warning(f"Failed to load simulation state: {e}")
+            logger.exception("Failed to initialize durable simulation state")
+            raise RuntimeError("durable simulation initialization failed") from e
 
     async def _bootstrap_redeployment_state(self) -> None:
         """Recover an actionable deployment queue after a process restart.
@@ -158,20 +193,18 @@ class InvestmentSimulation:
         if not self.db_service:
             return
 
-        try:
-            conn = self.db_service._connection
-            # 获取每只股票的最后交易日期
-            async with conn.execute("""
-                SELECT ticker, MAX(traded_at) as last_trade
-                FROM simulation_trades
-                GROUP BY ticker
-            """) as cursor:
-                async for row in cursor:
-                    self.last_trade_records[row[0]] = row[1]
+        conn = self.db_service._connection
+        # 获取每只股票的最后交易日期。Failure must stop startup; silently
+        # dropping cooldown state would weaken a live execution constraint.
+        async with conn.execute("""
+            SELECT ticker, MAX(traded_at) as last_trade
+            FROM simulation_trades
+            GROUP BY ticker
+        """) as cursor:
+            async for row in cursor:
+                self.last_trade_records[row[0]] = row[1]
 
-            logger.info(f"Loaded cooldown records: {len(self.last_trade_records)} tickers")
-        except Exception as e:
-            logger.warning(f"Failed to load trade records: {e}")
+        logger.info(f"Loaded cooldown records: {len(self.last_trade_records)} tickers")
 
     def is_in_cooldown(self, ticker: str) -> bool:
         """检查股票是否在冷却期内"""
@@ -184,8 +217,13 @@ class InvestmentSimulation:
             days_since = (datetime.now() - last_date).days
             return days_since < self.cooldown_days
         except Exception as exc:
-            logger.warning("解析最近交易日期失败 %s=%r: %s", ticker, last_trade, exc)
-            return False
+            logger.error(
+                "解析最近交易日期失败，安全阻止新增仓位 %s=%r: %s",
+                ticker,
+                last_trade,
+                exc,
+            )
+            return True
 
     async def _estimate_trade_assets(
         self,
@@ -205,9 +243,7 @@ class InvestmentSimulation:
         if not self.db_service:
             return
 
-        try:
-            conn = self.db_service._connection
-
+        async with self.db_service.transaction(immediate=True) as conn:
             # 保存现金
             await conn.execute(
                 "INSERT OR REPLACE INTO system_stats (key, value, updated_at) VALUES (?, ?, ?)",
@@ -244,10 +280,6 @@ class InvestmentSimulation:
                 """, list(self.positions.keys()))
             else:
                 await conn.execute("DELETE FROM simulation_positions")
-
-            await conn.commit()
-        except Exception as e:
-            logger.warning(f"Failed to save simulation state: {e}")
 
     async def get_redeployment_state(self) -> Dict[str, Any]:
         """Return the durable operational-cash deployment state."""
@@ -440,6 +472,7 @@ class InvestmentSimulation:
         decisions: List[Dict[str, Any]],
         *,
         source: str = "run_discussion",
+        round_id: str | None = None,
     ) -> None:
         """Append vote diagnostics and prediction links for every outcome."""
         if not self.db_service or self.db_service._connection is None:
@@ -456,8 +489,9 @@ class InvestmentSimulation:
                     invalid_vote_count, quorum_required, quorum_met,
                     review_depth, prediction_id, evidence_gaps, reconsider_if,
                     individual_votes, stage_execution_audit, deadlock_review,
-                    initial_committee_decision, source, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    initial_committee_decision, source, created_at, round_id,
+                    decision_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     self._normalize_ticker(str(decision.get("ticker") or "")),
@@ -499,6 +533,8 @@ class InvestmentSimulation:
                     ),
                     str(source or "run_discussion"),
                     now,
+                    round_id or decision.get("round_id"),
+                    decision.get("decision_id"),
                 ),
             )
         await conn.commit()
@@ -698,6 +734,8 @@ class InvestmentSimulation:
         confidence: float | None = None,
         source: str = "investment_simulation",
         existing_id: int | None = None,
+        round_id: str | None = None,
+        intent_id: str | None = None,
     ) -> int | None:
         """Persist an unfilled ruling without trusting or storing a proposed price.
 
@@ -717,17 +755,24 @@ class InvestmentSimulation:
             if existing_id is None:
                 normalized_ticker = self._normalize_ticker(ticker)
                 normalized_direction = str(direction or "hold").lower()
-                async with conn.execute(
-                    """
-                    SELECT id
-                    FROM simulation_pending_decisions
-                    WHERE ticker = ? AND direction = ?
-                      AND status IN ('pending_next_trading_session', 'replaying')
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (normalized_ticker, normalized_direction),
-                ) as cursor:
+                if intent_id:
+                    lookup_sql = (
+                        "SELECT id FROM simulation_pending_decisions "
+                        "WHERE intent_id = ? "
+                        "AND status IN ('pending_next_trading_session', 'replaying') "
+                        "ORDER BY id DESC LIMIT 1"
+                    )
+                    lookup_params = (intent_id,)
+                else:
+                    lookup_sql = (
+                        "SELECT id FROM simulation_pending_decisions "
+                        "WHERE ticker = ? AND direction = ? "
+                        "AND status IN ('pending_next_trading_session', 'replaying') "
+                        "AND intent_id IS NULL "
+                        "ORDER BY id DESC LIMIT 1"
+                    )
+                    lookup_params = (normalized_ticker, normalized_direction)
+                async with conn.execute(lookup_sql, lookup_params) as cursor:
                     existing = await cursor.fetchone()
                 existing_id = int(existing[0]) if existing else None
             if existing_id is not None:
@@ -737,7 +782,9 @@ class InvestmentSimulation:
                     SET ticker = ?, direction = ?, target_position = ?, confidence = ?,
                         reason = ?, defer_code = ?, source = ?,
                         status = 'pending_next_trading_session', updated_at = ?,
-                        expires_at = COALESCE(expires_at, ?), resolution = ?
+                        expires_at = COALESCE(expires_at, ?), resolution = ?,
+                        round_id = COALESCE(?, round_id),
+                        intent_id = COALESCE(?, intent_id)
                     WHERE id = ?
                     """,
                     (
@@ -751,6 +798,8 @@ class InvestmentSimulation:
                         now,
                         expires_at,
                         f"replay_deferred:{defer_code}"[:500],
+                        round_id,
+                        intent_id,
                         int(existing_id),
                     ),
                 )
@@ -760,8 +809,9 @@ class InvestmentSimulation:
                 """
                 INSERT INTO simulation_pending_decisions (
                     ticker, direction, target_position, confidence, reason,
-                    defer_code, source, status, created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_next_trading_session', ?, ?, ?)
+                    defer_code, source, status, created_at, updated_at, expires_at,
+                    round_id, intent_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_next_trading_session', ?, ?, ?, ?, ?)
                 """,
                 (
                     self._normalize_ticker(ticker),
@@ -774,6 +824,8 @@ class InvestmentSimulation:
                     now,
                     now,
                     expires_at,
+                    round_id,
+                    intent_id,
                 ),
             )
             await conn.commit()
@@ -781,6 +833,201 @@ class InvestmentSimulation:
         except Exception as exc:
             logger.warning("Failed to persist pending simulated decision for %s: %s", ticker, exc)
             return None
+
+    async def create_execution_intent(
+        self,
+        *,
+        ticker: str,
+        direction: str,
+        target_position: float,
+        reason: str,
+        confidence: float | None = None,
+        round_id: str | None = None,
+        decision_id: str | None = None,
+        priority: int = 100,
+        idempotency_key: str | None = None,
+    ) -> str | None:
+        """Persist a typed price-free ruling before attempting a fill."""
+        if not self.db_service or self.db_service._connection is None:
+            return None
+        intent = ExecutionIntent(
+            ticker=self._normalize_ticker(ticker),
+            direction=str(direction or "hold").lower(),
+            target_position=max(0.0, min(float(target_position or 0.0), 1.0)),
+            confidence=confidence,
+            reason=str(reason or ""),
+            round_id=round_id,
+            decision_id=decision_id,
+            priority=int(priority),
+            idempotency_key=idempotency_key,
+        )
+        await self.db_service._connection.execute(
+            """
+            INSERT OR IGNORE INTO execution_intents (
+                id, round_id, decision_id, ticker, direction, target_position,
+                confidence, priority, reason, status, defer_code, resolution,
+                idempotency_key, created_at, updated_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+            """,
+            (
+                intent.id,
+                intent.round_id,
+                intent.decision_id,
+                intent.ticker,
+                intent.direction,
+                intent.target_position,
+                intent.confidence,
+                intent.priority,
+                intent.reason,
+                intent.status.value,
+                intent.stable_idempotency_key,
+                intent.created_at,
+                intent.updated_at,
+                intent.expires_at,
+            ),
+        )
+        await self.db_service._connection.commit()
+        async with self.db_service._connection.execute(
+            "SELECT id FROM execution_intents WHERE idempotency_key = ?",
+            (intent.stable_idempotency_key,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row[0]) if row else None
+
+    async def _set_execution_intent_status(
+        self,
+        intent_id: str | None,
+        *,
+        status: str,
+        resolution: str,
+        defer_code: str | None = None,
+    ) -> None:
+        if (
+            not intent_id
+            or not self.db_service
+            or self.db_service._connection is None
+        ):
+            return
+        now = datetime.now().isoformat()
+        await self.db_service._connection.execute(
+            """
+            UPDATE execution_intents
+            SET status = ?, resolution = ?, defer_code = ?, updated_at = ?
+            WHERE id = ? AND status <> 'executed'
+            """,
+            (
+                status,
+                str(resolution or "")[:1000],
+                defer_code,
+                now,
+                intent_id,
+            ),
+        )
+        await self.db_service._connection.commit()
+
+    async def update_execution_intent(
+        self,
+        intent_id: str,
+        *,
+        target_position: float,
+        reason: str,
+    ) -> bool:
+        """Refine a price-free ruling after sizing, before execution."""
+        if not self.db_service or self.db_service._connection is None:
+            return False
+        cursor = await self.db_service._connection.execute(
+            """
+            UPDATE execution_intents
+            SET target_position = ?, reason = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (
+                max(0.0, min(float(target_position or 0.0), 1.0)),
+                str(reason or "")[:2000],
+                datetime.now().isoformat(),
+                intent_id,
+            ),
+        )
+        await self.db_service._connection.commit()
+        return bool(cursor.rowcount)
+
+    async def reject_execution_intent(
+        self,
+        intent_id: str | None,
+        *,
+        code: str,
+        reason: str,
+    ) -> None:
+        """Persist an auditable non-fill after a ruling reaches execution."""
+        await self._set_execution_intent_status(
+            intent_id,
+            status="rejected",
+            resolution=f"{code}:{reason}",
+        )
+
+    async def execute_intent(self, intent_id: str, llm: LLMClient = None) -> Dict[str, Any]:
+        """Canonical simulated-execution entry; callers cannot provide a price."""
+        if not self.db_service or self.db_service._connection is None:
+            return {
+                "success": False,
+                "action": "error",
+                "reason": "模拟执行数据库不可用",
+            }
+        async with self.db_service._connection.execute(
+            "SELECT * FROM execution_intents WHERE id = ?",
+            (intent_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return {
+                "success": False,
+                "action": "error",
+                "reason": f"执行裁决不存在: {intent_id}",
+            }
+        item = dict(row)
+        if item["status"] == "executed":
+            return {
+                "success": True,
+                "action": "already_executed",
+                "intent_id": intent_id,
+                "reason": "执行裁决已完成，幂等重放未产生新成交",
+            }
+        if item["status"] in {"rejected", "expired", "cancelled"}:
+            return {
+                "success": False,
+                "action": item["status"],
+                "intent_id": intent_id,
+                "reason": item.get("resolution") or item["status"],
+            }
+        result = await self.execute_trade(
+            ticker=item["ticker"],
+            direction=item["direction"],
+            target_position=float(item["target_position"]),
+            current_price=None,
+            llm=llm,
+            reason=item.get("reason") or "",
+            confidence=item.get("confidence"),
+            risk_cap_already_applied=True,
+            pending_decision_id=None,
+            round_id=item.get("round_id"),
+            intent_id=intent_id,
+            idempotency_key=item["idempotency_key"],
+        )
+        action = str(result.get("action") or "")
+        if action == "pending":
+            await self._set_execution_intent_status(
+                intent_id,
+                status="deferred",
+                resolution=result.get("reason") or "execution deferred",
+                defer_code=_execution_defer_code(result.get("reason")),
+            )
+        elif action not in {"buy", "sell", "already_executed"}:
+            await self._set_execution_intent_status(
+                intent_id,
+                status="rejected",
+                resolution=result.get("reason") or action or "execution rejected",
+            )
+        return {"intent_id": intent_id, **result}
 
     async def replay_pending_decisions(self, max_count: int | None = None) -> Dict[str, Any]:
         """Consume deferred rulings once, only in an open trading session.
@@ -806,9 +1053,7 @@ class InvestmentSimulation:
             return summary
 
         conn = self.db_service._connection
-        from .market_data import get_market_data
-
-        market_data = get_market_data()
+        market_data = self._market_data_service()
         summary["pending_before"] = await self.pending_decision_count()
         if summary["pending_before"] <= 0:
             summary["status"] = "empty"
@@ -842,7 +1087,7 @@ class InvestmentSimulation:
         async with conn.execute(
             """
             SELECT id, ticker, direction, target_position, confidence, reason,
-                   defer_code, created_at, expires_at
+                   defer_code, created_at, expires_at, round_id, intent_id
             FROM simulation_pending_decisions
             WHERE status = 'pending_next_trading_session'
             ORDER BY CASE WHEN direction IN ('sell', 'short') THEN 0 ELSE 1 END,
@@ -891,16 +1136,20 @@ class InvestmentSimulation:
                 continue
             summary["attempted"] += 1
             try:
-                result = await self.execute_trade(
-                    ticker=str(row["ticker"]),
-                    direction=str(row["direction"]),
-                    target_position=float(row["target_position"]),
-                    current_price=0.0,
-                    reason=f"待执行裁决重放: {row.get('reason') or row.get('defer_code') or ''}",
-                    confidence=row.get("confidence"),
-                    risk_cap_already_applied=False,
-                    pending_decision_id=pending_id,
-                )
+                if row.get("intent_id"):
+                    result = await self.execute_intent(str(row["intent_id"]))
+                else:
+                    result = await self.execute_trade(
+                        ticker=str(row["ticker"]),
+                        direction=str(row["direction"]),
+                        target_position=float(row["target_position"]),
+                        current_price=0.0,
+                        reason=f"待执行裁决重放: {row.get('reason') or row.get('defer_code') or ''}",
+                        confidence=row.get("confidence"),
+                        risk_cap_already_applied=False,
+                        pending_decision_id=pending_id,
+                        round_id=row.get("round_id"),
+                    )
             except Exception as exc:
                 logger.exception("Pending simulated decision replay failed: id=%s", pending_id)
                 result = {"success": False, "action": "error", "reason": str(exc)}
@@ -953,15 +1202,11 @@ class InvestmentSimulation:
 
     async def get_current_price(self, ticker: str) -> Optional[float]:
         """获取实时行情价格；不使用AI预测或历史价格替代。"""
-        from .market_data import get_market_data
-
-        return await get_market_data().get_current_price(ticker)
+        return await self._market_data_service().get_current_price(ticker)
 
     async def get_current_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
         """获取带来源和抓取时间的实时行情。"""
-        from .market_data import get_market_data
-
-        market_data = get_market_data()
+        market_data = self._market_data_service()
         if hasattr(market_data, "get_current_quote"):
             return await market_data.get_current_quote(ticker)
         if not hasattr(market_data, "get_current_price"):
@@ -992,7 +1237,7 @@ class InvestmentSimulation:
         code = self._normalize_ticker(ticker)
         if self.realtime_quotes_enabled():
             quote = await self.get_current_quote(code)
-            if quote and quote.get("price") and float(quote["price"]) > 0:
+            if self._quote_is_fresh(quote):
                 return {
                     "price": float(quote["price"]),
                     "source": str(quote.get("source") or "realtime_quote"),
@@ -1004,9 +1249,33 @@ class InvestmentSimulation:
             "price_at": "",
         }
 
+    def _quote_is_fresh(self, quote: Any) -> bool:
+        if not isinstance(quote, dict):
+            return False
+        try:
+            if float(quote.get("price") or 0.0) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+        fetched_text = str(quote.get("fetched_at") or "").strip()
+        source = str(quote.get("source") or "").strip()
+        if not fetched_text or not source:
+            return False
+        try:
+            fetched = datetime.fromisoformat(fetched_text.replace("Z", "+00:00"))
+            now = datetime.now(fetched.tzinfo) if fetched.tzinfo else datetime.now()
+            age_seconds = (now - fetched).total_seconds()
+        except (TypeError, ValueError):
+            return False
+        return -60.0 <= age_seconds <= float(self.max_realtime_quote_age_seconds)
+
     async def resolve_trade_price(self, ticker: str) -> tuple[Optional[float], str]:
         """Resolve a realtime-only simulated-trade price."""
         detail = await self.resolve_trade_price_detail(ticker)
+        self._last_trade_quote_detail = {
+            "ticker": self._normalize_ticker(ticker),
+            **detail,
+        }
         source = str(detail.get("source", ""))
         price_at = str(detail.get("price_at", ""))
         label = f"{source} {price_at}".strip()
@@ -1017,13 +1286,16 @@ class InvestmentSimulation:
         ticker: str,
         direction: str,
         target_position: float,
-        current_price: float,
+        current_price: float | None = None,
         llm: LLMClient = None,
         reason: str = "",
         confidence: float | None = None,
         signal_count: int | None = None,
         risk_cap_already_applied: bool = False,
         pending_decision_id: int | None = None,
+        round_id: str | None = None,
+        intent_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Dict:
         """
         执行交易（支持买入、卖出、持有）
@@ -1039,10 +1311,9 @@ class InvestmentSimulation:
         Returns:
             交易结果
         """
-        from .market_data import get_market_data
-
-        market_data = get_market_data()
+        market_data = self._market_data_service()
         direction_norm = (direction or "").lower()
+        ticker = self._normalize_ticker(ticker)
 
         if not await market_data.is_trading_day():
             pending_id = await self.record_pending_decision(
@@ -1053,6 +1324,8 @@ class InvestmentSimulation:
                 reason=reason or "非交易日裁决",
                 defer_code="non_trading_day",
                 existing_id=pending_decision_id,
+                round_id=round_id,
+                intent_id=intent_id,
             )
             return {
                 'success': False,
@@ -1074,6 +1347,8 @@ class InvestmentSimulation:
                 reason=reason or "闭市裁决",
                 defer_code="market_closed",
                 existing_id=pending_decision_id,
+                round_id=round_id,
+                intent_id=intent_id,
             )
             return {
                 'success': False,
@@ -1093,6 +1368,8 @@ class InvestmentSimulation:
                 reason=reason or "超过每日成交硬门",
                 defer_code="daily_trade_limit",
                 existing_id=pending_decision_id,
+                round_id=round_id,
+                intent_id=intent_id,
             )
             return {
                 'success': False,
@@ -1139,6 +1416,18 @@ class InvestmentSimulation:
                 'ticker': ticker,
                 'reason': '无法获取实时现价，拒绝模拟交易；不使用本地估值或历史价格兜底'
             }
+        quote_detail = getattr(self, "_last_trade_quote_detail", {}) or {}
+        if quote_detail.get("ticker") != ticker or not quote_detail.get("price"):
+            quote_detail = {
+                "ticker": ticker,
+                "price": price,
+                "source": price_source or "realtime_quote",
+                "price_at": datetime.now().isoformat(),
+            }
+        quote_provider = str(quote_detail.get("source") or "realtime_quote")
+        quote_fetched_at = str(
+            quote_detail.get("price_at") or datetime.now().isoformat()
+        )
 
         # 计算当前持仓
         if direction_norm in ("short", "sell"):
@@ -1185,71 +1474,147 @@ class InvestmentSimulation:
         if diff_value > 0:
             # 需要买入
             buy_amount = diff_value
-            # 扣除手续费
-            buy_amount_with_fee = buy_amount / (1 + self.trading_fee)
-            shares_to_buy = int(buy_amount_with_fee / price / self.min_unit) * self.min_unit
+            # Target position describes market value; commission is paid from
+            # operational cash. Dividing the target by (1 + fee) before lot
+            # rounding turned an exact one-lot 10% allocation into zero shares.
+            shares_to_buy = int(buy_amount / price / self.min_unit) * self.min_unit
 
             if shares_to_buy <= 0:
                 return {'success': True, 'action': 'hold', 'reason': '金额不足一手'}
 
             cost = shares_to_buy * price
-            fee = cost * self.trading_fee
-            total_cost = cost + fee
+            commission = cost * self.trading_fee
+            slippage_cost = cost * self.slippage_rate
+            total_fee = commission + slippage_cost
+            total_cost = cost + total_fee
 
             if total_cost > self.cash:
                 # 资金不足，调整数量
-                max_shares = int(self.cash / price / (1 + self.trading_fee) / self.min_unit) * self.min_unit
+                max_shares = int(
+                    self.cash
+                    / price
+                    / (1 + self.trading_fee + self.slippage_rate)
+                    / self.min_unit
+                ) * self.min_unit
                 if max_shares <= 0:
                     return {'success': True, 'action': 'hold', 'reason': '资金不足'}
                 shares_to_buy = max_shares
                 cost = shares_to_buy * price
-                fee = cost * self.trading_fee
-                total_cost = cost + fee
+                commission = cost * self.trading_fee
+                slippage_cost = cost * self.slippage_rate
+                total_fee = commission + slippage_cost
+                total_cost = cost + total_fee
 
-            # 执行买入
-            self.cash -= total_cost
-
-            if ticker in self.positions:
-                old_shares = self.positions[ticker]['shares']
-                old_cost = self.positions[ticker]['avg_cost'] * old_shares
+            new_cash = self.cash - total_cost
+            new_positions = copy.deepcopy(self.positions)
+            now = datetime.now()
+            if ticker in new_positions:
+                old_shares = new_positions[ticker]['shares']
+                old_cost = new_positions[ticker]['avg_cost'] * old_shares
                 new_shares = old_shares + shares_to_buy
                 new_cost = old_cost + cost
-                existing = self.positions[ticker]
+                existing = new_positions[ticker]
                 existing.update({
                     'shares': new_shares,
                     'avg_cost': new_cost / new_shares,
                     'peak_price': max(float(existing.get('peak_price') or price), price),
                 })
             else:
-                self.positions[ticker] = {
+                new_positions[ticker] = {
                     'shares': shares_to_buy,
                     'avg_cost': price,
-                    'opened_at': datetime.now().isoformat(),
+                    'opened_at': now.isoformat(),
                     'peak_price': price,
                     'last_mark_price': price,
-                    'last_mark_at': datetime.now().isoformat(),
-                    'last_mark_source': price_source,
-                    'last_reviewed_at': datetime.now().isoformat(),
+                    'last_mark_at': quote_fetched_at,
+                    'last_mark_source': quote_provider,
+                    'last_reviewed_at': now.isoformat(),
                     'review_status': 'opened',
                     'review_reason': reason or '新建模拟持仓',
                 }
 
-            self.last_trade_date = datetime.now()
-            self.last_trade_records[ticker] = datetime.now().isoformat()
-
-            # 记录交易
-            await self._record_trade(
-                ticker=ticker,
-                direction='buy',
-                shares=shares_to_buy,
-                price=price,
-                fee=fee,
-                reason=(reason or f"加仓至{target_position*100:.0f}%") + (
-                    f"; price_source={price_source}" if price_source else ""
-                )
+            durable_reason = (reason or f"加仓至{target_position*100:.0f}%") + (
+                f"; price_source={quote_provider} {quote_fetched_at}"
             )
+            stable_key = idempotency_key or (
+                f"intent:{intent_id}" if intent_id else new_id("fill")
+            )
+            trade_id = None
+            quote_snapshot_id = None
+            if self.db_service:
+                try:
+                    committed = await AtomicSimulationExecutor(
+                        self.db_service,
+                        max_daily_trades=self.max_daily_trades,
+                        max_quote_age_seconds=self.max_realtime_quote_age_seconds,
+                    ).commit(
+                        TradeCommitRequest(
+                            ticker=ticker,
+                            direction="buy",
+                            shares=shares_to_buy,
+                            price=price,
+                            gross_amount=cost,
+                            commission=commission,
+                            stamp_duty=0.0,
+                            slippage_cost=slippage_cost,
+                            total_fee=total_fee,
+                            reason=durable_reason,
+                            quote_provider=quote_provider,
+                            quote_fetched_at=quote_fetched_at,
+                            new_cash=new_cash,
+                            new_positions=new_positions,
+                            idempotency_key=stable_key,
+                            round_id=round_id,
+                            intent_id=intent_id,
+                            pending_decision_id=pending_decision_id,
+                            traded_at=now.isoformat(),
+                        )
+                    )
+                    trade_id = committed.trade_id
+                    quote_snapshot_id = committed.quote_snapshot_id
+                    if committed.duplicate:
+                        return {
+                            "success": True,
+                            "action": "already_executed",
+                            "ticker": ticker,
+                            "trade_id": trade_id,
+                            "reason": "同一执行裁决已成交，幂等重放未产生新成交",
+                        }
+                except DailyTradeLimitReached:
+                    pending_id = await self.record_pending_decision(
+                        ticker=ticker,
+                        direction=direction_norm,
+                        target_position=target_position,
+                        confidence=confidence,
+                        reason=reason or "事务内达到每日成交硬门",
+                        defer_code="daily_trade_limit",
+                        existing_id=pending_decision_id,
+                        round_id=round_id,
+                        intent_id=intent_id,
+                    )
+                    return {
+                        "success": False,
+                        "action": "pending",
+                        "ticker": ticker,
+                        "pending_decision_id": pending_id,
+                        "reason": (
+                            f"今日模拟成交已达硬上限 {self.max_daily_trades} 笔；"
+                            "裁决已持久化到下一交易时段"
+                        ),
+                    }
+                except Exception as exc:
+                    logger.exception("Atomic simulated buy failed for %s", ticker)
+                    return {
+                        "success": False,
+                        "action": "error",
+                        "ticker": ticker,
+                        "reason": f"模拟买入事务回滚: {exc}",
+                    }
 
-            await self.save_state()
+            self.cash = new_cash
+            self.positions = new_positions
+            self.last_trade_date = now
+            self.last_trade_records[ticker] = now.isoformat()
 
             return {
                 'success': True,
@@ -1258,7 +1623,11 @@ class InvestmentSimulation:
                 'shares': shares_to_buy,
                 'price': price,
                 'cost': total_cost,
-                'remaining_cash': self.cash
+                'remaining_cash': self.cash,
+                'trade_id': trade_id,
+                'quote_snapshot_id': quote_snapshot_id,
+                'price_source': quote_provider,
+                'quote_fetched_at': quote_fetched_at,
             }
 
         # === 卖出 ===
@@ -1280,38 +1649,101 @@ class InvestmentSimulation:
             proceeds = shares_to_sell * price
             trading_fee = proceeds * self.trading_fee
             stamp_duty = proceeds * self.stamp_duty  # 印花税
-            total_fee = trading_fee + stamp_duty
+            slippage_cost = proceeds * self.slippage_rate
+            total_fee = trading_fee + stamp_duty + slippage_cost
             net_proceeds = proceeds - total_fee
 
-            # 执行卖出
-            self.cash += net_proceeds
+            new_cash = self.cash + net_proceeds
             remaining_shares = current_shares - shares_to_sell
-
+            new_positions = copy.deepcopy(self.positions)
             if remaining_shares > 0:
-                self.positions[ticker]['shares'] = remaining_shares
+                new_positions[ticker]['shares'] = remaining_shares
             else:
-                del self.positions[ticker]
+                del new_positions[ticker]
 
-            self.last_trade_date = datetime.now()
-            self.last_trade_records[ticker] = datetime.now().isoformat()
-
-            # 记录交易
-            trade_id = await self._record_trade(
-                ticker=ticker,
-                direction='sell',
-                shares=shares_to_sell,
-                price=price,
-                fee=total_fee,
-                reason=(reason or f"减仓至{target_position*100:.0f}%") + (
-                    f"; price_source={price_source}" if price_source else ""
-                )
+            now = datetime.now()
+            durable_reason = (reason or f"减仓至{target_position*100:.0f}%") + (
+                f"; price_source={quote_provider} {quote_fetched_at}"
             )
-
-            await self.save_state()
-            await self.mark_redeployment_required(
-                net_proceeds,
-                source=f"simulation_sell_trade:{trade_id or 'unknown'}:{ticker}",
+            stable_key = idempotency_key or (
+                f"intent:{intent_id}" if intent_id else new_id("fill")
             )
+            trade_id = None
+            quote_snapshot_id = None
+            if self.db_service:
+                try:
+                    committed = await AtomicSimulationExecutor(
+                        self.db_service,
+                        max_daily_trades=self.max_daily_trades,
+                        max_quote_age_seconds=self.max_realtime_quote_age_seconds,
+                    ).commit(
+                        TradeCommitRequest(
+                            ticker=ticker,
+                            direction="sell",
+                            shares=shares_to_sell,
+                            price=price,
+                            gross_amount=proceeds,
+                            commission=trading_fee,
+                            stamp_duty=stamp_duty,
+                            slippage_cost=slippage_cost,
+                            total_fee=total_fee,
+                            reason=durable_reason,
+                            quote_provider=quote_provider,
+                            quote_fetched_at=quote_fetched_at,
+                            new_cash=new_cash,
+                            new_positions=new_positions,
+                            idempotency_key=stable_key,
+                            round_id=round_id,
+                            intent_id=intent_id,
+                            pending_decision_id=pending_decision_id,
+                            traded_at=now.isoformat(),
+                        )
+                    )
+                    trade_id = committed.trade_id
+                    quote_snapshot_id = committed.quote_snapshot_id
+                    if committed.duplicate:
+                        return {
+                            "success": True,
+                            "action": "already_executed",
+                            "ticker": ticker,
+                            "trade_id": trade_id,
+                            "reason": "同一执行裁决已成交，幂等重放未产生新成交",
+                        }
+                except DailyTradeLimitReached:
+                    pending_id = await self.record_pending_decision(
+                        ticker=ticker,
+                        direction=direction_norm,
+                        target_position=target_position,
+                        confidence=confidence,
+                        reason=reason or "事务内达到每日成交硬门",
+                        defer_code="daily_trade_limit",
+                        existing_id=pending_decision_id,
+                        round_id=round_id,
+                        intent_id=intent_id,
+                    )
+                    return {
+                        "success": False,
+                        "action": "pending",
+                        "ticker": ticker,
+                        "pending_decision_id": pending_id,
+                        "reason": (
+                            f"今日模拟成交已达硬上限 {self.max_daily_trades} 笔；"
+                            "裁决已持久化到下一交易时段"
+                        ),
+                    }
+                except Exception as exc:
+                    logger.exception("Atomic simulated sell failed for %s", ticker)
+                    return {
+                        "success": False,
+                        "action": "error",
+                        "ticker": ticker,
+                        "reason": f"模拟卖出事务回滚: {exc}",
+                    }
+
+            self.cash = new_cash
+            self.positions = new_positions
+            self.last_trade_date = now
+            self.last_trade_records[ticker] = now.isoformat()
             await self.refresh_simulation_risk_memory()
 
             return {
@@ -1321,38 +1753,15 @@ class InvestmentSimulation:
                 'shares': shares_to_sell,
                 'price': price,
                 'proceeds': net_proceeds,
-                'remaining_cash': self.cash
+                'remaining_cash': self.cash,
+                'trade_id': trade_id,
+                'quote_snapshot_id': quote_snapshot_id,
+                'price_source': quote_provider,
+                'quote_fetched_at': quote_fetched_at,
             }
 
         # === 持有 ===
         return {'success': True, 'action': 'hold', 'reason': '仓位合适'}
-
-    async def _record_trade(
-        self,
-        ticker: str,
-        direction: str,
-        shares: int,
-        price: float,
-        fee: float,
-        reason: str = ""
-    ) -> int | None:
-        """记录交易到数据库"""
-        if not self.db_service:
-            return
-
-        try:
-            conn = self.db_service._connection
-            cursor = await conn.execute("""
-                INSERT INTO simulation_trades (ticker, direction, shares, price, fee, reason, traded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                ticker, direction, shares, price, fee, reason, datetime.now().isoformat()
-            ))
-            await conn.commit()
-            return int(cursor.lastrowid)
-        except Exception as e:
-            logger.warning(f"Failed to record trade: {e}")
-            return None
 
     async def refresh_simulation_risk_memory(self) -> List[Dict]:
         """Persist recent realized-loss memory derived from local simulated trades."""
@@ -1424,7 +1833,11 @@ class InvestmentSimulation:
             logger.warning(f"Failed to refresh simulation risk memory: {e}")
             return []
 
-    async def review_open_positions(self) -> List[Dict[str, Any]]:
+    async def review_open_positions(
+        self,
+        *,
+        round_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """Review every open position before considering new simulated trades."""
         reviews: List[Dict[str, Any]] = []
         now = datetime.now()
@@ -1459,14 +1872,45 @@ class InvestmentSimulation:
 
             result = review.as_dict()
             if review.action == "exit" and executable_price:
-                execution = await self.execute_trade(
-                    ticker=ticker,
-                    direction="sell",
-                    target_position=0.0,
-                    current_price=float(executable_price),
-                    reason=f"逐仓强制复核: {review.reason}; price_source={detail.get('source')} {detail.get('price_at')}",
-                    risk_cap_already_applied=True,
+                execution_reason = (
+                    f"逐仓强制复核: {review.reason}; "
+                    f"review_quote_source={detail.get('source')} "
+                    f"{detail.get('price_at')}; 成交前必须重新获取实时行情"
                 )
+                if self.db_service and self.db_service._connection is not None:
+                    intent_id = await self.create_execution_intent(
+                        ticker=ticker,
+                        direction="sell",
+                        target_position=0.0,
+                        confidence=1.0,
+                        reason=execution_reason,
+                        round_id=round_id,
+                        priority=0,
+                        idempotency_key=(
+                            f"{round_id or 'lifecycle'}:{ticker}:"
+                            f"exit:{now.date().isoformat()}"
+                        ),
+                    )
+                    execution = (
+                        await self.execute_intent(intent_id)
+                        if intent_id
+                        else {
+                            "success": False,
+                            "action": "error",
+                            "reason": "生命周期退出裁决持久化失败",
+                        }
+                    )
+                else:
+                    # Production exits use ExecutionIntent. The in-memory seam
+                    # remains for pure policy unit tests only.
+                    execution = await self.execute_trade(
+                        ticker=ticker,
+                        direction="sell",
+                        target_position=0.0,
+                        current_price=float(executable_price),
+                        reason=execution_reason,
+                        risk_cap_already_applied=True,
+                    )
                 result["execution"] = execution
                 if not execution.get("success") and ticker in self.positions:
                     pos["review_status"] = "exit_pending_execution"
@@ -1492,7 +1936,7 @@ class InvestmentSimulation:
             price = None
             if self.realtime_quotes_enabled():
                 quote = await self.get_current_quote(code)
-                if quote and quote.get("price") and float(quote["price"]) > 0:
+                if self._quote_is_fresh(quote):
                     price = float(quote["price"])
                     quote_details[code] = dict(quote)
             if not price:
@@ -1969,9 +2413,15 @@ class InvestmentSimulation:
                 )
 
         await conn.commit()
+        await apply_architecture_migrations(conn)
         await self.refresh_simulation_risk_memory()
 
-    async def save_snapshot(self, reflection: str = ""):
+    async def save_snapshot(
+        self,
+        reflection: str = "",
+        *,
+        round_id: str | None = None,
+    ):
         """保存每日资产快照"""
         if not self.db_service:
             return
@@ -1987,15 +2437,18 @@ class InvestmentSimulation:
             conn = self.db_service._connection
 
             await conn.execute("""
-                INSERT INTO simulation_snapshots (total_assets, cash, positions_value, reflection, snapshot_date, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO simulation_snapshots (
+                    total_assets, cash, positions_value, reflection,
+                    snapshot_date, created_at, round_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 assets['total_assets'],
                 assets['cash'],
                 assets['positions_value'],
                 reflection[:2000] if reflection else "",
                 datetime.now().date().isoformat(),
-                datetime.now().isoformat()
+                datetime.now().isoformat(),
+                round_id,
             ))
             await conn.commit()
             logger.info(f"Saved snapshot: total={assets['total_assets']}")
@@ -2035,18 +2488,26 @@ async def run_daily_simulation(llm: LLMClient, db_service, proposals: List[Dict]
             direction = proposal.get('direction', 'long')
             target_position = proposal.get('target_position', 0.1)
 
-            current_price, price_source = await simulation.resolve_trade_price(ticker)
-            if current_price is None:
-                logger.info(f"Skip simulation trade for {ticker}: no realtime quote")
-                continue
-
-            result = await simulation.execute_trade(
+            intent_id = await simulation.create_execution_intent(
                 ticker=ticker,
                 direction=direction,
                 target_position=target_position,
-                current_price=current_price,
-                llm=llm,
-                reason=f"proposal simulation; price_source={price_source}",
+                confidence=proposal.get("confidence"),
+                reason="legacy daily-simulation proposal routed through canonical intent",
+                decision_id=proposal.get("decision_id"),
+                idempotency_key=(
+                    f"daily:{datetime.now().date().isoformat()}:"
+                    f"{proposal.get('decision_id') or ticker}:{direction}"
+                ),
+            )
+            result = (
+                await simulation.execute_intent(intent_id, llm=llm)
+                if intent_id
+                else {
+                    "success": False,
+                    "action": "error",
+                    "reason": "cannot persist execution intent",
+                }
             )
 
             if result.get('success'):

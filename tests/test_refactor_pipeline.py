@@ -132,6 +132,11 @@ def test_simulation_account_return_is_the_only_authoritative_score():
     assert metrics["performance_standard"] == PERFORMANCE_STANDARD
     assert metrics["score"] == pytest.approx(-0.027278)
     assert metrics["net_total_return"] == metrics["score"]
+    assert metrics["recorded_fees"] == pytest.approx(12.34)
+    assert metrics["recorded_cost_ratio"] == pytest.approx(0.001234)
+    assert metrics["gross_total_return_before_recorded_cost"] == pytest.approx(
+        -0.026044
+    )
     assert metrics["offline_backtest_promotion_allowed"] is False
     assert metrics["health_status"] == "system_failure_no_live_deployment"
 
@@ -151,6 +156,7 @@ def test_incomplete_realtime_valuation_never_falls_back_to_offline_return():
 
     assert metrics["score"] is None
     assert metrics["net_total_return"] is None
+    assert metrics["gross_total_return_before_recorded_cost"] is None
     assert metrics["health_status"] == "valuation_incomplete"
     assert metrics["missing_price_tickers"] == ["600519"]
 

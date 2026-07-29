@@ -67,13 +67,15 @@ async def print_report(context):
 
 
 async def run_research_question(question: str) -> None:
-    from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
-
-    system = ResearchDiscussionSystem(
-        enable_search=True,
-        enable_web=False
+    from sovereign_hall.application.answer_research_question import (
+        answer_research_question,
     )
-    context = await system.research(question)
+
+    context = await answer_research_question(
+        question,
+        enable_search=True,
+        enable_web=False,
+    )
     await print_report(context)
 
     # 保存到文件

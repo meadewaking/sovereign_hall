@@ -59,6 +59,7 @@ from sovereign_hall.services.heuristic_policy import (
     load_latest_heuristic_context,
     recent_prediction_observation_count,
 )
+from sovereign_hall.domain.common.ids import new_id
 
 # 延迟导入Agent避免循环引用
 Agent = None
@@ -987,7 +988,14 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
 # ============================================================================
 # 阶段2：深度研报生成
 # ============================================================================
-async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, lessons_prompt: str = "") -> list:
+async def stage2_deep_research(
+    llm,
+    docs: list,
+    topic: str,
+    db_service=None,
+    lessons_prompt: str = "",
+    round_id: str | None = None,
+) -> list:
     """阶段2：从文档中提取投资提案"""
     from sovereign_hall.core.config import get_config
 
@@ -1020,6 +1028,7 @@ async def stage2_deep_research(llm, docs: list, topic: str, db_service=None, les
                 raw_excerpt=raw_excerpt,
                 reason=reason,
                 source="run_discussion.stage2_deep_research",
+                round_id=round_id,
             )
         except Exception as diagnostic_error:
             logger.warning("[diag] stage2 diagnostic persistence failed: %s", diagnostic_error)
@@ -2177,7 +2186,14 @@ def preflight_committee_decisions(
 # ============================================================================
 # 阶段3：投委会审议（多轮辩论）
 # ============================================================================
-async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lessons_prompt: str = ""):
+async def stage3_ic_discussion(
+    llm,
+    spiders,
+    proposals: list,
+    topic: str,
+    lessons_prompt: str = "",
+    round_id: str | None = None,
+):
     """阶段3：投委会审议"""
     if not proposals:
         logger.warning("阶段3：无提案，跳过审议")
@@ -2592,6 +2608,8 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                     print("      ➖ 死锁复核未通过，保留HOLD并记录具体缺口")
             expected_days = normalize_proposal_holding_period(proposal, topic)
             committee_decision.update({
+                'decision_id': new_id("decision"),
+                'round_id': round_id,
                 'ticker': ticker,
                 'thesis': thesis,
                 'cio_vote': vote_results[0][:200],
@@ -2630,6 +2648,8 @@ async def stage3_ic_discussion(llm, spiders, proposals: list, topic: str, lesson
                             f"reconsider_if={committee_decision.get('reconsider_if', [])}"
                         ),
                         expected_days=expected_days,
+                        round_id=round_id,
+                        decision_id=committee_decision["decision_id"],
                     )
                     committee_decision["prediction_id"] = prediction_id
                     if committee_decision.get("direction") == "hold":
@@ -2778,6 +2798,9 @@ async def run_committee_approved_simulation(
     llm,
     decisions: List[Dict],
     initial_rejections: Optional[List[Dict[str, str]]] = None,
+    round_id: str | None = None,
+    round_coordinator=None,
+    pre_reviewed_positions: Optional[List[Dict[str, Any]]] = None,
 ):
     """Run the daily simulated portfolio step after committee decisions exist."""
     from sovereign_hall.services.portfolio_policy import (
@@ -2837,7 +2860,11 @@ async def run_committee_approved_simulation(
         print("   离线回测仅作诊断，不产生best/score，也不能替代模拟成交")
 
     print("   🔎 先执行全部现有持仓的强制生命周期复核...")
-    position_reviews = await simulation.review_open_positions()
+    position_reviews = (
+        list(pre_reviewed_positions)
+        if pre_reviewed_positions is not None
+        else await simulation.review_open_positions()
+    )
     logger.info(
         "SIMULATION_LIFECYCLE_REVIEW positions=%s outcomes=%s",
         len(position_reviews),
@@ -2890,6 +2917,21 @@ async def run_committee_approved_simulation(
                 f"{replayed.get('action', 'unknown')}；{replayed.get('reason', '')}"
             )
 
+    if round_coordinator and round_id:
+        from sovereign_hall.domain.research import ResearchRoundStatus
+
+        current_round = await round_coordinator.get(round_id)
+        if (
+            current_round
+            and current_round.status == ResearchRoundStatus.PREDICTIONS_RECORDED
+        ):
+            await round_coordinator.advance(
+                round_id,
+                ResearchRoundStatus.PORTFOLIO_REVIEWED,
+                event_type="PortfolioLifecycleReviewed",
+                payload={"position_count": len(position_reviews)},
+            )
+
     assets = await simulation.calculate_assets()
     if assets.get("valuation_complete"):
         print(
@@ -2906,7 +2948,10 @@ async def run_committee_approved_simulation(
     current_tickers = set(current_positions.keys())
     current_ticker_codes = {simulation._normalize_ticker(ticker) for ticker in current_tickers}
     if hasattr(simulation, "record_committee_outcomes"):
-        await simulation.record_committee_outcomes(decisions, source="run_discussion")
+        outcome_kwargs = {"source": "run_discussion"}
+        if round_id is not None:
+            outcome_kwargs["round_id"] = round_id
+        await simulation.record_committee_outcomes(decisions, **outcome_kwargs)
     max_daily_trades = int(getattr(simulation, "max_daily_trades", MAX_DAILY_TRADES))
     prior_trade_count = (
         await simulation.count_trades_on_date()
@@ -2923,6 +2968,66 @@ async def run_committee_approved_simulation(
     )
     if initial_rejections:
         redeployment_rejections = list(initial_rejections) + redeployment_rejections
+    intent_stage_recorded = False
+
+    async def note_execution_intent(intent_id: str | None) -> None:
+        nonlocal intent_stage_recorded
+        if (
+            not intent_id
+            or intent_stage_recorded
+            or not round_coordinator
+            or not round_id
+        ):
+            return
+        from sovereign_hall.domain.research import ResearchRoundStatus
+
+        current_round = await round_coordinator.get(round_id)
+        if (
+            current_round
+            and current_round.status == ResearchRoundStatus.PORTFOLIO_REVIEWED
+        ):
+            await round_coordinator.advance(
+                round_id,
+                ResearchRoundStatus.EXECUTION_INTENTS_CREATED,
+                event_type="FirstExecutionIntentPersisted",
+                payload={"intent_id": intent_id},
+            )
+        intent_stage_recorded = True
+
+    async def persist_rejected_intent(
+        decision: Dict[str, Any],
+        *,
+        ticker: str,
+        direction: str,
+        target_position: float,
+        confidence: float,
+        code: str,
+        reason: str,
+    ) -> None:
+        if not hasattr(simulation, "create_execution_intent"):
+            return
+        intent_id = await simulation.create_execution_intent(
+            ticker=ticker,
+            direction=direction,
+            target_position=target_position,
+            confidence=confidence,
+            reason=reason,
+            round_id=round_id,
+            decision_id=decision.get("decision_id"),
+            priority=50 if direction in {"sell", "short"} else 100,
+            idempotency_key=(
+                f"{round_id or 'standalone'}:"
+                f"{decision.get('decision_id') or ticker}:"
+                f"{direction}"
+            ),
+        )
+        await note_execution_intent(intent_id)
+        if intent_id and hasattr(simulation, "reject_execution_intent"):
+            await simulation.reject_execution_intent(
+                intent_id,
+                code=code,
+                reason=reason,
+            )
 
     def reject(code: str, reason: str, ticker: str = "") -> None:
         item = {"code": code, "ticker": ticker, "reason": reason}
@@ -2979,6 +3084,15 @@ async def run_committee_approved_simulation(
             target_position = float(decision.get("target_position") or 0.0)
             confidence = float(decision.get("confidence") or 0.0)
             if direction == "long" and not assets.get("valuation_complete"):
+                await persist_rejected_intent(
+                    decision,
+                    ticker=ticker,
+                    direction=direction,
+                    target_position=target_position,
+                    confidence=confidence,
+                    code="valuation_incomplete",
+                    reason="组合实时估值不完整，禁止形成新增/扩仓待执行裁决",
+                )
                 reject(
                     "valuation_incomplete",
                     "组合实时估值不完整，禁止形成新增/扩仓待执行裁决",
@@ -3024,6 +3138,18 @@ async def run_committee_approved_simulation(
                     context=heuristic_context,
                 )
                 if target_position <= current_position_pct:
+                    await persist_rejected_intent(
+                        decision,
+                        ticker=ticker,
+                        direction=direction,
+                        target_position=target_position,
+                        confidence=confidence,
+                        code="heuristic_entry_veto",
+                        reason=(
+                            cap_reason
+                            or "heuristic风控未允许形成新增或扩仓待执行裁决"
+                        ),
+                    )
                     reject(
                         "heuristic_entry_veto",
                         cap_reason or "heuristic风控未允许形成新增或扩仓待执行裁决",
@@ -3041,15 +3167,51 @@ async def run_committee_approved_simulation(
             )
             if cap_reason:
                 pending_reason += f"；{cap_reason}"
-            pending_id = await simulation.record_pending_decision(
-                ticker=ticker,
-                direction=direction,
-                target_position=target_position,
-                confidence=confidence,
-                reason=pending_reason,
-                defer_code="non_trading_day" if not trading_day else "market_closed",
-                source="run_discussion_preflight",
-            )
+            if hasattr(simulation, "create_execution_intent"):
+                intent_id = await simulation.create_execution_intent(
+                    ticker=ticker,
+                    direction=direction,
+                    target_position=target_position,
+                    confidence=confidence,
+                    reason=pending_reason,
+                    round_id=round_id,
+                    decision_id=decision.get("decision_id"),
+                    priority=50 if direction in {"sell", "short"} else 100,
+                    idempotency_key=(
+                        f"{round_id or 'standalone'}:"
+                        f"{decision.get('decision_id') or ticker}:"
+                        f"{direction}"
+                    ),
+                )
+                pending_result = (
+                    await simulation.execute_intent(intent_id, llm=llm)
+                    if intent_id
+                    else {
+                        "success": False,
+                        "action": "error",
+                        "reason": "执行裁决持久化失败",
+                    }
+                )
+                await note_execution_intent(intent_id)
+            else:
+                # Compatibility seam for tests/third-party adapters. Production
+                # InvestmentSimulation always uses the durable intent path.
+                pending_id = await simulation.record_pending_decision(
+                    ticker=ticker,
+                    direction=direction,
+                    target_position=target_position,
+                    confidence=confidence,
+                    reason=pending_reason,
+                    defer_code=(
+                        "non_trading_day" if not trading_day else "market_closed"
+                    ),
+                )
+                pending_result = {
+                    "success": False,
+                    "action": "pending",
+                    "pending_decision_id": pending_id,
+                }
+            pending_id = pending_result.get("pending_decision_id")
             if pending_id is not None:
                 pending_count += 1
                 print(f"   🗂️ {ticker}: 裁决 #{pending_id} 已排队，未记录成交价")
@@ -3089,7 +3251,7 @@ async def run_committee_approved_simulation(
         if reflection:
             print(f"\n📝 每日投资反思:")
             print(reflection[:500] + "...")
-        await simulation.save_snapshot(reflection)
+        await simulation.save_snapshot(reflection, round_id=round_id)
         logger.info(
             "SIMULATION_PIPELINE_END fills=0 pending=%s candidates=%s "
             "valuation_complete=%s invested_ratio=%s terminal=market_closed",
@@ -3098,7 +3260,24 @@ async def run_committee_approved_simulation(
             final_assets.get("valuation_complete"),
             final_assets.get("invested_ratio"),
         )
-        return
+        closed_terminal = (
+            "market_closed_pending"
+            if pending_count > 0
+            else (
+                "execution_rejected"
+                if trade_candidates or redeployment_rejections
+                else ("committee_hold" if decisions else "no_evidence")
+            )
+        )
+        return {
+            "terminal": closed_terminal,
+            "fills": 0,
+            "pending": pending_count,
+            "candidate_count": len(trade_candidates),
+            "rejections": redeployment_rejections,
+            "assets": final_assets,
+            "performance": performance,
+        }
 
     if trade_candidates:
         bounded_candidates = trade_candidates[:5]
@@ -3113,18 +3292,56 @@ async def run_committee_approved_simulation(
                     deferred_ticker = simulation._normalize_ticker(deferred.get("ticker"))
                     if not deferred_ticker:
                         continue
-                    await simulation.record_pending_decision(
-                        ticker=deferred_ticker,
-                        direction=deferred.get("direction", "hold"),
-                        target_position=float(deferred.get("target_position", 0.0)),
-                        confidence=float(deferred.get("confidence", 0.5)),
-                        reason="投委会裁决超过当日5笔共享硬门",
-                        defer_code="daily_trade_limit",
-                        source="run_discussion_preflight",
-                    )
+                    if hasattr(simulation, "create_execution_intent"):
+                        deferred_intent_id = await simulation.create_execution_intent(
+                            ticker=deferred_ticker,
+                            direction=deferred.get("direction", "hold"),
+                            target_position=float(deferred.get("target_position", 0.0)),
+                            confidence=float(deferred.get("confidence", 0.5)),
+                            reason="投委会裁决超过当日5笔共享硬门",
+                            round_id=round_id,
+                            decision_id=deferred.get("decision_id"),
+                            priority=(
+                                50
+                                if str(deferred.get("direction") or "").lower()
+                                in {"sell", "short"}
+                                else 100
+                            ),
+                            idempotency_key=(
+                                f"{round_id or 'standalone'}:"
+                                f"{deferred.get('decision_id') or deferred_ticker}:"
+                                f"{str(deferred.get('direction') or 'hold').lower()}"
+                            ),
+                        )
+                        if deferred_intent_id:
+                            await note_execution_intent(deferred_intent_id)
+                            await simulation.execute_intent(deferred_intent_id, llm=llm)
+                    elif hasattr(simulation, "record_pending_decision"):
+                        await simulation.record_pending_decision(
+                            ticker=deferred_ticker,
+                            direction=deferred.get("direction", "hold"),
+                            target_position=float(
+                                deferred.get("target_position", 0.0)
+                            ),
+                            confidence=float(deferred.get("confidence", 0.5)),
+                            reason="投委会裁决超过当日5笔共享硬门",
+                            defer_code="daily_trade_limit",
+                        )
                 print(f"   ⏹️ {blocker}，剩余裁决已记录到下一交易时段")
                 break
             if simulation.is_in_cooldown(ticker):
+                direction = str(decision.get("direction") or "hold").lower()
+                confidence = float(decision.get("confidence") or 0.0)
+                target_position = float(decision.get("target_position") or 0.0)
+                await persist_rejected_intent(
+                    decision,
+                    ticker=ticker,
+                    direction=direction,
+                    target_position=target_position,
+                    confidence=confidence,
+                    code="cooldown",
+                    reason="同一标的仍在交易冷却期",
+                )
                 reject("cooldown", "同一标的仍在交易冷却期", ticker)
                 print(f"   ⏳ {ticker} 在冷却期内，跳过交易")
                 continue
@@ -3134,6 +3351,15 @@ async def run_committee_approved_simulation(
             target_position = float(decision.get('target_position', 0.0))
             current_price, price_source = await simulation.resolve_trade_price(ticker)
             if current_price is None:
+                await persist_rejected_intent(
+                    decision,
+                    ticker=ticker,
+                    direction=str(direction).lower(),
+                    target_position=target_position,
+                    confidence=confidence,
+                    code="realtime_quote_unavailable",
+                    reason="实时行情不可用",
+                )
                 reject("realtime_quote_unavailable", "实时行情不可用", ticker)
                 print(f"   ⏭️ {ticker}: 无法获取实时现价，跳过模拟交易")
                 continue
@@ -3149,6 +3375,15 @@ async def run_committee_approved_simulation(
                 trade_position = target_position * 0.3
                 trade_reason = "反思建议谨慎，小幅建仓"
             elif has_position and direction == "long":
+                await persist_rejected_intent(
+                    decision,
+                    ticker=ticker,
+                    direction=str(direction).lower(),
+                    target_position=target_position,
+                    confidence=confidence,
+                    code="no_position_change",
+                    reason="已有持仓，重复买入裁决没有形成仓位变化",
+                )
                 print(f"   ⏭️ {ticker} 已有持仓，跳过买入")
                 continue
             elif confidence < 0.4:
@@ -3174,6 +3409,19 @@ async def run_committee_approved_simulation(
                 missing_price_tickers,
             ) = await simulation._estimate_trade_assets(ticker, current_price)
             if missing_price_tickers and direction == "long":
+                await persist_rejected_intent(
+                    decision,
+                    ticker=ticker,
+                    direction=str(direction).lower(),
+                    target_position=trade_position,
+                    confidence=confidence,
+                    code="valuation_incomplete",
+                    reason=(
+                        "组合实时估值不完整("
+                        + ",".join(missing_price_tickers)
+                        + ")"
+                    ),
+                )
                 reject(
                     "valuation_incomplete",
                     f"组合实时估值不完整({','.join(missing_price_tickers)})",
@@ -3209,6 +3457,15 @@ async def run_committee_approved_simulation(
                 trade_reason = f"{trade_reason}；{cap_reason}"
             trade_position = capped_position
             if direction == "long" and trade_position <= current_position_pct:
+                await persist_rejected_intent(
+                    decision,
+                    ticker=ticker,
+                    direction=str(direction).lower(),
+                    target_position=trade_position,
+                    confidence=confidence,
+                    code="heuristic_entry_veto",
+                    reason=cap_reason or "heuristic风控未允许新增或扩大仓位",
+                )
                 reject(
                     "heuristic_entry_veto",
                     cap_reason or "heuristic风控未允许新增或扩大仓位",
@@ -3217,24 +3474,48 @@ async def run_committee_approved_simulation(
                 print(f"   ⛔ {ticker}: heuristic入场否决；{cap_reason or '目标仓位未增加'}")
                 continue
 
-            result = await simulation.execute_trade(
-                ticker=ticker,
-                direction=direction,
-                target_position=trade_position,
-                current_price=current_price,
-                llm=llm,
-                reason=trade_reason,
-                confidence=confidence,
-                signal_count=signal_count,
-                risk_cap_already_applied=True,
-            )
+            if hasattr(simulation, "create_execution_intent"):
+                intent_id = await simulation.create_execution_intent(
+                    ticker=ticker,
+                    direction=direction,
+                    target_position=trade_position,
+                    confidence=confidence,
+                    reason=trade_reason,
+                    round_id=round_id,
+                    decision_id=decision.get("decision_id"),
+                    priority=50 if str(direction).lower() in {"sell", "short"} else 100,
+                    idempotency_key=(
+                        f"{round_id or 'standalone'}:"
+                        f"{decision.get('decision_id') or ticker}:"
+                        f"{str(direction).lower()}"
+                    ),
+                )
+                result = (
+                    await simulation.execute_intent(intent_id, llm=llm)
+                    if intent_id
+                    else {
+                        "success": False,
+                        "action": "error",
+                        "reason": "执行裁决持久化失败",
+                    }
+                )
+                await note_execution_intent(intent_id)
+            else:
+                result = await simulation.execute_trade(
+                    ticker=ticker,
+                    direction=direction,
+                    target_position=trade_position,
+                    current_price=current_price,
+                    llm=llm,
+                    reason=trade_reason,
+                )
 
             if result.get('success') is False:
                 reason = result.get('reason', '交易失败')
-                if "交易时段" in reason or "非交易日" in reason:
-                    code = "market_closed"
-                elif "硬上限" in reason:
+                if "硬上限" in reason:
                     code = "daily_trade_limit"
+                elif "交易时段" in reason or "非交易日" in reason:
+                    code = "market_closed"
                 elif "实时现价" in reason:
                     code = "realtime_quote_unavailable"
                 elif "估值不完整" in reason:
@@ -3359,7 +3640,29 @@ async def run_committee_approved_simulation(
     if reflection:
         print(f"\n📝 每日投资反思:")
         print(reflection[:500] + "...")
-    await simulation.save_snapshot(reflection)
+    await simulation.save_snapshot(reflection, round_id=round_id)
+    if trade_count > 0:
+        terminal = "filled"
+    elif trade_candidates:
+        terminal = "execution_rejected"
+    elif any(
+        str(item.get("direction") or "hold").lower() in {"long", "buy", "short", "sell"}
+        for item in decisions
+    ):
+        terminal = "execution_rejected"
+    elif decisions:
+        terminal = "committee_hold"
+    else:
+        terminal = "no_evidence"
+    return {
+        "terminal": terminal,
+        "fills": trade_count,
+        "pending": 0,
+        "candidate_count": len(trade_candidates),
+        "rejections": redeployment_rejections,
+        "assets": final_assets,
+        "performance": final_performance,
+    }
 
 
 # ============================================================================
@@ -3373,6 +3676,8 @@ async def main():
     from sovereign_hall.services.llm_client import LLMClient
     from sovereign_hall.services.market_data import get_market_data
     from sovereign_hall.services.spider_service import SearchQueryGenerator, SpiderSwarm
+    from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
+    from sovereign_hall.domain.research import ResearchRoundStatus
 
     args = parse_args()
 
@@ -3489,6 +3794,7 @@ async def main():
     db_service = DatabaseService(str(db_path))
     await db_service._init_db()
     await db_service.init_report_tables()
+    round_coordinator = ResearchRoundCoordinator(db_service)
     vector_db.set_database_service(db_service)
     market_data = get_market_data()
 
@@ -3565,9 +3871,18 @@ async def main():
                 topic = base_topic
 
             iteration += 1
+            docs = []
+            proposals = []
             round_start = datetime.now()
             round_start_stats = llm.get_stats()
+            round_record = await round_coordinator.start(
+                base_topic=base_topic,
+                research_objective=topic,
+                prompt_version="run_discussion_canonical_v1",
+            )
+            active_round_id = round_record.id
             logger.info(f"🔥 第 {iteration} 轮开始 | 议题: {topic}")
+            logger.info("RESEARCH_ROUND_STARTED round_id=%s", active_round_id)
             print(f"\n{'='*60}")
             print(f"🔥 第 {iteration} 轮 | 议题: {topic}")
             print(f"{'='*60}")
@@ -3579,6 +3894,27 @@ async def main():
 
             # 先验证到期预测，再把最新结果和旧结论注入本轮。
             try:
+                # Existing holdings are reviewed before any new-research work.
+                # This keeps lifecycle exits and redeployment ahead of candidate
+                # discovery while still requiring a fresh quote at actual fill time.
+                pre_round_position_reviews = await simulation.review_open_positions(
+                    round_id=active_round_id,
+                )
+                await round_coordinator.record_event(
+                    active_round_id,
+                    "PreResearchPortfolioLifecycleReviewed",
+                    {
+                        "position_count": len(pre_round_position_reviews),
+                        "outcomes": [
+                            {
+                                "ticker": item.get("ticker"),
+                                "action": item.get("action"),
+                                "reason": item.get("reason"),
+                            }
+                            for item in pre_round_position_reviews
+                        ],
+                    },
+                )
                 t0 = datetime.now()
                 learning_engine = LearningEngine(str(db_path))
                 logger.info("[diag] validate_pending begin")
@@ -3627,6 +3963,15 @@ async def main():
                 logger.exception(f"加载历史教训/验证失败: {e}")
                 lessons_prompt = ""
                 research_memory_prompt = ""
+            await round_coordinator.advance(
+                active_round_id,
+                ResearchRoundStatus.MEMORY_LOADED,
+                event_type="HistoricalMemoryLoaded",
+                payload={
+                    "lessons_loaded": bool(lessons_prompt),
+                    "topic_memory_loaded": bool(research_memory_prompt),
+                },
+            )
 
             try:
                 # 阶段1：按需搜索（先检查本地数据是否足够）
@@ -3714,7 +4059,10 @@ async def main():
                     # 先保存到数据库
                     for i, doc in enumerate(external_docs):
                         try:
-                            if await asyncio.wait_for(db_service.add_document(doc), timeout=30):
+                            if await asyncio.wait_for(
+                                db_service.add_document(doc, round_id=active_round_id),
+                                timeout=30,
+                            ):
                                 saved_docs += 1
                         except asyncio.TimeoutError:
                             logger.warning(f"保存文档超时 (30s): doc #{i} {getattr(doc, 'title', '')[:50]}")
@@ -3750,6 +4098,12 @@ async def main():
                         f"   ✅ 文档已保存 (DB新增: {saved_docs}, Wiki同步: {vector_saved}, "
                         f"Wiki延后懒迁移: {deferred_wiki_docs}, 跳过本地派生: {skipped_docs})"
                     )
+                await round_coordinator.advance(
+                    active_round_id,
+                    ResearchRoundStatus.SOURCES_PERSISTED,
+                    event_type="SourcesPersisted",
+                    payload={"source_count": len(docs)},
+                )
 
                 redeployment_context = (
                     await simulation.format_redeployment_learning_context()
@@ -3788,7 +4142,14 @@ async def main():
                 )
 
                 # 阶段2：深度研报 → 提案
-                proposals = await stage2_deep_research(llm, docs, topic, db_service, lessons_prompt=prompt_lessons)
+                proposals = await stage2_deep_research(
+                    llm,
+                    docs,
+                    topic,
+                    db_service,
+                    lessons_prompt=prompt_lessons,
+                    round_id=active_round_id,
+                )
                 proposals = dedupe_proposals(proposals)
                 rejection_memory = (
                     await simulation.get_candidate_rejection_memory(limit=100)
@@ -3809,18 +4170,62 @@ async def main():
                     )
                 for proposal in proposals:
                     try:
-                        proposal["proposal_id"] = await db_service.add_proposal(proposal)
+                        proposal["round_id"] = active_round_id
+                        proposal["proposal_id"] = await db_service.add_proposal(
+                            proposal,
+                            round_id=active_round_id,
+                        )
                     except Exception as e:
                         logger.warning(f"保存提案失败: {e}")
 
                 # 阶段3：投委会讨论
                 logger.info(f"开始阶段3投委会审议，提案数: {len(proposals)}")
-                try:
-                    discussions, decisions = await stage3_ic_discussion(llm, spiders, proposals, topic, lessons_prompt=prompt_lessons)
-                    logger.info(f"阶段3完成，讨论长度: {len(discussions)}, 决策数: {len(decisions)}")
-                except Exception as e:
-                    logger.error(f"阶段3失败: {e}", exc_info=True)
-                    raise
+                if proposals:
+                    await round_coordinator.advance(
+                        active_round_id,
+                        ResearchRoundStatus.PROPOSALS_EXTRACTED,
+                        event_type="ProposalsExtracted",
+                        payload={"proposal_count": len(proposals)},
+                    )
+                    try:
+                        discussions, decisions = await stage3_ic_discussion(
+                            llm,
+                            spiders,
+                            proposals,
+                            topic,
+                            lessons_prompt=prompt_lessons,
+                            round_id=active_round_id,
+                        )
+                        logger.info(f"阶段3完成，讨论长度: {len(discussions)}, 决策数: {len(decisions)}")
+                    except Exception as e:
+                        logger.error(f"阶段3失败: {e}", exc_info=True)
+                        raise
+                    await round_coordinator.advance(
+                        active_round_id,
+                        ResearchRoundStatus.COMMITTEE_DECIDED,
+                        event_type="CommitteeDecisionsRecorded",
+                        payload={"decision_count": len(decisions)},
+                    )
+                    await round_coordinator.advance(
+                        active_round_id,
+                        ResearchRoundStatus.PREDICTIONS_RECORDED,
+                        event_type="PredictionsRecorded",
+                        payload={
+                            "prediction_count": sum(
+                                bool(item.get("prediction_id")) for item in decisions
+                            )
+                        },
+                    )
+                else:
+                    discussions, decisions = "", []
+                    await round_coordinator.advance(
+                        active_round_id,
+                        ResearchRoundStatus.NO_EVIDENCE,
+                        event_type="NoEvidenceTerminal",
+                        payload={"source_count": len(docs), "proposal_count": 0},
+                        terminal_code="no_evidence",
+                        terminal_reason="阶段2没有形成满足证据约束的结构化提案",
+                    )
 
                 # 投委会原始讨论是独立记忆，不依赖后续综合结论是否成功。
                 proposal_by_ticker = {
@@ -3872,6 +4277,7 @@ async def main():
                                     else []
                                 ),
                             ],
+                            round_id=active_round_id,
                         )
                     except Exception as e:
                         logger.warning("保存投委会会议记忆失败 %s: %s", ticker_key, e)
@@ -3912,6 +4318,7 @@ async def main():
                         ensure_ascii=False,
                         default=str,
                     ),
+                    round_id=active_round_id,
                 )
                 await db_service.save_reflection_summary(
                     question=base_topic,
@@ -3929,15 +4336,63 @@ async def main():
                     ),
                     adjusted_conclusion=conclusion_data.get('conclusion', '')[:12000],
                     lessons_learned=lessons_prompt[:8000],
+                    round_id=active_round_id,
                 )
 
                 # 💰 每日投资模拟：只消费投委会裁决后的结构化决策
-                await run_committee_approved_simulation(
+                simulation_result = await run_committee_approved_simulation(
                     simulation,
                     market_data,
                     llm,
                     decisions,
                     initial_rejections=repeated_candidate_rejections,
+                    round_id=active_round_id,
+                    round_coordinator=round_coordinator,
+                    pre_reviewed_positions=pre_round_position_reviews,
+                )
+                current_round = await round_coordinator.get(active_round_id)
+                terminal_map = {
+                    "market_closed_pending": ResearchRoundStatus.MARKET_CLOSED_PENDING,
+                    "execution_rejected": ResearchRoundStatus.EXECUTION_REJECTED,
+                    "committee_hold": ResearchRoundStatus.COMMITTEE_HOLD,
+                    "filled": ResearchRoundStatus.FILLED,
+                    "no_evidence": ResearchRoundStatus.NO_EVIDENCE,
+                }
+                terminal_name = str(simulation_result.get("terminal") or "failed")
+                if (
+                    current_round
+                    and current_round.status != ResearchRoundStatus.NO_EVIDENCE
+                ):
+                    await round_coordinator.advance(
+                        active_round_id,
+                        terminal_map.get(terminal_name, ResearchRoundStatus.FAILED),
+                        event_type="SimulationPipelineTerminal",
+                        payload={
+                            "terminal": terminal_name,
+                            "fills": simulation_result.get("fills", 0),
+                            "pending": simulation_result.get("pending", 0),
+                            "candidate_count": simulation_result.get("candidate_count", 0),
+                        },
+                        terminal_code=terminal_name,
+                        terminal_reason=(
+                            "模拟投资管线已持久化明确终态；"
+                            f"fills={simulation_result.get('fills', 0)}"
+                        ),
+                    )
+                await round_coordinator.advance(
+                    active_round_id,
+                    ResearchRoundStatus.REFLECTED,
+                    event_type="RoundReflectionPersisted",
+                    payload={"reflection_saved": True},
+                )
+                await round_coordinator.advance(
+                    active_round_id,
+                    ResearchRoundStatus.COMPLETED,
+                    event_type="RoundCompleted",
+                    payload={
+                        "simulation_terminal": terminal_name,
+                        "fills": simulation_result.get("fills", 0),
+                    },
                 )
 
                 # 更新已完成议题
@@ -3952,12 +4407,31 @@ async def main():
                 print("="*60)
 
             except KeyboardInterrupt:
+                await round_coordinator.fail(
+                    active_round_id,
+                    code="interrupted",
+                    reason="研究轮被用户中断",
+                )
                 raise
             except asyncio.CancelledError:
                 print(f"\n⚠️ 任务被取消，保存进度...")
+                await round_coordinator.fail(
+                    active_round_id,
+                    code="cancelled",
+                    reason="研究轮被取消",
+                )
                 raise
             except Exception as e:
                 print(f"\n❌ 本轮错误: {e}")
+                logger.exception(
+                    "RESEARCH_ROUND_FAILED round_id=%s",
+                    active_round_id,
+                )
+                await round_coordinator.fail(
+                    active_round_id,
+                    code="pipeline_exception",
+                    reason=str(e),
+                )
 
             # 统计
             round_time = (datetime.now() - round_start).total_seconds()
@@ -3965,8 +4439,15 @@ async def main():
             llm_stats = llm.get_stats()
             round_llm_stats = _llm_stats_delta(llm_stats, round_start_stats)
 
-            # 检查本轮是否有有效结果
-            has_valid_result = bool(docs and proposals)
+            final_round = await round_coordinator.get(active_round_id)
+            round_completed = bool(
+                final_round
+                and final_round.status == ResearchRoundStatus.COMPLETED
+            )
+            has_valid_result = bool(
+                round_completed
+                and final_round.terminal_code not in {"no_evidence", "failed"}
+            )
 
             if has_valid_result:
                 if empty_rounds > 0:
@@ -3977,10 +4458,17 @@ async def main():
                 logger.warning(f"第{iteration}轮无有效结果 (连续{empty_rounds}轮)")
 
             # 更新持久化统计
-            persistence.increment_rounds()
-            persistence.add_topic(base_topic)
-            persistence.add_time(round_time)
-            persistence.increment_proposals(len(proposals))
+            if round_completed:
+                persistence.increment_rounds()
+                persistence.add_topic(base_topic)
+                persistence.add_time(round_time)
+                persistence.increment_proposals(len(proposals))
+            else:
+                logger.error(
+                    "研究轮未完成，不计入完成轮次: round_id=%s status=%s",
+                    active_round_id,
+                    final_round.status.value if final_round else "missing",
+                )
 
             stats_msg = (
                 f"⏱️  本轮用时: {round_time:.1f}秒 | "
