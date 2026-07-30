@@ -72,6 +72,7 @@ from sovereign_hall.run_discussion import (
     committee_deadlock_requires_review,
     committee_role_weight,
     collect_committee_results,
+    retry_absent_committee_results,
     build_deployment_evidence_queries,
     filter_repeated_rejection_proposals,
     extract_stage2_candidate_windows,
@@ -172,6 +173,58 @@ async def test_spider_local_only_hard_gate_blocks_network(monkeypatch):
     assert docs == []
     network_call.assert_not_awaited()
     await spider.close()
+
+
+@pytest.mark.asyncio
+async def test_committee_retry_recovers_only_absent_roles():
+    initial = [
+        '{"direction":"long","confidence":0.8,"position":0.1}',
+        "[committee_task_absent] role=risk",
+        "[committee_task_absent] role=quant",
+    ]
+    audit = {
+        "stage": "round4_vote",
+        "task_count": 3,
+        "completed_count": 1,
+        "timeout_count": 2,
+        "error_count": 0,
+        "absent_labels": ["risk", "quant"],
+        "tasks": [
+            {"label": "cio", "status": "completed"},
+            {"label": "risk", "status": "timeout"},
+            {"label": "quant", "status": "timeout"},
+        ],
+    }
+    factories = [
+        ("cio", lambda: AsyncMock(return_value="must not run")()),
+        (
+            "risk",
+            lambda: AsyncMock(
+                return_value='{"direction":"long","confidence":0.7,"position":0.08}'
+            )(),
+        ),
+        (
+            "quant",
+            lambda: AsyncMock(
+                return_value='{"direction":"hold","confidence":0.6,"position":0}'
+            )(),
+        ),
+    ]
+
+    results, final_audit = await retry_absent_committee_results(
+        initial,
+        audit,
+        factories,
+        timeout_seconds=1,
+        stage="round4_vote",
+    )
+
+    assert results[0] == initial[0]
+    assert '"direction":"long"' in results[1]
+    assert '"direction":"hold"' in results[2]
+    assert final_audit["completed_count"] == 3
+    assert final_audit["retry_attempted_count"] == 2
+    assert final_audit["retry_recovered_count"] == 2
 
 
 def test_stage2_parser_recovers_json_after_verbose_reasoning():

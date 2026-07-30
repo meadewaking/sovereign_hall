@@ -18,6 +18,7 @@ from ..core import DATA_DIR
 from ..application.execute_simulation_cycle import (
     AtomicSimulationExecutor,
     DailyTradeLimitReached,
+    ExecutionRejectionCommitRequest,
     TradeCommitRequest,
 )
 from ..domain.common.ids import new_id
@@ -377,6 +378,45 @@ class InvestmentSimulation:
             ),
             "- 离线回测收益、Sharpe和leaderboard只可诊断，不能证明系统有效、不能产生best、不能放大仓位。",
         ]
+        if performance.get("valuation_complete"):
+            total_assets = float(performance.get("total_assets") or 0.0)
+            available_cash = float(performance.get("cash") or 0.0)
+            max_single_position = float(
+                self.config.get("max_single_position", 0.10) or 0.10
+            )
+            one_lot_market_value_budget = total_assets * max_single_position
+            max_quote_by_position = (
+                one_lot_market_value_budget / int(self.min_unit)
+                if self.min_unit > 0
+                else 0.0
+            )
+            max_quote_by_cash = (
+                available_cash
+                / int(self.min_unit)
+                / (1 + self.trading_fee + self.slippage_rate)
+                if self.min_unit > 0
+                else 0.0
+            )
+            max_executable_one_lot_quote = min(
+                max_quote_by_position,
+                max_quote_by_cash,
+            )
+            if total_assets > 0 and max_executable_one_lot_quote > 0:
+                performance_lines.extend([
+                    (
+                        f"- 当前整手可执行边界: 账户{total_assets:.2f}元，"
+                        f"静态单标的上限{max_single_position:.1%}，"
+                        f"每手{int(self.min_unit)}股；新建仓一手要求交易时实时价<="
+                        f"{max_executable_one_lot_quote:.4f}元"
+                        f"（目标市值预算{one_lot_market_value_budget:.2f}元，"
+                        "另须覆盖佣金和滑点）。"
+                    ),
+                    (
+                        "- 研究/投委会不得批准结构上无法买入一手的多头后再以泛化"
+                        "“金额不足”结束；应换成满足同一证据门与实时整手边界的候选，"
+                        "成交层仍须重新取价；不得放宽静态单标的上限。"
+                    ),
+                ])
         if performance.get("health_status") == "system_failure_no_live_deployment":
             performance_lines.extend([
                 "- 状态=SYSTEM FAILURE：长期低投入/无成交。空仓不是成功的风险控制，也不是正常观望。",
@@ -431,6 +471,81 @@ class InvestmentSimulation:
             "它具体消除了哪条最近拒绝原因及失效条件，否则输出hold/空提案。"
         )
         return "\n\n".join(("\n".join(performance_lines), "\n".join(lines)))
+
+    async def screen_proposal_lot_feasibility(
+        self,
+        proposals: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Remove structurally unbuyable long proposals before committee work.
+
+        The quote is used only as a current screening reference.  Execution
+        still creates a durable intent and fetches a new, fresh quote in an
+        open market session.  Unavailable screening quotes are not rejected
+        here because the execution path owns the authoritative quote gate.
+        """
+        assets = await self.calculate_assets()
+        if (
+            not assets.get("valuation_complete")
+            or float(assets.get("total_assets") or 0.0) <= 0
+            or int(self.min_unit or 0) <= 0
+        ):
+            return list(proposals or []), []
+
+        total_assets = float(assets["total_assets"])
+        cash = float(assets.get("cash") or 0.0)
+        max_single_position = float(
+            self.config.get("max_single_position", 0.10) or 0.10
+        )
+        position_budget = total_assets * max_single_position
+        max_quote_by_position = position_budget / int(self.min_unit)
+        max_quote_by_cash = (
+            cash
+            / int(self.min_unit)
+            / (1 + self.trading_fee + self.slippage_rate)
+        )
+        executable_quote_ceiling = min(
+            max_quote_by_position,
+            max_quote_by_cash,
+        )
+
+        feasible: List[Dict[str, Any]] = []
+        rejections: List[Dict[str, Any]] = []
+        for proposal in proposals or []:
+            direction = str(proposal.get("direction") or "long").lower()
+            ticker = self._normalize_ticker(str(proposal.get("ticker") or ""))
+            if direction != "long" or not ticker:
+                feasible.append(proposal)
+                continue
+            try:
+                quote = await self.get_current_quote(ticker)
+                reference_price = float((quote or {}).get("price") or 0.0)
+            except Exception as exc:
+                logger.warning(
+                    "Proposal lot-feasibility quote failed for %s: %s",
+                    ticker,
+                    exc,
+                )
+                reference_price = 0.0
+                quote = None
+            if reference_price <= 0 or reference_price <= executable_quote_ceiling:
+                feasible.append(proposal)
+                continue
+
+            rejections.append({
+                "ticker": ticker,
+                "code": "proposal_lot_infeasible",
+                "reason": (
+                    f"当前筛选参考价{reference_price:.4f}元高于整手可执行上限"
+                    f"{executable_quote_ceiling:.4f}元；账户{total_assets:.2f}元、"
+                    f"单标的上限{max_single_position:.1%}、每手{int(self.min_unit)}股。"
+                    "该报价仅用于投委会前可行性筛选，成交时仍须重新获取实时行情；"
+                    "下一轮应研究有独立证据且满足整手边界的ETF/低价候选。"
+                ),
+                "reference_price": reference_price,
+                "quote_source": str((quote or {}).get("source") or ""),
+                "max_executable_quote": executable_quote_ceiling,
+            })
+        return feasible, rejections
 
     async def _record_candidate_rejections(
         self,
@@ -1019,14 +1134,70 @@ class InvestmentSimulation:
                 intent_id,
                 status="deferred",
                 resolution=result.get("reason") or "execution deferred",
-                defer_code=_execution_defer_code(result.get("reason")),
+                defer_code=str(
+                    result.get("blocker_code")
+                    or _execution_defer_code(result.get("reason"))
+                ),
             )
         elif action not in {"buy", "sell", "already_executed"}:
-            await self._set_execution_intent_status(
-                intent_id,
-                status="rejected",
-                resolution=result.get("reason") or action or "execution rejected",
-            )
+            execution_quote = result.get("execution_quote") or {}
+            if (
+                execution_quote.get("price")
+                and execution_quote.get("provider")
+                and execution_quote.get("fetched_at")
+            ):
+                blocker_code = str(
+                    result.get("blocker_code") or "execution_rejected"
+                )
+                try:
+                    committed = await AtomicSimulationExecutor(
+                        self.db_service,
+                        max_daily_trades=self.max_daily_trades,
+                        max_quote_age_seconds=self.max_realtime_quote_age_seconds,
+                    ).commit_rejection(
+                        ExecutionRejectionCommitRequest(
+                            ticker=str(item["ticker"]),
+                            price=float(execution_quote["price"]),
+                            quote_provider=str(execution_quote["provider"]),
+                            quote_fetched_at=str(execution_quote["fetched_at"]),
+                            code=blocker_code,
+                            reason=str(
+                                result.get("reason")
+                                or action
+                                or "execution rejected"
+                            ),
+                            intent_id=intent_id,
+                            idempotency_key=str(item["idempotency_key"]),
+                            round_id=item.get("round_id"),
+                            pending_decision_id=result.get("pending_decision_id"),
+                            deployment_gap=result.get("deployment_gap"),
+                            next_action=str(result.get("next_action") or ""),
+                        )
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Atomic simulated execution rejection failed for %s",
+                        item["ticker"],
+                    )
+                    return {
+                        "intent_id": intent_id,
+                        "success": False,
+                        "action": "error",
+                        "blocker_code": "execution_rejection_persistence_failed",
+                        "reason": f"模拟执行拒绝事务回滚: {exc}",
+                    }
+                result["quote_snapshot_id"] = committed.quote_snapshot_id
+                result["rejection_duplicate"] = committed.duplicate
+            else:
+                # Missing/stale quotes intentionally create no quote snapshot.
+                await self._set_execution_intent_status(
+                    intent_id,
+                    status="rejected",
+                    resolution=result.get("reason") or action or "execution rejected",
+                    defer_code=str(
+                        result.get("blocker_code") or "execution_rejected"
+                    ),
+                )
         return {"intent_id": intent_id, **result}
 
     async def replay_pending_decisions(self, max_count: int | None = None) -> Dict[str, Any]:
@@ -1331,6 +1502,7 @@ class InvestmentSimulation:
                 'success': False,
                 'action': 'pending',
                 'ticker': ticker,
+                'blocker_code': 'non_trading_day',
                 'pending_decision_id': pending_id,
                 'reason': '当前非交易日，裁决已延至下一交易时段；届时必须重新取得实时行情'
             }
@@ -1354,6 +1526,7 @@ class InvestmentSimulation:
                 'success': False,
                 'action': 'pending',
                 'ticker': ticker,
+                'blocker_code': 'market_closed',
                 'pending_decision_id': pending_id,
                 'reason': '当前不在A股交易时段，仅记录待执行裁决；下一交易时段重新取得实时行情后再判断'
             }
@@ -1375,6 +1548,7 @@ class InvestmentSimulation:
                 'success': False,
                 'action': 'pending',
                 'ticker': ticker,
+                'blocker_code': 'daily_trade_limit',
                 'pending_decision_id': pending_id,
                 'reason': (
                     f'今日模拟成交已达硬上限 {self.max_daily_trades} 笔；'
@@ -1388,6 +1562,7 @@ class InvestmentSimulation:
                 'success': False,
                 'action': 'hold',
                 'ticker': ticker,
+                'blocker_code': 'cooldown',
                 'reason': f'冷却期内，上次交易{self.last_trade_records.get(ticker, "")[:10]}'
             }
 
@@ -1397,6 +1572,7 @@ class InvestmentSimulation:
                 'success': True,
                 'action': 'hold',
                 'ticker': ticker,
+                'blocker_code': 'committee_hold',
                 'reason': '投委会裁决为观望'
             }
         if direction_norm in ("short", "sell") and current_shares <= 0:
@@ -1404,6 +1580,7 @@ class InvestmentSimulation:
                 'success': False,
                 'action': 'hold',
                 'ticker': ticker,
+                'blocker_code': 'short_without_position',
                 'reason': '模拟账户不支持裸做空，空仓不交易'
             }
 
@@ -1414,6 +1591,7 @@ class InvestmentSimulation:
                 'success': False,
                 'action': 'hold',
                 'ticker': ticker,
+                'blocker_code': 'realtime_quote_unavailable',
                 'reason': '无法获取实时现价，拒绝模拟交易；不使用本地估值或历史价格兜底'
             }
         quote_detail = getattr(self, "_last_trade_quote_detail", {}) or {}
@@ -1428,17 +1606,37 @@ class InvestmentSimulation:
         quote_fetched_at = str(
             quote_detail.get("price_at") or datetime.now().isoformat()
         )
+        execution_quote = {
+            "price": float(price),
+            "provider": quote_provider,
+            "fetched_at": quote_fetched_at,
+        }
 
         # 计算当前持仓
         if direction_norm in ("short", "sell"):
             target_position = 0.0
 
         position_values, total_assets, missing_price_tickers = await self._estimate_trade_assets(ticker, price)
+        invested_value = sum(position_values.values())
+        deployment_gap = (
+            max(
+                total_assets * self.target_invested_ratio - invested_value,
+                0.0,
+            )
+            if total_assets > 0
+            else None
+        )
         if missing_price_tickers and direction_norm == "long":
             return {
                 'success': False,
                 'action': 'hold',
                 'ticker': ticker,
+                'blocker_code': 'valuation_incomplete',
+                'execution_quote': execution_quote,
+                'deployment_gap': None,
+                'next_action': (
+                    '补齐所有持仓实时行情后重试；禁止用旧价、成本价或prediction价格兜底'
+                ),
                 'reason': (
                     '组合实时估值不完整，拒绝新增/扩大模拟仓位；缺少实时现价: '
                     + ', '.join(missing_price_tickers)
@@ -1480,7 +1678,34 @@ class InvestmentSimulation:
             shares_to_buy = int(buy_amount / price / self.min_unit) * self.min_unit
 
             if shares_to_buy <= 0:
-                return {'success': True, 'action': 'hold', 'reason': '金额不足一手'}
+                one_lot_value = float(price) * int(self.min_unit)
+                max_executable_quote = (
+                    buy_amount / int(self.min_unit)
+                    if self.min_unit > 0
+                    else 0.0
+                )
+                return {
+                    'success': True,
+                    'action': 'hold',
+                    'ticker': ticker,
+                    'blocker_code': 'lot_size_cap_infeasible',
+                    'execution_quote': execution_quote,
+                    'deployment_gap': deployment_gap,
+                    'one_lot_value': one_lot_value,
+                    'max_target_value': buy_amount,
+                    'max_executable_quote': max_executable_quote,
+                    'next_action': (
+                        f'下一轮优先研究在当前目标仓位下实时价格不高于'
+                        f'{max_executable_quote:.4f}元、且证据与投委会门槛均合格的候选；'
+                        '不得放宽静态单标的上限或使用旧价'
+                    ),
+                    'reason': (
+                        f'整手与静态仓位上限冲突：实时价{price:.4f}元，'
+                        f'一手市值{one_lot_value:.2f}元，'
+                        f'目标可用市值{buy_amount:.2f}元，'
+                        f'可执行一手的最高实时价{max_executable_quote:.4f}元'
+                    ),
+                }
 
             cost = shares_to_buy * price
             commission = cost * self.trading_fee
@@ -1497,7 +1722,38 @@ class InvestmentSimulation:
                     / self.min_unit
                 ) * self.min_unit
                 if max_shares <= 0:
-                    return {'success': True, 'action': 'hold', 'reason': '资金不足'}
+                    one_lot_cash_cost = (
+                        float(price)
+                        * int(self.min_unit)
+                        * (1 + self.trading_fee + self.slippage_rate)
+                    )
+                    max_cash_quote = (
+                        self.cash
+                        / int(self.min_unit)
+                        / (1 + self.trading_fee + self.slippage_rate)
+                        if self.min_unit > 0
+                        else 0.0
+                    )
+                    return {
+                        'success': True,
+                        'action': 'hold',
+                        'ticker': ticker,
+                        'blocker_code': 'cash_lot_infeasible',
+                        'execution_quote': execution_quote,
+                        'deployment_gap': deployment_gap,
+                        'one_lot_cash_cost': one_lot_cash_cost,
+                        'max_executable_quote': max_cash_quote,
+                        'next_action': (
+                            f'下一轮优先研究实时价格不高于{max_cash_quote:.4f}元、'
+                            '且证据与投委会门槛均合格的候选；不得省略费用或使用旧价'
+                        ),
+                        'reason': (
+                            f'现金与整手约束冲突：实时价{price:.4f}元，'
+                            f'含佣金/滑点的一手成本{one_lot_cash_cost:.2f}元，'
+                            f'可用现金{self.cash:.2f}元，'
+                            f'现金可执行一手的最高实时价{max_cash_quote:.4f}元'
+                        ),
+                    }
                 shares_to_buy = max_shares
                 cost = shares_to_buy * price
                 commission = cost * self.trading_fee
@@ -1641,7 +1897,15 @@ class InvestmentSimulation:
             )
 
             if shares_to_sell <= 0:
-                return {'success': True, 'action': 'hold', 'reason': '数量不足一手'}
+                return {
+                    'success': True,
+                    'action': 'hold',
+                    'ticker': ticker,
+                    'blocker_code': 'sell_lot_size_no_change',
+                    'execution_quote': execution_quote,
+                    'deployment_gap': deployment_gap,
+                    'reason': '目标减仓数量不足一手，未改变模拟持仓',
+                }
 
             if shares_to_sell > current_shares:
                 shares_to_sell = current_shares
@@ -1761,7 +2025,15 @@ class InvestmentSimulation:
             }
 
         # === 持有 ===
-        return {'success': True, 'action': 'hold', 'reason': '仓位合适'}
+        return {
+            'success': True,
+            'action': 'hold',
+            'ticker': ticker,
+            'blocker_code': 'no_position_change',
+            'execution_quote': execution_quote,
+            'deployment_gap': deployment_gap,
+            'reason': '实时估值后目标仓位无需整手调整',
+        }
 
     async def refresh_simulation_risk_memory(self) -> List[Dict]:
         """Persist recent realized-loss memory derived from local simulated trades."""

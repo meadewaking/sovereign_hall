@@ -856,6 +856,35 @@ def pending_decision_diagnostics(conn):
     return diagnostics
 
 
+def execution_intent_diagnostics(conn):
+    """Expose the latest price-free intent and any auditable execution quote."""
+    try:
+        row = conn.execute(
+            """
+            SELECT ei.id AS intent_id, ei.round_id, ei.ticker, ei.direction,
+                   ei.target_position, ei.status, ei.defer_code, ei.resolution,
+                   ei.created_at, ei.updated_at,
+                   qs.id AS quote_snapshot_id, qs.price AS quote_price,
+                   qs.provider AS quote_provider, qs.fetched_at AS quote_fetched_at,
+                   qs.purpose AS quote_purpose
+            FROM execution_intents ei
+            LEFT JOIN quote_snapshots qs
+              ON qs.id = (
+                  SELECT newest.id
+                  FROM quote_snapshots newest
+                  WHERE newest.intent_id = ei.id
+                  ORDER BY newest.rowid DESC
+                  LIMIT 1
+              )
+            ORDER BY datetime(ei.created_at) DESC, ei.rowid DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return dict(row) if row else None
+    except sqlite3.Error:
+        return None
+
+
 def committee_outcome_diagnostics(conn, limit: int = 5):
     """Read append-only committee vote audits without inventing legacy rows."""
     diagnostics = {
@@ -1222,10 +1251,12 @@ def show_investment_status(db_path):
     except sqlite3.Error:
         snapshot_rows = []
     try:
+        simulation_config = get_config().get("simulation", {})
         max_daily_trades = int(
-            get_config().get("simulation", {}).get("max_daily_trades", MAX_DAILY_TRADES)
+            simulation_config.get("max_daily_trades", MAX_DAILY_TRADES)
         )
     except Exception:
+        simulation_config = {}
         max_daily_trades = MAX_DAILY_TRADES
 
     redeployment_state = None
@@ -1285,6 +1316,7 @@ def show_investment_status(db_path):
     pending_diagnostics = pending_decision_diagnostics(conn)
     pending_decisions = pending_diagnostics["pending_rows"]
     pending_decision_total = pending_diagnostics["unresolved_count"]
+    latest_execution_intent = execution_intent_diagnostics(conn)
     committee_diagnostics = committee_outcome_diagnostics(conn)
     stage2_diagnostics = research_stage_diagnostics(conn)
 
@@ -1426,6 +1458,30 @@ def show_investment_status(db_path):
         )
     else:
         print("   最近裁决结果: 尚无已解决裁决")
+    if latest_execution_intent:
+        quote_text = "quote=N/A（该历史执行拒绝没有可审计报价快照）"
+        if latest_execution_intent.get("quote_price") is not None:
+            quote_text = (
+                f"quote={float(latest_execution_intent['quote_price']):.4f}"
+                f"@{latest_execution_intent.get('quote_provider') or 'unknown'} "
+                f"{latest_execution_intent.get('quote_fetched_at') or 'unknown'}"
+            )
+        print(
+            "   最近ExecutionIntent: "
+            f"{latest_execution_intent.get('ticker')} "
+            f"{latest_execution_intent.get('direction')} -> "
+            f"{float(latest_execution_intent.get('target_position') or 0.0):.1%} | "
+            f"{latest_execution_intent.get('status')} | "
+            f"code={latest_execution_intent.get('defer_code') or 'N/A'} | "
+            f"{quote_text}"
+        )
+        if latest_execution_intent.get("resolution"):
+            print(
+                "   ExecutionIntent结果: "
+                f"{latest_execution_intent['resolution']}"
+            )
+    else:
+        print("   最近ExecutionIntent: 尚无 price-free 执行裁决")
     score_text = (
         "N/A"
         if performance["score"] is None
@@ -1457,6 +1513,32 @@ def show_investment_status(db_path):
         )
         if deployment['deployment_gap'] > 0:
             print("   说明: 现金不是风险储备；只允许因缺少合格标的、实时报价、手续费或整手约束暂时留存")
+            max_single_position = float(
+                simulation_config.get("max_single_position", 0.10) or 0.10
+            )
+            min_unit = int(simulation_config.get("min_unit", 100) or 100)
+            buy_cost_rate = float(
+                simulation_config.get("trading_fee", 0.0003) or 0.0003
+            ) + float(
+                simulation_config.get("slippage_rate", 0.0005) or 0.0005
+            )
+            max_quote_by_position = (
+                total_value * max_single_position / min_unit
+                if min_unit > 0
+                else 0.0
+            )
+            max_quote_by_cash = (
+                cash / min_unit / (1 + buy_cost_rate)
+                if min_unit > 0
+                else 0.0
+            )
+            max_one_lot_quote = min(max_quote_by_position, max_quote_by_cash)
+            print(
+                "   当前整手可执行边界: "
+                f"静态单标的上限{max_single_position:.1%}、每手{min_unit}股，"
+                f"新建仓一手要求交易时实时价<={max_one_lot_quote:.4f}元；"
+                "成交时仍须重新取价并重过全部硬门"
+            )
 
     print("\n   🧾 资金再配置队列:")
     if redeployment_state:

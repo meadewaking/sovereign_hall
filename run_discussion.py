@@ -917,6 +917,8 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
             f"{topic_keyword} 上市公司 营收 毛利率",
             f"{topic_keyword} 龙头 财报 现金流",
             f"{topic_keyword} 候选公司 估值对比",
+            f"{topic_keyword} 场内ETF 基金代码 规模 成交额",
+            f"{topic_keyword} ETF 跟踪指数 流动性 费率",
             f"{topic_keyword} 机构调研 订单份额",
             f"{topic_keyword} 业绩催化 验证时间",
             f"{topic_keyword} 风险 失效条件",
@@ -940,7 +942,13 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
     # 合并额外查询词并去重（保序）
     seen = set()
     all_queries = []
-    for q in queries + extra_queries:
+    # Deployment recovery queries carry required company/ETF evidence fields
+    # and must not be crowded out when the query generator already returns the
+    # full count.  Other research keeps the generated-query-first order.
+    query_candidates = (
+        extra_queries + queries if deployment_research else queries + extra_queries
+    )
+    for q in query_candidates:
         key = str(q).strip().lower()
         if key and key not in seen:
             seen.add(key)
@@ -1119,8 +1127,11 @@ async def stage2_deep_research(
 1. 只推荐资料中有明确新增证据支持的标的；证据不足时宁可少输出
 2. 不要重复同一行业逻辑，不要为了凑数输出相似提案
 3. 必须把“已验证事实”和“推断”分开写入thesis
-4. 不能确定具体标的时，才允许使用ETF，并把confidence降到0.55以下
-5. 黑名单标的一律排除
+4. ETF是空仓部署的一等候选，不是低置信度替代品；若资料能验证其跟踪指数、
+   规模、流动性、折溢价和行业暴露，可按与个股相同的证据门给出confidence
+5. 若上文“当前整手可执行边界”存在，多头候选必须优先满足该参考价边界；
+   明显无法买入一手的个股不得进入投委会，应比较资料中已有代码的可执行ETF或低价候选
+6. 黑名单标的一律排除
 
 请直接输出JSON数组格式（不要输出思考过程，只要JSON）：
 [
@@ -1786,6 +1797,90 @@ async def collect_committee_results(
     return results, audit
 
 
+async def retry_absent_committee_results(
+    results: List[str],
+    audit: Dict[str, Any],
+    retry_factories: List[tuple[str, Callable[[], Awaitable[str]]]],
+    *,
+    timeout_seconds: float,
+    stage: str,
+) -> tuple[List[str], Dict[str, Any]]:
+    """Retry only absent roles once while preserving every completed result."""
+    absent = {
+        str(item.get("label") or "")
+        for item in (audit.get("tasks") or [])
+        if item.get("status") != "completed"
+    }
+    retry_specs = [
+        (label, factory)
+        for label, factory in retry_factories
+        if label in absent
+    ]
+    if not retry_specs:
+        return results, audit
+
+    retry_results, retry_audit = await collect_committee_results(
+        [(label, factory()) for label, factory in retry_specs],
+        timeout_seconds=timeout_seconds,
+        stage=f"{stage}_retry",
+    )
+    merged_results = list(results)
+    merged_tasks = [dict(item) for item in (audit.get("tasks") or [])]
+    index_by_label = {
+        str(item.get("label") or ""): index
+        for index, item in enumerate(merged_tasks)
+    }
+    recovered = 0
+    for (label, _factory), retry_result, retry_task in zip(
+        retry_specs,
+        retry_results,
+        retry_audit.get("tasks") or [],
+    ):
+        original_index = index_by_label.get(label)
+        if original_index is None:
+            continue
+        if retry_task.get("status") == "completed":
+            merged_results[original_index] = retry_result
+            merged_tasks[original_index] = {
+                **retry_task,
+                "stage": f"{stage}_retry",
+                "recovered_after_retry": True,
+            }
+            recovered += 1
+
+    final_audit = {
+        **audit,
+        "tasks": merged_tasks,
+        "completed_count": sum(
+            item.get("status") == "completed" for item in merged_tasks
+        ),
+        "timeout_count": sum(
+            item.get("status") == "timeout" for item in merged_tasks
+        ),
+        "error_count": sum(
+            item.get("status") == "error" for item in merged_tasks
+        ),
+        "absent_labels": [
+            str(item.get("label") or "")
+            for item in merged_tasks
+            if item.get("status") != "completed"
+        ],
+        "retry_attempted_count": len(retry_specs),
+        "retry_recovered_count": recovered,
+        "initial_attempt": audit,
+        "retry_attempt": retry_audit,
+    }
+    logger.info(
+        "Committee stage %s retry recovered %s/%s absent roles; final=%s/%s",
+        stage,
+        recovered,
+        len(retry_specs),
+        final_audit["completed_count"],
+        final_audit["task_count"],
+    )
+    return merged_results, final_audit
+
+
 def aggregate_committee_decision(
     proposal: Dict,
     vote_results: List[str],
@@ -2055,6 +2150,8 @@ def preflight_committee_decisions(
     decisions: List[Dict],
     current_tickers: set[str],
     normalize_ticker: Callable[[str], str],
+    *,
+    min_long_confidence: float | None = None,
 ) -> tuple[List[Dict], List[Dict[str, str]]]:
     """Separate executable committee decisions from deterministic rejections.
 
@@ -2065,6 +2162,16 @@ def preflight_committee_decisions(
     executable: List[Dict] = []
     rejections: List[Dict[str, str]] = []
     from sovereign_hall.services.market_data import MarketDataService
+    if min_long_confidence is None:
+        from sovereign_hall.core.config import get_config
+
+        min_long_confidence = float(
+            get_config().get("simulation", {}).get(
+                "min_committee_confidence",
+                0.65,
+            )
+            or 0.65
+        )
 
     normalized_positions = {normalize_ticker(ticker) for ticker in current_tickers}
 
@@ -2163,6 +2270,28 @@ def preflight_committee_decisions(
                 "reason": "已有持仓；新增提案不能替代独立生命周期复核",
             })
             continue
+        raw_confidence = decision.get("confidence")
+        try:
+            confidence = (
+                float(raw_confidence) if raw_confidence is not None else None
+            )
+        except (TypeError, ValueError):
+            confidence = None
+        if (
+            direction == "long"
+            and confidence is not None
+            and confidence < float(min_long_confidence)
+        ):
+            rejections.append({
+                "code": "heuristic_entry_veto",
+                "ticker": ticker,
+                "reason": (
+                    f"投委会置信度{confidence:.1%}低于统一入场硬门"
+                    f"{float(min_long_confidence):.1%}；不得进入闭市队列或"
+                    "在开市路径绕过同一门槛"
+                ) + suffix,
+            })
+            continue
         try:
             target_position = float(decision.get("target_position") or 0.0)
         except (TypeError, ValueError):
@@ -2225,6 +2354,12 @@ async def stage3_ic_discussion(
     vote_role_timeout = float(
         research_config.get("committee_vote_role_timeout_seconds", 90) or 90
     )
+    vote_retry_timeout = float(
+        research_config.get("committee_vote_retry_timeout_seconds", 60) or 60
+    )
+    vote_retry_max_tokens = int(
+        research_config.get("committee_vote_retry_max_tokens", 1800) or 1800
+    )
     deadlock_review_enabled = bool(
         research_config.get("committee_deadlock_review_enabled", True)
     )
@@ -2273,6 +2408,8 @@ async def stage3_ic_discussion(
             review_depth = "full"
         elif committee_min_review_depth == "focused" and review_depth == "light":
             review_depth = "focused"
+        if not committee_full_discussion and review_depth == "full":
+            review_depth = "focused"
         priority_score = proposal_priority_score(proposal)
         learned_context = f"\n\n{lessons_prompt}" if lessons_prompt else ""
         analysis_format = (
@@ -2288,10 +2425,8 @@ async def stage3_ic_discussion(
         stage_execution_audit: List[Dict[str, Any]] = []
 
         # ============================================================
-        # 第一轮：14路并发分析
+        # 第一轮：按审议深度并发分析
         # ============================================================
-        print("   📝 第一轮：14路并发分析...")
-
         round1_tasks = [
             (agents[AgentRole.RISK_OFFICER], "风控-财务风险", f"作为风控官，分析{ticker}的财务造假风险。核心观点：{thesis}。请找出潜在风险。{learned_context}{analysis_format}", [f"{ticker} 财务", f"{ticker} 风险"]),
             (agents[AgentRole.RISK_OFFICER], "风控-最坏情况", f"作为风控官，分析{ticker}最坏情况可能跌多少。{learned_context}{analysis_format}", [f"{ticker} 历史跌幅"]),
@@ -2321,6 +2456,7 @@ async def stage3_ic_discussion(
         elif not committee_full_discussion and review_depth == "light":
             light_names = {"风控-最坏情况", "量化-技术面", "宏观-时机", "CIO-综合"}
             round1_tasks = [task for task in round1_tasks if task[1] in light_names]
+        print(f"   📝 第一轮：{len(round1_tasks)}路并发分析...")
 
         try:
             round1_results, round1_audit = await collect_committee_results(
@@ -2427,6 +2563,22 @@ async def stage3_ic_discussion(
                 (agents[AgentRole.CONSUMER_ANALYST], "需求-验证框架", "复核需求侧证据、渠道库存、价格敏感性和消费场景变化，给出验证路径。"),
                 (agents[AgentRole.CYCLE_ANALYST], "周期-拐点复核", "复核周期拐点、库存、产能、价格传导和盈利弹性，给出反转/失败条件。"),
             ]
+            if not committee_full_discussion and review_depth == "focused":
+                focused_revision_names = {
+                    "CIO-最终修正",
+                    "风控-否决清单",
+                    "量化-执行计划",
+                    "宏观-情景矩阵",
+                }
+                revision_tasks = [
+                    task for task in revision_tasks
+                    if task[1] in focused_revision_names
+                ]
+            elif not committee_full_discussion and review_depth == "light":
+                revision_tasks = [
+                    task for task in revision_tasks
+                    if task[1] in {"CIO-最终修正", "风控-否决清单"}
+                ]
             revision_results, revision_audit = await collect_committee_results(
                 [
                     (
@@ -2503,6 +2655,30 @@ async def stage3_ic_discussion(
                 timeout_seconds=vote_role_timeout,
                 stage="round4_vote",
             )
+            vote_retry_factories: List[
+                tuple[str, Callable[[], Awaitable[str]]]
+            ] = []
+            for (agent, _role, name, _weight), prompt in zip(
+                vote_tasks,
+                vote_prompts,
+            ):
+                vote_retry_factories.append(
+                    (
+                        name,
+                        lambda agent=agent, prompt=prompt: agent.think(
+                            task=prompt,
+                            temperature=0.1,
+                            max_tokens=vote_retry_max_tokens,
+                        ),
+                    )
+                )
+            vote_results, vote_audit = await retry_absent_committee_results(
+                vote_results,
+                vote_audit,
+                vote_retry_factories,
+                timeout_seconds=vote_retry_timeout,
+                stage="round4_vote",
+            )
             stage_execution_audit.append(vote_audit)
             vote_weights = [
                 committee_role_weight(role, sector, topic, weight)
@@ -2570,6 +2746,35 @@ async def stage3_ic_discussion(
                     ],
                     timeout_seconds=deadlock_review_timeout,
                     stage="deployment_deadlock_review",
+                )
+                review_retry_factories: List[
+                    tuple[str, Callable[[], Awaitable[str]]]
+                ] = []
+                for (agent, role_view, _weight) in review_specs:
+                    review_retry_factories.append(
+                        (
+                            role_view,
+                            lambda agent=agent, role_view=role_view: agent.think(
+                                task=build_deployment_deadlock_review_prompt(
+                                    ticker,
+                                    role_view,
+                                    proposal,
+                                    committee_decision,
+                                    full_context,
+                                ),
+                                temperature=0.1,
+                                max_tokens=vote_retry_max_tokens,
+                            ),
+                        )
+                    )
+                review_results, review_audit = (
+                    await retry_absent_committee_results(
+                        review_results,
+                        review_audit,
+                        review_retry_factories,
+                        timeout_seconds=vote_retry_timeout,
+                        stage="deployment_deadlock_review",
+                    )
                 )
                 stage_execution_audit.append(review_audit)
                 review_decision = aggregate_committee_decision(
@@ -3512,7 +3717,10 @@ async def run_committee_approved_simulation(
 
             if result.get('success') is False:
                 reason = result.get('reason', '交易失败')
-                if "硬上限" in reason:
+                result_blocker_code = str(result.get("blocker_code") or "")
+                if result_blocker_code:
+                    code = result_blocker_code
+                elif "硬上限" in reason:
                     code = "daily_trade_limit"
                 elif "交易时段" in reason or "非交易日" in reason:
                     code = "market_closed"
@@ -3552,9 +3760,11 @@ async def run_committee_approved_simulation(
                 )
             elif result.get('action') == 'hold' and result.get('reason'):
                 reason = result.get('reason')
-                code = "lot_size_or_cash" if any(
-                    marker in reason for marker in ("一手", "资金不足", "数量不足")
-                ) else "no_position_change"
+                code = str(result.get("blocker_code") or "")
+                if not code:
+                    code = "lot_size_or_cash" if any(
+                        marker in reason for marker in ("一手", "资金不足", "数量不足")
+                    ) else "no_position_change"
                 reject(code, reason, ticker)
                 print(f"   ➖ 持有 {ticker}: {result['reason']}")
     elif current_positions:
@@ -4160,6 +4370,29 @@ async def main():
                     proposals,
                     rejection_memory,
                 )
+                lot_rejections: List[Dict[str, Any]] = []
+                if proposals and hasattr(simulation, "screen_proposal_lot_feasibility"):
+                    proposals, lot_rejections = (
+                        await simulation.screen_proposal_lot_feasibility(proposals)
+                    )
+                    repeated_candidate_rejections.extend(lot_rejections)
+                    if lot_rejections:
+                        logger.warning(
+                            "投委会前整手可行性筛选移除%s个候选: %s",
+                            len(lot_rejections),
+                            ", ".join(
+                                str(item.get("ticker") or "")
+                                for item in lot_rejections
+                            ),
+                        )
+                        print(
+                            "   🧮 整手可行性硬门: "
+                            + ", ".join(
+                                f"{item['ticker']}(参考价>"
+                                f"{float(item.get('max_executable_quote') or 0):.4f})"
+                                for item in lot_rejections
+                            )
+                        )
                 if repeated_candidate_rejections:
                     print(
                         "   🧱 重复候选硬门: "

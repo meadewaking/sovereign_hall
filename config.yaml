@@ -130,12 +130,14 @@ research:
   agent_search_max_docs: 10
   agent_search_doc_chars: 1200
   committee_proposal_limit: 5
-  committee_min_review_depth: "full"
-  committee_full_discussion: true
-  committee_round1_max_tokens: 18000
-  committee_round2_max_tokens: 15000
-  committee_revision_max_tokens: 12000
-  committee_vote_max_tokens: 7500
+  # 生产运行按提案强度选择审议深度。此前所有提案固定跑满42路任务，
+  # 本地LLM长期排队并造成投票角色超时；focused仍保留CIO/风控/量化/宏观核心审议。
+  committee_min_review_depth: "focused"
+  committee_full_discussion: false
+  committee_round1_max_tokens: 9000
+  committee_round2_max_tokens: 7000
+  committee_revision_max_tokens: 6000
+  committee_vote_max_tokens: 3500
   committee_summary_chars: 1200
   committee_vote_context_chars: 6000
   # Independent deadlines preserve completed roles; timeout is an audited
@@ -144,6 +146,9 @@ research:
   committee_round2_role_timeout_seconds: 180
   committee_revision_role_timeout_seconds: 120
   committee_vote_role_timeout_seconds: 90
+  # 最终投票缺席角色只做一次短、无搜索重试；已完成票保持不变。
+  committee_vote_retry_timeout_seconds: 60
+  committee_vote_retry_max_tokens: 1800
   # 空仓部署议题若首轮在法定人数下全体HOLD，对证据最强的一个提案做
   # CIO/风控/量化三角色独立复核。仅高置信、高方向支持的复核可改变HOLD；
   # 这不是强制交易，也不降低证据、实时行情或交易时段门槛。
