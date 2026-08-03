@@ -3200,6 +3200,17 @@ async def run_committee_approved_simulation(
             pnl_text = "N/A" if pnl is None else f"{float(pnl):.1%}"
             print(f"   ➖ {ticker} 复核持有: PnL={pnl_text}；{reason}")
 
+    # Lifecycle exits belong to the active round because their price-free
+    # intents were created during its mandatory pre-research review.  Count
+    # only newly committed fills; a duplicate idempotent replay is not a fill.
+    lifecycle_fill_count = sum(
+        1
+        for review in position_reviews
+        if str((review.get("execution") or {}).get("action") or "")
+        in {"buy", "sell"}
+        and (review.get("execution") or {}).get("success") is not False
+    )
+
     pending_replay = (
         await simulation.replay_pending_decisions()
         if hasattr(simulation, "replay_pending_decisions")
@@ -3220,6 +3231,15 @@ async def run_committee_approved_simulation(
                 f"      - #{replayed.get('id')} {replayed.get('ticker', '')}: "
                 f"{replayed.get('action', 'unknown')}；{replayed.get('reason', '')}"
             )
+    replay_fill_count = int(pending_replay.get("executed") or 0)
+    if lifecycle_fill_count or replay_fill_count:
+        logger.info(
+            "SIMULATION_CYCLE_EXISTING_INTENT_FILLS lifecycle_fills=%s "
+            "replay_fills=%s cycle_fills_before_new_candidates=%s",
+            lifecycle_fill_count,
+            replay_fill_count,
+            lifecycle_fill_count + replay_fill_count,
+        )
 
     if round_coordinator and round_id:
         from sovereign_hall.domain.research import ResearchRoundStatus
@@ -3576,6 +3596,8 @@ async def run_committee_approved_simulation(
         return {
             "terminal": closed_terminal,
             "fills": 0,
+            "replay_fills": 0,
+            "cycle_fills": 0,
             "pending": pending_count,
             "candidate_count": len(trade_candidates),
             "rejections": redeployment_rejections,
@@ -3896,11 +3918,13 @@ async def run_committee_approved_simulation(
         )
 
     final_assets = await simulation.calculate_assets()
+    round_fill_count = lifecycle_fill_count + trade_count
+    cycle_fill_count = round_fill_count + replay_fill_count
     if hasattr(simulation, "record_redeployment_attempt"):
         state = await simulation.record_redeployment_attempt(
             final_assets,
             candidate_count=len(deployable_new_longs),
-            trade_count=trade_count,
+            trade_count=cycle_fill_count,
             blockers=redeployment_blockers,
             rejections=redeployment_rejections,
         )
@@ -3928,15 +3952,24 @@ async def run_committee_approved_simulation(
     print(
         "   唯一绩效结算: "
         f"模拟账户累计净收益={final_return_text} | "
-        f"本轮新增成交={trade_count} | "
+        f"本轮新增成交={cycle_fill_count} "
+        f"(当前round={round_fill_count}, pending replay={replay_fill_count}) | "
         f"health={final_performance.get('health_status', 'valuation_incomplete')}"
     )
-    if trade_count == 0:
+    if cycle_fill_count == 0:
         print("   本轮绩效改进=N/A（没有新增模拟成交，不允许声明策略收益改进）")
+    else:
+        print(
+            "   本轮有可审计新增成交；改进值必须由本次实时score"
+            "相对前次实时计量计算，不由成交数、代码或离线结果证明"
+        )
     logger.info(
-        "SIMULATION_PIPELINE_END fills=%s candidates=%s rejections=%s "
+        "SIMULATION_PIPELINE_END fills=%s replay_fills=%s cycle_fills=%s "
+        "candidates=%s rejections=%s "
         "valuation_complete=%s invested_ratio=%s net_total_return=%s health=%s",
-        trade_count,
+        round_fill_count,
+        replay_fill_count,
+        cycle_fill_count,
         len(trade_candidates),
         len(redeployment_rejections),
         final_assets.get("valuation_complete"),
@@ -3950,7 +3983,7 @@ async def run_committee_approved_simulation(
         print(f"\n📝 每日投资反思:")
         print(reflection[:500] + "...")
     await simulation.save_snapshot(reflection, round_id=round_id)
-    if trade_count > 0:
+    if round_fill_count > 0:
         terminal = "filled"
     elif trade_candidates:
         terminal = "execution_rejected"
@@ -3965,7 +3998,12 @@ async def run_committee_approved_simulation(
         terminal = "no_evidence"
     return {
         "terminal": terminal,
-        "fills": trade_count,
+        # ``fills`` remains the active round's fill count so a replay keeps
+        # its originating round_id. ``cycle_fills`` is the operational count
+        # for this invocation and includes fills from deferred-intent replay.
+        "fills": round_fill_count,
+        "replay_fills": replay_fill_count,
+        "cycle_fills": cycle_fill_count,
         "pending": 0,
         "candidate_count": len(trade_candidates),
         "rejections": redeployment_rejections,
@@ -4724,6 +4762,8 @@ async def main():
                         payload={
                             "terminal": terminal_name,
                             "fills": simulation_result.get("fills", 0),
+                            "replay_fills": simulation_result.get("replay_fills", 0),
+                            "cycle_fills": simulation_result.get("cycle_fills", 0),
                             "pending": simulation_result.get("pending", 0),
                             "candidate_count": simulation_result.get("candidate_count", 0),
                         },
@@ -4746,6 +4786,8 @@ async def main():
                     payload={
                         "simulation_terminal": terminal_name,
                         "fills": simulation_result.get("fills", 0),
+                        "replay_fills": simulation_result.get("replay_fills", 0),
+                        "cycle_fills": simulation_result.get("cycle_fills", 0),
                     },
                 )
 

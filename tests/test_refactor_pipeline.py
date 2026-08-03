@@ -94,6 +94,7 @@ from sovereign_hall.run_discussion import (
     run_committee_approved_simulation,
 )
 from sovereign_hall.services.persistence import PersistenceManager
+from sovereign_hall.domain.research import ResearchRound, ResearchRoundStatus
 import sovereign_hall.services.persistence as persistence_module
 
 
@@ -113,6 +114,25 @@ def test_entry_imports():
     import sovereign_hall.check_db  # noqa: F401
     import sovereign_hall.research_interactive  # noqa: F401
     import sovereign_hall.run_discussion  # noqa: F401
+
+
+def test_check_db_help_exits_before_database_or_realtime_reads(monkeypatch, capsys):
+    import sovereign_hall.check_db as check_db_module
+
+    monkeypatch.setattr(
+        check_db_module,
+        "show_stats",
+        lambda *_args, **_kwargs: pytest.fail("--help must not read production state"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        check_db_module.main(["--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "usage:" in output
+    assert "realtime" in output
+    assert "simulated-account score" in output
 
 
 def test_simulation_account_return_is_the_only_authoritative_score():
@@ -2371,6 +2391,108 @@ async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(mo
     simulation.execute_trade.assert_awaited_once()
     simulation.review_open_positions.assert_awaited_once()
     simulation.record_redeployment_attempt.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pending_replay_fills_count_in_cycle_without_reassigning_current_round(monkeypatch):
+    """Deferred fills are cycle activity but retain their originating rounds."""
+    import sovereign_hall.run_discussion as discussion_module
+
+    monkeypatch.setattr(
+        discussion_module,
+        "load_latest_heuristic_context",
+        lambda: HeuristicRiskContext(None, "", None, 0.10, True, "test", []),
+    )
+    assets = {
+        "valuation_complete": True,
+        "total_assets": 9_700.0,
+        "cash": 4_300.0,
+        "positions_value": 5_400.0,
+        "positions": {},
+        "position_values": {},
+        "invested_ratio": 5_400.0 / 9_700.0,
+        "deployment_gap": 4_300.0,
+        "target_invested_ratio": 1.0,
+        "missing_price_tickers": [],
+    }
+    simulation = type("FakeSimulation", (), {})()
+    simulation.calculate_assets = AsyncMock(return_value=assets)
+    simulation.get_performance_metrics = AsyncMock(return_value={
+        "net_total_return": -0.03,
+        "health_status": "degraded_underdeployed",
+    })
+    simulation.get_recent_reflection = AsyncMock(return_value="")
+    simulation.review_open_positions = AsyncMock(return_value=[])
+    simulation.replay_pending_decisions = AsyncMock(return_value={
+        "status": "processed",
+        "pending_before": 3,
+        "attempted": 3,
+        "executed": 3,
+        "rejected": 0,
+        "expired": 0,
+        "remaining": 0,
+        "results": [],
+    })
+    simulation.record_committee_outcomes = AsyncMock()
+    simulation.count_trades_on_date = AsyncMock(return_value=3)
+    simulation.record_redeployment_attempt = AsyncMock(return_value={
+        "status": "partially_redeployed",
+        "deployment_gap": 4_300.0,
+        "blocker_code": "residual_operational_cash",
+    })
+    simulation.daily_reflection = AsyncMock(return_value="")
+    simulation.save_snapshot = AsyncMock()
+    simulation.positions = {}
+    simulation.last_trade_records = {}
+    simulation.max_daily_trades = MAX_DAILY_TRADES
+    simulation._normalize_ticker = lambda ticker: ticker
+    market_data = type(
+        "FakeMarket",
+        (),
+        {
+            "is_trading_day": AsyncMock(return_value=True),
+            "is_market_open": AsyncMock(return_value=True),
+        },
+    )()
+
+    result = await run_committee_approved_simulation(
+        simulation,
+        market_data,
+        None,
+        [],
+        round_id="current_research_round",
+        pre_reviewed_positions=[],
+    )
+
+    # No intent from current_research_round filled. The three replay fills keep
+    # their original round_id, but the operational cycle must not report zero.
+    assert result["terminal"] == "no_evidence"
+    assert result["fills"] == 0
+    assert result["replay_fills"] == 3
+    assert result["cycle_fills"] == 3
+    attempt = simulation.record_redeployment_attempt.await_args.kwargs
+    assert attempt["trade_count"] == 3
+
+
+def test_weaker_research_terminal_cannot_overwrite_atomic_fill_terminal():
+    filled_during_lifecycle = ResearchRound(
+        base_topic="lifecycle exit",
+        research_objective="review before research",
+        status=ResearchRoundStatus.SOURCES_PERSISTED,
+        current_stage=ResearchRoundStatus.SOURCES_PERSISTED.value,
+        terminal_code="filled",
+        terminal_reason="atomic simulated sell committed",
+    )
+
+    no_proposal_after_fill = filled_during_lifecycle.transition(
+        ResearchRoundStatus.NO_EVIDENCE,
+        terminal_code="no_evidence",
+        terminal_reason="stage2 returned no proposal",
+    )
+
+    assert no_proposal_after_fill.status == ResearchRoundStatus.NO_EVIDENCE
+    assert no_proposal_after_fill.terminal_code == "filled"
+    assert no_proposal_after_fill.terminal_reason == "atomic simulated sell committed"
 
 
 @pytest.mark.asyncio

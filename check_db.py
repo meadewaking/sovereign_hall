@@ -5,6 +5,7 @@
 用法：直接运行此脚本
 """
 
+import argparse
 import sys
 import os
 import csv
@@ -2444,7 +2445,23 @@ def clean_database(db_path):
     return deleted_docs, deleted_proposals
 
 
-def main():
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Return the read-only entry parser without touching quotes or SQLite."""
+    return argparse.ArgumentParser(
+        prog="python -m sovereign_hall.check_db",
+        description=(
+            "Inspect the durable research pipeline and the authoritative "
+            "realtime simulated-account score"
+        ),
+    )
+
+
+def main(argv: list[str] | None = None):
+    # Parse before resolving the database or realtime quotes. In particular,
+    # ``--help`` must be a side-effect-free CLI operation suitable for health
+    # checks; the no-argument path below deliberately keeps realtime valuation
+    # enabled by default.
+    build_argument_parser().parse_args([] if argv is None else argv)
     db_path = project_root / "data" / "sovereign_hall.db"
 
     if not db_path.exists():
@@ -2505,4 +2522,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
