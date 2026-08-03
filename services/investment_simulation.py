@@ -588,71 +588,116 @@ class InvestmentSimulation:
         *,
         source: str = "run_discussion",
         round_id: str | None = None,
+        append_round_events: bool = False,
     ) -> None:
-        """Append vote diagnostics and prediction links for every outcome."""
+        """Persist each committee outcome once, optionally with its round event."""
         if not self.db_service or self.db_service._connection is None:
             return
-        conn = self.db_service._connection
         now = datetime.now().isoformat()
-        for decision in decisions:
-            vote_summary = decision.get("vote_summary") or {}
-            await conn.execute(
-                """
-                INSERT INTO simulation_committee_outcomes (
-                    ticker, direction, confidence, target_position,
-                    vote_summary, vote_margin, vote_count, parsed_vote_count,
-                    invalid_vote_count, quorum_required, quorum_met,
-                    review_depth, prediction_id, evidence_gaps, reconsider_if,
-                    individual_votes, stage_execution_audit, deadlock_review,
-                    initial_committee_decision, source, created_at, round_id,
-                    decision_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    self._normalize_ticker(str(decision.get("ticker") or "")),
-                    str(decision.get("direction") or "hold").lower(),
-                    float(decision.get("confidence") or 0.0),
-                    float(decision.get("target_position") or 0.0),
-                    json.dumps(vote_summary, ensure_ascii=False, sort_keys=True),
-                    float(decision.get("vote_margin") or 0.0),
-                    int(decision.get("vote_count") or 0),
-                    int(decision.get("parsed_vote_count") or 0),
-                    int(decision.get("invalid_vote_count") or 0),
-                    int(decision.get("vote_quorum_required") or 0),
-                    1 if decision.get("vote_quorum_met") else 0,
-                    str(decision.get("review_depth") or ""),
-                    str(decision.get("prediction_id") or "") or None,
-                    json.dumps(
-                        decision.get("evidence_gaps") or [],
-                        ensure_ascii=False,
+        async with self.db_service.transaction(immediate=True) as conn:
+            for decision in decisions:
+                vote_summary = decision.get("vote_summary") or {}
+                effective_round_id = round_id or decision.get("round_id")
+                cursor = await conn.execute(
+                    """
+                    INSERT OR IGNORE INTO simulation_committee_outcomes (
+                        ticker, direction, confidence, target_position,
+                        vote_summary, vote_margin, vote_count, parsed_vote_count,
+                        invalid_vote_count, quorum_required, quorum_met,
+                        review_depth, prediction_id, evidence_gaps, reconsider_if,
+                        individual_votes, stage_execution_audit, deadlock_review,
+                        initial_committee_decision, source, created_at, round_id,
+                        decision_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self._normalize_ticker(str(decision.get("ticker") or "")),
+                        str(decision.get("direction") or "hold").lower(),
+                        float(decision.get("confidence") or 0.0),
+                        float(decision.get("target_position") or 0.0),
+                        json.dumps(vote_summary, ensure_ascii=False, sort_keys=True),
+                        float(decision.get("vote_margin") or 0.0),
+                        int(decision.get("vote_count") or 0),
+                        int(decision.get("parsed_vote_count") or 0),
+                        int(decision.get("invalid_vote_count") or 0),
+                        int(decision.get("vote_quorum_required") or 0),
+                        1 if decision.get("vote_quorum_met") else 0,
+                        str(decision.get("review_depth") or ""),
+                        str(decision.get("prediction_id") or "") or None,
+                        json.dumps(
+                            decision.get("evidence_gaps") or [],
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            decision.get("reconsider_if") or [],
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            decision.get("individual_votes") or [],
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            decision.get("stage_execution_audit") or [],
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            decision.get("deadlock_review") or {},
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            decision.get("initial_committee_decision") or {},
+                            ensure_ascii=False,
+                        ),
+                        str(source or "run_discussion"),
+                        now,
+                        effective_round_id,
+                        decision.get("decision_id"),
                     ),
-                    json.dumps(
-                        decision.get("reconsider_if") or [],
-                        ensure_ascii=False,
-                    ),
-                    json.dumps(
-                        decision.get("individual_votes") or [],
-                        ensure_ascii=False,
-                    ),
-                    json.dumps(
-                        decision.get("stage_execution_audit") or [],
-                        ensure_ascii=False,
-                    ),
-                    json.dumps(
-                        decision.get("deadlock_review") or {},
-                        ensure_ascii=False,
-                    ),
-                    json.dumps(
-                        decision.get("initial_committee_decision") or {},
-                        ensure_ascii=False,
-                    ),
-                    str(source or "run_discussion"),
-                    now,
-                    round_id or decision.get("round_id"),
-                    decision.get("decision_id"),
-                ),
-            )
-        await conn.commit()
+                )
+                if (
+                    append_round_events
+                    and cursor.rowcount > 0
+                    and effective_round_id
+                ):
+                    async with conn.execute(
+                        """
+                        SELECT COALESCE(MAX(sequence), 0) + 1
+                        FROM round_events
+                        WHERE round_id = ?
+                        """,
+                        (effective_round_id,),
+                    ) as event_cursor:
+                        sequence_row = await event_cursor.fetchone()
+                    await conn.execute(
+                        """
+                        INSERT INTO round_events (
+                            round_id, sequence, event_type,
+                            payload_json, created_at
+                        ) VALUES (
+                            ?, ?, 'CommitteeDecisionPersisted', ?, ?
+                        )
+                        """,
+                        (
+                            effective_round_id,
+                            int(sequence_row[0] if sequence_row else 1),
+                            json.dumps(
+                                {
+                                    "decision_id": decision.get("decision_id"),
+                                    "ticker": decision.get("ticker"),
+                                    "direction": decision.get("direction"),
+                                    "parsed_vote_count": decision.get(
+                                        "parsed_vote_count"
+                                    ),
+                                    "quorum_met": bool(
+                                        decision.get("vote_quorum_met")
+                                    ),
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            now,
+                        ),
+                    )
 
     async def _write_redeployment_state(
         self,
@@ -1016,6 +1061,7 @@ class InvestmentSimulation:
         status: str,
         resolution: str,
         defer_code: str | None = None,
+        pending_decision_id: int | None = None,
     ) -> None:
         if (
             not intent_id
@@ -1024,21 +1070,38 @@ class InvestmentSimulation:
         ):
             return
         now = datetime.now().isoformat()
-        await self.db_service._connection.execute(
-            """
-            UPDATE execution_intents
-            SET status = ?, resolution = ?, defer_code = ?, updated_at = ?
-            WHERE id = ? AND status <> 'executed'
-            """,
-            (
-                status,
-                str(resolution or "")[:1000],
-                defer_code,
-                now,
-                intent_id,
-            ),
-        )
-        await self.db_service._connection.commit()
+        resolution_text = str(resolution or "")[:1000]
+        async with self.db_service.transaction(immediate=True) as conn:
+            await conn.execute(
+                """
+                UPDATE execution_intents
+                SET status = ?, resolution = ?, defer_code = ?, updated_at = ?
+                WHERE id = ? AND status <> 'executed'
+                """,
+                (
+                    status,
+                    resolution_text,
+                    defer_code,
+                    now,
+                    intent_id,
+                ),
+            )
+            if pending_decision_id is not None and status == "rejected":
+                await conn.execute(
+                    """
+                    UPDATE simulation_pending_decisions
+                    SET status = 'rejected', resolution = ?, defer_code = ?,
+                        updated_at = ?, resolved_at = ?
+                    WHERE id = ? AND status = 'replaying'
+                    """,
+                    (
+                        resolution_text,
+                        defer_code,
+                        now,
+                        now,
+                        int(pending_decision_id),
+                    ),
+                )
 
     async def update_execution_intent(
         self,
@@ -1080,7 +1143,13 @@ class InvestmentSimulation:
             resolution=f"{code}:{reason}",
         )
 
-    async def execute_intent(self, intent_id: str, llm: LLMClient = None) -> Dict[str, Any]:
+    async def execute_intent(
+        self,
+        intent_id: str,
+        llm: LLMClient = None,
+        *,
+        pending_decision_id: int | None = None,
+    ) -> Dict[str, Any]:
         """Canonical simulated-execution entry; callers cannot provide a price."""
         if not self.db_service or self.db_service._connection is None:
             return {
@@ -1123,7 +1192,7 @@ class InvestmentSimulation:
             reason=item.get("reason") or "",
             confidence=item.get("confidence"),
             risk_cap_already_applied=True,
-            pending_decision_id=None,
+            pending_decision_id=pending_decision_id,
             round_id=item.get("round_id"),
             intent_id=intent_id,
             idempotency_key=item["idempotency_key"],
@@ -1139,6 +1208,11 @@ class InvestmentSimulation:
                     or _execution_defer_code(result.get("reason"))
                 ),
             )
+        elif action == "error":
+            # Persistence failures are retryable. The atomic executor has
+            # rolled back every durable fill consequence, so rejecting the
+            # price-free intent here would discard a valid ruling.
+            pass
         elif action not in {"buy", "sell", "already_executed"}:
             execution_quote = result.get("execution_quote") or {}
             if (
@@ -1154,7 +1228,7 @@ class InvestmentSimulation:
                         self.db_service,
                         max_daily_trades=self.max_daily_trades,
                         max_quote_age_seconds=self.max_realtime_quote_age_seconds,
-                    ).commit_rejection(
+                        ).commit_rejection(
                         ExecutionRejectionCommitRequest(
                             ticker=str(item["ticker"]),
                             price=float(execution_quote["price"]),
@@ -1169,7 +1243,7 @@ class InvestmentSimulation:
                             intent_id=intent_id,
                             idempotency_key=str(item["idempotency_key"]),
                             round_id=item.get("round_id"),
-                            pending_decision_id=result.get("pending_decision_id"),
+                            pending_decision_id=pending_decision_id,
                             deployment_gap=result.get("deployment_gap"),
                             next_action=str(result.get("next_action") or ""),
                         )
@@ -1197,6 +1271,7 @@ class InvestmentSimulation:
                     defer_code=str(
                         result.get("blocker_code") or "execution_rejected"
                     ),
+                    pending_decision_id=pending_decision_id,
                 )
         return {"intent_id": intent_id, **result}
 
@@ -1308,7 +1383,10 @@ class InvestmentSimulation:
             summary["attempted"] += 1
             try:
                 if row.get("intent_id"):
-                    result = await self.execute_intent(str(row["intent_id"]))
+                    result = await self.execute_intent(
+                        str(row["intent_id"]),
+                        pending_decision_id=pending_id,
+                    )
                 else:
                     result = await self.execute_trade(
                         ticker=str(row["ticker"]),
@@ -1327,10 +1405,34 @@ class InvestmentSimulation:
 
             action = str(result.get("action") or "")
             if action in {"buy", "sell"} and result.get("success"):
-                status = "executed"
                 summary["executed"] += 1
+                # The fill transaction already resolved this pending row
+                # together with quote, fill, ledger, cash, position, intent,
+                # redeployment state, round terminal and append-only event.
+                summary["results"].append({"id": pending_id, **result})
+                continue
             elif action == "pending":
                 # ``execute_trade`` updated this same row; do not duplicate it.
+                summary["results"].append({"id": pending_id, **result})
+                continue
+            elif action == "error":
+                # A persistence failure must leave the price-free ruling
+                # retryable. The failed atomic fill/rejection transaction has
+                # already rolled back every durable consequence.
+                await conn.execute(
+                    """
+                    UPDATE simulation_pending_decisions
+                    SET status = 'pending_next_trading_session',
+                        updated_at = ?, resolution = ?
+                    WHERE id = ? AND status = 'replaying'
+                    """,
+                    (
+                        datetime.now().isoformat(),
+                        f"retryable_after_atomic_failure:{result.get('reason', '')}"[:500],
+                        pending_id,
+                    ),
+                )
+                await conn.commit()
                 summary["results"].append({"id": pending_id, **result})
                 continue
             else:

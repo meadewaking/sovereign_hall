@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -286,7 +287,7 @@ def refresh_tape_update_from_local_db(
         return refresh_tape_update_freshness(overlaid, now=now)
 
     try:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             table_exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='price_predictions'"
             ).fetchone()
@@ -939,7 +940,7 @@ def recent_prediction_observation_count(
         return 0
 
     try:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='price_predictions'"
             ).fetchone()
@@ -1137,7 +1138,7 @@ def load_active_simulation_risk_memory(
         return []
     now_iso = (now or datetime.now()).isoformat()
     try:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='simulation_risk_memory'"
@@ -2173,12 +2174,25 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
     return "\n".join(lines)
 
 
-def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
-    """Show the live simulated account as the sole performance authority."""
+def format_heuristic_status(
+    context: HeuristicRiskContext | None = None,
+    *,
+    live_performance: dict[str, Any] | None = None,
+) -> str:
+    """Show the live simulated account as the sole performance authority.
+
+    ``check_db`` supplies the realtime valuation it already fetched so this
+    secondary status block cannot contradict the authoritative account block
+    with the price-free persisted projection.
+    """
     ctx = context or load_latest_heuristic_context()
     if not ctx.available:
         return "\n🧭 Heuristic 学习状态: 暂无本地运行结果\n"
-    performance = ctx.simulation_performance or {}
+    performance = (
+        live_performance
+        if live_performance is not None
+        else (ctx.simulation_performance or {})
+    )
     live_return = performance.get("net_total_return", ctx.score)
     score_text = (
         f"{float(live_return):.6f}" if live_return is not None else "N/A"
@@ -2187,6 +2201,11 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
     invested_text = (
         f"{float(invested_ratio):.1%}" if invested_ratio is not None else "N/A"
     )
+    live_warning = "；".join(
+        str(item) for item in (performance.get("failure_reasons") or []) if item
+    )
+    if not live_warning:
+        live_warning = str(performance.get("health_status") or ctx.warning)
     lines = [
         "\n🧭 Heuristic / 模拟账户绩效状态",
         "=" * 60,
@@ -2205,7 +2224,7 @@ def format_heuristic_status(context: HeuristicRiskContext | None = None) -> str:
         ),
         f"   当前执行安全策略: {ctx.policy_name} | 单标的上限: {ctx.max_position:.1%}",
         f"   本地信号观察门槛: >={ctx.min_signal_count} 条同日预测观察",
-        f"   诊断: {ctx.warning}",
+        f"   诊断: {live_warning}",
         "   离线回测: 仅诊断失败模式；不产生best/score，不得晋升为模拟交易策略",
     ]
     if ctx.evaluation_engine:

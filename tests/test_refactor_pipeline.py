@@ -71,6 +71,7 @@ from sovereign_hall.run_discussion import (
     committee_decision_is_predictable,
     committee_deadlock_requires_review,
     committee_role_weight,
+    committee_think_from_persisted_evidence,
     collect_committee_results,
     retry_absent_committee_results,
     build_deployment_evidence_queries,
@@ -87,6 +88,7 @@ from sovereign_hall.run_discussion import (
     prioritize_deployment_research,
     rank_stage2_documents,
     select_next_topic,
+    load_recent_topics,
     stage2_deep_research,
     stage3_ic_discussion,
     run_committee_approved_simulation,
@@ -1022,6 +1024,114 @@ def test_check_db_realtime_quotes_are_on_by_default(monkeypatch):
     assert check_db.realtime_quotes_enabled() is False
 
 
+def test_per_round_sqlite_reads_explicitly_close_connections(tmp_path, monkeypatch):
+    """The autonomous loop must not retain sqlite handles across rounds."""
+    import sovereign_hall.services.heuristic_policy as heuristic_policy
+
+    db_path = tmp_path / "round_reads.db"
+    setup = sqlite3.connect(db_path)
+    try:
+        setup.executescript(
+            """
+            CREATE TABLE report_conclusions (
+                question TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE price_predictions (
+                ticker TEXT,
+                predicted_at TEXT
+            );
+            CREATE TABLE simulation_risk_memory (
+                ticker TEXT,
+                source TEXT,
+                failure_count INTEGER,
+                last_loss_pct REAL,
+                worst_loss_pct REAL,
+                last_trade_id INTEGER,
+                last_updated TEXT,
+                expires_at TEXT,
+                reason TEXT
+            );
+            INSERT INTO report_conclusions VALUES ('topic', datetime('now'));
+            INSERT INTO price_predictions VALUES ('600000', datetime('now'));
+            """
+        )
+        setup.commit()
+    finally:
+        setup.close()
+
+    real_connect = sqlite3.connect
+    opened = []
+
+    class TrackingConnection(sqlite3.Connection):
+        explicitly_closed = False
+
+        def close(self):
+            self.explicitly_closed = True
+            return super().close()
+
+    def tracked_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+
+    assert set(load_recent_topics(db_path, hours=24)) == {"topic"}
+    heuristic_policy.refresh_tape_update_from_local_db(
+        {"current_prediction_rows": 0},
+        db_path=db_path,
+    )
+    heuristic_policy.recent_prediction_observation_count(
+        "600000",
+        db_path=db_path,
+    )
+    heuristic_policy.load_active_simulation_risk_memory(db_path=db_path)
+
+    assert len(opened) == 4
+    assert all(connection.explicitly_closed for connection in opened)
+
+
+def test_live_iteration_attribution_requires_fill_and_uses_prior_realtime_score(
+    tmp_path,
+):
+    module = load_script_module(
+        "heuristic_cycle_stdlib_attribution_test_module",
+        "scripts/run_heuristic_cycle_stdlib.py",
+    )
+    previous_run = tmp_path / "20260730_151700"
+    previous_run.mkdir()
+    (previous_run / "simulation_account_metrics.json").write_text(
+        json.dumps(
+            {
+                "measured_at": "2026-07-30T15:18:34",
+                "score": -0.027278097,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    window_start, baseline_score = module.live_iteration_baseline(
+        previous_run,
+        "fallback",
+    )
+    no_fill = module.attach_live_iteration_attribution(
+        {"score": -0.02, "trades_since_window_start": 0},
+        baseline_score=baseline_score,
+    )
+    with_fill = module.attach_live_iteration_attribution(
+        {"score": -0.02775, "trades_since_window_start": 3},
+        baseline_score=baseline_score,
+    )
+
+    assert window_start == "2026-07-30T15:18:34"
+    assert no_fill["iteration_performance_improvement"] is None
+    assert with_fill["iteration_performance_improvement"] == pytest.approx(
+        -0.000471903
+    )
+
+
 def test_check_db_filters_placeholder_candidate_rejections():
     import sovereign_hall.check_db as check_db
 
@@ -1096,12 +1206,81 @@ def test_check_db_values_positions_from_realtime_quote(tmp_path, monkeypatch, ca
         },
     )
 
-    check_db.show_investment_status(db_path)
+    performance = check_db.show_investment_status(db_path)
     output = capsys.readouterr().out
 
     assert "当前资产: 10230.00 元（实时现价）" in output
     assert "实时现价12.300" in output
     assert "test_realtime_quote" in output
+    assert performance["valuation_complete"] is True
+    assert performance["score"] == pytest.approx(0.023)
+
+
+def test_check_db_lifecycle_review_surfaces_complete_position_evidence(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "lifecycle.db"
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE system_stats (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO system_stats VALUES ('simulation_cash', '9000')")
+    conn.execute(
+        """
+        CREATE TABLE simulation_positions (
+            ticker TEXT, shares INTEGER, avg_cost REAL, opened_at TEXT,
+            peak_price REAL, last_mark_price REAL, last_mark_at TEXT,
+            last_mark_source TEXT, last_reviewed_at TEXT,
+            review_status TEXT, review_reason TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO simulation_positions VALUES (
+            '600519', 100, 10.0, ?, 12.0, 11.0, ?,
+            'test_realtime_quote', ?, 'hold', 'durable hold reason'
+        )
+        """,
+        (now, now, now),
+    )
+    conn.execute(
+        """
+        CREATE TABLE simulation_trades (
+            ticker TEXT, direction TEXT, shares INTEGER, price REAL,
+            fee REAL, reason TEXT, traded_at TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        check_db,
+        "get_realtime_prices",
+        lambda tickers: {
+            "600519": {
+                "price": 11.0,
+                "source": "test_realtime_quote",
+                "fetched_at": now,
+            }
+        },
+    )
+
+    performance = check_db.show_investment_status(db_path)
+    output = capsys.readouterr().out
+    review = performance["position_lifecycle_reviews"][0]
+
+    assert "unrealized=+10.00%" in output
+    assert "stop=9.2000(-8.0%)" in output
+    assert "take_profit=11.5000(15.0%)" in output
+    assert "peak_drawdown=-8.33%" in output
+    assert "last_review=" in output
+    assert "durable hold reason" in output
+    assert review["max_holding_days"] == 30
+    assert review["peak_drawdown"] == pytest.approx(-1 / 12)
 
 
 def test_check_db_reports_pending_decision_terminal_counts(tmp_path, capsys):
@@ -3699,6 +3878,45 @@ def test_format_heuristic_status_includes_failure_cases(tmp_path):
     assert "worst_trade" in status
 
 
+def test_format_heuristic_status_prefers_injected_realtime_account_view(tmp_path):
+    context = HeuristicRiskContext(
+        run_dir=tmp_path,
+        policy_name="simulation_live_policy_v1",
+        score=None,
+        max_position=0.10,
+        overfit_risk=False,
+        warning="模拟账户实时估值不完整",
+        failure_cases=[],
+        simulation_performance={
+            "net_total_return": None,
+            "score": None,
+            "health_status": "valuation_incomplete",
+            "current_invested_ratio": None,
+            "trade_count": 31,
+        },
+    )
+    live_performance = {
+        "net_total_return": -0.02775,
+        "score": -0.02775,
+        "health_status": "degraded_underdeployed",
+        "current_invested_ratio": 0.272,
+        "trade_count": 31,
+        "latest_trade_at": "2026-07-31T10:08:29",
+        "failure_reasons": ["模拟账户投入率27.2%低于80%健康线"],
+    }
+
+    status = format_heuristic_status(
+        context,
+        live_performance=live_performance,
+    )
+
+    assert "score: -0.027750" in status
+    assert "系统健康: degraded_underdeployed" in status
+    assert "投入率: 27.2%" in status
+    assert "模拟账户投入率27.2%低于80%健康线" in status
+    assert "实时估值不完整" not in status
+
+
 def test_format_heuristic_prompt_context_marks_failure_tickers(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
@@ -4028,10 +4246,29 @@ async def test_pending_replay_is_exit_first_and_resolves_each_row_once(tmp_path,
     )()
     monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
     sim.count_trades_on_date = AsyncMock(return_value=0)
-    sim.execute_trade = AsyncMock(side_effect=[
-        {"success": True, "action": "sell", "ticker": "000001"},
-        {"success": False, "action": "hold", "ticker": "600519", "reason": "heuristic veto"},
-    ])
+
+    async def execute_with_atomic_pending_projection(**kwargs):
+        if kwargs["ticker"] == "000001":
+            now = datetime.now().isoformat()
+            await db._connection.execute(
+                """
+                UPDATE simulation_pending_decisions
+                SET status = 'executed', resolved_at = ?, updated_at = ?,
+                    resolution = 'simulation_trade:test'
+                WHERE id = ?
+                """,
+                (now, now, kwargs["pending_decision_id"]),
+            )
+            await db._connection.commit()
+            return {"success": True, "action": "sell", "ticker": "000001"}
+        return {
+            "success": False,
+            "action": "hold",
+            "ticker": "600519",
+            "reason": "heuristic veto",
+        }
+
+    sim.execute_trade = AsyncMock(side_effect=execute_with_atomic_pending_projection)
 
     result = await sim.replay_pending_decisions()
     second = await sim.replay_pending_decisions()
@@ -4867,6 +5104,49 @@ async def test_committee_task_timeouts_preserve_completed_results_and_audit_abse
     assert audit["absent_labels"] == ["消费行业视角"]
 
 
+@pytest.mark.asyncio
+async def test_committee_analysis_uses_only_persisted_round_evidence():
+    class FakeAgent:
+        def __init__(self):
+            self.calls = []
+
+        async def think(self, **kwargs):
+            self.calls.append(kwargs)
+            return "durable evidence analysis"
+
+        async def think_with_search(self, **_kwargs):
+            raise AssertionError("committee must not launch untracked searches")
+
+    agent = FakeAgent()
+    result = await committee_think_from_persisted_evidence(
+        agent,
+        task="独立质疑估值与流动性",
+        proposal={
+            "ticker": "588170",
+            "direction": "long",
+            "confidence": 0.7,
+            "target_position": 0.1,
+            "thesis": "事实与推断分离",
+            "evidence": ["来源A事实", "来源B反证"],
+            "evidence_delta": "新增资金流证据",
+            "reject_if": "流动性恶化",
+        },
+        discussion_context="只审计本轮资料",
+        temperature=0.6,
+        max_tokens=3000,
+        round_id="round_test",
+    )
+
+    assert result == "durable evidence analysis"
+    assert len(agent.calls) == 1
+    call = agent.calls[0]
+    assert call["use_memory"] is False
+    assert call["context"] == "只审计本轮资料"
+    assert "round_test" in call["task"]
+    assert "来源A事实；来源B反证" in call["task"]
+    assert "不得另发不可追溯搜索" in call["task"]
+
+
 def test_committee_domain_weight_reduces_out_of_domain_hold_pressure():
     assert committee_role_weight(
         AgentRole.TMT_ANALYST, "半导体设备", "国产替代", 1.0
@@ -5152,6 +5432,8 @@ def test_core_discussion_prompts_are_evidence_rich_and_machine_readable():
     assert "证据不足时输出空数组" in stage2_source
     assert "max_tokens=8000" in stage2_source
     assert "build_structured_vote_prompt" in stage3_source
+    assert "committee_think_from_persisted_evidence" in stage3_source
+    assert ".think_with_search(" not in stage3_source
     assert "review_depth" in stage3_source
     assert "二次修正与反事实复盘" in stage3_source
     assert "vote_max_tokens" in stage3_source

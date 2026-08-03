@@ -781,6 +781,82 @@ def read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+def live_iteration_baseline(
+    previous_run: Path | None,
+    fallback_start: str,
+) -> tuple[str, float | None]:
+    """Use the prior realtime measurement as the fill-attribution boundary."""
+    if previous_run is None:
+        return fallback_start, None
+    prior = read_json(previous_run / "simulation_account_metrics.json")
+    measured_at = str(prior.get("measured_at") or "").strip()
+    prior_score = prior.get("score")
+    try:
+        parsed_score = float(prior_score) if prior_score is not None else None
+    except (TypeError, ValueError):
+        parsed_score = None
+    return measured_at or fallback_start, parsed_score
+
+
+def attach_live_iteration_attribution(
+    metrics: dict[str, Any],
+    *,
+    baseline_score: float | None,
+) -> dict[str, Any]:
+    """Report a realtime score delta only when the window contains fills."""
+    attributed = dict(metrics)
+    fill_count = int(attributed.get("trades_since_window_start") or 0)
+    current_score = attributed.get("score")
+    improvement = None
+    if fill_count > 0 and baseline_score is not None and current_score is not None:
+        improvement = float(current_score) - float(baseline_score)
+    attributed["iteration_start_score"] = baseline_score
+    attributed["iteration_performance_improvement"] = improvement
+    attributed["iteration_improvement_rule"] = (
+        "realtime score delta since the previous realtime measurement; "
+        "reported only when at least one auditable simulated fill exists"
+    )
+    return attributed
+
+
+def merge_realtime_lifecycle_review(
+    persisted: dict[str, Any],
+    live_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach the read-only realtime lifecycle review used by this cycle."""
+    merged = dict(persisted)
+    reviews = list(live_metrics.get("position_lifecycle_reviews") or [])
+    merged.update(
+        {
+            "reviewed_at": live_metrics.get("measured_at"),
+            "status": (
+                "realtime_lifecycle_reviewed"
+                if live_metrics.get("valuation_complete")
+                else "realtime_lifecycle_blocked_missing_quote"
+            ),
+            "valuation_complete": bool(live_metrics.get("valuation_complete")),
+            "cash": live_metrics.get("cash"),
+            "market_value": live_metrics.get("positions_value"),
+            "total_assets": live_metrics.get("total_assets"),
+            "invested_ratio": live_metrics.get("current_invested_ratio"),
+            "deployment_gap": live_metrics.get("deployment_gap"),
+            "position_count": len(reviews),
+            "reviewed_position_count": len(reviews),
+            "blocked_price_count": sum(
+                str(item.get("action") or "").startswith("blocked_")
+                for item in reviews
+            ),
+            "lifecycle_review_ran": True,
+            "positions": reviews,
+            "valuation_rule": (
+                "Realtime quotes only; no daily price, prediction, cost or "
+                "stored-mark fallback. This report does not create trades."
+            ),
+        }
+    )
+    return merged
+
+
 def previous_best_score(root: Path) -> tuple[float | None, Path | None]:
     best: float | None = None
     best_path: Path | None = None
@@ -1812,6 +1888,13 @@ def write_live_readme(
     offline_return_text = (
         "N/A" if offline_return is None else f"{float(offline_return):+.4%}"
     )
+    new_fill_count = int(metrics.get("trades_since_window_start") or 0)
+    improvement = metrics.get("iteration_performance_improvement")
+    improvement_text = (
+        "N/A"
+        if improvement is None
+        else f"{float(improvement):+.6f} realtime score delta"
+    )
     path.write_text(
         f"""# Heuristic Learning Cycle — Live Simulation Authority
 
@@ -1823,15 +1906,16 @@ def write_live_readme(
 - Authoritative simulated-account score: {score_text}
 - Cumulative realtime-valued net return: {return_text}
 - Health: `{metrics.get('health_status', 'valuation_incomplete')}`
-- New live fills: {int(metrics.get('trades_since_window_start') or 0)}
-- Iteration improvement: `N/A` without new live fills
+- New live fills: {new_fill_count}
+- Iteration improvement: `{improvement_text}`
 
 ## System Failure Review
 {failure_lines}
 - Invested ratio: {invested_text}; deployment gap: {gap_text}
 - Cumulative fills: {int(metrics.get('trade_count') or 0)}
 - Latest fill: {metrics.get('latest_trade_at') or 'none'}
-- Empty/underdeployed without recent fills is a system failure, not normal observation.
+- Under-80% deployment without a fill for at least three days is a system
+  failure. Recent fills reset that timer but low deployment remains degraded.
 
 ## Offline Diagnostics — Non-authoritative
 - `{offline_name}` diagnostic return={offline_return_text}; samples={sample_count}
@@ -1840,7 +1924,7 @@ def write_live_readme(
 
 ## User Entry Impact
 - `check_db` shows only the realtime simulated-account return as score.
-- `run_discussion` records empty-book/no-decision as
+- `run_discussion` records prolonged empty-book/no-decision as
   `system_failure_no_live_deployment`; zero fills means improvement=N/A.
 - `research_interactive` receives the same live-only performance context.
 - Per-position lifecycle review ran: yes; positions reviewed=
@@ -1908,6 +1992,14 @@ def main() -> int:
     parser.add_argument("--db", default="data/sovereign_hall.db", help="SQLite database path")
     parser.add_argument("--runs-root", default="runs/heuristic_cycle", help="Output root")
     parser.add_argument("--timestamp", default=None, help="Optional run timestamp")
+    parser.add_argument(
+        "--window-start",
+        default=None,
+        help=(
+            "Optional ISO timestamp for auditable new-fill attribution; "
+            "defaults to the previous run's realtime measurement"
+        ),
+    )
     args = parser.parse_args()
 
     project_root = Path.cwd()
@@ -1918,13 +2010,24 @@ def main() -> int:
     run_started = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_started_at = datetime.now().isoformat(timespec="seconds")
     run_id = args.timestamp or run_started
+    previous_run = latest_completed_run(runs_root)
+    inferred_window_start, previous_live_score = live_iteration_baseline(
+        previous_run,
+        run_started_at,
+    )
+    iteration_window_start = args.window_start or inferred_window_start
     run_dir = runs_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
-    live_metrics = asyncio.run(
-        collect_simulation_performance(db_path, window_start=run_started_at)
+    live_metrics = attach_live_iteration_attribution(
+        asyncio.run(
+            collect_simulation_performance(
+                db_path,
+                window_start=iteration_window_start,
+            )
+        ),
+        baseline_score=previous_live_score,
     )
 
-    previous_run = latest_completed_run(runs_root)
     previous_score, previous_path = previous_best_score(runs_root)
     predictions = load_predictions(db_path)
     if not predictions:
@@ -2059,7 +2162,10 @@ def main() -> int:
         pending_price_readiness=price_readiness,
     )
     failures = analyze_failures(best_result, daily, best_policy)
-    portfolio_lifecycle = build_persisted_lifecycle_review(db_path)
+    portfolio_lifecycle = merge_realtime_lifecycle_review(
+        build_persisted_lifecycle_review(db_path),
+        live_metrics,
+    )
     source_counts = price_coverage.get("daily_signal_price_source_counts", {})
     price_source = (
         "daily_prices"
@@ -2140,7 +2246,12 @@ def main() -> int:
                     ),
                     "score": live_metrics.get("score"),
                 },
-                "suspected_reason": "研究到模拟成交链路未产生近期成交",
+                "suspected_reason": (
+                    "本轮虽有可审计模拟成交，但投入率仍低于80%，"
+                    "研究与组合再配置尚未完成100%部署目标"
+                    if int(live_metrics.get("trades_since_window_start") or 0) > 0
+                    else "研究到模拟成交链路未产生近期成交"
+                ),
                 "repair_direction": "追踪首个真实终止拒绝码并修复，禁止以离线收益替代",
             }
         ],

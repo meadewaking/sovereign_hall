@@ -134,9 +134,12 @@ research:
   # 本地LLM长期排队并造成投票角色超时；focused仍保留CIO/风控/量化/宏观核心审议。
   committee_min_review_depth: "focused"
   committee_full_discussion: false
-  committee_round1_max_tokens: 9000
-  committee_round2_max_tokens: 7000
-  committee_revision_max_tokens: 6000
+  # 主研究阶段已联网并持久化资料；投委会只审计该 durable evidence，
+  # 不再为每个角色重复搜索。下列输出上限覆盖完整结构化质疑，同时避免
+  # 生成长度本身耗尽角色 deadline（下游每角色摘要只消费1200字符）。
+  committee_round1_max_tokens: 4500
+  committee_round2_max_tokens: 4000
+  committee_revision_max_tokens: 3000
   committee_vote_max_tokens: 3500
   committee_summary_chars: 1200
   committee_vote_context_chars: 6000

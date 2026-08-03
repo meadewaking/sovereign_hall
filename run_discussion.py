@@ -649,7 +649,11 @@ def load_recent_topics(db_path: Path, hours: int = DEFAULT_TOPIC_COOLDOWN_HOURS)
         return {}
     cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
     try:
-        with sqlite3.connect(db_path) as conn:
+        # sqlite3.Connection.__exit__ commits/rolls back but does not close the
+        # connection.  This path runs once per production round, so relying on
+        # ``with sqlite3.connect(...)`` leaked one database handle per round in
+        # the long-running process.
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
             rows = conn.execute(
                 """
                 SELECT question, MAX(created_at) AS last_discussed_at
@@ -1723,6 +1727,74 @@ def build_structured_vote_prompt(ticker: str, role_view: str, context: str, lear
 """.strip()
 
 
+def build_persisted_committee_evidence_context(
+    proposal: Dict[str, Any],
+    *,
+    round_id: str | None = None,
+) -> str:
+    """Render only the evidence already persisted by the research stage.
+
+    Committee analysis must challenge the durable research record. Launching
+    fresh per-role searches here both loses round lineage and makes the role
+    deadline include a shared Spider queue.
+    """
+
+    def render_items(value: Any) -> str:
+        if isinstance(value, str):
+            parsed = _safe_parse_json(value, default=None)
+            if isinstance(parsed, list):
+                value = parsed
+        if isinstance(value, (list, tuple)):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            return "；".join(items) if items else "未提供"
+        return str(value or "").strip() or "未提供"
+
+    return (
+        "【本轮持久化提案证据（只能审计、交叉质疑，不得补造事实）】\n"
+        f"- round_id: {round_id or proposal.get('round_id') or 'N/A'}\n"
+        f"- ticker: {proposal.get('ticker') or 'N/A'}\n"
+        f"- direction/confidence/target: "
+        f"{proposal.get('direction') or 'N/A'} / "
+        f"{proposal.get('confidence') if proposal.get('confidence') is not None else 'N/A'} / "
+        f"{proposal.get('target_position') if proposal.get('target_position') is not None else 'N/A'}\n"
+        f"- thesis: {render_items(proposal.get('thesis'))}\n"
+        f"- evidence: {render_items(proposal.get('evidence'))}\n"
+        f"- evidence_delta: {render_items(proposal.get('evidence_delta'))}\n"
+        f"- resolved_rejection: {render_items(proposal.get('resolved_rejection'))}\n"
+        f"- reject_if: {render_items(proposal.get('reject_if'))}\n"
+        "资料已由本轮主研究阶段联网取得并按 round_id 持久化。"
+        "此处不得另发不可追溯搜索；证据不足必须明确指出缺口并保持HOLD/弃权。"
+    )
+
+
+class CommitteeDecisionPersistenceError(RuntimeError):
+    """A completed vote could not be durably linked to its research round."""
+
+
+async def committee_think_from_persisted_evidence(
+    agent: Any,
+    *,
+    task: str,
+    proposal: Dict[str, Any],
+    discussion_context: str,
+    temperature: float,
+    max_tokens: int,
+    round_id: str | None = None,
+) -> str:
+    """Run one independent committee analysis on durable round evidence."""
+    evidence_context = build_persisted_committee_evidence_context(
+        proposal,
+        round_id=round_id,
+    )
+    return await agent.think(
+        task=f"{task}\n\n{evidence_context}",
+        context=discussion_context,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        use_memory=False,
+    )
+
+
 async def collect_committee_results(
     tasks: List[tuple[str, Awaitable[str]]],
     *,
@@ -2322,6 +2394,7 @@ async def stage3_ic_discussion(
     topic: str,
     lessons_prompt: str = "",
     round_id: str | None = None,
+    decision_callback: Callable[[Dict[str, Any]], Awaitable[None]] | None = None,
 ):
     """阶段3：投委会审议"""
     if not proposals:
@@ -2463,19 +2536,26 @@ async def stage3_ic_discussion(
                 [
                     (
                         name,
-                        agent.think_with_search(
+                        committee_think_from_persisted_evidence(
+                            agent,
                             task=task,
-                            search_queries=queries,
-                            context=thesis,
+                            proposal=proposal,
+                            discussion_context=thesis,
                             temperature=0.8,
                             max_tokens=round1_max_tokens,
+                            round_id=round_id,
                         ),
                     )
-                    for agent, name, task, queries in round1_tasks
+                    for agent, name, task, _queries in round1_tasks
                 ],
                 timeout_seconds=round1_role_timeout,
                 stage="round1_independent_analysis",
             )
+            round1_audit.update({
+                "input_lineage": "persisted_round_proposal",
+                "round_id": round_id,
+                "committee_network_search_requests": 0,
+            })
             stage_execution_audit.append(round1_audit)
 
             task_names = [name for _, name, _, _ in round1_tasks]
@@ -2517,19 +2597,28 @@ async def stage3_ic_discussion(
                     [
                         (
                             name,
-                            agent.think_with_search(
+                            committee_think_from_persisted_evidence(
+                                agent,
                                 task=task,
-                                search_queries=queries,
-                                context=round1_summary[:vote_context_chars],
+                                proposal=proposal,
+                                discussion_context=round1_summary[
+                                    :vote_context_chars
+                                ],
                                 temperature=0.7,
                                 max_tokens=round2_max_tokens,
+                                round_id=round_id,
                             ),
                         )
-                        for agent, name, task, queries in debate_tasks
+                        for agent, name, task, _queries in debate_tasks
                     ],
                     timeout_seconds=round2_role_timeout,
                     stage="round2_cross_challenge",
                 )
+                round2_audit.update({
+                    "input_lineage": "persisted_round_proposal",
+                    "round_id": round_id,
+                    "committee_network_search_requests": 0,
+                })
                 stage_execution_audit.append(round2_audit)
 
                 debate_names = [name for _, name, _, _ in debate_tasks]
@@ -2829,8 +2918,6 @@ async def stage3_ic_discussion(
                 'discussion_excerpt': full_context[:24000],
                 'stage_execution_audit': stage_execution_audit,
             })
-            final_decisions.append(committee_decision)
-
             # 记录到决策追踪器
             try:
                 if committee_decision_is_predictable(committee_decision):
@@ -2869,6 +2956,16 @@ async def stage3_ic_discussion(
             except Exception as e:
                 logger.warning(f"记录决策失败: {e}")
 
+            if decision_callback is not None:
+                try:
+                    await decision_callback(committee_decision)
+                except Exception as exc:
+                    raise CommitteeDecisionPersistenceError(
+                        f"committee decision persistence failed for {ticker}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+            final_decisions.append(committee_decision)
+
             print(
                 f"      ✅ 投票完成 "
                 f"({vote_audit['completed_count']}/{vote_audit['task_count']}完成，"
@@ -2884,6 +2981,8 @@ async def stage3_ic_discussion(
             print(f"      ⚠️ 讨论被取消")
             all_discussions.append(f"\n【{ticker}】讨论被取消")
             raise  # 重新抛出 CancelledError，让上层处理
+        except CommitteeDecisionPersistenceError:
+            raise
         except Exception as e:
             print(f"      ❌ 错误: {str(e)[:50]}")
             all_discussions.append(f"\n【{ticker}】错误: {str(e)[:100]}")
@@ -4005,6 +4104,17 @@ async def main():
     await db_service._init_db()
     await db_service.init_report_tables()
     round_coordinator = ResearchRoundCoordinator(db_service)
+    recovered_rounds = await round_coordinator.recover_abandoned_rounds()
+    if recovered_rounds:
+        logger.warning(
+            "Recovered %s abandoned research round(s) before production resumed: %s",
+            len(recovered_rounds),
+            [item["round_id"] for item in recovered_rounds],
+        )
+        print(
+            "   ♻️ 已原子收敛 "
+            f"{len(recovered_rounds)} 个上一进程遗留的无终态研究轮"
+        )
     vector_db.set_database_service(db_service)
     market_data = get_market_data()
 
@@ -4421,6 +4531,16 @@ async def main():
                         payload={"proposal_count": len(proposals)},
                     )
                     try:
+                        async def persist_committee_decision(
+                            decision: Dict[str, Any],
+                        ) -> None:
+                            await simulation.record_committee_outcomes(
+                                [decision],
+                                source="run_discussion",
+                                round_id=active_round_id,
+                                append_round_events=True,
+                            )
+
                         discussions, decisions = await stage3_ic_discussion(
                             llm,
                             spiders,
@@ -4428,6 +4548,7 @@ async def main():
                             topic,
                             lessons_prompt=prompt_lessons,
                             round_id=active_round_id,
+                            decision_callback=persist_committee_decision,
                         )
                         logger.info(f"阶段3完成，讨论长度: {len(discussions)}, 决策数: {len(decisions)}")
                     except Exception as e:
@@ -4642,16 +4763,16 @@ async def main():
             except KeyboardInterrupt:
                 await round_coordinator.fail(
                     active_round_id,
-                    code="interrupted",
-                    reason="研究轮被用户中断",
+                    code="failed",
+                    reason="研究轮失败：用户中断",
                 )
                 raise
             except asyncio.CancelledError:
                 print(f"\n⚠️ 任务被取消，保存进度...")
                 await round_coordinator.fail(
                     active_round_id,
-                    code="cancelled",
-                    reason="研究轮被取消",
+                    code="failed",
+                    reason="研究轮失败：任务取消",
                 )
                 raise
             except Exception as e:
@@ -4662,8 +4783,8 @@ async def main():
                 )
                 await round_coordinator.fail(
                     active_round_id,
-                    code="pipeline_exception",
-                    reason=str(e),
+                    code="failed",
+                    reason=f"研究轮失败：管线异常：{e}",
                 )
 
             # 统计

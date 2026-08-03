@@ -1142,7 +1142,7 @@ def research_stage_diagnostics(conn, stage: str = "stage2", limit: int = 5):
     return diagnostics
 
 
-def show_investment_status(db_path):
+def show_investment_status(db_path) -> dict[str, Any]:
     """显示投资模拟状态"""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -1167,7 +1167,21 @@ def show_investment_status(db_path):
         print("   离线回测: 仅诊断，不参与best/score/策略晋升")
         print("   ❌ 系统异常: 模拟交易表尚未初始化且无任何模拟成交")
         conn.close()
-        return
+        return build_simulation_performance(
+            initial_capital=10000.0,
+            assets={
+                "valuation_complete": True,
+                "total_assets": 10000.0,
+                "cash": 10000.0,
+                "positions_value": 0.0,
+                "invested_ratio": 0.0,
+                "deployment_gap": 10000.0,
+                "missing_price_tickers": [],
+            },
+            trade_count=0,
+            recorded_fees=0.0,
+            latest_trade_at=None,
+        )
 
     # 获取初始资金
     c.execute("SELECT value FROM system_stats WHERE key = 'simulation_cash'")
@@ -1180,7 +1194,9 @@ def show_investment_status(db_path):
         position_columns = {row[1] for row in c.execute("PRAGMA table_info(simulation_positions)")}
         metadata_columns = [
             column for column in (
-                "opened_at", "last_reviewed_at", "review_status", "review_reason"
+                "opened_at", "peak_price", "last_mark_price", "last_mark_at",
+                "last_mark_source", "last_reviewed_at", "review_status",
+                "review_reason",
             ) if column in position_columns
         ]
         select_columns = "ticker, shares, avg_cost"
@@ -1332,6 +1348,13 @@ def show_investment_status(db_path):
     missing_realtime_tickers = []
     position_details = []
     lifecycle_details = []
+    lifecycle_records = []
+    stop_loss_pct = float(simulation_config.get("stop_loss_pct", -0.08) or -0.08)
+    take_profit_pct = float(simulation_config.get("take_profit_pct", 0.15) or 0.15)
+    max_holding_days = int(simulation_config.get("max_holding_days", 30) or 30)
+    max_trade_price_age_days = int(
+        simulation_config.get("max_trade_price_age_days", 3) or 3
+    )
     for pos in positions:
         ticker = pos[0]
         shares = pos[1]
@@ -1369,14 +1392,73 @@ def show_investment_status(db_path):
             price_at=price_at,
             price_source=price_source,
             now=datetime.now(),
-            max_price_age_days=3,
-            stop_loss_pct=-0.08,
-            take_profit_pct=0.15,
-            max_holding_days=30,
+            max_price_age_days=max_trade_price_age_days,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            max_holding_days=max_holding_days,
+        )
+        peak_price_raw = (
+            pos["peak_price"] if "peak_price" in metadata_columns else None
+        )
+        peak_price = (
+            max(float(peak_price_raw or current_price), float(current_price))
+            if current_price is not None
+            else (float(peak_price_raw) if peak_price_raw is not None else None)
+        )
+        peak_drawdown = (
+            float(current_price) / peak_price - 1.0
+            if current_price is not None and peak_price and peak_price > 0
+            else None
+        )
+        last_reviewed_at = (
+            pos["last_reviewed_at"]
+            if "last_reviewed_at" in metadata_columns
+            else None
+        )
+        durable_review_status = (
+            pos["review_status"] if "review_status" in metadata_columns else None
+        )
+        durable_review_reason = (
+            pos["review_reason"] if "review_reason" in metadata_columns else None
+        )
+        stop_price = float(cost) * (1.0 + stop_loss_pct)
+        take_profit_price = float(cost) * (1.0 + take_profit_pct)
+        pnl_text = (
+            "N/A" if lifecycle.pnl_pct is None else f"{lifecycle.pnl_pct:+.2%}"
+        )
+        drawdown_text = (
+            "N/A" if peak_drawdown is None else f"{peak_drawdown:+.2%}"
         )
         lifecycle_details.append(
-            f"  {ticker}: action={lifecycle.action}, held={lifecycle.holding_days if lifecycle.holding_days is not None else 'unknown'}d, "
-            f"quote_age={lifecycle.price_age_days if lifecycle.price_age_days is not None else 'unknown'}d, {lifecycle.reason}"
+            f"  {ticker}: action={lifecycle.action}, "
+            f"held={lifecycle.holding_days if lifecycle.holding_days is not None else 'unknown'}d/"
+            f"{max_holding_days}d, quote={current_price if current_price is not None else 'N/A'} "
+            f"@{price_source} {price_at or 'N/A'}, "
+            f"unrealized={pnl_text}, stop={stop_price:.4f}({stop_loss_pct:.1%}), "
+            f"take_profit={take_profit_price:.4f}({take_profit_pct:.1%}), "
+            f"peak={peak_price if peak_price is not None else 'N/A'}, "
+            f"peak_drawdown={drawdown_text}, "
+            f"last_review={last_reviewed_at or 'N/A'} "
+            f"[{durable_review_status or 'N/A'}: {durable_review_reason or 'N/A'}], "
+            f"current_reason={lifecycle.reason}"
+        )
+        lifecycle_records.append(
+            {
+                **lifecycle.as_dict(),
+                "shares": int(shares),
+                "avg_cost": float(cost),
+                "opened_at": opened_at,
+                "stop_loss_pct": stop_loss_pct,
+                "stop_price": stop_price,
+                "take_profit_pct": take_profit_pct,
+                "take_profit_price": take_profit_price,
+                "max_holding_days": max_holding_days,
+                "peak_price": peak_price,
+                "peak_drawdown": peak_drawdown,
+                "last_reviewed_at": last_reviewed_at,
+                "durable_review_status": durable_review_status,
+                "durable_review_reason": durable_review_reason,
+            }
         )
 
     valuation_complete = not missing_realtime_tickers
@@ -1417,6 +1499,11 @@ def show_investment_status(db_path):
             or 0.80
         ),
     )
+    performance["position_lifecycle_reviews"] = lifecycle_records
+    performance["quote_details"] = {
+        str(ticker): dict(quote)
+        for ticker, quote in realtime_prices.items()
+    }
 
     print("\n" + "="*60)
     print("📊 投资模拟状态")
@@ -1827,6 +1914,7 @@ def show_investment_status(db_path):
             print(f"   {trade[5][:10]} {trade[1]} {trade[0]} {trade[2]}股 @ {trade[3]:.2f}")
     else:
         print("   (无交易记录)")
+    return performance
 
 
 def show_canonical_pipeline_status(db_path: Path) -> None:
@@ -1900,7 +1988,7 @@ def show_stats(db_path):
     print("="*60)
 
     # 先显示投资状态
-    show_investment_status(db_path)
+    live_performance = show_investment_status(db_path)
     show_canonical_pipeline_status(Path(db_path))
     try:
         from sovereign_hall.services.heuristic_policy import (
@@ -1920,7 +2008,7 @@ def show_stats(db_path):
                 except Exception as template_exc:
                     progress["template_write_error"] = str(template_exc)
             backfill_progress = format_daily_price_backfill_progress(conn, progress=progress)
-        print(format_heuristic_status())
+        print(format_heuristic_status(live_performance=live_performance))
         if backfill_progress:
             print(backfill_progress)
     except Exception as exc:
