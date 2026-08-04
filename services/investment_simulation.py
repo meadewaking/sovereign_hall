@@ -478,9 +478,10 @@ class InvestmentSimulation:
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Remove structurally unbuyable long proposals before committee work.
 
-        The quote is used only as a current screening reference.  Execution
-        still creates a durable intent and fetches a new, fresh quote in an
-        open market session.  Unavailable screening quotes are not rejected
+        The quote is used only as a current screening reference and must pass
+        the same freshness gate as valuation/execution quotes.  Execution still
+        creates a durable intent and fetches a new, fresh quote in an open
+        market session.  Missing or stale screening quotes are not rejected
         here because the execution path owns the authoritative quote gate.
         """
         assets = await self.calculate_assets()
@@ -518,7 +519,12 @@ class InvestmentSimulation:
                 continue
             try:
                 quote = await self.get_current_quote(ticker)
-                reference_price = float((quote or {}).get("price") or 0.0)
+                quote_is_fresh = self._quote_is_fresh(quote)
+                reference_price = (
+                    float((quote or {}).get("price") or 0.0)
+                    if quote_is_fresh
+                    else 0.0
+                )
             except Exception as exc:
                 logger.warning(
                     "Proposal lot-feasibility quote failed for %s: %s",
@@ -527,6 +533,13 @@ class InvestmentSimulation:
                 )
                 reference_price = 0.0
                 quote = None
+                quote_is_fresh = False
+            if quote and not quote_is_fresh:
+                logger.warning(
+                    "Proposal lot-feasibility quote unavailable/stale for %s; "
+                    "candidate remains eligible for committee and execution must refetch",
+                    ticker,
+                )
             if reference_price <= 0 or reference_price <= executable_quote_ceiling:
                 feasible.append(proposal)
                 continue
@@ -543,6 +556,8 @@ class InvestmentSimulation:
                 ),
                 "reference_price": reference_price,
                 "quote_source": str((quote or {}).get("source") or ""),
+                "quote_fetched_at": str((quote or {}).get("fetched_at") or ""),
+                "quote_purpose": "proposal_lot_feasibility_screening",
                 "max_executable_quote": executable_quote_ceiling,
             })
         return feasible, rejections

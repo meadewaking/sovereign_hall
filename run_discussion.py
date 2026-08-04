@@ -871,6 +871,45 @@ def build_lessons_with_heuristic_context(
     return "\n\n".join(parts)
 
 
+async def record_proposal_lot_screening_event(
+    round_coordinator,
+    round_id: str | None,
+    rejections: List[Dict[str, Any]],
+) -> None:
+    """Attach fresh quote lineage for proposal lot rejections to the round.
+
+    This is a research-screening audit event, not an execution quote snapshot.
+    Missing/stale quotes never enter ``rejections`` and therefore cannot create
+    a durable price record or eliminate a committee candidate.
+    """
+    if not round_coordinator or not round_id or not rejections:
+        return
+    quote_rejections = []
+    for item in rejections:
+        quote_rejections.append({
+            "ticker": str(item.get("ticker") or ""),
+            "code": str(item.get("code") or "proposal_lot_infeasible"),
+            "price": float(item.get("reference_price") or 0.0),
+            "provider": str(item.get("quote_source") or ""),
+            "fetched_at": str(item.get("quote_fetched_at") or ""),
+            "purpose": str(
+                item.get("quote_purpose")
+                or "proposal_lot_feasibility_screening"
+            ),
+            "max_executable_quote": float(
+                item.get("max_executable_quote") or 0.0
+            ),
+        })
+    await round_coordinator.record_event(
+        round_id,
+        "ProposalLotFeasibilityRejected",
+        {
+            "rejection_count": len(quote_rejections),
+            "rejections": quote_rejections,
+        },
+    )
+
+
 # ============================================================================
 # 阶段1：海量信息搜索（高并发）
 # ============================================================================
@@ -4522,6 +4561,11 @@ async def main():
                 if proposals and hasattr(simulation, "screen_proposal_lot_feasibility"):
                     proposals, lot_rejections = (
                         await simulation.screen_proposal_lot_feasibility(proposals)
+                    )
+                    await record_proposal_lot_screening_event(
+                        round_coordinator,
+                        active_round_id,
+                        lot_rejections,
                     )
                     repeated_candidate_rejections.extend(lot_rejections)
                     if lot_rejections:

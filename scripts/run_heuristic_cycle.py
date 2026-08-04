@@ -3494,7 +3494,6 @@ def main() -> int:
         },
     )
     write_json(run_dir / "simulation_account_metrics.json", live_metrics)
-    write_json(run_dir / "best_metrics.json", live_metrics)
     best_result["curve"].to_csv(
         run_dir / "offline_diagnostic_equity_curve.csv", index=False
     )

@@ -2205,7 +2205,6 @@ def main() -> int:
         },
     )
     write_json(run_dir / "simulation_account_metrics.json", live_metrics)
-    write_json(run_dir / "best_metrics.json", live_metrics)
     write_json(run_dir / "offline_diagnostic_overfit_checks.json", checks)
     write_json(run_dir / "project_context.json", project_context)
     write_json(run_dir / "daily_price_backfill_plan.json", backfill_plan_summary)
