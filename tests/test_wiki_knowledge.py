@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -6,6 +7,8 @@ from sovereign_hall.core import Document
 from sovereign_hall.services.database import DatabaseService
 from sovereign_hall.services.vector_db import VectorDatabase
 from sovereign_hall.services.wiki_knowledge import (
+    WikiPage,
+    WikiSearchIndex,
     WikiKnowledgeBase,
     chunk_markdown,
     merge_markdown_page,
@@ -179,6 +182,83 @@ async def test_hybrid_search_returns_wiki_documents_with_vector_scores(tmp_path,
     assert results[0].source == "obsidian_wiki"
     assert results[0].metadata["wiki_path"].startswith("wiki/")
     assert results[0].metadata["vector_score"] is not None
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_does_not_pad_keyword_hits_with_irrelevant_pages(tmp_path):
+    pages = [
+        WikiPage(
+            path=tmp_path / "semis.md",
+            rel_path="wiki/semis.md",
+            title="半导体订单跟踪",
+            page_type="source",
+            body="半导体设备订单和经营现金流同步改善。",
+        ),
+        WikiPage(
+            path=tmp_path / "consumer.md",
+            rel_path="wiki/consumer.md",
+            title="消费行业跟踪",
+            page_type="source",
+            body="消费行业库存仍待验证。",
+        ),
+    ]
+
+    class StaticStore:
+        def all_wiki_pages(self):
+            return pages
+
+    class CountingEmbeddingLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def get_embedding(self, text):
+            self.calls.append(text)
+            return [1.0, 0.0]
+
+    llm = CountingEmbeddingLLM()
+    index = WikiSearchIndex(StaticStore(), llm_client=llm, embedding_enabled=True)
+
+    hits = await index.search("半导体", top_k=5)
+
+    assert hits
+    assert [hit.page.rel_path for hit in hits] == ["wiki/semis.md"]
+    assert len(llm.calls) == 2  # query plus the sole lexical candidate page
+    assert all("消费行业" not in call for call in llm.calls)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_keeps_lexical_hits_when_vector_enrichment_times_out(
+    tmp_path, monkeypatch
+):
+    page = WikiPage(
+        path=tmp_path / "semis.md",
+        rel_path="wiki/semis.md",
+        title="半导体订单跟踪",
+        page_type="source",
+        body="半导体设备订单和经营现金流同步改善。",
+    )
+
+    class StaticStore:
+        def all_wiki_pages(self):
+            return [page]
+
+    class HangingEmbeddingLLM:
+        async def get_embedding(self, text):
+            await asyncio.Event().wait()
+
+    import sovereign_hall.services.wiki_knowledge as wiki_module
+
+    monkeypatch.setattr(wiki_module, "VECTOR_ENRICHMENT_TIMEOUT_SECONDS", 0.01)
+    index = WikiSearchIndex(
+        StaticStore(),
+        llm_client=HangingEmbeddingLLM(),
+        embedding_enabled=True,
+    )
+
+    hits = await index.search("半导体", top_k=5)
+
+    assert [hit.page.rel_path for hit in hits] == ["wiki/semis.md"]
+    assert hits[0].vector_score is None
 
 
 @pytest.mark.asyncio

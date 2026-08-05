@@ -160,10 +160,10 @@ class MarketDataService:
                 return {key: value for key, value in cached.items() if key != "fetched_at_datetime"}
 
         self._ensure_client()
-        price = await self._fetch_tencent_quote(code)
+        price, name = await self._fetch_tencent_quote(code)
         source = "tencent_realtime_quote"
         if price is None:
-            price = await self._fetch_eastmoney_quote(code)
+            price, name = await self._fetch_eastmoney_quote(code)
             source = "eastmoney_realtime_quote"
 
         if price is not None and price > 0:
@@ -171,6 +171,7 @@ class MarketDataService:
             quote = {
                 "ticker": code,
                 "price": float(price),
+                "name": name or "",
                 "source": source,
                 "fetched_at": fetched_at.isoformat(),
             }
@@ -180,27 +181,28 @@ class MarketDataService:
         logger.warning("No market quote for %s", code)
         return None
 
-    async def _fetch_tencent_quote(self, ticker: str) -> Optional[float]:
+    async def _fetch_tencent_quote(self, ticker: str) -> tuple[Optional[float], str]:
         market = self.infer_market(ticker)
         if not market:
-            return None
+            return None, ""
         url = f"http://qt.gtimg.cn/q={market}{ticker}"
         try:
             resp = await self._client.get(url)
             if resp.status_code != 200 or "none_match" in resp.text:
-                return None
+                return None, ""
             text = resp.content.decode("gbk", errors="ignore")
             parts = text.split("~")
+            name = parts[1].strip() if len(parts) > 1 else ""
             if len(parts) > 3 and parts[3]:
-                return float(parts[3])
+                return float(parts[3]), name
         except Exception as exc:
             logger.debug("Tencent quote failed for %s: %s", ticker, exc)
-        return None
+        return None, ""
 
-    async def _fetch_eastmoney_quote(self, ticker: str) -> Optional[float]:
+    async def _fetch_eastmoney_quote(self, ticker: str) -> tuple[Optional[float], str]:
         secid = self.eastmoney_secid(ticker)
         if not secid:
-            return None
+            return None, ""
         url = "http://push2.eastmoney.com/api/qt/stock/get"
         params = {"secid": secid, "fields": "f43,f57,f58,f59"}
         try:
@@ -209,11 +211,12 @@ class MarketDataService:
             data = resp.json().get("data") or {}
             raw = data.get("f43")
             if raw in (None, "-", ""):
-                return None
-            return self._parse_eastmoney_price(raw, data.get("f59"), ticker)
+                return None, ""
+            name = str(data.get("f58") or "").strip()
+            return self._parse_eastmoney_price(raw, data.get("f59"), ticker), name
         except Exception as exc:
             logger.debug("Eastmoney quote failed for %s: %s", ticker, exc)
-        return None
+        return None, ""
 
     @staticmethod
     def _parse_eastmoney_price(raw: object, precision: object = None, ticker: str = "") -> Optional[float]:

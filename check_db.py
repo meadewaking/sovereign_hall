@@ -1365,12 +1365,14 @@ def show_investment_status(db_path) -> dict[str, Any]:
             current_price = float(quote["price"])
             price_at = str(quote.get("fetched_at") or datetime.now().isoformat())
             price_source = str(quote.get("source") or "realtime_quote")
+            stock_name = str(quote.get("name") or "").strip()
             position_value = shares * current_price
             known_position_value += position_value
             change = (current_price - cost) / cost * 100 if cost > 0 else 0
             sign = '+' if change >= 0 else ''
+            display_ticker = f"{ticker}({stock_name})" if stock_name else ticker
             position_details.append(
-                f"  {ticker}: {shares}股 @ 实时现价{current_price:.3f} 成本{cost:.3f} "
+                f"  {display_ticker}: {shares}股 @ 实时现价{current_price:.3f} 成本{cost:.3f} "
                 f"({sign}{change:.1f}%) | {price_source} @ {price_at}"
             )
         else:

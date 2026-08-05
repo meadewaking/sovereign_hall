@@ -39,6 +39,13 @@ MAX_SEARCH_PAGES = 10000
 # 向量检索预筛页面数：先用关键词排序取 top N，再做 embedding
 # 71700 全量 embedding 会超时，预筛后只需 embedding N 个页面
 VECTOR_PREFILTER_TOP_N = 200
+# Semantic enrichment is optional: lexical wiki hits are already durable local
+# evidence and must not be discarded when the embedding provider is slow.  A
+# bounded enrichment budget also keeps the production research loop moving to
+# its default online evidence refresh instead of stalling for the outer 120s
+# timeout on every round.
+VECTOR_ENRICHMENT_TIMEOUT_SECONDS = 20.0
+VECTOR_ZERO_KEYWORD_FALLBACK_TOP_N = 32
 MIN_WIKI_SOURCE_CHARS = 80
 NOISY_SOURCE_TITLE_RE = re.compile(
     r"(?:^|\b)(403|404|operations too frequent|google search|microsoft bing|search -|"
@@ -829,22 +836,34 @@ class WikiSearchIndex:
         # 预筛：取关键词得分最高的 VECTOR_PREFILTER_TOP_N 页面做向量检索
         # 避免 71700+ 页面全量 embedding 导致超时
         prefilter_sorted = sorted(keyword_hits, key=lambda item: item[1], reverse=True)
+        prefilter_paths = {
+            rel_path
+            for rel_path, _ in prefilter_sorted[:VECTOR_PREFILTER_TOP_N]
+        }
         prefilter_pages = [
             page for page in pages
-            if any(page.rel_path == hit[0] for hit in prefilter_sorted[:VECTOR_PREFILTER_TOP_N])
+            if page.rel_path in prefilter_paths
         ]
-        # 如果关键词命中不足，从全部页面里随机补足，保证向量检索有候选
-        if len(prefilter_pages) < VECTOR_PREFILTER_TOP_N:
-            existing = {p.rel_path for p in prefilter_pages}
-            for page in pages:
-                if page.rel_path not in existing:
-                    prefilter_pages.append(page)
-                    if len(prefilter_pages) >= VECTOR_PREFILTER_TOP_N:
-                        break
+        # With no lexical hit, preserve a small bounded semantic-discovery
+        # sample.  Do not pad a real keyword hit set with arbitrary pages: the
+        # old deterministic padding embedded up to 199 irrelevant pages and
+        # repeatedly exhausted the production round's outer timeout.
+        if not prefilter_pages:
+            prefilter_pages = pages[:VECTOR_ZERO_KEYWORD_FALLBACK_TOP_N]
 
         vector_hits: List[Tuple[str, float]] = []
         if self.embedding_enabled and self.llm_client:
-            vector_hits = await self._vector_search(query, prefilter_pages)
+            try:
+                vector_hits = await asyncio.wait_for(
+                    self._vector_search(query, prefilter_pages),
+                    timeout=VECTOR_ENRICHMENT_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "wiki vector enrichment timeout (%.1fs); returning %s lexical hits",
+                    VECTOR_ENRICHMENT_TIMEOUT_SECONDS,
+                    len(keyword_hits),
+                )
 
         hits = self._merge_hits(query, pages, keyword_hits, vector_hits)
         hits = [hit for hit in hits if hit.score >= min_similarity]
