@@ -1967,10 +1967,16 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
             "以 round_events 的最后阶段继续排查。"
         )
     elif health == "completed_no_evidence":
-        print(
-            "   ⚠️ 本轮资料未形成满足证据门槛的提案；"
-            "空结果已审计，未伪造候选。"
-        )
+        if status.get("round_finalization_pending"):
+            print(
+                "   ⚠️ 本轮 no_evidence 终态已持久化；"
+                "反思与 completed 收尾仍在进行，空结果未伪造候选。"
+            )
+        else:
+            print(
+                "   ⚠️ 本轮资料未形成满足证据门槛的提案；"
+                "空结果已审计，未伪造候选。"
+            )
     elif health == "completed_execution_rejected":
         print(
             "   ⚠️ 已形成裁决但未成交；查看 execution_intents 的 resolution，"

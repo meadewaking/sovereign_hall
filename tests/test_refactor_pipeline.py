@@ -383,6 +383,8 @@ async def test_search_query_generator_repairs_reasoning_without_inventing_ticker
 
     assert queries == ["中国中免601888财报", "海南机场600515现金流"]
     assert len(llm.calls) == 2
+    assert "银行 股息率 2025" not in llm.calls[0]["user"]
+    assert "免税店竞争格局 政策进展" in llm.calls[0]["user"]
     assert llm.calls[1]["temperature"] == 0.0
     assert llm.calls[1]["use_cache"] is False
 
@@ -1150,6 +1152,20 @@ def test_live_iteration_attribution_requires_fill_and_uses_prior_realtime_score(
     assert with_fill["iteration_performance_improvement"] == pytest.approx(
         -0.000471903
     )
+    assert "低于80%" in module.live_failure_suspected_reason(
+        {
+            "trades_since_window_start": 1,
+            "current_invested_ratio": 0.79,
+        }
+    )
+    healthy_reason = module.live_failure_suspected_reason(
+        {
+            "trades_since_window_start": 3,
+            "current_invested_ratio": 0.8101,
+        }
+    )
+    assert "已恢复到80%以上" in healthy_reason
+    assert "低于80%" not in healthy_reason
 
 
 def test_check_db_filters_placeholder_candidate_rejections():

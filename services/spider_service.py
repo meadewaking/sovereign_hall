@@ -1139,6 +1139,13 @@ class SearchQueryGenerator:
             ]
 
         topic_str = topic or "当前A股投资机会"
+        format_example = json.dumps(
+            [
+                f"{topic_str} 政策进展",
+                f"{topic_str} 财务数据",
+            ],
+            ensure_ascii=False,
+        )
         prompt = f"""
 针对议题「{topic_str}」，生成{count}个具体的搜索引擎查询词，用于发现相关投资机会。
 
@@ -1156,8 +1163,8 @@ class SearchQueryGenerator:
 6. 个股查询词必须带具体股票代码或名称
 
 【输出格式】
-仅返回JSON数组，不要其他文字。示例：
-["银行 股息率 2025", "江苏银行 业绩 财报", "降准 对银行影响", "银行PB 估值"]
+仅返回JSON数组，不要其他文字。当前议题的格式示例：
+{format_example}
 """
 
         try:

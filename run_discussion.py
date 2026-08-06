@@ -14,6 +14,7 @@ import sys
 import sqlite3
 import json
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, List, Dict, Optional
@@ -388,6 +389,104 @@ def cli_args_can_run_without_instance_lock(argv: list[str] | None = None) -> boo
     """Allow pure CLI help to work while a long discussion runner is active."""
     args = sys.argv[1:] if argv is None else argv
     return any(arg in {"-h", "--help"} for arg in args)
+
+
+def kill_existing_run_discussion_instances() -> list[int]:
+    """Stop any other ``python -m sovereign_hall.run_discussion`` processes.
+
+    Returns the list of PIDs that were signalled. The current process is
+    always excluded. Screen wrappers (`SCREEN -L -dmS sovereign_hall_prod ...`)
+    are torn down via ``screen -X quit`` so the child python is reaped too.
+    """
+    import subprocess
+
+    own_pid = os.getpid()
+    signalled: list[int] = []
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.warning("启动前进程扫描失败: %s", exc)
+        return signalled
+
+    screen_sessions: set[str] = set()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_str, args = line.split(None, 1)
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid == own_pid:
+            continue
+        if "run_discussion" not in args:
+            continue
+        tokens = args.split()
+        first_token = tokens[0] if tokens else ""
+        if first_token.endswith("grep") or first_token.endswith("/ps"):
+            continue
+        is_real_runner = any(
+            token == "run_discussion.py"
+            or token.endswith("/run_discussion.py")
+            or token == "sovereign_hall.run_discussion"
+            for token in tokens
+        )
+        if not is_real_runner:
+            continue
+        match = re.search(r"SCREEN\s+-\S*\s*-?\S*\s+(\S+)", args)
+        if match:
+            screen_sessions.add(match.group(1))
+        try:
+            os.kill(pid, 15)
+            signalled.append(pid)
+            print(f"   🛑 已向旧 run_discussion 进程发送 SIGTERM: pid={pid}")
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            print(f"   ⚠️ 无权限停止 pid={pid}（可能属于其他用户）")
+
+    for session in screen_sessions:
+        try:
+            subprocess.run(
+                ["screen", "-S", session, "-X", "quit"],
+                check=False,
+                timeout=5,
+            )
+            print(f"   🛑 已关闭 screen 会话: {session}")
+        except Exception as exc:
+            logger.debug("screen 会话 %s 关闭失败: %s", session, exc)
+
+    if signalled:
+        for _ in range(10):
+            time.sleep(0.3)
+            alive = []
+            for pid in signalled:
+                try:
+                    os.kill(pid, 0)
+                    alive.append(pid)
+                except ProcessLookupError:
+                    continue
+                except PermissionError:
+                    continue
+            if not alive:
+                break
+            for pid in alive:
+                try:
+                    os.kill(pid, 9)
+                    print(f"   💀 旧进程未退出，已 SIGKILL: pid={pid}")
+                except ProcessLookupError:
+                    continue
+                except PermissionError:
+                    continue
+
+    return signalled
 
 
 async def run_startup_preflight(llm, spiders, *, check_search: bool = True) -> bool:
@@ -4974,6 +5073,9 @@ if __name__ == "__main__":
         parse_args()
         sys.exit(0)
     try:
+        killed = kill_existing_run_discussion_instances()
+        if killed:
+            print(f"   ✅ 已停掉 {len(killed)} 个旧 run_discussion 进程，继续启动新实例")
         with SingleInstanceLock(project_root / "data" / "run_discussion.lock"):
             asyncio.run(main())
     except RuntimeError as exc:

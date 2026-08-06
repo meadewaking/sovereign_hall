@@ -1182,6 +1182,25 @@ def attach_live_iteration_attribution(
     return attributed
 
 
+def live_failure_suspected_reason(metrics: dict[str, Any]) -> str:
+    """Describe live deployment state without contradicting the measured ratio."""
+    fill_count = int(metrics.get("trades_since_window_start") or 0)
+    if fill_count <= 0:
+        return "研究、证据提案、投委会、实时行情或模拟执行链路未产生近期成交"
+    invested_ratio = metrics.get("current_invested_ratio")
+    if invested_ratio is None:
+        return "本轮有可审计模拟成交，但实时估值不完整；不得判断投入率或扩大仓位"
+    if float(invested_ratio) < 0.80:
+        return (
+            "本轮虽有可审计模拟成交，但投入率仍低于80%，"
+            "研究与组合再配置尚未解除部署失败"
+        )
+    return (
+        "本轮有可审计模拟成交且投入率已恢复到80%以上；"
+        "剩余现金仍在100%目标的再配置队列，不是战略现金"
+    )
+
+
 def merge_realtime_lifecycle_review(
     persisted: dict[str, Any],
     live_metrics: dict[str, Any],
@@ -3527,14 +3546,7 @@ def main() -> int:
             "simulated_account_net_return": live_metrics.get("net_total_return"),
             "score": live_metrics.get("score"),
         },
-        "suspected_reason": (
-            (
-                "本轮虽有可审计模拟成交，但投入率仍低于80%，"
-                "研究与组合再配置尚未完成100%部署目标"
-            )
-            if int(live_metrics.get("trades_since_window_start") or 0) > 0
-            else "研究、证据提案、投委会、实时行情或模拟执行链路未产生近期成交"
-        ),
+        "suspected_reason": live_failure_suspected_reason(live_metrics),
         "repair_direction": (
             "运行真实入口并持久化首个精确终止拒绝码；修复最早断点，"
             "不得用离线回测收益替代"
