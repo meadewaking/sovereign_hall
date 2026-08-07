@@ -178,7 +178,7 @@ def extract_stage2_candidate_windows(
     not evidence and must never become a simulated-trade candidate.
     """
     source = str(text or "")
-    windows: List[Dict[str, str]] = []
+    ranked_windows: List[tuple[int, int, Dict[str, str]]] = []
     seen = set()
     for match in STAGE2_TICKER_RE.finditer(source):
         ticker = match.group(0).split(".", 1)[0].upper()
@@ -187,13 +187,83 @@ def extract_stage2_candidate_windows(
         seen.add(ticker)
         start = max(0, match.start() - max(0, int(radius)))
         end = min(len(source), match.end() + max(0, int(radius)))
-        windows.append({
+        excerpt = source[start:end].strip()
+        nearby = source[
+            max(0, match.start() - 100):min(len(source), match.end() + 100)
+        ]
+        priority = 0
+        # Reasoning answers often enumerate high-price individual companies
+        # before comparing an executable ETF.  A first-N cut silently dropped
+        # those later ETF candidates even though the model and source material
+        # both named them.  Ranking changes only which already-mentioned
+        # windows receive the bounded audit; it never creates a ticker or
+        # bypasses evidence, committee, quote, or execution gates.
+        if re.search(r"ETF|交易型开放式指数基金|场内基金", nearby, re.IGNORECASE):
+            priority += 8
+        if re.search(
+            r"\b(?:long|short)\b|多头|空头|做多|做空|推荐|投资提案",
+            excerpt,
+            re.IGNORECASE,
+        ):
+            priority += 4
+        if re.search(r"\d+(?:\.\d+)?%|同比|环比|亿元|订单|现金流", excerpt):
+            priority += 2
+        ranked_windows.append((priority, match.start(), {
             "ticker": ticker,
-            "excerpt": source[start:end].strip(),
-        })
-        if len(windows) >= max(0, int(limit)):
+            "excerpt": excerpt,
+        }))
+    ranked_windows.sort(key=lambda item: (-item[0], item[1], item[2]["ticker"]))
+    return [
+        item[2]
+        for item in ranked_windows[:max(0, int(limit))]
+    ]
+
+
+def select_stage2_candidate_source_excerpts(
+    doc_contents: List[str],
+    candidate_tickers: List[str],
+    *,
+    limit: int = 12,
+) -> tuple[List[str], Dict[str, int]]:
+    """Select source excerpts with fair, auditable candidate coverage.
+
+    The old global first-12 slice could be consumed by documents for the first
+    company, leaving later candidates with no source text in the adjudication
+    prompt.  This selector takes one matching source per candidate before a
+    second pass.  It only returns existing excerpts that literally contain the
+    ticker and reports coverage for durable stage diagnostics.
+    """
+    ordered_tickers = list(dict.fromkeys(
+        str(ticker or "").split(".", 1)[0].upper()
+        for ticker in candidate_tickers
+        if str(ticker or "").strip()
+    ))
+    matches = {
+        ticker: [item for item in doc_contents if ticker in item]
+        for ticker in ordered_tickers
+    }
+    coverage = {ticker: len(items) for ticker, items in matches.items()}
+    selected: List[str] = []
+    selected_values = set()
+    depth = 0
+    bounded_limit = max(0, int(limit))
+    while len(selected) < bounded_limit:
+        added = False
+        for ticker in ordered_tickers:
+            ticker_matches = matches[ticker]
+            if depth >= len(ticker_matches):
+                continue
+            item = ticker_matches[depth]
+            if item not in selected_values:
+                selected.append(item)
+                selected_values.add(item)
+                added = True
+                if len(selected) >= bounded_limit:
+                    break
+        if not added:
             break
-    return windows
+        depth += 1
+    return selected, coverage
 
 
 def format_stage2_diagnostic_context(rows: List[Dict[str, Any]]) -> str:
@@ -394,9 +464,12 @@ def cli_args_can_run_without_instance_lock(argv: list[str] | None = None) -> boo
 def kill_existing_run_discussion_instances() -> list[int]:
     """Stop any other ``python -m sovereign_hall.run_discussion`` processes.
 
-    Returns the list of PIDs that were signalled. The current process is
-    always excluded. Screen wrappers (`SCREEN -L -dmS sovereign_hall_prod ...`)
-    are torn down via ``screen -X quit`` so the child python is reaped too.
+    Returns the list of PIDs that were signalled. The current process and its
+    ancestor chain are always excluded.  The latter matters when the runner is
+    launched under ``screen``: its wrapper command contains ``run_discussion``
+    too, but killing that wrapper tears down the new process before it can
+    acquire the instance lock.  Unrelated old screen wrappers are still torn
+    down via ``screen -X quit`` so their child Python is reaped too.
     """
     import subprocess
 
@@ -404,7 +477,7 @@ def kill_existing_run_discussion_instances() -> list[int]:
     signalled: list[int] = []
     try:
         result = subprocess.run(
-            ["ps", "-eo", "pid=,args="],
+            ["ps", "-eo", "pid=,ppid=,args="],
             check=False,
             text=True,
             capture_output=True,
@@ -414,17 +487,33 @@ def kill_existing_run_discussion_instances() -> list[int]:
         logger.warning("启动前进程扫描失败: %s", exc)
         return signalled
 
-    screen_sessions: set[str] = set()
+    processes: List[tuple[int, int, str]] = []
+    parent_by_pid: Dict[int, int] = {}
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            pid_str, args = line.split(None, 1)
+            pid_str, ppid_str, args = line.split(None, 2)
             pid = int(pid_str)
+            ppid = int(ppid_str)
         except ValueError:
             continue
-        if pid == own_pid:
+        processes.append((pid, ppid, args))
+        parent_by_pid[pid] = ppid
+
+    protected_pids = {own_pid}
+    cursor = own_pid
+    while cursor in parent_by_pid:
+        parent = parent_by_pid[cursor]
+        if parent <= 0 or parent in protected_pids:
+            break
+        protected_pids.add(parent)
+        cursor = parent
+
+    screen_sessions: set[str] = set()
+    for pid, _ppid, args in processes:
+        if pid in protected_pids:
             continue
         if "run_discussion" not in args:
             continue
@@ -1155,6 +1244,7 @@ async def stage2_deep_research(
     stage2_context_chars = int(research_config.get("stage2_context_chars", 24000) or 24000)
     diagnostic_repair_modes: List[str] = []
     detected_candidate_windows: List[Dict[str, str]] = []
+    candidate_source_coverage: Dict[str, int] = {}
 
     async def record_stage2_diagnostic(
         status: str,
@@ -1391,14 +1481,17 @@ async def stage2_deep_research(
             # A second, narrowly scoped pass adjudicates only ticker mentions
             # already present in the primary answer against the original
             # source excerpts.  It cannot introduce a ticker, source or fact.
-            candidate_tickers = {
+            candidate_ticker_order = [
                 item["ticker"] for item in detected_candidate_windows
-            }
-            source_excerpts = [
-                item
-                for item in doc_contents
-                if any(ticker in item for ticker in candidate_tickers)
-            ][:12]
+            ]
+            candidate_tickers = set(candidate_ticker_order)
+            source_excerpts, candidate_source_coverage = (
+                select_stage2_candidate_source_excerpts(
+                    doc_contents,
+                    candidate_ticker_order,
+                    limit=12,
+                )
+            )
             adjudication_prompt = f"""
 审计下面的“候选窗口”，判断它们是否已经被“原始资料”支持为明确、可证伪的投资提案。
 
@@ -1549,7 +1642,9 @@ async def stage2_deep_research(
             raw_excerpt=str(response or "")[:8000],
             reason=(
                 f"cleaned={len(cleaned)}; "
-                f"cleaning_rejections={json.dumps(cleaning_rejections, ensure_ascii=False)}"
+                f"cleaning_rejections={json.dumps(cleaning_rejections, ensure_ascii=False)}; "
+                "candidate_source_coverage="
+                f"{json.dumps(candidate_source_coverage, ensure_ascii=False, sort_keys=True)}"
             ),
         )
         return cleaned

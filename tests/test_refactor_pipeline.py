@@ -79,6 +79,7 @@ from sovereign_hall.run_discussion import (
     extract_stage2_candidate_windows,
     extract_stage2_proposal_array,
     format_stage2_diagnostic_context,
+    kill_existing_run_discussion_instances,
     merge_committee_deadlock_review,
     parse_committee_vote,
     parse_args,
@@ -87,6 +88,7 @@ from sovereign_hall.run_discussion import (
     proposal_priority_score,
     prioritize_deployment_research,
     rank_stage2_documents,
+    select_stage2_candidate_source_excerpts,
     select_next_topic,
     load_recent_topics,
     stage2_deep_research,
@@ -407,6 +409,46 @@ def test_stage2_candidate_windows_only_capture_tickers_already_in_response():
     assert "600515" in windows[0]["excerpt"]
 
 
+def test_stage2_candidate_windows_keep_late_explicit_etf_before_first_n_cut():
+    response = "\n".join(
+        [
+            f"候选公司 {ticker} 有经营数据，但价格或整手可执行性尚未确认。"
+            for ticker in (
+                "600031", "603338", "601100", "000680",
+                "000425", "600761", "000528", "000157",
+            )
+        ]
+        + [
+            "工程机械ETF 560280 是资料明确比较的可执行多头投资提案，"
+            "规模同比增长且资金净流入。"
+        ]
+    )
+
+    windows = extract_stage2_candidate_windows(response, radius=120, limit=8)
+
+    assert "560280" in [item["ticker"] for item in windows]
+    assert len(windows) == 8
+
+
+def test_stage2_candidate_sources_cover_each_ticker_before_second_excerpt():
+    docs = [
+        "【A1】600031 订单同比增长\n来源: local://a1",
+        "【A2】600031 现金流改善\n来源: local://a2",
+        "【ETF1】560280 规模增长\n来源: local://etf1",
+        "【ETF2】560280 资金净流入\n来源: local://etf2",
+    ]
+
+    selected, coverage = select_stage2_candidate_source_excerpts(
+        docs,
+        ["600031", "560280"],
+        limit=2,
+    )
+
+    assert any("600031" in item for item in selected)
+    assert any("560280" in item for item in selected)
+    assert coverage == {"600031": 2, "560280": 2}
+
+
 @pytest.mark.asyncio
 async def test_stage2_repairs_reasoning_only_response_without_fallback_ticker():
     class ReasoningThenRepairLLM:
@@ -680,6 +722,42 @@ def test_run_discussion_defaults_to_network_research():
 def test_run_discussion_help_does_not_need_instance_lock():
     assert cli_args_can_run_without_instance_lock(["--help"]) is True
     assert cli_args_can_run_without_instance_lock(["--once"]) is False
+
+
+def test_runner_cleanup_protects_own_screen_ancestor(monkeypatch):
+    import sovereign_hall.run_discussion as runner
+
+    ps_output = "\n".join([
+        "700 1 SCREEN -L -dmS sovereign_hall_prod zsh -lc python /repo/run_discussion.py",
+        "600 700 zsh -lc python /repo/run_discussion.py",
+        "500 600 python /repo/run_discussion.py",
+        "400 1 python /old/run_discussion.py",
+    ])
+    subprocess_calls = []
+    signals = []
+
+    class Result:
+        stdout = ps_output
+
+    def fake_run(command, **kwargs):
+        subprocess_calls.append((command, kwargs))
+        return Result()
+
+    def fake_kill(pid, signal):
+        signals.append((pid, signal))
+        if pid == 400 and signal == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(runner.subprocess if hasattr(runner, "subprocess") else __import__("subprocess"), "run", fake_run)
+    monkeypatch.setattr(runner.os, "getpid", lambda: 500)
+    monkeypatch.setattr(runner.os, "kill", fake_kill)
+
+    killed = kill_existing_run_discussion_instances()
+
+    assert killed == [400]
+    assert (400, 15) in signals
+    assert not any(pid in {500, 600, 700} for pid, _signal in signals)
+    assert subprocess_calls[0][0] == ["ps", "-eo", "pid=,ppid=,args="]
 
 
 def test_vote_context_balances_all_deliberation_stages():
