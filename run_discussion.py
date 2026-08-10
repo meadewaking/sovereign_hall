@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import fcntl
 import os
+import signal
 import sys
 import sqlite3
 import json
@@ -440,6 +441,12 @@ def normalize_proposal_holding_period(proposal: Dict, topic: str) -> int:
 
 logger = logging.getLogger(__name__)
 
+RUNNER_SHUTDOWN_POLL_SECONDS = 0.5
+RUNNER_SHUTDOWN_GRACE_SECONDS = 130.0
+RUNNER_SHUTDOWN_POLL_COUNT = int(
+    RUNNER_SHUTDOWN_GRACE_SECONDS / RUNNER_SHUTDOWN_POLL_SECONDS
+)
+
 
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Sovereign Hall continuous discussion runner")
@@ -459,6 +466,69 @@ def cli_args_can_run_without_instance_lock(argv: list[str] | None = None) -> boo
     """Allow pure CLI help to work while a long discussion runner is active."""
     args = sys.argv[1:] if argv is None else argv
     return any(arg in {"-h", "--help"} for arg in args)
+
+
+def install_sigterm_shutdown_handler(
+    loop: asyncio.AbstractEventLoop,
+    callback: Callable[[], None],
+) -> Callable[[], None]:
+    """Route SIGTERM through asyncio so the active round can be finalized.
+
+    Production replacement deliberately sends SIGTERM to the old canonical
+    runner.  The default process action exits immediately and bypasses the
+    per-round ``CancelledError`` handler, leaving the durable round between
+    stages.  Keep SIGINT's normal interactive behaviour and make only SIGTERM
+    cooperative here.
+    """
+    previous = signal.getsignal(signal.SIGTERM)
+    installed_on_loop = False
+    try:
+        loop.add_signal_handler(signal.SIGTERM, callback)
+        installed_on_loop = True
+    except (NotImplementedError, RuntimeError, ValueError):
+        def synchronous_handler(_signum, _frame):
+            loop.call_soon_threadsafe(callback)
+
+        signal.signal(signal.SIGTERM, synchronous_handler)
+
+    def cleanup() -> None:
+        if installed_on_loop:
+            loop.remove_signal_handler(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, previous)
+
+    return cleanup
+
+
+async def run_with_graceful_shutdown(
+    main_factory: Callable[[], Awaitable[Any]],
+    *,
+    install_handler: Callable[
+        [asyncio.AbstractEventLoop, Callable[[], None]],
+        Callable[[], None],
+    ] = install_sigterm_shutdown_handler,
+) -> None:
+    """Run the canonical loop and turn SIGTERM into one orderly cancellation."""
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.create_task(main_factory())
+    shutdown_requested = False
+
+    def request_shutdown() -> None:
+        nonlocal shutdown_requested
+        if shutdown_requested or main_task.done():
+            return
+        shutdown_requested = True
+        logger.warning("SIGTERM received; finalizing the active research round")
+        main_task.cancel()
+
+    cleanup = install_handler(loop, request_shutdown)
+    try:
+        await main_task
+    except asyncio.CancelledError:
+        if not shutdown_requested:
+            raise
+        logger.info("Canonical runner finished cooperative SIGTERM shutdown")
+    finally:
+        cleanup()
 
 
 def kill_existing_run_discussion_instances() -> list[int]:
@@ -521,6 +591,21 @@ def kill_existing_run_discussion_instances() -> list[int]:
         first_token = tokens[0] if tokens else ""
         if first_token.endswith("grep") or first_token.endswith("/ps"):
             continue
+        executable = Path(first_token).name.lower()
+        if executable == "screen":
+            for index, token in enumerate(tokens[:-1]):
+                if token in {"-S", "-dmS"}:
+                    screen_sessions.add(tokens[index + 1])
+                    break
+                if token.startswith("-S") and len(token) > 2:
+                    screen_sessions.add(token[2:])
+                    break
+            # Signalling the wrapper first may SIGHUP its Python child before
+            # that child can persist the SIGTERM terminal.  The real runner is
+            # signalled below; the wrapper is reaped only after the grace wait.
+            continue
+        if not executable.startswith("python"):
+            continue
         is_real_runner = any(
             token == "run_discussion.py"
             or token.endswith("/run_discussion.py")
@@ -529,9 +614,6 @@ def kill_existing_run_discussion_instances() -> list[int]:
         )
         if not is_real_runner:
             continue
-        match = re.search(r"SCREEN\s+-\S*\s*-?\S*\s+(\S+)", args)
-        if match:
-            screen_sessions.add(match.group(1))
         try:
             os.kill(pid, 15)
             signalled.append(pid)
@@ -541,7 +623,37 @@ def kill_existing_run_discussion_instances() -> list[int]:
         except PermissionError:
             print(f"   ⚠️ 无权限停止 pid={pid}（可能属于其他用户）")
 
-    for session in screen_sessions:
+    alive: list[int] = []
+    if signalled:
+        alive = list(signalled)
+        for _ in range(RUNNER_SHUTDOWN_POLL_COUNT):
+            time.sleep(RUNNER_SHUTDOWN_POLL_SECONDS)
+            remaining = []
+            for pid in alive:
+                try:
+                    os.kill(pid, 0)
+                    remaining.append(pid)
+                except ProcessLookupError:
+                    continue
+                except PermissionError:
+                    continue
+            alive = remaining
+            if not alive:
+                break
+        if alive:
+            logger.error(
+                "Old runner(s) did not cooperatively exit within %.1fs; "
+                "refusing SIGKILL to preserve active round durability: %s",
+                RUNNER_SHUTDOWN_GRACE_SECONDS,
+                alive,
+            )
+            print(
+                "   ⛔ 旧 runner 未在 "
+                f"{RUNNER_SHUTDOWN_GRACE_SECONDS:.0f} 秒内协作退出；"
+                "拒绝 SIGKILL 和 screen 清理，新实例将由单实例锁安全阻止"
+            )
+
+    for session in (() if alive else screen_sessions):
         try:
             subprocess.run(
                 ["screen", "-S", session, "-X", "quit"],
@@ -551,29 +663,6 @@ def kill_existing_run_discussion_instances() -> list[int]:
             print(f"   🛑 已关闭 screen 会话: {session}")
         except Exception as exc:
             logger.debug("screen 会话 %s 关闭失败: %s", session, exc)
-
-    if signalled:
-        for _ in range(10):
-            time.sleep(0.3)
-            alive = []
-            for pid in signalled:
-                try:
-                    os.kill(pid, 0)
-                    alive.append(pid)
-                except ProcessLookupError:
-                    continue
-                except PermissionError:
-                    continue
-            if not alive:
-                break
-            for pid in alive:
-                try:
-                    os.kill(pid, 9)
-                    print(f"   💀 旧进程未退出，已 SIGKILL: pid={pid}")
-                except ProcessLookupError:
-                    continue
-                except PermissionError:
-                    continue
 
     return signalled
 
@@ -4437,6 +4526,7 @@ async def main():
     iteration = prev_stats.get('total_rounds', 0) if prev_stats else 0
     start_time = datetime.now()
 
+    active_round_id: Optional[str] = None
     try:
         # 连续无结果计数
         empty_rounds = 0
@@ -5236,6 +5326,23 @@ async def main():
                 print(f"\n💤 搜索失败，休息 {wait_time} 秒后重试...")
                 await asyncio.sleep(wait_time)
 
+    except asyncio.CancelledError:
+        if active_round_id:
+            try:
+                await asyncio.shield(
+                    round_coordinator.fail(
+                        active_round_id,
+                        code="failed",
+                        reason="研究轮失败：生产进程收到终止信号",
+                        payload={"shutdown_signal": "SIGTERM"},
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist SIGTERM terminal for round_id=%s",
+                    active_round_id,
+                )
+        raise
     except KeyboardInterrupt:
         print(f"\n\n{'='*60}")
         print("🛑 已停止")
@@ -5263,11 +5370,11 @@ if __name__ == "__main__":
         parse_args()
         sys.exit(0)
     try:
-        killed = kill_existing_run_discussion_instances()
-        if killed:
-            print(f"   ✅ 已停掉 {len(killed)} 个旧 run_discussion 进程，继续启动新实例")
+        signalled = kill_existing_run_discussion_instances()
+        if signalled:
+            print(f"   ✅ 已请求 {len(signalled)} 个旧 run_discussion 进程协作退出，继续检查单实例锁")
         with SingleInstanceLock(project_root / "data" / "run_discussion.lock"):
-            asyncio.run(main())
+            asyncio.run(run_with_graceful_shutdown(main))
     except RuntimeError as exc:
         logger.error(str(exc))
         print(f"❌ {exc}")

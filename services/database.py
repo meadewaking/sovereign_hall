@@ -23,6 +23,7 @@ from .prediction_store import ensure_prediction_schema
 logger = logging.getLogger(__name__)
 
 MIN_STORED_DOCUMENT_CHARS = 20
+MAX_CANONICAL_LINEAGE_PER_PRESENTED_DOCUMENT = 50
 IGNORED_DOCUMENT_SOURCES = {"obsidian_wiki"}
 TRACKING_QUERY_PREFIXES = ("utm_",)
 TRACKING_QUERY_KEYS = {"from", "spm", "fbclid", "gclid", "yclid"}
@@ -713,10 +714,35 @@ class DatabaseService:
 
         resolved: List[List[str]] = []
         for values in identities:
+            # IDs and URLs are explicit lineage and take precedence over
+            # weaker hashes/titles.  Unioning every identity class allowed a
+            # derived page with a large ``source_ids`` accumulator (or a
+            # generic exact title) to attach tens of thousands of unrelated
+            # documents to one round even though only hundreds were shown.
             document_ids: set[str] = set()
-            for field, candidates in values.items():
-                for candidate in candidates:
+            for field in ("id", "url"):
+                for candidate in values[field]:
                     document_ids.update(canonical[field].get(candidate, set()))
+
+            if not document_ids:
+                for candidate in values["content_hash"]:
+                    matches = canonical["content_hash"].get(candidate, set())
+                    if len(matches) == 1:
+                        document_ids.update(matches)
+
+            if not document_ids:
+                for candidate in values["title"]:
+                    matches = canonical["title"].get(candidate, set())
+                    if len(matches) == 1:
+                        document_ids.update(matches)
+
+            if len(document_ids) > MAX_CANONICAL_LINEAGE_PER_PRESENTED_DOCUMENT:
+                logger.warning(
+                    "Excluded presented document with lineage fanout=%s above limit=%s",
+                    len(document_ids),
+                    MAX_CANONICAL_LINEAGE_PER_PRESENTED_DOCUMENT,
+                )
+                document_ids = set()
             resolved.append(sorted(document_ids))
         return resolved
 

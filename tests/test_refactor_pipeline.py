@@ -95,6 +95,7 @@ from sovereign_hall.run_discussion import (
     stage2_deep_research,
     stage3_ic_discussion,
     run_committee_approved_simulation,
+    run_with_graceful_shutdown,
 )
 from sovereign_hall.services.persistence import PersistenceManager
 from sovereign_hall.domain.research import ResearchRound, ResearchRoundStatus
@@ -828,6 +829,96 @@ def test_runner_cleanup_protects_own_screen_ancestor(monkeypatch):
     assert (400, 15) in signals
     assert not any(pid in {500, 600, 700} for pid, _signal in signals)
     assert subprocess_calls[0][0] == ["ps", "-eo", "pid=,ppid=,args="]
+
+
+def test_runner_cleanup_refuses_sigkill_after_full_grace_period(monkeypatch):
+    import sovereign_hall.run_discussion as runner
+
+    class Result:
+        stdout = "400 1 python /old/run_discussion.py"
+
+    signals = []
+    sleeps = []
+
+    monkeypatch.setattr(__import__("subprocess"), "run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr(runner.os, "getpid", lambda: 500)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+
+    def fake_kill(pid, sig):
+        signals.append((pid, sig))
+
+    monkeypatch.setattr(runner.os, "kill", fake_kill)
+
+    assert kill_existing_run_discussion_instances() == [400]
+    assert sleeps == [runner.RUNNER_SHUTDOWN_POLL_SECONDS] * runner.RUNNER_SHUTDOWN_POLL_COUNT
+    assert signals[0] == (400, 15)
+    assert (400, 9) not in signals
+
+
+def test_runner_cleanup_signals_python_before_reaping_screen_wrapper(monkeypatch):
+    import sovereign_hall.run_discussion as runner
+
+    ps_output = "\n".join([
+        "800 1 SCREEN -dmS old_prod zsh -lc python -m sovereign_hall.run_discussion",
+        "801 800 python -m sovereign_hall.run_discussion",
+    ])
+    subprocess_calls = []
+    signals = []
+
+    class Result:
+        stdout = ps_output
+
+    def fake_run(command, **kwargs):
+        subprocess_calls.append(command)
+        return Result()
+
+    def fake_kill(pid, sig):
+        signals.append((pid, sig))
+        if pid == 801 and sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(__import__("subprocess"), "run", fake_run)
+    monkeypatch.setattr(runner.os, "getpid", lambda: 500)
+    monkeypatch.setattr(runner.os, "kill", fake_kill)
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    assert kill_existing_run_discussion_instances() == [801]
+    assert (801, 15) in signals
+    assert not any(pid == 800 for pid, _sig in signals)
+    assert ["screen", "-S", "old_prod", "-X", "quit"] in subprocess_calls
+
+
+@pytest.mark.asyncio
+async def test_sigterm_cancellation_reaches_round_cleanup():
+    callback_holder = {}
+    runner_started = asyncio.Event()
+    runner_cleaned = asyncio.Event()
+    handler_cleaned = asyncio.Event()
+
+    def fake_install(_loop, callback):
+        callback_holder["callback"] = callback
+
+        def cleanup():
+            handler_cleaned.set()
+
+        return cleanup
+
+    async def fake_main():
+        runner_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            runner_cleaned.set()
+
+    wrapper = asyncio.create_task(
+        run_with_graceful_shutdown(fake_main, install_handler=fake_install)
+    )
+    await runner_started.wait()
+    callback_holder["callback"]()
+    await wrapper
+
+    assert runner_cleaned.is_set()
+    assert handler_cleaned.is_set()
 
 
 def test_vote_context_balances_all_deliberation_stages():
