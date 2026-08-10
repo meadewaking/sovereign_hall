@@ -89,6 +89,7 @@ from sovereign_hall.run_discussion import (
     prioritize_deployment_research,
     rank_stage2_documents,
     select_stage2_candidate_source_excerpts,
+    select_simulation_terminal,
     select_next_topic,
     load_recent_topics,
     stage2_deep_research,
@@ -353,7 +354,76 @@ def test_search_query_generator_rejects_punctuation_only_placeholder():
     generator = SearchQueryGenerator(AsyncMock())
 
     assert generator._is_valid_query("...", topic="消费电子复苏前景") is False
+    assert generator._is_valid_query("query1", topic="消费电子复苏前景") is False
+    assert generator._is_valid_query("search_query_02", topic="消费电子复苏前景") is False
     assert generator._is_valid_query("消费电子 财报", topic="消费电子复苏前景") is True
+
+
+@pytest.mark.asyncio
+async def test_search_query_generator_drops_numbered_placeholders_before_search():
+    llm = AsyncMock()
+    llm.chat.return_value = json.dumps(
+        ["query1", "query2", "固态电池设备订单"],
+        ensure_ascii=False,
+    )
+    generator = SearchQueryGenerator(llm)
+
+    queries = await generator.generate_queries(
+        count=5,
+        seeds={"macro": [], "sector": ["固态电池"], "stocks": []},
+        topic="固态电池技术路线",
+    )
+
+    assert queries == ["固态电池设备订单"]
+    assert llm.chat.await_count == 1
+
+
+def test_rejected_candidate_is_not_classified_as_no_evidence():
+    rejection = {
+        "ticker": "605338",
+        "code": "proposal_lot_infeasible",
+        "reason": "fresh whole-lot quote exceeds executable ceiling",
+    }
+
+    assert select_simulation_terminal(
+        round_fill_count=0,
+        pending_count=0,
+        trade_candidates=[],
+        decisions=[],
+        rejections=[rejection],
+    ) == "execution_rejected"
+    assert select_simulation_terminal(
+        round_fill_count=0,
+        pending_count=0,
+        trade_candidates=[],
+        decisions=[],
+        rejections=[],
+    ) == "no_evidence"
+    assert select_simulation_terminal(
+        round_fill_count=0,
+        pending_count=0,
+        trade_candidates=[],
+        decisions=[],
+        rejections=[{"code": "system_failure_no_live_deployment"}],
+    ) == "no_evidence"
+
+
+def test_source_persisted_round_accepts_rejected_candidate_terminal():
+    round_state = ResearchRound(
+        base_topic="candidate screening",
+        research_objective="retain exact rejection terminal",
+        status=ResearchRoundStatus.SOURCES_PERSISTED,
+        current_stage=ResearchRoundStatus.SOURCES_PERSISTED.value,
+    )
+
+    rejected = round_state.transition(
+        ResearchRoundStatus.EXECUTION_REJECTED,
+        terminal_code="execution_rejected",
+        terminal_reason="all candidates rejected by auditable hard gates",
+    )
+
+    assert rejected.status == ResearchRoundStatus.EXECUTION_REJECTED
+    assert rejected.terminal_code == "execution_rejected"
 
 
 @pytest.mark.asyncio

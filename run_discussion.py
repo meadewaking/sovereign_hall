@@ -3817,14 +3817,12 @@ async def run_committee_approved_simulation(
             final_assets.get("valuation_complete"),
             final_assets.get("invested_ratio"),
         )
-        closed_terminal = (
-            "market_closed_pending"
-            if pending_count > 0
-            else (
-                "execution_rejected"
-                if trade_candidates or redeployment_rejections
-                else ("committee_hold" if decisions else "no_evidence")
-            )
+        closed_terminal = select_simulation_terminal(
+            round_fill_count=0,
+            pending_count=pending_count,
+            trade_candidates=trade_candidates,
+            decisions=decisions,
+            rejections=redeployment_rejections,
         )
         return {
             "terminal": closed_terminal,
@@ -4216,19 +4214,13 @@ async def run_committee_approved_simulation(
         print(f"\n📝 每日投资反思:")
         print(reflection[:500] + "...")
     await simulation.save_snapshot(reflection, round_id=round_id)
-    if round_fill_count > 0:
-        terminal = "filled"
-    elif trade_candidates:
-        terminal = "execution_rejected"
-    elif any(
-        str(item.get("direction") or "hold").lower() in {"long", "buy", "short", "sell"}
-        for item in decisions
-    ):
-        terminal = "execution_rejected"
-    elif decisions:
-        terminal = "committee_hold"
-    else:
-        terminal = "no_evidence"
+    terminal = select_simulation_terminal(
+        round_fill_count=round_fill_count,
+        pending_count=0,
+        trade_candidates=trade_candidates,
+        decisions=decisions,
+        rejections=redeployment_rejections,
+    )
     return {
         "terminal": terminal,
         # ``fills`` remains the active round's fill count so a replay keeps
@@ -4243,6 +4235,45 @@ async def run_committee_approved_simulation(
         "assets": final_assets,
         "performance": final_performance,
     }
+
+
+def select_simulation_terminal(
+    *,
+    round_fill_count: int,
+    pending_count: int,
+    trade_candidates: List[Dict[str, Any]],
+    decisions: List[Dict[str, Any]],
+    rejections: List[Dict[str, Any]],
+) -> str:
+    """Choose one canonical terminal from durable pipeline facts.
+
+    Candidate evidence that reached a repeated-candidate, lot-feasibility or
+    execution hard gate must remain distinguishable from a stage-2 response
+    that contained no usable evidence at all.
+    """
+    if round_fill_count > 0:
+        return "filled"
+    if pending_count > 0:
+        return "market_closed_pending"
+    candidate_screen_rejection_codes = {
+        "proposal_lot_infeasible",
+        "repeated_candidate_cooldown",
+    }
+    has_candidate_screen_rejection = any(
+        str(item.get("code") or "") in candidate_screen_rejection_codes
+        for item in rejections
+    )
+    if trade_candidates or has_candidate_screen_rejection:
+        return "execution_rejected"
+    if any(
+        str(item.get("direction") or "hold").lower()
+        in {"long", "buy", "short", "sell"}
+        for item in decisions
+    ):
+        return "execution_rejected"
+    if decisions:
+        return "committee_hold"
+    return "no_evidence"
 
 
 # ============================================================================
@@ -4651,7 +4682,11 @@ async def main():
                     for i, doc in enumerate(external_docs):
                         try:
                             if await asyncio.wait_for(
-                                db_service.add_document(doc, round_id=active_round_id),
+                                # Raw documents may be globally durable before
+                                # the research phase commits, but round links
+                                # must only be written by ``persist_sources``
+                                # together with the stage/event transition.
+                                db_service.add_document(doc),
                                 timeout=30,
                             ):
                                 saved_docs += 1
@@ -4689,11 +4724,36 @@ async def main():
                         f"   ✅ 文档已保存 (DB新增: {saved_docs}, Wiki同步: {vector_saved}, "
                         f"Wiki延后懒迁移: {deferred_wiki_docs}, 跳过本地派生: {skipped_docs})"
                     )
-                await round_coordinator.advance(
+                presented_document_count = len(docs)
+                resolved_lineage = await db_service.resolve_document_lineage(docs)
+                traceable_docs = [
+                    doc
+                    for doc, document_ids in zip(docs, resolved_lineage)
+                    if document_ids
+                ]
+                linked_document_ids = sorted(
+                    {
+                        document_id
+                        for document_ids in resolved_lineage
+                        for document_id in document_ids
+                    }
+                )
+                untraceable_document_count = (
+                    presented_document_count - len(traceable_docs)
+                )
+                if untraceable_document_count:
+                    logger.warning(
+                        "阶段1：排除 %s/%s 条无法回链 SQLite 原始资料的派生文档",
+                        untraceable_document_count,
+                        presented_document_count,
+                    )
+                docs = traceable_docs
+                await round_coordinator.persist_sources(
                     active_round_id,
-                    ResearchRoundStatus.SOURCES_PERSISTED,
-                    event_type="SourcesPersisted",
-                    payload={"source_count": len(docs)},
+                    document_ids=linked_document_ids,
+                    presented_document_count=presented_document_count,
+                    traceable_document_count=len(traceable_docs),
+                    untraceable_document_count=untraceable_document_count,
                 )
 
                 redeployment_context = (
@@ -4848,14 +4908,44 @@ async def main():
                     )
                 else:
                     discussions, decisions = "", []
-                    await round_coordinator.advance(
-                        active_round_id,
-                        ResearchRoundStatus.NO_EVIDENCE,
-                        event_type="NoEvidenceTerminal",
-                        payload={"source_count": len(docs), "proposal_count": 0},
-                        terminal_code="no_evidence",
-                        terminal_reason="阶段2没有形成满足证据约束的结构化提案",
-                    )
+                    if repeated_candidate_rejections:
+                        # Stage 2 did produce one or more evidence candidates,
+                        # but every candidate was removed by an auditable hard
+                        # gate.  Keep the round non-terminal until the
+                        # simulation read model records the exact rejection;
+                        # writing no_evidence here used to create a canonical
+                        # terminal that contradicted RoundCompleted.
+                        await round_coordinator.record_event(
+                            active_round_id,
+                            "CandidatePipelineRejectedAll",
+                            {
+                                "rejection_count": len(
+                                    repeated_candidate_rejections
+                                ),
+                                "codes": sorted(
+                                    {
+                                        str(item.get("code") or "unknown")
+                                        for item in repeated_candidate_rejections
+                                    }
+                                ),
+                                "tickers": sorted(
+                                    {
+                                        str(item.get("ticker") or "")
+                                        for item in repeated_candidate_rejections
+                                        if str(item.get("ticker") or "")
+                                    }
+                                ),
+                            },
+                        )
+                    else:
+                        await round_coordinator.advance(
+                            active_round_id,
+                            ResearchRoundStatus.NO_EVIDENCE,
+                            event_type="NoEvidenceTerminal",
+                            payload={"source_count": len(docs), "proposal_count": 0},
+                            terminal_code="no_evidence",
+                            terminal_reason="阶段2没有形成满足证据约束的结构化提案",
+                        )
 
                 # 投委会原始讨论是独立记忆，不依赖后续综合结论是否成功。
                 proposal_by_ticker = {
@@ -4989,13 +5079,18 @@ async def main():
                     "no_evidence": ResearchRoundStatus.NO_EVIDENCE,
                 }
                 terminal_name = str(simulation_result.get("terminal") or "failed")
+                target_terminal_status = terminal_map.get(
+                    terminal_name,
+                    ResearchRoundStatus.FAILED,
+                )
                 if (
                     current_round
                     and current_round.status != ResearchRoundStatus.NO_EVIDENCE
+                    and current_round.status != target_terminal_status
                 ):
                     await round_coordinator.advance(
                         active_round_id,
-                        terminal_map.get(terminal_name, ResearchRoundStatus.FAILED),
+                        target_terminal_status,
                         event_type="SimulationPipelineTerminal",
                         payload={
                             "terminal": terminal_name,

@@ -619,6 +619,107 @@ class DatabaseService:
             (round_id, document_id, usage, datetime.now().isoformat()),
         )
 
+    async def resolve_document_lineage(
+        self,
+        docs: List[Any],
+    ) -> List[List[str]]:
+        """Resolve presented research documents to canonical SQLite sources.
+
+        Wiki search results are derived pages and are deliberately not inserted
+        into ``documents``.  Their frontmatter retains a source id, URL, or
+        source-title references that can be mapped back to the raw durable
+        documents.  The aligned return value lets the production loop exclude
+        any presented document whose evidence cannot be audited by round id.
+        """
+        await self._ensure_initialized()
+        conn = await self._get_connection()
+
+        identities: List[Dict[str, set[str]]] = []
+        all_values: Dict[str, set[str]] = {
+            "id": set(),
+            "url": set(),
+            "title": set(),
+            "content_hash": set(),
+        }
+        for doc in docs or []:
+            metadata = getattr(doc, "metadata", {}) or {}
+            doc_id = str(
+                getattr(doc, "id", "")
+                or getattr(doc, "doc_id", "")
+                or ""
+            ).strip()
+            source = str(getattr(doc, "source", "") or "").strip()
+            is_wiki = source == "obsidian_wiki" or doc_id.startswith("wiki:")
+            values = {name: set() for name in all_values}
+
+            source_id = str(metadata.get("source_id") or "").strip()
+            if source_id:
+                values["id"].add(source_id)
+            if doc_id and not is_wiki:
+                values["id"].add(doc_id)
+
+            url = normalize_document_url(
+                getattr(doc, "url", "") or metadata.get("url", "")
+            )
+            if url:
+                values["url"].add(url)
+
+            source_references = metadata.get("source_ids") or []
+            if isinstance(source_references, str):
+                source_references = [source_references]
+            for reference in source_references:
+                reference_text = str(reference or "").strip()
+                if not reference_text:
+                    continue
+                if reference_text.startswith(("http://", "https://")):
+                    values["url"].add(normalize_document_url(reference_text))
+                elif reference_text.startswith("doc_"):
+                    values["id"].add(reference_text)
+                else:
+                    values["title"].add(normalize_document_text(reference_text))
+
+            if is_wiki and str(metadata.get("wiki_type") or "") == "source":
+                title = normalize_document_text(
+                    getattr(doc, "title", "") or metadata.get("title", "")
+                )
+                if title:
+                    values["title"].add(title)
+            if not is_wiki:
+                content = getattr(doc, "content", "")
+                if content:
+                    values["content_hash"].add(document_content_hash(content))
+
+            identities.append(values)
+            for field, candidates in values.items():
+                all_values[field].update(value for value in candidates if value)
+
+        canonical: Dict[str, Dict[str, set[str]]] = {
+            name: {} for name in all_values
+        }
+        for field, candidates in all_values.items():
+            ordered = sorted(candidates)
+            for offset in range(0, len(ordered), 300):
+                chunk = ordered[offset : offset + 300]
+                placeholders = ",".join("?" for _ in chunk)
+                async with conn.execute(
+                    f"SELECT id, {field} FROM documents "
+                    f"WHERE {field} IN ({placeholders})",
+                    chunk,
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                for row in rows:
+                    key = str(row[field] or "")
+                    canonical[field].setdefault(key, set()).add(str(row["id"]))
+
+        resolved: List[List[str]] = []
+        for values in identities:
+            document_ids: set[str] = set()
+            for field, candidates in values.items():
+                for candidate in candidates:
+                    document_ids.update(canonical[field].get(candidate, set()))
+            resolved.append(sorted(document_ids))
+        return resolved
+
     async def get_document(self, doc_id: str) -> Optional[Dict]:
         """获取文档"""
         await self._ensure_initialized()

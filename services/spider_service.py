@@ -1280,6 +1280,10 @@ class SearchQueryGenerator:
         "查询词", "示例", "占位", "xxx", "test",
         "投资机会", "股票推荐", "a股市场",  # 兜底词，不应出现在真实结果中
     ]
+    _NUMBERED_PLACEHOLDER_QUERY = re.compile(
+        r"^(?:query|search[\s_-]*query|keyword)[\s_:#-]*\d*$",
+        re.IGNORECASE,
+    )
     # 通用泛词黑名单（独立词时过滤）
     _GENERIC_WORDS = {
         "最新", "最新消息", "新闻", "行情", "大盘", "a股", "股市",
@@ -1295,6 +1299,12 @@ class SearchQueryGenerator:
         if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", q):
             return False
         low = q.lower()
+        # Reasoning models sometimes emit the literal JSON example keys
+        # ``query1``/``query2``.  They previously passed the character-level
+        # validation and consumed real network-search slots even though they
+        # carry no topic evidence.
+        if self._NUMBERED_PLACEHOLDER_QUERY.fullmatch(low):
+            return False
         # 占位符直接过滤
         for pat in self._PLACEHOLDER_PATTERNS:
             if pat in low:

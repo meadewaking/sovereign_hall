@@ -1956,6 +1956,19 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
         )
         return
     health = status.get("pipeline_health")
+    lineage = status.get("source_lineage") or {}
+    if lineage and not lineage.get("consistent"):
+        print(
+            "   ❌ SourcesPersisted 与 round_documents 不一致："
+            f"event={lineage.get('claimed_source_count', 0)}，"
+            f"linked={lineage.get('linked_source_count', 0)}；"
+            "历史缺失关联不回填，新生产轮必须通过原子 lineage gate。"
+        )
+    elif lineage and int(lineage.get("untraceable_document_count") or 0) > 0:
+        print(
+            "   🧾 未能回链原始资料的派生文档已在 stage2 前排除："
+            f"{lineage.get('untraceable_document_count')} 条。"
+        )
     if health == "failed":
         print(
             "   ❌ 最近一轮失败；先查看 terminal_reason 和 round_events，"

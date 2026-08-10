@@ -1185,6 +1185,10 @@ class WikiKnowledgeBase:
             "keywords": _as_list(page.frontmatter.get("tags")),
             "wiki_path": page.rel_path,
             "wiki_type": page.page_type,
+            # Preserve the canonical SQLite identity of source pages.  The
+            # wiki document itself is derived evidence and must not be saved
+            # back into ``documents`` as though it were a new raw source.
+            "source_id": page.frontmatter.get("source_id", ""),
             "source_ids": _as_list(page.frontmatter.get("sources")),
             "search_score": hit.score,
             "vector_score": hit.vector_score,
@@ -1207,6 +1211,9 @@ class WikiKnowledgeBase:
                     "sector": page.frontmatter.get("sector", ""),
                     "keywords": _as_list(page.frontmatter.get("tags")),
                     "wiki_path": page.rel_path,
+                    "wiki_type": page.page_type,
+                    "source_id": page.frontmatter.get("source_id", ""),
+                    "source_ids": _as_list(page.frontmatter.get("sources")),
                 },
                 source="obsidian_wiki",
                 doc_id=f"wiki:{page.rel_path}",
