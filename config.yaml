@@ -76,6 +76,16 @@ vector_db:
 # Obsidian-compatible LLM Wiki knowledge base
 knowledge_wiki:
   root: "./data/knowledge"
+  max_size_bytes: 1073741824  # 1 GiB hard ceiling for the whole knowledge vault
+  target_size_ratio: 0.70
+  maintenance_ratio: 0.80
+  bulk_write_stop_ratio: 0.90
+  source_excerpt_chars: 500
+  aggregate_page_max_chars: 32768
+  aggregate_source_limit: 50
+  log_rotate_bytes: 8388608
+  log_rotate_keep: 5
+  raw_hot_retention_days: 30
   embedding_enabled: true
   lazy_migration_batch_size: 10
   min_wiki_hits: 5
@@ -88,6 +98,19 @@ knowledge_wiki:
 database:
   provider: "sqlite"
   path: "./sovereign_hall/data/sovereign_hall.db"
+  max_bundle_size_bytes: 2147483648  # 2 GiB including DB/WAL/SHM
+  max_main_file_bytes: 2080374784  # 1984 MiB, reserving 64 MiB for WAL/SHM
+  target_size_ratio: 0.70
+  maintenance_ratio: 0.80
+  bulk_write_stop_ratio: 0.90
+  max_round_document_links: 300
+  wal_autocheckpoint_pages: 1000
+  journal_size_limit_bytes: 16777216
+  online_maintenance_batch_rows: 1000
+  snapshot_full_retention_days: 30
+  snapshot_daily_retention_days: 180
+  non_trade_quote_retention_days: 7
+  knowledge_rescan_interval_rounds: 24
 
 # 系统运行配置
 system:
@@ -97,6 +120,7 @@ system:
   # 只有明确需要无人值守成本保护时才设置为正数。
   daily_token_budget: 0
   daily_budget_pause_seconds: 3600
+  storage_pressure_pause_seconds: 60
   validation_batch_size: 100
 
   # 迭代控制

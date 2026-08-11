@@ -4376,6 +4376,7 @@ async def main():
     from sovereign_hall.services.llm_client import LLMClient
     from sovereign_hall.services.market_data import get_market_data
     from sovereign_hall.services.spider_service import SearchQueryGenerator, SpiderSwarm
+    from sovereign_hall.services.storage_governor import StorageGovernor
     from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
     from sovereign_hall.domain.research import ResearchRoundStatus
 
@@ -4451,6 +4452,10 @@ async def main():
     )
     daily_budget_pause = int(system_config.get("daily_budget_pause_seconds", 3600) or 3600)
     validation_batch_size = int(system_config.get("validation_batch_size", 100) or 100)
+    storage_pressure_pause = max(
+        10,
+        int(system_config.get("storage_pressure_pause_seconds", 60) or 60),
+    )
     topic_cooldown_hours = int(system_config.get("topic_cooldown_hours", DEFAULT_TOPIC_COOLDOWN_HOURS) or 0)
     search_query_count = int(research_config.get("search_query_count", 30) or 30)
     wiki_ingest_max_docs = int(
@@ -4507,6 +4512,9 @@ async def main():
             f"{len(recovered_rounds)} 个上一进程遗留的无终态研究轮"
         )
     vector_db.set_database_service(db_service)
+    storage_governor = StorageGovernor(db_service, vector_db.knowledge.store)
+    initial_storage = await storage_governor.initialize()
+    logger.info("Storage governor initialized: %s", initial_storage.to_dict())
     market_data = get_market_data()
 
     # 初始化投资模拟
@@ -4554,6 +4562,22 @@ async def main():
                     f"今日Token预算已用尽: {format_token(used)}/{format_token(daily_budget.budget)}，暂停{daily_budget_pause}秒"
                 )
                 await asyncio.sleep(daily_budget_pause)
+                continue
+
+            storage_snapshot = await storage_governor.before_round()
+            if not storage_snapshot.research_round_allowed:
+                logger.warning(
+                    "存储达到研究限流水位，暂停新轮次: database=%.1f%% knowledge=%.1f%%",
+                    storage_snapshot.database.ratio * 100,
+                    storage_snapshot.knowledge.ratio * 100,
+                )
+                print(
+                    "\n🧹 存储整理中："
+                    f"数据库 {storage_snapshot.database.ratio:.1%}/2 GiB，"
+                    f"知识库 {storage_snapshot.knowledge.ratio:.1%}/1 GiB；"
+                    "降至90%以下后自动恢复研究"
+                )
+                await asyncio.sleep(storage_pressure_pause)
                 continue
 
             # 连续无结果时增加延迟，防止空转
@@ -5297,6 +5321,11 @@ async def main():
                 f"累计成本: {format_cost_breakdown(llm_stats)}"
             )
             logger.info(stats_msg)
+            try:
+                maintenance_report = await storage_governor.after_round()
+                logger.info("Storage maintenance after round: %s", maintenance_report)
+            except Exception as maintenance_error:
+                logger.warning("轮后存储整理失败，下轮将重试: %s", maintenance_error)
             db_fd_count = count_open_file_handles(db_path)
             if db_fd_count > 5:
                 logger.warning("SQLite fd count is high: %s handles open for %s", db_fd_count, db_path)

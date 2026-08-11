@@ -459,12 +459,14 @@ class TokenStats:
             persistence = get_persistence()
             prev_stats = persistence.load_previous_stats()
             if prev_stats and prev_stats.get('total_tokens', 0) > 0:
-                self.total_tokens = prev_stats.get('total_tokens', 0)
                 self.prompt_tokens = prev_stats.get('prompt_tokens', 0)
                 self.completion_tokens = prev_stats.get('completion_tokens', 0)
-                self.total_cost = prev_stats.get('total_cost_usd', 0.0)
                 self.input_cost = prev_stats.get('input_cost_usd', 0.0)
                 self.output_cost = prev_stats.get('output_cost_usd', 0.0)
+                # total must always equal the sum of subfields; legacy files
+                # with a drifted total are silently corrected on load.
+                self.total_tokens = self.prompt_tokens + self.completion_tokens
+                self.total_cost = self.input_cost + self.output_cost
                 self.request_count = prev_stats.get('total_requests', 0)
                 self.total_requests = self.request_count
                 self._loaded_total_tokens = self.total_tokens

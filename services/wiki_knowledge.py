@@ -9,6 +9,7 @@ existing research flows can keep consuming Document objects.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ import yaml
 
 from ..core import DATA_DIR, PROJECT_ROOT, Document
 from ..core.config import get_config
+from .storage_governor import ALLOCATION_BLOCK_BYTES, allocated_size, directory_size
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,10 @@ IGNORED_ENTITY_TOKENS = {
     "N/A",
     "NA",
 }
+
+
+class KnowledgeCapacityError(RuntimeError):
+    """Raised before a wiki write would violate its configured capacity."""
 
 
 @dataclass
@@ -513,6 +519,14 @@ class WikiStore:
         self.index_path = root / "index.md"
         self.log_path = root / "log.md"
         self._pages_cache: Optional[List[WikiPage]] = None
+        cfg = get_config().get("knowledge_wiki", {})
+        self.max_size_bytes = max(1, int(cfg.get("max_size_bytes", 1024**3)))
+        self.bulk_write_stop_ratio = float(cfg.get("bulk_write_stop_ratio", 0.90))
+        self.aggregate_page_max_chars = max(1024, int(cfg.get("aggregate_page_max_chars", 32768)))
+        self.aggregate_source_limit = max(1, int(cfg.get("aggregate_source_limit", 50)))
+        self.log_rotate_bytes = max(1024, int(cfg.get("log_rotate_bytes", 8 * 1024**2)))
+        self.log_rotate_keep = max(1, int(cfg.get("log_rotate_keep", 5)))
+        self._used_bytes: Optional[int] = None
 
     def ensure_vault(self) -> None:
         for directory in [
@@ -565,12 +579,19 @@ class WikiStore:
 
     def save_cache(self, cache: Dict[str, Any]) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.write_text(
+            self.cache_path,
+            json.dumps(cache, ensure_ascii=False, separators=(",", ":")),
+            bulk=False,
+        )
 
     def append_log(self, action: str, message: str) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"## [{utc_timestamp()}] {action}\n\n{message.strip()}\n\n")
+        entry = f"## [{utc_timestamp()}] {action}\n\n{message.strip()}\n\n"
+        current_size = self.log_path.stat().st_size if self.log_path.exists() else 0
+        if current_size + len(entry.encode("utf-8")) > self.log_rotate_bytes:
+            self._rotate_log()
+        self.append_text(self.log_path, entry)
 
     def all_wiki_pages(self) -> List[WikiPage]:
         if self._pages_cache is not None:
@@ -598,7 +619,8 @@ class WikiStore:
     def write_page(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text(encoding="utf-8") if path.exists() else None
-        path.write_text(merge_markdown_page(existing, content), encoding="utf-8")
+        merged = merge_markdown_page(existing, content)
+        self.write_text(path, self._bound_aggregate_page(merged))
         self._pages_cache = None
 
     def rebuild_index(self) -> None:
@@ -618,7 +640,7 @@ class WikiStore:
             *(f"- {link}" for link in sources),
             "",
         ]
-        self.index_path.write_text("\n".join(content), encoding="utf-8")
+        self.write_text(self.index_path, "\n".join(content), bulk=False)
 
     def _index_links(self, directory: Path) -> List[str]:
         links = []
@@ -628,10 +650,102 @@ class WikiStore:
             links.append(wiki_link(title))
         return links
 
+    def used_bytes(self, *, refresh: bool = False) -> int:
+        if refresh or self._used_bytes is None:
+            self._used_bytes = directory_size(self.root)
+        return self._used_bytes
+
+    def assert_bulk_capacity(self, estimated_growth: int = 0) -> None:
+        used = self.used_bytes()
+        stop_bytes = int(self.max_size_bytes * self.bulk_write_stop_ratio)
+        if used + max(0, int(estimated_growth)) >= stop_bytes:
+            raise KnowledgeCapacityError(
+                "knowledge bulk-write watermark reached: "
+                f"used={used} projected={used + max(0, int(estimated_growth))} "
+                f"stop={stop_bytes} hard={self.max_size_bytes}"
+            )
+
+    def write_text(self, path: Path, content: str, *, bulk: bool = True) -> None:
+        encoded = content.encode("utf-8")
+        previous_stat = path.stat() if path.exists() else None
+        previous = allocated_size(previous_stat) if previous_stat else 0
+        projected_file = (
+            (len(encoded) + ALLOCATION_BLOCK_BYTES - 1)
+            // ALLOCATION_BLOCK_BYTES
+            * ALLOCATION_BLOCK_BYTES
+        )
+        projected = self.used_bytes() - previous + projected_file
+        if projected > self.max_size_bytes and projected_file > previous:
+            raise KnowledgeCapacityError(
+                f"knowledge hard limit exceeded by write to {path.name}: "
+                f"projected={projected} hard={self.max_size_bytes}"
+            )
+        if bulk and projected >= int(self.max_size_bytes * self.bulk_write_stop_ratio) and projected_file > previous:
+            raise KnowledgeCapacityError(
+                f"knowledge bulk-write watermark reached by {path.name}: projected={projected}"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        self._used_bytes = projected
+
+    def append_text(self, path: Path, content: str) -> None:
+        encoded_size = len(content.encode("utf-8"))
+        previous_stat = path.stat() if path.exists() else None
+        previous = allocated_size(previous_stat) if previous_stat else 0
+        logical_size = (previous_stat.st_size if previous_stat else 0) + encoded_size
+        projected_file = (
+            (logical_size + ALLOCATION_BLOCK_BYTES - 1)
+            // ALLOCATION_BLOCK_BYTES
+            * ALLOCATION_BLOCK_BYTES
+        )
+        projected = self.used_bytes() - previous + projected_file
+        if projected > self.max_size_bytes:
+            raise KnowledgeCapacityError(
+                f"knowledge hard limit exceeded by append to {path.name}: projected={projected}"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(content)
+        self._used_bytes = projected
+
+    def _bound_aggregate_page(self, content: str) -> str:
+        frontmatter, body = parse_frontmatter(content)
+        if str(frontmatter.get("type") or "") not in {"topic", "entity"}:
+            return content
+        for field_name in ("sources", "related"):
+            values = _as_list(frontmatter.get(field_name))
+            frontmatter[field_name] = values[-self.aggregate_source_limit :]
+        tags = _as_list(frontmatter.get("tags"))
+        frontmatter["tags"] = tags[-20:]
+        if len(body) > self.aggregate_page_max_chars:
+            title = str(frontmatter.get("title") or "知识摘要")
+            tail_budget = max(0, self.aggregate_page_max_chars - len(title) - 40)
+            body = f"# {title}\n\n## 压缩后的近期记录\n\n{body[-tail_budget:]}"
+        return dump_markdown(frontmatter, body)
+
+    def _rotate_log(self) -> None:
+        if not self.log_path.exists():
+            return
+        oldest = self.root / f"log.{self.log_rotate_keep}.md.gz"
+        if oldest.exists():
+            oldest.unlink()
+        for index in range(self.log_rotate_keep - 1, 0, -1):
+            source = self.root / f"log.{index}.md.gz"
+            target = self.root / f"log.{index + 1}.md.gz"
+            if source.exists():
+                source.replace(target)
+        target = self.root / "log.1.md.gz"
+        with self.log_path.open("rb") as source, gzip.open(target, "wb") as output:
+            shutil.copyfileobj(source, output)
+        self.log_path.write_text("# Knowledge Log\n\n", encoding="utf-8")
+        self._used_bytes = None
+
 
 class WikiIngestor:
     def __init__(self, store: WikiStore):
         self.store = store
+        cfg = get_config().get("knowledge_wiki", {})
+        self.source_excerpt_chars = max(100, int(cfg.get("source_excerpt_chars", 500)))
 
     def ingest_document(self, doc: Document) -> List[str]:
         content_hash = stable_hash(doc.content or "", 24)
@@ -641,7 +755,8 @@ class WikiIngestor:
         entry = cache.get("entries", {}).get(cache_key)
         if entry and entry.get("content_hash") == content_hash:
             paths = entry.get("files", [])
-            if all((self.store.root / path).exists() for path in paths):
+            durable_pages = [path for path in paths if str(path).startswith("wiki/sources/")]
+            if durable_pages and all((self.store.root / path).exists() for path in durable_pages):
                 return paths
 
         source_title = doc.title or doc.url or doc.id or "Untitled Source"
@@ -652,12 +767,15 @@ class WikiIngestor:
         topic_path = self.store.topics_dir / f"{slugify(topic_title, 'topic')}.md"
         entities = self._extract_entities(doc)
 
+        estimated_growth = len((doc.content or "").encode("utf-8")) + 8192 + len(entities) * 2048
+        self.store.assert_bulk_capacity(estimated_growth)
+
         source_link = wiki_link(source_title)
         topic_link = wiki_link(topic_title)
         entity_links = [wiki_link(entity) for entity in entities]
 
         raw_body = self._raw_body(doc, source_title)
-        raw_path.write_text(raw_body, encoding="utf-8")
+        self.store.write_text(raw_path, raw_body)
 
         source_page = self._source_page(
             doc=doc,
@@ -753,8 +871,8 @@ class WikiIngestor:
             "related": [topic_title, *entities],
         }
         excerpt = (doc.content or "").strip()
-        if len(excerpt) > 3000:
-            excerpt = excerpt[:3000] + "..."
+        if len(excerpt) > self.source_excerpt_chars:
+            excerpt = excerpt[: self.source_excerpt_chars] + "..."
         body = (
             f"# {title}\n\n"
             f"- 主题: {wiki_link(topic_title)}\n"
