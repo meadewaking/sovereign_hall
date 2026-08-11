@@ -921,6 +921,41 @@ async def test_sigterm_cancellation_reaches_round_cleanup():
     assert handler_cleaned.is_set()
 
 
+@pytest.mark.asyncio
+async def test_sigterm_terminal_is_single_idempotent_and_carries_exact_signal(tmp_path):
+    from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
+    from sovereign_hall.services.database import DatabaseService
+    from sovereign_hall.run_discussion import persist_sigterm_round_terminal
+
+    db = DatabaseService(str(tmp_path / "sigterm-terminal.db"))
+    await db._init_db()
+    coordinator = ResearchRoundCoordinator(db)
+    round_state = await coordinator.start(
+        base_topic="graceful replacement",
+        research_objective="retain exact shutdown cause",
+    )
+
+    await persist_sigterm_round_terminal(coordinator, round_state.id)
+    await persist_sigterm_round_terminal(coordinator, round_state.id)
+
+    conn = await db._get_connection()
+    async with conn.execute(
+        """
+        SELECT payload_json
+        FROM round_events
+        WHERE round_id = ? AND event_type = 'RoundFailed'
+        """,
+        (round_state.id,),
+    ) as cursor:
+        events = await cursor.fetchall()
+    assert len(events) == 1
+    assert json.loads(events[0][0])["shutdown_signal"] == "SIGTERM"
+    terminal = await coordinator.get(round_state.id)
+    assert terminal.terminal_code == "failed"
+    assert "终止信号" in terminal.terminal_reason
+    await db.close()
+
+
 def test_vote_context_balances_all_deliberation_stages():
     context = build_balanced_vote_context(
         {

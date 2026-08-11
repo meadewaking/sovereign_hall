@@ -2003,6 +2003,56 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
         print("   ✅ 最近一轮已完成，资料、裁决和模拟执行结果可按 round_id 追溯。")
 
 
+def show_runtime_storage_status(db_path: Path) -> dict[str, Any]:
+    """Expose capacity gates and stale production code in the main read model."""
+    from sovereign_hall.services.storage_governor import runtime_storage_read_model
+
+    status = runtime_storage_read_model(
+        db_path=db_path,
+        knowledge_root=project_root / "data" / "knowledge",
+        lock_path=project_root / "data" / "run_discussion.lock",
+        runner_source=project_root / "run_discussion.py",
+    )
+    database = status["database"]
+    knowledge = status["knowledge"]
+    runner = status["runner"]
+    print("\n" + "=" * 60)
+    print("💾 生产容量与运行代码")
+    print("=" * 60)
+    print(
+        "   数据库: "
+        f"{int(database['used_bytes']) / 1024**3:.2f} / "
+        f"{int(database['max_bytes']) / 1024**3:.2f} GiB "
+        f"({float(database['ratio']):.1%})"
+    )
+    print(
+        "   知识库: "
+        f"{int(knowledge['used_bytes']) / 1024**3:.2f} / "
+        f"{int(knowledge['max_bytes']) / 1024**3:.2f} GiB "
+        f"({float(knowledge['ratio']):.1%})"
+    )
+    print(
+        "   新研究轮容量门: "
+        f"{'允许' if status['research_round_allowed'] else '阻塞'} | "
+        f"source={status['status_source']} @ {status['checked_at']}"
+    )
+    if runner.get("pid_alive"):
+        print(
+            f"   生产 runner: pid={runner.get('pid')} | "
+            f"started_at={runner.get('started_at')} | "
+            f"code_stale={str(bool(runner.get('code_stale'))).lower()}"
+        )
+    else:
+        print("   生产 runner: 未运行")
+    if status["blockers"]:
+        print(
+            "   ❌ 生产阻塞: "
+            + ", ".join(status["blockers"])
+            + "；先协作收敛 active round、离线压缩并部署当前代码。"
+        )
+    return status
+
+
 def show_stats(db_path):
     """显示数据库统计"""
     print("\n" + "="*60)
@@ -2012,6 +2062,7 @@ def show_stats(db_path):
     # 先显示投资状态
     live_performance = show_investment_status(db_path)
     show_canonical_pipeline_status(Path(db_path))
+    show_runtime_storage_status(Path(db_path))
     try:
         from sovereign_hall.services.heuristic_policy import (
             format_heuristic_status,

@@ -531,6 +531,21 @@ async def run_with_graceful_shutdown(
         cleanup()
 
 
+async def persist_sigterm_round_terminal(round_coordinator, round_id: str) -> None:
+    """Write the one canonical SIGTERM terminal for an active round.
+
+    Inner pipeline cancellation handlers must not pre-empt this write with a
+    generic ``failed`` terminal: ``ResearchRoundCoordinator.fail`` is
+    intentionally idempotent and preserves the first terminal it sees.
+    """
+    await round_coordinator.fail(
+        round_id,
+        code="failed",
+        reason="研究轮失败：生产进程收到终止信号",
+        payload={"shutdown_signal": "SIGTERM"},
+    )
+
+
 def kill_existing_run_discussion_instances() -> list[int]:
     """Stop any other ``python -m sovereign_hall.run_discussion`` processes.
 
@@ -760,7 +775,11 @@ class SingleInstanceLock:
 
         self._handle.seek(0)
         self._handle.truncate()
-        self._handle.write(f"pid={os.getpid()} started_at={datetime.now().isoformat()}\n")
+        source_mtime_ns = Path(__file__).stat().st_mtime_ns
+        self._handle.write(
+            f"pid={os.getpid()} started_at={datetime.now().isoformat()} "
+            f"source_mtime_ns={source_mtime_ns}\n"
+        )
         self._handle.flush()
         return self
 
@@ -5258,11 +5277,10 @@ async def main():
                 raise
             except asyncio.CancelledError:
                 print(f"\n⚠️ 任务被取消，保存进度...")
-                await round_coordinator.fail(
-                    active_round_id,
-                    code="failed",
-                    reason="研究轮失败：任务取消",
-                )
+                # The outer runner guard knows whether cancellation came from
+                # SIGTERM and owns the single durable terminal.  Persisting a
+                # generic failure here made the later SIGTERM write a no-op,
+                # losing the exact shutdown cause from the append-only event.
                 raise
             except Exception as e:
                 print(f"\n❌ 本轮错误: {e}")
@@ -5359,11 +5377,9 @@ async def main():
         if active_round_id:
             try:
                 await asyncio.shield(
-                    round_coordinator.fail(
+                    persist_sigterm_round_terminal(
+                        round_coordinator,
                         active_round_id,
-                        code="failed",
-                        reason="研究轮失败：生产进程收到终止信号",
-                        payload={"shutdown_signal": "SIGTERM"},
                     )
                 )
             except Exception:
