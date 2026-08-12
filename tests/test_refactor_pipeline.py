@@ -66,6 +66,7 @@ from sovereign_hall.run_discussion import (
     choose_review_depth,
     build_proposal_thesis,
     build_lessons_with_heuristic_context,
+    bound_round_source_lineage,
     bounded_sync_index_batch,
     cli_args_can_run_without_instance_lock,
     committee_decision_is_predictable,
@@ -357,6 +358,8 @@ def test_search_query_generator_rejects_punctuation_only_placeholder():
     assert generator._is_valid_query("...", topic="消费电子复苏前景") is False
     assert generator._is_valid_query("query1", topic="消费电子复苏前景") is False
     assert generator._is_valid_query("search_query_02", topic="消费电子复苏前景") is False
+    assert generator._is_valid_query("词1", topic="消费电子复苏前景") is False
+    assert generator._is_valid_query("搜索词2", topic="消费电子复苏前景") is False
     assert generator._is_valid_query("消费电子 财报", topic="消费电子复苏前景") is True
 
 
@@ -364,7 +367,7 @@ def test_search_query_generator_rejects_punctuation_only_placeholder():
 async def test_search_query_generator_drops_numbered_placeholders_before_search():
     llm = AsyncMock()
     llm.chat.return_value = json.dumps(
-        ["query1", "query2", "固态电池设备订单"],
+        ["query1", "词1", "搜索词2", "固态电池设备订单"],
         ensure_ascii=False,
     )
     generator = SearchQueryGenerator(llm)
@@ -5754,6 +5757,37 @@ def test_sync_wiki_index_batch_is_bounded_while_source_batch_is_preserved():
     assert len(source_documents) == 227
     assert len(sync_documents) == 30
     assert sync_documents == source_documents[:30]
+
+
+def test_round_source_lineage_excludes_whole_documents_at_total_cap():
+    documents = ["direct-a", "aggregate", "direct-b", "overlap"]
+    selected, linked_ids, audit = bound_round_source_lineage(
+        documents,
+        [
+            ["doc-a"],
+            ["doc-b", "doc-c", "doc-d"],
+            ["doc-e"],
+            ["doc-a"],
+        ],
+        max_links=2,
+    )
+
+    assert selected == ["direct-a", "direct-b", "overlap"]
+    assert linked_ids == ["doc-a", "doc-e"]
+    assert audit == {
+        "presented_document_count": 4,
+        "resolved_document_count": 4,
+        "traceable_document_count": 3,
+        "untraceable_document_count": 0,
+        "capacity_excluded_document_count": 1,
+        "resolved_source_count_before_limit": 5,
+        "lineage_limit": 2,
+    }
+
+
+def test_round_source_lineage_rejects_alignment_mismatch():
+    with pytest.raises(ValueError, match="alignment mismatch"):
+        bound_round_source_lineage(["one", "two"], [["doc-one"]], 3)
 
 
 def test_materially_invested_book_keeps_normal_research_topic():

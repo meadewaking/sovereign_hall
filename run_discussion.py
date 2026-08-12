@@ -1061,6 +1061,70 @@ def bounded_sync_index_batch(documents: List[Any], limit: int) -> List[Any]:
     return list(documents or [])[:bounded_limit] if bounded_limit else []
 
 
+def bound_round_source_lineage(
+    documents: List[Any],
+    resolved_lineage: List[List[str]],
+    max_links: int,
+) -> tuple[List[Any], List[str], Dict[str, int]]:
+    """Select a traceable evidence set without partially linking a document.
+
+    A derived Wiki document can legitimately resolve to several canonical raw
+    sources.  The storage hard cap protects SQLite, but raising after research
+    caused the production loop to fail and retry the same source-heavy topic.
+    Keep documents in presentation order, skip an entire document when adding
+    all of its lineage would exceed the cap, and continue scanning so smaller
+    later documents can still participate.  This guarantees that every
+    document sent to stage2 has its complete canonical lineage persisted.
+    """
+    source_documents = list(documents or [])
+    source_lineage = list(resolved_lineage or [])
+    if len(source_documents) != len(source_lineage):
+        raise ValueError(
+            "document lineage alignment mismatch: "
+            f"documents={len(source_documents)} lineage={len(source_lineage)}"
+        )
+
+    link_limit = max(int(max_links or 0), 1)
+    selected_documents: List[Any] = []
+    selected_ids: set[str] = set()
+    resolved_ids: set[str] = set()
+    untraceable_documents = 0
+    capacity_excluded_documents = 0
+
+    for document, document_ids in zip(source_documents, source_lineage):
+        canonical_ids = {
+            str(document_id).strip()
+            for document_id in (document_ids or [])
+            if document_id and str(document_id).strip()
+        }
+        if not canonical_ids:
+            untraceable_documents += 1
+            continue
+        resolved_ids.update(canonical_ids)
+        new_ids = canonical_ids - selected_ids
+        if len(selected_ids) + len(new_ids) > link_limit:
+            capacity_excluded_documents += 1
+            continue
+        selected_documents.append(document)
+        selected_ids.update(canonical_ids)
+
+    return (
+        selected_documents,
+        sorted(selected_ids),
+        {
+            "presented_document_count": len(source_documents),
+            "resolved_document_count": (
+                len(source_documents) - untraceable_documents
+            ),
+            "traceable_document_count": len(selected_documents),
+            "untraceable_document_count": untraceable_documents,
+            "capacity_excluded_document_count": capacity_excluded_documents,
+            "resolved_source_count_before_limit": len(resolved_ids),
+            "lineage_limit": link_limit,
+        },
+    )
+
+
 def dedupe_proposals(proposals: List[Dict]) -> List[Dict]:
     """同一轮内按标的和方向去重，保留置信度最高的提案。"""
     from sovereign_hall.services.market_data import MarketDataService
@@ -4857,36 +4921,60 @@ async def main():
                         f"   ✅ 文档已保存 (DB新增: {saved_docs}, Wiki同步: {vector_saved}, "
                         f"Wiki延后懒迁移: {deferred_wiki_docs}, 跳过本地派生: {skipped_docs})"
                     )
-                presented_document_count = len(docs)
                 resolved_lineage = await db_service.resolve_document_lineage(docs)
-                traceable_docs = [
-                    doc
-                    for doc, document_ids in zip(docs, resolved_lineage)
-                    if document_ids
-                ]
-                linked_document_ids = sorted(
-                    {
-                        document_id
-                        for document_ids in resolved_lineage
-                        for document_id in document_ids
-                    }
+                from sovereign_hall.core.config import get_config
+                lineage_limit = max(
+                    1,
+                    int(
+                        get_config()
+                        .get("database", {})
+                        .get("max_round_document_links", 300)
+                    ),
                 )
-                untraceable_document_count = (
-                    presented_document_count - len(traceable_docs)
+                docs, linked_document_ids, lineage_audit = (
+                    bound_round_source_lineage(
+                        docs,
+                        resolved_lineage,
+                        lineage_limit,
+                    )
                 )
-                if untraceable_document_count:
+                if lineage_audit["untraceable_document_count"]:
                     logger.warning(
                         "阶段1：排除 %s/%s 条无法回链 SQLite 原始资料的派生文档",
-                        untraceable_document_count,
-                        presented_document_count,
+                        lineage_audit["untraceable_document_count"],
+                        lineage_audit["presented_document_count"],
                     )
-                docs = traceable_docs
+                if lineage_audit["capacity_excluded_document_count"]:
+                    logger.warning(
+                        "阶段1：来源硬门保留 %s/%s 条完整可追溯资料、%s/%s 个 canonical links；"
+                        "容量排除 %s 条资料后继续研究，不再令整轮失败",
+                        lineage_audit["traceable_document_count"],
+                        lineage_audit["resolved_document_count"],
+                        len(linked_document_ids),
+                        lineage_audit["resolved_source_count_before_limit"],
+                        lineage_audit["capacity_excluded_document_count"],
+                    )
                 await round_coordinator.persist_sources(
                     active_round_id,
                     document_ids=linked_document_ids,
-                    presented_document_count=presented_document_count,
-                    traceable_document_count=len(traceable_docs),
-                    untraceable_document_count=untraceable_document_count,
+                    presented_document_count=lineage_audit[
+                        "presented_document_count"
+                    ],
+                    resolved_document_count=lineage_audit[
+                        "resolved_document_count"
+                    ],
+                    traceable_document_count=lineage_audit[
+                        "traceable_document_count"
+                    ],
+                    untraceable_document_count=lineage_audit[
+                        "untraceable_document_count"
+                    ],
+                    capacity_excluded_document_count=lineage_audit[
+                        "capacity_excluded_document_count"
+                    ],
+                    resolved_source_count_before_limit=lineage_audit[
+                        "resolved_source_count_before_limit"
+                    ],
                 )
 
                 redeployment_context = (
