@@ -1717,6 +1717,105 @@ async def stage2_deep_research(
                     len(adjudicated),
                     adjudication_mode,
                 )
+                adjudication_candidate_windows = extract_stage2_candidate_windows(
+                    adjudicated_response
+                )
+                if (
+                    not adjudicated
+                    and adjudication_mode != "explicit_empty"
+                    and adjudication_candidate_windows
+                ):
+                    # The evidence adjudicator is still an LLM and can repeat
+                    # the primary model's failure mode: a long, candidate-
+                    # bearing audit followed by an empty/missing JSON result.
+                    # Previously that second-level format loss was silently
+                    # terminal even though the same failure on the primary
+                    # answer received a bounded repair.  Repair only the
+                    # adjudicator's own answer and retain the original ticker
+                    # allow-list; this cannot create a candidate or bypass the
+                    # source-evidence audit.
+                    logger.warning(
+                        "[diag] stage2 candidate adjudication was %s; "
+                        "requesting bounded format repair",
+                        adjudication_mode,
+                    )
+                    adjudication_repair_prompt = f"""
+把下面“证据审计回答”中已经明确通过审计、且带有具体证据的投资提案转换为合法JSON数组。
+
+允许的ticker（只可从此集合选择）：
+{json.dumps(sorted(candidate_tickers), ensure_ascii=False)}
+
+硬约束：
+1. 只能转换证据审计回答已经明确通过的标的、方向、论点和证据；不得新增ticker、ETF、来源或事实。
+2. 回答只是分析过程、候选比较、否决说明，或没有明确通过审计的提案时，输出[]。
+3. 每项必须包含 ticker、direction、target_position、stop_loss、take_profit、
+   holding_period、holding_period_reason、confidence、thesis、sector、evidence、
+   resolved_rejection、evidence_delta、reject_if。
+4. 只输出合法JSON数组，不要Markdown、解释或思考过程。
+
+证据审计回答：
+{str(adjudicated_response)[:20000]}
+"""
+                    try:
+                        adjudication_repaired_response = await asyncio.wait_for(
+                            llm.chat(
+                                system=(
+                                    "你是格式修复器，只能结构化证据审计器已明确通过的提案；"
+                                    "不能重新审计、生成候选或补造事实。没有通过项时只输出[]。"
+                                ),
+                                user=adjudication_repair_prompt,
+                                temperature=0.0,
+                                max_tokens=5000,
+                                use_cache=False,
+                            ),
+                            timeout=300,
+                        )
+                        adjudication_repaired, adjudication_repair_mode = (
+                            extract_stage2_proposal_array(
+                                adjudication_repaired_response
+                            )
+                        )
+                        diagnostic_repair_modes.append(
+                            "candidate_adjudication_format:"
+                            f"{adjudication_repair_mode}"
+                        )
+                        adjudication_repaired = [
+                            item
+                            for item in adjudication_repaired
+                            if str(item.get("ticker") or "")
+                            .split(".", 1)[0]
+                            .upper()
+                            in candidate_tickers
+                        ]
+                        logger.info(
+                            "[diag] stage2 candidate adjudication repair "
+                            "len=%s, parsed=%s, mode=%s",
+                            len(adjudication_repaired_response or ""),
+                            len(adjudication_repaired),
+                            adjudication_repair_mode,
+                        )
+                        if adjudication_repaired:
+                            adjudicated = adjudication_repaired
+                            adjudication_mode = (
+                                "format_repair:"
+                                f"{adjudication_repair_mode}"
+                            )
+                    except asyncio.TimeoutError:
+                        diagnostic_repair_modes.append(
+                            "candidate_adjudication_format:timeout"
+                        )
+                        logger.warning(
+                            "[diag] stage2 candidate adjudication format repair timed out"
+                        )
+                    except Exception as adjudication_repair_error:
+                        diagnostic_repair_modes.append(
+                            "candidate_adjudication_format:error:"
+                            f"{type(adjudication_repair_error).__name__}"
+                        )
+                        logger.warning(
+                            "[diag] stage2 candidate adjudication format repair failed: %s",
+                            adjudication_repair_error,
+                        )
                 if adjudicated:
                     proposals = adjudicated
                     parse_mode = f"candidate_adjudication:{adjudication_mode}"

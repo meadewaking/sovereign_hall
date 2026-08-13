@@ -683,6 +683,95 @@ async def test_stage2_adjudicates_candidate_after_format_repair_stays_empty():
 
 
 @pytest.mark.asyncio
+async def test_stage2_repairs_candidate_adjudicator_format_loss_without_new_ticker():
+    class VerboseAdjudicationThenRepairLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return (
+                    "原资料中的600515具有订单增长与现金流改善两条证据，"
+                    "可作为long候选，但最终格式错误。\n[]"
+                )
+            if len(self.calls) == 2:
+                return "[]"
+            if len(self.calls) == 3:
+                return (
+                    "审计结论：600515的两条公司公告证据可独立回链，明确通过long提案审计；"
+                    "601888不在允许集合，不得使用。\n[]"
+                )
+            return json.dumps([
+                {
+                    "ticker": "600515",
+                    "direction": "long",
+                    "target_position": 0.08,
+                    "stop_loss": 6.0,
+                    "take_profit": 12.0,
+                    "holding_period": 30,
+                    "holding_period_reason": "等待下一月订单验证",
+                    "confidence": 0.7,
+                    "thesis": "事实: 订单增长且现金流改善；推断: 盈利质量提升",
+                    "sector": "交通服务",
+                    "evidence": ["公司公告：订单增长", "公司公告：现金流改善"],
+                    "resolved_rejection": "",
+                    "evidence_delta": "本轮公司公告补充两条经营证据",
+                    "reject_if": "订单取消或现金流重新恶化",
+                },
+                {
+                    "ticker": "601888",
+                    "direction": "long",
+                    "target_position": 0.08,
+                    "stop_loss": 6.0,
+                    "take_profit": 12.0,
+                    "holding_period": 30,
+                    "holding_period_reason": "不允许的新标的",
+                    "confidence": 0.7,
+                    "thesis": "不得采用",
+                    "sector": "消费",
+                    "evidence": ["不得采用"],
+                    "resolved_rejection": "",
+                    "evidence_delta": "",
+                    "reject_if": "",
+                },
+            ], ensure_ascii=False)
+
+    db = AsyncMock()
+    db.get_blacklist.return_value = []
+    doc = Document(
+        title="600515公司公告",
+        content=(
+            "证券代码600515，公司公告披露新增订单增长；"
+            "经营活动现金流同比改善，数据可追溯。"
+        ) * 3,
+        url="https://example.com/600515",
+        source="unit",
+    )
+    llm = VerboseAdjudicationThenRepairLLM()
+
+    proposals = await stage2_deep_research(
+        llm,
+        [doc],
+        "空仓资金部署候选证据比较",
+        db_service=db,
+    )
+
+    assert [proposal["ticker"] for proposal in proposals] == ["600515"]
+    assert len(llm.calls) == 4
+    assert llm.calls[3]["temperature"] == 0.0
+    assert llm.calls[3]["use_cache"] is False
+    assert '"600515"' in llm.calls[3]["user"]
+    diagnostic = db.record_research_stage_diagnostic.await_args.kwargs
+    assert diagnostic["status"] == "proposals_recovered"
+    assert diagnostic["repair_modes"] == [
+        "format:explicit_empty",
+        "candidate_adjudication:ambiguous_empty_with_candidate_text",
+        "candidate_adjudication_format:generic_parser",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stage2_format_repair_cannot_introduce_unseen_ticker():
     class InventingRepairLLM:
         def __init__(self):
