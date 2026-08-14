@@ -424,6 +424,39 @@ def build_proposal_thesis(raw: Dict) -> str:
     return "\n".join(parts)
 
 
+def normalize_stage2_evidence(value: Any) -> tuple[List[str], str]:
+    """Validate the model's evidence container without coercing prose to chars.
+
+    JSON model responses occasionally return ``evidence`` as one string even
+    though the contract requires an array.  Iterating that string used to turn
+    it into one-character "evidence" rows (for example ``金融周报`` became
+    ``["金", "融", ...]``), allowing a malformed proposal into committee and
+    durable storage.  Evidence is a gate, so malformed containers/items are
+    rejected rather than repaired or guessed.
+    """
+    if not isinstance(value, list):
+        return [], "invalid_evidence_container"
+
+    normalized: List[str] = []
+    seen = set()
+    for item in value[:8]:
+        if not isinstance(item, str):
+            return [], "invalid_evidence_item"
+        text = item.strip()[:240]
+        # A single character cannot identify a source title or a falsifiable
+        # fact.  Reject the whole proposal instead of silently dropping parts
+        # of an already malformed evidence array.
+        if len(text) <= 1:
+            return [], "invalid_evidence_item"
+        if text not in seen:
+            seen.add(text)
+            normalized.append(text)
+
+    if not normalized:
+        return [], "insufficient_structured_evidence"
+    return normalized, ""
+
+
 def infer_default_holding_period(topic: str) -> int:
     """根据议题给默认验证窗口，作为模型缺省值的后备。"""
     return _normalize_expected_days(None, topic)
@@ -1852,12 +1885,13 @@ async def stage2_deep_research(
                 continue
             ticker = str(p.get('ticker', '')).strip().upper()
             direction = str(p.get("direction") or "").strip().lower()
-            evidence = [
-                str(item)[:240]
-                for item in (p.get("evidence") or [])[:8]
-                if str(item).strip()
-            ]
-            thesis = build_proposal_thesis(p)
+            evidence, evidence_rejection = normalize_stage2_evidence(
+                p.get("evidence")
+            )
+            if evidence_rejection:
+                reject_cleaning(evidence_rejection)
+                continue
+            thesis = build_proposal_thesis(p | {"evidence": evidence})
             if direction not in {"long", "short"}:
                 reject_cleaning("missing_explicit_direction")
                 continue

@@ -819,6 +819,17 @@ class DatabaseService:
         created_at = pget("created_at") or datetime.now().isoformat()
         round_id = round_id or pget("round_id")
         proposal_id = pget('proposal_id') or pget('id')
+        evidence = pget('evidence', [])
+        if evidence is None:
+            evidence = []
+        if not isinstance(evidence, list) or any(
+            not isinstance(item, str) or len(item.strip()) <= 1
+            for item in evidence
+        ):
+            raise ValueError(
+                "proposal evidence must be a JSON array of meaningful strings; "
+                "scalar or character-split evidence cannot be persisted"
+            )
         conn = await self._get_connection()
         await conn.execute("""
             INSERT OR REPLACE INTO proposals
@@ -843,7 +854,7 @@ class DatabaseService:
             pget('status', 'pending'),
             created_at,
             pget('holding_period_reason', None),
-            json.dumps(pget('evidence', []), ensure_ascii=False),
+            json.dumps(evidence, ensure_ascii=False),
             pget('resolved_rejection', None),
             pget('evidence_delta', None),
             pget('reject_if', None),

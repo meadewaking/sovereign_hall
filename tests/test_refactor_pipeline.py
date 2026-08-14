@@ -86,6 +86,7 @@ from sovereign_hall.run_discussion import (
     parse_args,
     preflight_committee_decisions,
     merge_documents_prefer_richer,
+    normalize_stage2_evidence,
     proposal_priority_score,
     prioritize_deployment_research,
     rank_stage2_documents,
@@ -521,6 +522,68 @@ def test_stage2_candidate_sources_cover_each_ticker_before_second_excerpt():
     assert any("600031" in item for item in selected)
     assert any("560280" in item for item in selected)
     assert coverage == {"600031": 2, "560280": 2}
+
+
+def test_stage2_evidence_rejects_scalar_and_character_arrays():
+    assert normalize_stage2_evidence("金融周报推荐关注") == (
+        [],
+        "invalid_evidence_container",
+    )
+    assert normalize_stage2_evidence(["金", "融", "周", "报"]) == (
+        [],
+        "invalid_evidence_item",
+    )
+    assert normalize_stage2_evidence(
+        ["公司公告：净息差环比企稳", "公司季报：不良率下降"]
+    ) == (
+        ["公司公告：净息差环比企稳", "公司季报：不良率下降"],
+        "",
+    )
+
+
+@pytest.mark.asyncio
+async def test_stage2_scalar_evidence_cannot_reach_committee_or_storage():
+    class ScalarEvidenceLLM:
+        async def chat(self, **_kwargs):
+            return json.dumps([
+                {
+                    "ticker": "601916",
+                    "direction": "long",
+                    "target_position": 0.08,
+                    "stop_loss": 5.0,
+                    "take_profit": 10.0,
+                    "holding_period": 30,
+                    "holding_period_reason": "等待季报验证",
+                    "confidence": 0.65,
+                    "thesis": "事实: 周报推荐关注；推断: 股息较稳定",
+                    "sector": "银行",
+                    "evidence": "金融周报推荐关注",
+                    "resolved_rejection": "",
+                    "evidence_delta": "",
+                    "reject_if": "股息率低于行业中位数",
+                }
+            ], ensure_ascii=False)
+
+    db = AsyncMock()
+    db.get_blacklist.return_value = []
+    doc = Document(
+        title="银行周报",
+        content="金融周报推荐关注601916，但没有给出结构化财务证据。" * 4,
+        url="https://example.com/601916",
+        source="unit",
+    )
+
+    proposals = await stage2_deep_research(
+        ScalarEvidenceLLM(),
+        [doc],
+        "银行股高股息价值",
+        db_service=db,
+    )
+
+    assert proposals == []
+    diagnostic = db.record_research_stage_diagnostic.await_args.kwargs
+    assert diagnostic["status"] == "empty_after_adjudication"
+    assert '"invalid_evidence_container": 1' in diagnostic["reason"]
 
 
 @pytest.mark.asyncio
@@ -2447,6 +2510,29 @@ async def test_dict_proposal_can_be_stored(tmp_path):
     meetings = await db.get_meetings(limit=5)
     assert meetings[0]["proposal_id"] == proposal_id
     assert meetings[0]["discussion"] == "四轮讨论摘要"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_scalar_proposal_evidence(tmp_path):
+    db = DatabaseService(str(tmp_path / "test.db"))
+    await db._init_db()
+
+    with pytest.raises(ValueError, match="JSON array of meaningful strings"):
+        await db.add_proposal({
+            "ticker": "601916",
+            "direction": "long",
+            "evidence": "金融周报推荐关注",
+        })
+
+    with pytest.raises(ValueError, match="character-split evidence"):
+        await db.add_proposal({
+            "ticker": "601916",
+            "direction": "long",
+            "evidence": ["金", "融", "周", "报"],
+        })
+
+    assert await db.get_proposals(limit=5) == []
     await db.close()
 
 
