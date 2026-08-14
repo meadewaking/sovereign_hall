@@ -242,6 +242,7 @@ class Config:
             # but runtime validation protects the product invariants.
             'simulation': {
                 'enabled': True,
+                'execution_mode': 'simulation',
                 'initial_capital': 10000,
                 'target_invested_ratio': 1.0,
                 'realtime_quotes_required': True,
@@ -260,9 +261,27 @@ class Config:
                 'no_trade_failure_days': 3,
                 'min_unit': 100,
                 'trading_fee': 0.0003,
-                'stamp_duty': 0.001,
+                'minimum_commission': 5.0,
+                'stamp_duty': 0.0005,
+                'etf_stamp_duty': 0.0,
                 'slippage_rate': 0.0005,
+                'cost_model_version': 'cn_a_share_etf_v1_20260814',
                 'max_daily_trades': 5,
+            },
+
+            # Read-only shadow evaluation.  It never shares cash or positions
+            # with the authoritative simulation account.
+            'shadow_evaluation': {
+                'enabled': True,
+                'execution_mode': 'paper',
+                'initial_capital': 10000,
+                'cagr_target': 0.15,
+                'max_drawdown_budget': 0.15,
+                'risk_reduction_drawdown': 0.10,
+                'minimum_annualization_sessions': 252,
+                'systematic_qualification_sessions': 756,
+                'llm_qualification_sessions': 252,
+                'llm_minimum_closed_trades': 100,
             },
 
             # 监控配置
@@ -387,6 +406,9 @@ class Config:
         """Return configuration errors that would weaken product invariants."""
         errors: list[str] = []
         simulation = self.get("simulation", {}) or {}
+        execution_mode = str(simulation.get("execution_mode", "simulation")).strip().lower()
+        if execution_mode not in {"simulation", "paper"}:
+            errors.append("simulation.execution_mode only permits simulation/paper; live is forbidden")
         if not bool(simulation.get("realtime_quotes_required", True)):
             errors.append("simulation.realtime_quotes_required must remain true")
         if not bool(simulation.get("trade_during_market_hours_only", True)):
@@ -400,10 +422,20 @@ class Config:
             errors.append("simulation.max_gross cannot exceed 1.0")
         if float(simulation.get("trading_fee", 0.0) or 0.0) <= 0:
             errors.append("simulation.trading_fee must be positive")
+        if float(simulation.get("minimum_commission", 0.0) or 0.0) <= 0:
+            errors.append("simulation.minimum_commission must be positive")
         if float(simulation.get("stamp_duty", 0.0) or 0.0) <= 0:
             errors.append("simulation.stamp_duty must be positive")
         if float(simulation.get("slippage_rate", 0.0) or 0.0) <= 0:
             errors.append("simulation.slippage_rate must be positive")
+        if int(simulation.get("initial_capital", 10000) or 0) != 10000:
+            errors.append("simulation.initial_capital must remain 10000 for the current account")
+        shadow = self.get("shadow_evaluation", {}) or {}
+        shadow_mode = str(shadow.get("execution_mode", "paper")).strip().lower()
+        if shadow_mode not in {"simulation", "paper"}:
+            errors.append("shadow_evaluation.execution_mode only permits simulation/paper")
+        if int(shadow.get("initial_capital", 10000) or 0) != 10000:
+            errors.append("shadow_evaluation.initial_capital must equal 10000")
         quote_age = int(
             simulation.get("max_realtime_quote_age_seconds", 120) or 0
         )

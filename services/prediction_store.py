@@ -100,11 +100,27 @@ async def ensure_prediction_schema(db: aiosqlite.Connection) -> None:
             close REAL NOT NULL,
             volume REAL,
             source TEXT,
+            adjustment TEXT,
+            provider TEXT,
+            fetched_at TEXT,
+            quality_status TEXT,
+            trade_status TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (ticker, date)
         )
         """
     )
+    daily_price_columns = {
+        "adjustment": "TEXT",
+        "provider": "TEXT",
+        "fetched_at": "TEXT",
+        "quality_status": "TEXT",
+        "trade_status": "TEXT",
+    }
+    existing_daily = await _table_columns(db, "daily_prices")
+    for name, definition in daily_price_columns.items():
+        if name not in existing_daily:
+            await db.execute(f"ALTER TABLE daily_prices ADD COLUMN {name} {definition}")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_prices_date ON daily_prices(date)")
     await db.commit()
 

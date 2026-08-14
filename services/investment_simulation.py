@@ -22,6 +22,8 @@ from ..application.execute_simulation_cycle import (
     TradeCommitRequest,
 )
 from ..domain.common.ids import new_id
+from ..domain.portfolio.costs import CostSchedule
+from ..domain.portfolio.instruments import InstrumentProfile, normalize_ticker
 from ..domain.portfolio.models import ExecutionIntent
 from ..infrastructure.sqlite.migrations import apply_architecture_migrations
 from ..services.llm_client import LLMClient
@@ -62,9 +64,18 @@ class InvestmentSimulation:
         # 模拟参数
         self.initial_capital = self.config.get('initial_capital', 10000)
         self.min_unit = self.config.get('min_unit', 100)  # 一手=100股
-        self.trading_fee = self.config.get('trading_fee', 0.0003)  # 佣金万三
-        self.stamp_duty = self.config.get('stamp_duty', 0.001)  # 印花税千一
-        self.slippage_rate = float(self.config.get('slippage_rate', 0.0005))
+        self.cost_schedule = CostSchedule.from_mapping(self.config)
+        # Compatibility attributes remain read-only mirrors.  All actual cost
+        # calculations go through the shared versioned schedule below.
+        self.trading_fee = self.cost_schedule.commission_rate
+        self.minimum_commission = self.cost_schedule.minimum_commission
+        self.stamp_duty = self.cost_schedule.stock_sell_stamp_duty
+        self.etf_stamp_duty = self.cost_schedule.etf_sell_stamp_duty
+        self.slippage_rate = self.cost_schedule.slippage_rate
+        self.cost_model_version = self.cost_schedule.version
+        self.execution_mode = str(self.config.get("execution_mode", "simulation")).strip().lower()
+        if self.execution_mode not in {"simulation", "paper"}:
+            raise RuntimeError("真实交易模式被硬禁用；仅允许 simulation/paper")
         self.target_invested_ratio = float(self.config.get('target_invested_ratio', 1.0))
         self.realtime_quotes_required = bool(self.config.get('realtime_quotes_required', True))
         self.trade_during_market_hours_only = bool(
@@ -390,12 +401,10 @@ class InvestmentSimulation:
                 if self.min_unit > 0
                 else 0.0
             )
-            max_quote_by_cash = (
-                available_cash
-                / int(self.min_unit)
-                / (1 + self.trading_fee + self.slippage_rate)
-                if self.min_unit > 0
-                else 0.0
+            max_quote_by_cash = self._max_affordable_quote(
+                available_cash,
+                "510300",
+                int(self.min_unit),
             )
             max_executable_one_lot_quote = min(
                 max_quote_by_position,
@@ -499,10 +508,12 @@ class InvestmentSimulation:
         )
         position_budget = total_assets * max_single_position
         max_quote_by_position = position_budget / int(self.min_unit)
-        max_quote_by_cash = (
-            cash
-            / int(self.min_unit)
-            / (1 + self.trading_fee + self.slippage_rate)
+        # Screening uses the candidate's own asset type below when available;
+        # this common ceiling is a conservative ETF one-lot cash boundary.
+        max_quote_by_cash = self._max_affordable_quote(
+            cash,
+            "510300",
+            int(self.min_unit),
         )
         executable_quote_ceiling = min(
             max_quote_by_position,
@@ -1511,8 +1522,50 @@ class InvestmentSimulation:
 
     @staticmethod
     def _normalize_ticker(ticker: str) -> str:
-        code = str(ticker or "").strip().upper()
-        return code.split(".")[0] if "." in code else code
+        return normalize_ticker(ticker)
+
+    def _trade_cost(self, ticker: str, side: str, *, price: float, shares: int):
+        return self.cost_schedule.calculate(
+            InstrumentProfile.from_ticker(ticker, lot_size=self.min_unit),
+            side,
+            price=price,
+            shares=shares,
+        )
+
+    def _max_affordable_shares(
+        self,
+        cash: float,
+        ticker: str,
+        price: float,
+    ) -> int:
+        if cash <= 0 or price <= 0 or self.min_unit <= 0:
+            return 0
+        lots = int(cash / price / self.min_unit)
+        while lots > 0:
+            shares = lots * self.min_unit
+            trade_cost = self._trade_cost(ticker, "buy", price=price, shares=shares)
+            if trade_cost.notional + trade_cost.total <= cash + 1e-9:
+                return shares
+            lots -= 1
+        return 0
+
+    def _max_affordable_quote(
+        self,
+        cash: float,
+        ticker: str,
+        shares: int,
+    ) -> float:
+        if cash <= 0 or shares <= 0:
+            return 0.0
+        low, high = 0.0, cash / shares
+        for _ in range(64):
+            middle = (low + high) / 2.0
+            trade_cost = self._trade_cost(ticker, "buy", price=middle, shares=shares)
+            if trade_cost.notional + trade_cost.total <= cash:
+                low = middle
+            else:
+                high = middle
+        return low
 
     @staticmethod
     def realtime_quotes_enabled() -> bool:
@@ -1825,31 +1878,32 @@ class InvestmentSimulation:
                 }
 
             cost = shares_to_buy * price
-            commission = cost * self.trading_fee
-            slippage_cost = cost * self.slippage_rate
-            total_fee = commission + slippage_cost
+            trade_cost = self._trade_cost(
+                ticker,
+                "buy",
+                price=price,
+                shares=shares_to_buy,
+            )
+            commission = trade_cost.commission
+            slippage_cost = trade_cost.slippage
+            total_fee = trade_cost.total
             total_cost = cost + total_fee
 
             if total_cost > self.cash:
                 # 资金不足，调整数量
-                max_shares = int(
-                    self.cash
-                    / price
-                    / (1 + self.trading_fee + self.slippage_rate)
-                    / self.min_unit
-                ) * self.min_unit
+                max_shares = self._max_affordable_shares(self.cash, ticker, price)
                 if max_shares <= 0:
-                    one_lot_cash_cost = (
-                        float(price)
-                        * int(self.min_unit)
-                        * (1 + self.trading_fee + self.slippage_rate)
+                    one_lot_cost = self._trade_cost(
+                        ticker,
+                        "buy",
+                        price=price,
+                        shares=int(self.min_unit),
                     )
-                    max_cash_quote = (
-                        self.cash
-                        / int(self.min_unit)
-                        / (1 + self.trading_fee + self.slippage_rate)
-                        if self.min_unit > 0
-                        else 0.0
+                    one_lot_cash_cost = one_lot_cost.notional + one_lot_cost.total
+                    max_cash_quote = self._max_affordable_quote(
+                        self.cash,
+                        ticker,
+                        int(self.min_unit),
                     )
                     return {
                         'success': True,
@@ -1873,9 +1927,15 @@ class InvestmentSimulation:
                     }
                 shares_to_buy = max_shares
                 cost = shares_to_buy * price
-                commission = cost * self.trading_fee
-                slippage_cost = cost * self.slippage_rate
-                total_fee = commission + slippage_cost
+                trade_cost = self._trade_cost(
+                    ticker,
+                    "buy",
+                    price=price,
+                    shares=shares_to_buy,
+                )
+                commission = trade_cost.commission
+                slippage_cost = trade_cost.slippage
+                total_fee = trade_cost.total
                 total_cost = cost + total_fee
 
             new_cash = self.cash - total_cost
@@ -1941,6 +2001,8 @@ class InvestmentSimulation:
                             intent_id=intent_id,
                             pending_decision_id=pending_decision_id,
                             traded_at=now.isoformat(),
+                            asset_type=trade_cost.instrument_type.value,
+                            cost_model_version=trade_cost.model_version,
                         )
                     )
                     trade_id = committed.trade_id
@@ -2028,10 +2090,16 @@ class InvestmentSimulation:
                 shares_to_sell = current_shares
 
             proceeds = shares_to_sell * price
-            trading_fee = proceeds * self.trading_fee
-            stamp_duty = proceeds * self.stamp_duty  # 印花税
-            slippage_cost = proceeds * self.slippage_rate
-            total_fee = trading_fee + stamp_duty + slippage_cost
+            trade_cost = self._trade_cost(
+                ticker,
+                "sell",
+                price=price,
+                shares=shares_to_sell,
+            )
+            trading_fee = trade_cost.commission
+            stamp_duty = trade_cost.stamp_duty
+            slippage_cost = trade_cost.slippage
+            total_fee = trade_cost.total
             net_proceeds = proceeds - total_fee
 
             new_cash = self.cash + net_proceeds
@@ -2078,6 +2146,8 @@ class InvestmentSimulation:
                             intent_id=intent_id,
                             pending_decision_id=pending_decision_id,
                             traded_at=now.isoformat(),
+                            asset_type=trade_cost.instrument_type.value,
+                            cost_model_version=trade_cost.model_version,
                         )
                     )
                     trade_id = committed.trade_id

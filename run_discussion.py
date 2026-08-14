@@ -62,6 +62,7 @@ from sovereign_hall.services.heuristic_policy import (
     recent_prediction_observation_count,
 )
 from sovereign_hall.domain.common.ids import new_id
+from sovereign_hall.domain.portfolio.instruments import is_etf_ticker
 
 # 延迟导入Agent避免循环引用
 Agent = None
@@ -2169,7 +2170,7 @@ def proposal_priority_score(proposal: Dict) -> float:
 
 
 def is_substitute_etf(ticker: str) -> bool:
-    return str(ticker or "").startswith(("159", "510", "511", "512", "513", "515", "516", "517", "518", "560", "561", "562", "563", "588"))
+    return is_etf_ticker(ticker)
 
 
 def choose_review_depth(proposal: Dict) -> str:

@@ -44,6 +44,7 @@ spider:
 # 模拟投资配置
 simulation:
   enabled: true
+  execution_mode: "simulation"  # 只允许 simulation/paper；live 会在启动时硬失败
   initial_capital: 10000  # 初始资金 10000 元
   target_invested_ratio: 1.0  # 模拟资金全部属于投资组合，不因风险偏好保留战略现金
   realtime_quotes_required: true  # 当前估值、盈亏、持仓复核和模拟成交只允许实时行情
@@ -63,9 +64,25 @@ simulation:
   minimum_healthy_invested_ratio: 0.80
   min_unit: 100  # 最小买卖单位：一手=100股
   trading_fee: 0.0003  # 佣金万三
-  stamp_duty: 0.001  # 印花税千一（卖出时）
+  minimum_commission: 5.0  # 单笔最低佣金，1万元小账户不得忽略
+  stamp_duty: 0.0005  # A股卖出印花税万五
+  etf_stamp_duty: 0.0  # 场内ETF不收证券交易印花税
   slippage_rate: 0.0005  # 买卖双边模拟滑点，计入现金与净收益
+  cost_model_version: "cn_a_share_etf_v1_20260814"
   max_daily_trades: 5  # 每个交易日最多5笔模拟成交；逐仓退出和投委会交易共用该额度
+
+# 可信收益验证：默认仅影子运行，不改变当前模拟账户
+shadow_evaluation:
+  enabled: true
+  initial_capital: 10000
+  execution_mode: "paper"
+  cagr_target: 0.15
+  max_drawdown_budget: 0.15
+  risk_reduction_drawdown: 0.10
+  minimum_annualization_sessions: 252
+  systematic_qualification_sessions: 756
+  llm_qualification_sessions: 252
+  llm_minimum_closed_trades: 100
 
 # 向量数据库
 vector_db:

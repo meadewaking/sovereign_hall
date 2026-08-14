@@ -41,6 +41,14 @@ from sovereign_hall.services.simulation_performance import (
     PERFORMANCE_STANDARD,
     collect_simulation_performance,
 )
+from sovereign_hall.domain.portfolio.costs import (
+    DEFAULT_COST_MODEL_VERSION,
+    CostSchedule,
+)
+from sovereign_hall.domain.portfolio.instruments import (
+    is_etf_ticker,
+    normalize_ticker,
+)
 
 
 @dataclass(frozen=True)
@@ -84,17 +92,24 @@ class PolicyConfig:
 @dataclass(frozen=True)
 class CostConfig:
     trading_fee: float = 0.0003
-    stamp_duty: float = 0.0010
+    minimum_commission: float = 5.0
+    stamp_duty: float = 0.0005
+    etf_stamp_duty: float = 0.0
     slippage: float = 0.0005
+    initial_capital: float = 10000.0
+    cost_model_version: str = DEFAULT_COST_MODEL_VERSION
 
-
-def normalize_ticker(ticker: Any) -> str:
-    code = str(ticker or "").strip().upper()
-    return code.split(".")[0] if "." in code else code
-
-
-def is_etf_ticker(ticker: Any) -> bool:
-    return normalize_ticker(ticker).startswith(("15", "51", "56", "58"))
+    def schedule(self) -> CostSchedule:
+        if float(self.initial_capital) != 10000.0:
+            raise ValueError("heuristic compatibility evaluation is fixed to 10000 RMB")
+        return CostSchedule(
+            commission_rate=self.trading_fee,
+            minimum_commission=self.minimum_commission,
+            stock_sell_stamp_duty=self.stamp_duty,
+            etf_sell_stamp_duty=self.etf_stamp_duty,
+            slippage_rate=self.slippage,
+            version=self.cost_model_version,
+        )
 
 
 def capped_proportional_allocation(scores: dict[str, float], total_weight: float, max_weight: float) -> dict[str, float]:
@@ -491,8 +506,20 @@ def cost_for_rebalance(old: dict[str, float], new: dict[str, float], costs: Cost
     tickers = set(old) | set(new)
     buy_turnover = sum(max(new.get(t, 0.0) - old.get(t, 0.0), 0.0) for t in tickers)
     sell_turnover = sum(max(old.get(t, 0.0) - new.get(t, 0.0), 0.0) for t in tickers)
-    cost = buy_turnover * (costs.trading_fee + costs.slippage)
-    cost += sell_turnover * (costs.trading_fee + costs.stamp_duty + costs.slippage)
+    schedule = costs.schedule()
+    cash_cost = 0.0
+    for ticker in tickers:
+        buy_weight = max(new.get(ticker, 0.0) - old.get(ticker, 0.0), 0.0)
+        sell_weight = max(old.get(ticker, 0.0) - new.get(ticker, 0.0), 0.0)
+        if buy_weight > 0:
+            cash_cost += schedule.calculate(
+                ticker, "buy", notional=buy_weight * costs.initial_capital
+            ).total
+        if sell_weight > 0:
+            cash_cost += schedule.calculate(
+                ticker, "sell", notional=sell_weight * costs.initial_capital
+            ).total
+    cost = cash_cost / costs.initial_capital
     trade_count = sum(1 for t in tickers if abs(new.get(t, 0.0) - old.get(t, 0.0)) > 1e-9)
     return buy_turnover + sell_turnover, cost, trade_count
 
@@ -537,7 +564,8 @@ def summarize_metrics(
             "sample_end": sample_end,
             "days": 0,
             "total_return": 0.0,
-            "annualized_return": 0.0,
+            "annualized_return": None,
+            "annualization_status": "insufficient_history",
             "max_drawdown": 0.0,
             "sharpe": 0.0,
             "sortino": 0.0,
@@ -565,7 +593,10 @@ def summarize_metrics(
     returns = [row["net_return"] for row in curve]
     total_return = curve[-1]["equity"] - 1.0
     days = max(1, len(curve))
-    annualized = (1.0 + total_return) ** (252.0 / days) - 1.0 if total_return > -1 else -1.0
+    annualized = (
+        (1.0 + total_return) ** (252.0 / days) - 1.0
+        if days >= 252 and total_return > -1 else None
+    )
     dd, _, _ = max_drawdown_from_curve(curve)
     std = pstdev(returns) if len(returns) > 1 else 0.0
     downside = [value for value in returns if value < 0]
@@ -589,7 +620,8 @@ def summarize_metrics(
         "sample_end": sample_end,
         "days": days,
         "total_return": float(total_return),
-        "annualized_return": float(annualized),
+        "annualized_return": float(annualized) if annualized is not None else None,
+        "annualization_status": "available" if annualized is not None else "insufficient_history",
         "max_drawdown": float(dd),
         "sharpe": float(sharpe),
         "sortino": float(sortino),
@@ -623,10 +655,7 @@ def run_backtest(
     price_history: dict[tuple[str, str], float] | None = None,
 ) -> dict[str, Any]:
     dates = sorted({row["date"] for row in daily})
-    cost_assumption = (
-        f"fee={costs.trading_fee:.4%}, stamp_duty={costs.stamp_duty:.4%}, "
-        f"slippage={costs.slippage:.4%}, applied on turnover"
-    )
+    cost_assumption = costs.schedule().assumption_text() + "; capital=10000"
     if len(dates) < 2:
         metrics = summarize_metrics([], [], 0.0, 0.0, cost_assumption, "", "")
         return {"metrics": metrics, "curve": [], "trades": []}
@@ -1646,6 +1675,12 @@ def write_readme(
     tape_update: dict[str, Any],
     command: str,
 ) -> None:
+    annualized_value = best_metrics.get("annualized_return")
+    annualized_text = (
+        f"{float(annualized_value):.4%}"
+        if annualized_value is not None
+        else "sample insufficient (<252 trading sessions); not reported"
+    )
     comparison = "No previous heuristic_cycle best was found."
     if previous_score is not None and previous_path is not None:
         previous_metrics = read_json(previous_path)
@@ -1753,7 +1788,7 @@ def write_readme(
 
 ## Best Metrics
 - Total return: {best_metrics['total_return']:.4%}
-- Annualized return: {best_metrics['annualized_return']:.4%}
+- Annualized return: {annualized_text}
 - Max drawdown: {best_metrics['max_drawdown']:.4%}
 - Sharpe: {best_metrics['sharpe']:.3f}
 - Sortino: {best_metrics['sortino']:.3f}
@@ -2019,7 +2054,25 @@ def main() -> int:
             "defaults to the previous run's realtime measurement"
         ),
     )
+    parser.add_argument(
+        "--canonical-shadow",
+        action="store_true",
+        help=(
+            "Compatibility route to the canonical event-driven shadow evaluator; "
+            "the stdlib heuristic remains an unqualified diagnostic"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.canonical_shadow:
+        from scripts.run_shadow_evaluation import build_parser as shadow_parser
+        from scripts.run_shadow_evaluation import run as run_shadow
+
+        output_root = str(Path(args.runs_root).parent / "shadow_evaluation")
+        forwarded = ["--db", args.db, "--output-root", output_root]
+        if args.timestamp:
+            forwarded.extend(("--timestamp", args.timestamp))
+        return asyncio.run(run_shadow(shadow_parser().parse_args(forwarded)))
 
     project_root = Path.cwd()
     if str(project_root) not in sys.path:

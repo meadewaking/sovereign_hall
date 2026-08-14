@@ -268,7 +268,9 @@ simulation:
   initial_capital: 10000
   min_unit: 100
   trading_fee: 0.0003
-  stamp_duty: 0.001
+  minimum_commission: 5.0
+  stamp_duty: 0.0005
+  etf_stamp_duty: 0.0
   slippage_rate: 0.0005
   max_daily_trades: 5
   max_realtime_quote_age_seconds: 120

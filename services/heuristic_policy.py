@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from ..domain.portfolio.instruments import is_etf_ticker, normalize_ticker
 from .reward_policy import MAX_DAILY_TRADES
 from .simulation_performance import (
     PERFORMANCE_FORMULA,
@@ -1668,16 +1669,6 @@ def apply_heuristic_risk_cap(
     if risk_notes:
         return capped, "；".join(risk_notes)
     return capped, None
-
-
-def normalize_ticker(ticker: str) -> str:
-    code = str(ticker or "").strip().upper()
-    return code.split(".")[0] if "." in code else code
-
-
-def is_etf_ticker(ticker: str) -> bool:
-    code = normalize_ticker(ticker)
-    return code.startswith(("15", "51", "56", "58"))
 
 
 def sleeve_constraint_reason(context: HeuristicRiskContext, ticker: str) -> str | None:

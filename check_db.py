@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from sovereign_hall.core.config import get_config
+from sovereign_hall.domain.portfolio.instruments import normalize_ticker
 from sovereign_hall.services.heuristic_policy import (
     prepare_candidate_rejection_feedback,
     sanitize_candidate_rejection_reason,
@@ -91,11 +92,6 @@ def is_fresh_realtime_quote(quote: Any) -> bool:
         and bool(str(quote.get("source") or "").strip())
         and -60 <= age <= maximum
     )
-
-
-def normalize_ticker(ticker: str) -> str:
-    code = str(ticker or "").strip().upper()
-    return code.split(".")[0] if "." in code else code
 
 
 def filter_supported_candidate_rejections(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
