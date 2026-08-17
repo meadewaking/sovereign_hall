@@ -4586,6 +4586,32 @@ def select_simulation_terminal(
     return "no_evidence"
 
 
+def round_has_operational_result(
+    final_round: Any,
+    simulation_result: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return whether a completed loop made durable production progress.
+
+    A deferred intent replay keeps the fill on its originating ``round_id``.
+    Consequently the current research round may correctly remain
+    ``no_evidence`` while this invocation still committed a real simulated
+    fill.  Such activity must reset the empty-round backoff without relabeling
+    the current round or treating research coverage as reward.
+    """
+    if final_round is None:
+        return False
+    status = getattr(final_round, "status", None)
+    status_value = getattr(status, "value", status)
+    if str(status_value or "") != "completed":
+        return False
+    cycle_fills = int((simulation_result or {}).get("cycle_fills") or 0)
+    return bool(
+        cycle_fills > 0
+        or getattr(final_round, "terminal_code", None)
+        not in {"no_evidence", "failed"}
+    )
+
+
 # ============================================================================
 # 主循环
 # ============================================================================
@@ -4830,6 +4856,9 @@ async def main():
             iteration += 1
             docs = []
             proposals = []
+            # Reset every iteration so an exception cannot reuse the previous
+            # round's fill activity when deciding empty-round backoff.
+            simulation_result: Dict[str, Any] = {}
             round_start = datetime.now()
             round_start_stats = llm.get_stats()
             round_record = await round_coordinator.start(
@@ -5531,14 +5560,30 @@ async def main():
                 final_round
                 and final_round.status == ResearchRoundStatus.COMPLETED
             )
-            has_valid_result = bool(
-                round_completed
-                and final_round.terminal_code not in {"no_evidence", "failed"}
+            has_operational_result = round_has_operational_result(
+                final_round,
+                simulation_result,
             )
 
-            if has_valid_result:
+            if has_operational_result:
                 if empty_rounds > 0:
-                    logger.info(f"恢复搜索，成功获取{len(docs)}篇文档和{len(proposals)}个提案")
+                    cycle_fills = int(simulation_result.get("cycle_fills") or 0)
+                    if cycle_fills > 0:
+                        logger.info(
+                            "恢复生产活动，新增可审计模拟成交%s笔 "
+                            "(current_round=%s pending_replay=%s); "
+                            "研究终态=%s",
+                            cycle_fills,
+                            simulation_result.get("fills", 0),
+                            simulation_result.get("replay_fills", 0),
+                            final_round.terminal_code if final_round else "missing",
+                        )
+                    else:
+                        logger.info(
+                            "恢复搜索，成功获取%s篇文档和%s个提案",
+                            len(docs),
+                            len(proposals),
+                        )
                 empty_rounds = 0
             else:
                 empty_rounds += 1
@@ -5591,7 +5636,7 @@ async def main():
                 print("\n✅ --once 模式：本轮完成后退出")
                 break
 
-            if has_valid_result:
+            if has_operational_result:
                 print(f"\n💤 休息 1 秒后继续...")
                 await asyncio.sleep(1)
             else:

@@ -90,6 +90,7 @@ from sovereign_hall.run_discussion import (
     proposal_priority_score,
     prioritize_deployment_research,
     rank_stage2_documents,
+    round_has_operational_result,
     select_stage2_candidate_source_excerpts,
     select_simulation_terminal,
     select_next_topic,
@@ -2940,6 +2941,41 @@ async def test_pending_replay_fills_count_in_cycle_without_reassigning_current_r
     assert result["cycle_fills"] == 3
     attempt = simulation.record_redeployment_attempt.await_args.kwargs
     assert attempt["trade_count"] == 3
+
+
+def test_pending_replay_fill_resets_empty_backoff_without_reassigning_round_terminal():
+    current_round = ResearchRound(
+        base_topic="current empty research",
+        research_objective="research without inventing evidence",
+        status=ResearchRoundStatus.COMPLETED,
+        current_stage=ResearchRoundStatus.COMPLETED.value,
+        terminal_code="no_evidence",
+        terminal_reason="stage2 returned no proposal",
+    )
+
+    assert round_has_operational_result(
+        current_round,
+        {"fills": 0, "replay_fills": 1, "cycle_fills": 1},
+    )
+    assert current_round.terminal_code == "no_evidence"
+    assert not round_has_operational_result(
+        current_round,
+        {"fills": 0, "replay_fills": 0, "cycle_fills": 0},
+    )
+
+
+def test_incomplete_round_cannot_reuse_previous_cycle_fill_activity():
+    active_round = ResearchRound(
+        base_topic="interrupted research",
+        research_objective="must reach a durable terminal",
+        status=ResearchRoundStatus.SOURCES_PERSISTED,
+        current_stage=ResearchRoundStatus.SOURCES_PERSISTED.value,
+    )
+
+    assert not round_has_operational_result(
+        active_round,
+        {"fills": 0, "replay_fills": 1, "cycle_fills": 1},
+    )
 
 
 def test_weaker_research_terminal_cannot_overwrite_atomic_fill_terminal():
