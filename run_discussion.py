@@ -809,7 +809,11 @@ class SingleInstanceLock:
 
         self._handle.seek(0)
         self._handle.truncate()
-        source_mtime_ns = Path(__file__).stat().st_mtime_ns
+        from sovereign_hall.services.storage_governor import (
+            production_source_mtime_ns,
+        )
+
+        source_mtime_ns = production_source_mtime_ns(Path(__file__))
         self._handle.write(
             f"pid={os.getpid()} started_at={datetime.now().isoformat()} "
             f"source_mtime_ns={source_mtime_ns}\n"

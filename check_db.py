@@ -2039,12 +2039,39 @@ def show_runtime_storage_status(db_path: Path) -> dict[str, Any]:
             f"code_stale={str(bool(runner.get('code_stale'))).lower()}"
         )
     else:
-        print("   生产 runner: 未运行")
+        print(
+            "   生产 runner: 未运行 | "
+            f"stale_lock={str(bool(runner.get('stale_lock'))).lower()} | "
+            f"last_pid={runner.get('pid') or 'N/A'}"
+        )
+    if status.get("unterminated_round_count") is not None:
+        if runner.get("pid_alive"):
+            print(
+                "   活动中研究轮: "
+                f"{int(status['unterminated_round_count'])} | "
+                "由当前单实例 runner 持续推进"
+            )
+        else:
+            print(
+                "   待启动恢复研究轮: "
+                f"{int(status['unterminated_round_count'])} | "
+                "canonical run_discussion 启动时原子收敛为 failed"
+            )
     if status["blockers"]:
+        actions = []
+        if "production_runner_not_running" in status["blockers"]:
+            actions.append("启动 canonical python -m sovereign_hall.run_discussion")
+        if "orphaned_rounds_pending_startup_recovery" in status["blockers"]:
+            actions.append("由单实例启动恢复遗留 round，禁止手工伪造终态")
+        if "stale_runner_code" in status["blockers"]:
+            actions.append("协作替换旧 runner")
+        if any("storage_pressure" in item for item in status["blockers"]):
+            actions.append("离线压缩后再开放研究轮")
         print(
             "   ❌ 生产阻塞: "
             + ", ".join(status["blockers"])
-            + "；先协作收敛 active round、离线压缩并部署当前代码。"
+            + "；下一动作="
+            + "；".join(actions)
         )
     return status
 

@@ -101,6 +101,9 @@ from sovereign_hall.services.simulation_performance import (
     PERFORMANCE_STANDARD,
     collect_simulation_performance,
 )
+from sovereign_hall.services.heuristic_policy import (
+    build_price_readiness_stall_report,
+)
 from sovereign_hall.domain.portfolio.costs import (
     DEFAULT_COST_MODEL_VERSION,
     CostSchedule,
@@ -3620,8 +3623,6 @@ def main() -> int:
     price_readiness["backfill_plan_path"] = backfill_plan_summary.get("plan_csv", "")
     price_readiness["backfill_plan_summary_path"] = backfill_plan_summary.get("plan_json", "")
     write_json(run_dir / "price_readiness.json", price_readiness)
-    from services.heuristic_policy import build_price_readiness_stall_report
-
     price_readiness_stall = build_price_readiness_stall_report(
         runs_root,
         pending_run_dir=run_dir,
