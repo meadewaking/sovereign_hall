@@ -1311,7 +1311,15 @@ async def record_proposal_lot_screening_event(
 # ============================================================================
 # 阶段1：海量信息搜索（高并发）
 # ============================================================================
-async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) -> list:
+async def stage1_mass_search(
+    llm,
+    spiders,
+    topic: str,
+    query_count: int = 30,
+    *,
+    round_coordinator=None,
+    round_id: str | None = None,
+) -> list:
     """阶段1：海量信息搜索"""
     from sovereign_hall.core.config import get_config
 
@@ -1400,6 +1408,39 @@ async def stage1_mass_search(llm, spiders, topic: str, query_count: int = 30) ->
         all_queries,
         max_results_per_query=max_results_per_query,
     )
+    generator_gate = dict(getattr(query_gen, "last_validation_report", {}) or {})
+    provider_gate = dict(getattr(spiders, "last_query_gate_report", {}) or {})
+    if round_coordinator is not None and round_id:
+        await round_coordinator.record_event(
+            round_id,
+            "SearchQueriesValidated",
+            {
+                "generated_candidate_count": int(
+                    generator_gate.get("candidate_count") or 0
+                ),
+                "generated_accepted_count": int(
+                    generator_gate.get("accepted_count") or 0
+                ),
+                "generator_rejection_counts": dict(
+                    generator_gate.get("rejection_counts") or {}
+                ),
+                "generator_rejected_samples": list(
+                    generator_gate.get("rejected_samples") or []
+                )[:3],
+                "submitted_query_count": len(all_queries),
+                "provider_accepted_count": int(
+                    provider_gate.get("accepted_count") or 0
+                ),
+                "provider_rejection_counts": dict(
+                    provider_gate.get("rejection_counts") or {}
+                ),
+                "provider_rejected_samples": list(
+                    provider_gate.get("rejected_samples") or []
+                )[:3],
+                "result_document_count": len(raw_docs),
+                "network_enabled": bool(getattr(spiders, "network_enabled", True)),
+            },
+        )
     if deployment_research and raw_docs:
         evidence_queries = build_deployment_evidence_queries(raw_docs)
         if evidence_queries:
@@ -4999,13 +5040,27 @@ async def main():
                     pass
                 elif should_force_search and not existing_docs:
                     print(f"\n📚 阶段1：本地数据不足，进行搜索补充...")
-                    docs = await stage1_mass_search(llm, spiders, topic, query_count=search_query_count)
+                    docs = await stage1_mass_search(
+                        llm,
+                        spiders,
+                        topic,
+                        query_count=search_query_count,
+                        round_coordinator=round_coordinator,
+                        round_id=active_round_id,
+                    )
                 elif existing_docs and len(existing_docs) >= 10 and not force_search_due:
                     print(f"\n📚 阶段1：使用本地数据 ({len(existing_docs)} 条相关文档)")
                     docs = existing_docs
                 else:
                     print(f"\n📚 阶段1：定期更新数据 (每 {force_search_interval or 'N'} 轮强制搜索)")
-                    docs = await stage1_mass_search(llm, spiders, topic, query_count=search_query_count)
+                    docs = await stage1_mass_search(
+                        llm,
+                        spiders,
+                        topic,
+                        query_count=search_query_count,
+                        round_coordinator=round_coordinator,
+                        round_id=active_round_id,
+                    )
                     if not docs and existing_docs:
                         logger.warning(
                             "阶段1：外部搜索返回0篇，回退使用本地数据 %s 条，避免后续阶段空转",

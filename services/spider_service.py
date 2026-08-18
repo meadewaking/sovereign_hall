@@ -34,6 +34,59 @@ from .llm_client import LLMClient
 logger = logging.getLogger(__name__)
 
 MAX_STORED_CONTENT_CHARS = 50000
+MAX_SEARCH_QUERY_CHARS = 80
+
+_SEARCH_QUERY_PLACEHOLDER_PATTERNS = [
+    "查询词", "示例", "占位", "xxx", "test",
+    "投资机会", "股票推荐", "a股市场",
+]
+_NUMBERED_PLACEHOLDER_QUERY = re.compile(
+    r"^(?:query|search[\s_-]*query|keyword|词|搜索词|关键词)[\s_:#-]*\d*$",
+    re.IGNORECASE,
+)
+_SEARCH_QUERY_META_INSTRUCTION_PATTERNS = (
+    "搜索词格式修复器",
+    "整理为合法json",
+    "只输出json",
+    "原回答中",
+    "不得新增原回答",
+    "没有明确搜索词时输出",
+    "将下面原回答",
+)
+_GENERIC_SEARCH_QUERY_WORDS = {
+    "最新", "最新消息", "新闻", "行情", "大盘", "a股", "股市",
+    "政策", "财报", "业绩", "研报", "机构", "评级",
+    "龙头", "产业链", "供需", "库存", "价格",
+}
+
+
+def search_query_rejection_code(query: str, topic: str = None) -> Optional[str]:
+    """Return a stable code when a string must not reach a search provider.
+
+    Query-format repair is itself LLM-generated.  A model can echo the repair
+    instruction as a JSON string, so parsing success is not sufficient proof
+    that the value is a search query.  Keep this deterministic gate available
+    to both the generator and the network boundary.
+    """
+    q = (query or "").strip()
+    if not q or len(q) < 2:
+        return "empty_or_too_short"
+    if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", q):
+        return "punctuation_only"
+    low = re.sub(r"\s+", "", q.lower())
+    if any(pattern in low for pattern in _SEARCH_QUERY_META_INSTRUCTION_PATTERNS):
+        return "meta_instruction_leak"
+    if len(q) > MAX_SEARCH_QUERY_CHARS:
+        return "query_too_long"
+    if "\n" in q or "\r" in q:
+        return "multiline_query"
+    if _NUMBERED_PLACEHOLDER_QUERY.fullmatch(q.lower()):
+        return "numbered_placeholder"
+    if any(pattern in q.lower() for pattern in _SEARCH_QUERY_PLACEHOLDER_PATTERNS):
+        return "placeholder_or_generic"
+    if q in _GENERIC_SEARCH_QUERY_WORDS and topic and topic not in q:
+        return "generic_without_topic"
+    return None
 
 
 class SpiderSwarm:
@@ -133,6 +186,12 @@ class SpiderSwarm:
         default_source_timeout = max(10, min(20, self.timeout // 2 or 15))
         self.source_timeout = int(spider_config.get('source_timeout', default_source_timeout))
         self.network_enabled = bool(network_enabled)
+        self.last_query_gate_report: Dict[str, Any] = {
+            "candidate_count": 0,
+            "accepted_count": 0,
+            "rejection_counts": {},
+            "rejected_samples": [],
+        }
 
         # 搜索结果缓存（类级别共享，同一轮次内有效）
         self._search_cache: Dict[str, Tuple[List[Doc], float]] = {}  # query -> (docs, timestamp)
@@ -209,6 +268,38 @@ class SpiderSwarm:
             文档列表
         """
         import time
+        query_candidates = list(queries or [])
+        accepted_queries: List[str] = []
+        rejection_counts: Dict[str, int] = {}
+        rejected_samples: List[str] = []
+        seen_queries: Set[str] = set()
+        for raw_query in query_candidates:
+            query = str(raw_query or "").strip()
+            code = search_query_rejection_code(query)
+            key = query.lower()
+            if code is None and key in seen_queries:
+                code = "duplicate_query"
+            if code is not None:
+                rejection_counts[code] = rejection_counts.get(code, 0) + 1
+                if query and len(rejected_samples) < 3:
+                    rejected_samples.append(query[:120])
+                continue
+            seen_queries.add(key)
+            accepted_queries.append(query)
+        self.last_query_gate_report = {
+            "candidate_count": len(query_candidates),
+            "accepted_count": len(accepted_queries),
+            "rejection_counts": rejection_counts,
+            "rejected_samples": rejected_samples,
+        }
+        if rejection_counts:
+            logger.warning(
+                "Search query safety gate removed %s/%s values before provider calls: %s",
+                len(query_candidates) - len(accepted_queries),
+                len(query_candidates),
+                json.dumps(rejection_counts, ensure_ascii=False, sort_keys=True),
+            )
+        queries = accepted_queries
         if not queries:
             return []
 
@@ -1098,6 +1189,12 @@ class SearchQueryGenerator:
 
     def __init__(self, llm_client: LLMClient):
         self.llm = llm_client
+        self.last_validation_report: Dict[str, Any] = {
+            "candidate_count": 0,
+            "accepted_count": 0,
+            "rejection_counts": {},
+            "rejected_samples": [],
+        }
 
     async def generate_queries(
         self,
@@ -1116,8 +1213,27 @@ class SearchQueryGenerator:
         """
         MAX_RETRIES = 3  # 最大重试次数
         seeds = seeds or self.DEFAULT_SEEDS
+        validation_candidate_count = 0
+        validation_rejection_counts: Dict[str, int] = {}
+        validation_rejected_samples: List[str] = []
+
+        def reject_query(query: str, code: str) -> None:
+            validation_rejection_counts[code] = (
+                validation_rejection_counts.get(code, 0) + 1
+            )
+            if query and len(validation_rejected_samples) < 3:
+                validation_rejected_samples.append(query[:120])
+
+        def save_validation_report(accepted_count: int) -> None:
+            self.last_validation_report = {
+                "candidate_count": validation_candidate_count,
+                "accepted_count": int(accepted_count),
+                "rejection_counts": dict(validation_rejection_counts),
+                "rejected_samples": list(validation_rejected_samples),
+            }
 
         def parse_query_list(raw_response: str) -> List[str]:
+            nonlocal validation_candidate_count
             parsed = safe_parse_json(raw_response, [])
             if not parsed:
                 try:
@@ -1131,12 +1247,18 @@ class SearchQueryGenerator:
                 parsed = matches[:30] if matches else []
             if not isinstance(parsed, list):
                 return []
-            return [
-                str(query).strip()
-                for query in parsed
-                if isinstance(query, str)
-                and self._is_valid_query(query, topic=topic_str)
-            ]
+            accepted: List[str] = []
+            for query in parsed:
+                if not isinstance(query, str):
+                    continue
+                normalized = query.strip()
+                validation_candidate_count += 1
+                code = search_query_rejection_code(normalized, topic=topic_str)
+                if code is not None:
+                    reject_query(normalized, code)
+                    continue
+                accepted.append(normalized)
+            return accepted
 
         topic_str = topic or "当前A股投资机会"
         format_example = json.dumps(
@@ -1237,6 +1359,8 @@ class SearchQueryGenerator:
                 if key and key not in seen:
                     seen.add(key)
                     deduped.append(q)
+                elif key:
+                    reject_query(q, "duplicate_query")
             queries = deduped
 
             # 调试：记录原始响应
@@ -1245,6 +1369,7 @@ class SearchQueryGenerator:
                 raise ValueError("Failed to parse queries from response")
 
             if isinstance(queries, list) and len(queries) >= 1:
+                save_validation_report(len(queries[:count]))
                 logger.info(f"Generated {len(queries)} queries successfully")
                 return queries[:count]
 
@@ -1273,46 +1398,26 @@ class SearchQueryGenerator:
             except Exception as exc:
                 logger.warning("加载默认搜索种子失败，使用兜底种子: %s", exc)
                 fallback = ["投资机会", "A股市场", "股票推荐"]
-        return fallback[:count]
+        accepted_fallback = []
+        for query in fallback:
+            validation_candidate_count += 1
+            code = search_query_rejection_code(query, topic=topic or None)
+            if code is not None:
+                reject_query(query, code)
+                continue
+            accepted_fallback.append(query)
+        save_validation_report(len(accepted_fallback[:count]))
+        return accepted_fallback[:count]
 
     # 占位符/泛词黑名单（小写匹配）
-    _PLACEHOLDER_PATTERNS = [
-        "查询词", "示例", "占位", "xxx", "test",
-        "投资机会", "股票推荐", "a股市场",  # 兜底词，不应出现在真实结果中
-    ]
-    _NUMBERED_PLACEHOLDER_QUERY = re.compile(
-        r"^(?:query|search[\s_-]*query|keyword|词|搜索词|关键词)[\s_:#-]*\d*$",
-        re.IGNORECASE,
-    )
+    _PLACEHOLDER_PATTERNS = _SEARCH_QUERY_PLACEHOLDER_PATTERNS
+    _NUMBERED_PLACEHOLDER_QUERY = _NUMBERED_PLACEHOLDER_QUERY
     # 通用泛词黑名单（独立词时过滤）
-    _GENERIC_WORDS = {
-        "最新", "最新消息", "新闻", "行情", "大盘", "a股", "股市",
-        "政策", "财报", "业绩", "研报", "机构", "评级",
-        "龙头", "产业链", "供需", "库存", "价格",
-    }
+    _GENERIC_WORDS = _GENERIC_SEARCH_QUERY_WORDS
 
     def _is_valid_query(self, query: str, topic: str = None) -> bool:
         """校验查询词是否有效：非空、非占位符、非纯泛词。"""
-        q = (query or "").strip()
-        if not q or len(q) < 2:
-            return False
-        if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", q):
-            return False
-        low = q.lower()
-        # Reasoning models sometimes emit the literal JSON example keys
-        # ``query1``/``query2`` or Chinese equivalents such as ``词1``/``词2``.
-        # They previously passed character-level validation and consumed real
-        # network-search slots even though they carry no topic evidence.
-        if self._NUMBERED_PLACEHOLDER_QUERY.fullmatch(low):
-            return False
-        # 占位符直接过滤
-        for pat in self._PLACEHOLDER_PATTERNS:
-            if pat in low:
-                return False
-        # 纯泛词过滤（除非带了议题关键词）
-        if q in self._GENERIC_WORDS and topic and topic not in q:
-            return False
-        return True
+        return search_query_rejection_code(query, topic=topic) is None
 
     def get_default_seeds(self) -> Dict[str, List[str]]:
         """获取默认种子词"""

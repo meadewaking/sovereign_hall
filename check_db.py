@@ -1965,6 +1965,26 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
             "   🧾 未能回链原始资料的派生文档已在 stage2 前排除："
             f"{lineage.get('untraceable_document_count')} 条。"
         )
+    query_gate = status.get("search_query_gate") or {}
+    if query_gate:
+        rejected_count = int(query_gate.get("rejected_count") or 0)
+        rejection_counts = dict(query_gate.get("rejection_counts") or {})
+        if rejected_count:
+            print(
+                "   🧹 搜索词安全门已在 provider 调用前隔离 "
+                f"{rejected_count} 条无效输入："
+                + ", ".join(
+                    f"{code}={count}"
+                    for code, count in sorted(rejection_counts.items())
+                )
+            )
+        else:
+            print(
+                "   ✅ 搜索词安全门："
+                f"submitted={int(query_gate.get('submitted_query_count') or 0)}，"
+                f"provider_accepted={int(query_gate.get('provider_accepted_count') or 0)}，"
+                "无元指令/占位输入进入搜索 provider。"
+            )
     if health == "failed":
         print(
             "   ❌ 最近一轮失败；先查看 terminal_reason 和 round_events，"

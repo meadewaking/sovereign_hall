@@ -366,6 +366,53 @@ def test_search_query_generator_rejects_punctuation_only_placeholder():
 
 
 @pytest.mark.asyncio
+async def test_search_query_generator_rejects_format_repair_instruction_leak():
+    leaked_instruction = (
+        "将下面原回答中已经明确写出的搜索词整理为合法JSON字符串数组。"
+        "只保留与餐饮连锁扩张逻辑直接相关、可检索的词；只输出JSON数组。"
+    )
+    llm = AsyncMock()
+    llm.chat.return_value = json.dumps(
+        [leaked_instruction, "餐饮连锁门店同店收入"],
+        ensure_ascii=False,
+    )
+    generator = SearchQueryGenerator(llm)
+
+    queries = await generator.generate_queries(
+        count=5,
+        seeds={"macro": [], "sector": ["餐饮连锁"], "stocks": []},
+        topic="餐饮连锁扩张逻辑",
+    )
+
+    assert queries == ["餐饮连锁门店同店收入"]
+    assert generator.last_validation_report["rejection_counts"] == {
+        "meta_instruction_leak": 1,
+    }
+    assert generator.last_validation_report["accepted_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_spider_network_boundary_rejects_meta_instruction_defense_in_depth():
+    spider = SpiderSwarm(max_concurrent=1, timeout=1, retry_times=1)
+    spider._search_single_query = AsyncMock(return_value=[])
+    leaked_instruction = "将下面原回答中的搜索词整理为合法JSON；只输出JSON数组。"
+    try:
+        docs = await spider.aggressive_search(
+            [leaked_instruction, "云计算 财报"],
+            max_results_per_query=1,
+        )
+    finally:
+        await spider.close()
+
+    assert docs == []
+    spider._search_single_query.assert_awaited_once()
+    assert spider._search_single_query.await_args.args[0] == "云计算 财报"
+    assert spider.last_query_gate_report["rejection_counts"] == {
+        "meta_instruction_leak": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_search_query_generator_drops_numbered_placeholders_before_search():
     llm = AsyncMock()
     llm.chat.return_value = json.dumps(
