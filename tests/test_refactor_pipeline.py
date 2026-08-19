@@ -6066,6 +6066,50 @@ def test_materially_invested_book_keeps_normal_research_topic():
     assert prioritized == base_topic
 
 
+def test_actionable_residual_cash_queue_prioritizes_candidate_evidence_above_health_floor():
+    base_topic = "地产政策效果评估"
+
+    prioritized = prioritize_deployment_research(
+        base_topic,
+        {
+            "valuation_complete": True,
+            "total_assets": 9_718.45,
+            "invested_ratio": 0.9376,
+            "deployment_gap": 606.85,
+            "positions": {"512800": {"shares": 1100}},
+        },
+        {
+            "status": "blocked_no_approved_candidates",
+            "blocker_code": "missing_approved_candidates",
+        },
+    )
+
+    assert prioritized.startswith(base_topic)
+    assert "待部署606.85元（已投入94%）资金部署候选证据比较" in prioritized
+    assert not re.search(r"\b[03615]\d{5}\b", prioritized)
+
+
+def test_completed_residual_cash_queue_does_not_force_candidate_research():
+    base_topic = "家电以旧换新政策效果"
+
+    prioritized = prioritize_deployment_research(
+        base_topic,
+        {
+            "valuation_complete": True,
+            "total_assets": 10_000.0,
+            "invested_ratio": 0.99999,
+            "deployment_gap": 0.01,
+            "positions": {"600690": {"shares": 100}},
+        },
+        {
+            "status": "completed",
+            "blocker_code": "",
+        },
+    )
+
+    assert prioritized == base_topic
+
+
 def test_incomplete_realtime_valuation_does_not_claim_deployment_priority():
     base_topic = "家电以旧换新政策效果"
 

@@ -1075,16 +1075,48 @@ def prioritize_deployment_research(
     if total_assets <= 0:
         return topic
 
-    material_gap = max(1.0, total_assets * 0.20)
-    if deployment_gap < material_gap or invested_ratio >= 0.80:
-        return topic
-
     state = redeployment_state or {}
     status = str(state.get("status") or "")
     if status == "blocked_valuation_incomplete":
         return topic
 
-    book_state = "空仓" if not positions else f"低投入{invested_ratio:.0%}"
+    # The 80% invested-ratio threshold is a health/failure boundary, not the
+    # portfolio's deployment target.  Once the durable redeployment queue says
+    # that otherwise usable cash is blocked only by the absence of an approved
+    # candidate, keep online research focused on executable candidate evidence
+    # even when the book is above that health floor.  The old 20% material-gap
+    # shortcut stranded smaller but still actionable cash indefinitely and
+    # caused ordinary sector searches to keep proposing structurally
+    # unaffordable names.  This changes only the research objective: no ticker
+    # is inserted and all evidence, committee, realtime-quote and lot gates
+    # remain authoritative.
+    blocker_code = str(state.get("blocker_code") or "")
+    candidate_research_required = (
+        status
+        in {
+            "blocked_no_approved_candidates",
+            "partially_redeployed",
+            "pending_approved_candidates",
+        }
+        or blocker_code
+        in {
+            "missing_approved_candidates",
+            "released_capital_pending_redeployment",
+            "residual_operational_cash",
+        }
+    )
+    if not candidate_research_required:
+        material_gap = max(1.0, total_assets * 0.20)
+        if deployment_gap < material_gap or invested_ratio >= 0.80:
+            return topic
+    if deployment_gap <= 0.01:
+        return topic
+
+    book_state = (
+        "空仓"
+        if not positions
+        else f"待部署{deployment_gap:.2f}元（已投入{invested_ratio:.0%}）"
+    )
     return f"{topic}｜{book_state}资金部署候选证据比较"
 
 
