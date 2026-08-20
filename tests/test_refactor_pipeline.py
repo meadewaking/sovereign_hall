@@ -2841,6 +2841,90 @@ async def test_simulation_reviews_every_position_and_only_executes_fresh_exit():
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_exit_reuses_one_intent_across_research_rounds(
+    tmp_path,
+    monkeypatch,
+):
+    db = DatabaseService(str(tmp_path / "lifecycle_exit_idempotency.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    await db._connection.executemany(
+        """
+        INSERT INTO research_rounds (
+            id, base_topic, research_objective, status, current_stage,
+            engine_version, started_at, updated_at
+        ) VALUES (?, 'test', 'test', 'running', 'created', 'canonical_v1', ?, ?)
+        """,
+        [
+            ("round_first", datetime.now().isoformat(), datetime.now().isoformat()),
+            ("round_second", datetime.now().isoformat(), datetime.now().isoformat()),
+        ],
+    )
+    await db._connection.commit()
+    opened_at = "2026-08-19T09:30:00"
+    sim.positions = {
+        "588860": {
+            "shares": 1500,
+            "avg_cost": 0.63,
+            "opened_at": opened_at,
+        }
+    }
+    sim.resolve_trade_price_detail = AsyncMock(return_value={
+        "price": 0.73,
+        "source": "test_realtime_quote",
+        "price_at": datetime.now().isoformat(),
+    })
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {
+            "is_trading_day": AsyncMock(return_value=True),
+            "is_market_open": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(
+        "sovereign_hall.services.market_data.get_market_data",
+        lambda: fake_market,
+    )
+
+    first = await sim.review_open_positions(round_id="round_first")
+    second = await sim.review_open_positions(round_id="round_second")
+    intents = await db._connection.execute_fetchall(
+        """
+        SELECT id, round_id, idempotency_key, status
+        FROM execution_intents
+        WHERE ticker = '588860' AND direction = 'sell'
+        """
+    )
+    pending = await db._connection.execute_fetchall(
+        """
+        SELECT id, round_id, intent_id, status
+        FROM simulation_pending_decisions
+        WHERE ticker = '588860' AND direction = 'sell'
+        """
+    )
+    await db.close()
+
+    assert first[0]["action"] == "exit_pending_execution"
+    assert second[0]["action"] == "exit_pending_execution"
+    assert len(intents) == 1
+    assert tuple(intents[0][1:]) == (
+        "round_first",
+        f"lifecycle:588860:exit:{opened_at}",
+        "deferred",
+    )
+    assert len(pending) == 1
+    assert tuple(pending[0][1:]) == (
+        "round_first",
+        intents[0][0],
+        "pending_next_trading_session",
+    )
+    assert first[0]["execution"]["intent_id"] == intents[0][0]
+    assert second[0]["execution"]["intent_id"] == intents[0][0]
+
+
+@pytest.mark.asyncio
 async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(monkeypatch):
     """A lifecycle exit must be able to flow into same-cycle candidate sizing."""
     import sovereign_hall.run_discussion as discussion_module

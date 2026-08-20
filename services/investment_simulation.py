@@ -2331,6 +2331,16 @@ class InvestmentSimulation:
 
             result = review.as_dict()
             if review.action == "exit" and executable_price:
+                # A lifecycle exit belongs to the open-position episode, not to
+                # whichever research round happened to observe the same breach.
+                # Using round_id here used to create one deferred sell intent per
+                # round while the market was closed.  The first replay would sell
+                # the position and every duplicate would then be rejected as a
+                # naked short.  ``opened_at`` changes when a ticker is genuinely
+                # re-opened, so it is the durable idempotency boundary we need.
+                position_episode = str(
+                    pos.get("opened_at") or "legacy_open_position"
+                )
                 execution_reason = (
                     f"逐仓强制复核: {review.reason}; "
                     f"review_quote_source={detail.get('source')} "
@@ -2346,8 +2356,7 @@ class InvestmentSimulation:
                         round_id=round_id,
                         priority=0,
                         idempotency_key=(
-                            f"{round_id or 'lifecycle'}:{ticker}:"
-                            f"exit:{now.date().isoformat()}"
+                            f"lifecycle:{ticker}:exit:{position_episode}"
                         ),
                     )
                     execution = (
