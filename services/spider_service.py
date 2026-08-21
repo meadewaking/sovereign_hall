@@ -92,7 +92,9 @@ def search_query_rejection_code(query: str, topic: str = None) -> Optional[str]:
 class SpiderSwarm:
     """分布式爬虫集群"""
 
-    # 类级别的连续失败计数（所有实例共享）
+    # Legacy aggregate alarm fields are retained for startup compatibility.
+    # Provider isolation below owns production recovery: one healthy provider
+    # must never reset or disable another provider's failure state.
     _consecutive_failures = 0
     _failure_threshold = 5  # 连续失败5次后进入告警模式
     _alarm_mode = False
@@ -185,6 +187,34 @@ class SpiderSwarm:
             self.default_sources = [s.strip() for s in self.default_sources.split(',') if s.strip()]
         default_source_timeout = max(10, min(20, self.timeout // 2 or 15))
         self.source_timeout = int(spider_config.get('source_timeout', default_source_timeout))
+        self.provider_failure_threshold = max(
+            1,
+            int(spider_config.get('provider_failure_threshold', 3)),
+        )
+        self.provider_cooldown_seconds = max(
+            1.0,
+            float(spider_config.get('provider_cooldown_seconds', 300)),
+        )
+        provider_max_concurrent = max(
+            1,
+            int(spider_config.get('provider_max_concurrent', 3)),
+        )
+        self._provider_semaphores = {
+            str(source): asyncio.Semaphore(provider_max_concurrent)
+            for source in self.default_sources
+        }
+        self._provider_health_lock = asyncio.Lock()
+        self._provider_health: Dict[str, Dict[str, Any]] = {}
+        self._provider_metrics: Dict[str, Dict[str, int]] = {}
+        self.last_provider_health_report: Dict[str, Any] = {
+            "configured_sources": list(self.default_sources),
+            "attempted_counts": {},
+            "success_counts": {},
+            "failure_counts": {},
+            "skipped_open_circuit_counts": {},
+            "circuit_open_sources": [],
+            "states": {},
+        }
         self.network_enabled = bool(network_enabled)
         self.last_query_gate_report: Dict[str, Any] = {
             "candidate_count": 0,
@@ -250,6 +280,159 @@ class SpiderSwarm:
         self._search_cache.clear()
         logger.info("Search cache cleared")
 
+    def _provider_state(self, source: str) -> Dict[str, Any]:
+        return self._provider_health.setdefault(
+            source,
+            {
+                "consecutive_failures": 0,
+                "circuit_opened_at": None,
+                "circuit_open_until": 0.0,
+                "half_open_in_flight": False,
+                "last_success_at": None,
+                "last_failure_at": None,
+            },
+        )
+
+    def _provider_metric(self, source: str, name: str) -> None:
+        metrics = self._provider_metrics.setdefault(source, {})
+        metrics[name] = int(metrics.get(name, 0)) + 1
+
+    def _provider_metric_snapshot(self) -> Dict[str, Dict[str, int]]:
+        return {
+            source: {name: int(value) for name, value in metrics.items()}
+            for source, metrics in self._provider_metrics.items()
+        }
+
+    async def _provider_call_allowed(self, source: str) -> bool:
+        """Allow normal calls or exactly one probe after a provider cooldown."""
+        async with self._provider_health_lock:
+            state = self._provider_state(source)
+            now = time.monotonic()
+            opened_at = state.get("circuit_opened_at")
+            open_until = float(state.get("circuit_open_until") or 0.0)
+            if opened_at is not None and open_until > now:
+                self._provider_metric(source, "skipped_open_circuit")
+                return False
+            if opened_at is not None:
+                if state.get("half_open_in_flight"):
+                    self._provider_metric(source, "skipped_open_circuit")
+                    return False
+                state["half_open_in_flight"] = True
+            return True
+
+    async def _record_provider_outcome(
+        self,
+        source: str,
+        *,
+        success: bool,
+    ) -> None:
+        async with self._provider_health_lock:
+            state = self._provider_state(source)
+            observed_at = datetime.now().isoformat()
+            self._provider_metric(source, "attempted")
+            if success:
+                self._provider_metric(source, "success")
+                recovered = state.get("circuit_opened_at") is not None
+                state.update(
+                    {
+                        "consecutive_failures": 0,
+                        "circuit_opened_at": None,
+                        "circuit_open_until": 0.0,
+                        "half_open_in_flight": False,
+                        "last_success_at": observed_at,
+                    }
+                )
+                if recovered:
+                    logger.info("Search provider circuit recovered: %s", source)
+                return
+
+            self._provider_metric(source, "failure")
+            failures = int(state.get("consecutive_failures") or 0) + 1
+            state["consecutive_failures"] = failures
+            state["last_failure_at"] = observed_at
+            state["half_open_in_flight"] = False
+            if failures >= self.provider_failure_threshold:
+                newly_opened = state.get("circuit_opened_at") is None
+                state["circuit_opened_at"] = observed_at
+                state["circuit_open_until"] = (
+                    time.monotonic() + self.provider_cooldown_seconds
+                )
+                if newly_opened:
+                    logger.warning(
+                        "Search provider circuit opened: provider=%s "
+                        "failures=%s cooldown=%.0fs",
+                        source,
+                        failures,
+                        self.provider_cooldown_seconds,
+                    )
+
+    def get_provider_health_report(
+        self,
+        baseline: Optional[Dict[str, Dict[str, int]]] = None,
+    ) -> Dict[str, Any]:
+        """Return bounded provider health suitable for a durable round event."""
+        baseline = baseline or {}
+        now = time.monotonic()
+        sources = list(
+            dict.fromkeys(
+                list(self.default_sources)
+                + list(self._provider_health)
+                + list(self._provider_metrics)
+            )
+        )
+        report: Dict[str, Any] = {
+            "configured_sources": list(self.default_sources),
+            "attempted_counts": {},
+            "success_counts": {},
+            "failure_counts": {},
+            "skipped_open_circuit_counts": {},
+            "circuit_open_sources": [],
+            "states": {},
+        }
+        metric_names = (
+            "attempted",
+            "success",
+            "failure",
+            "skipped_open_circuit",
+        )
+        output_names = {
+            "attempted": "attempted_counts",
+            "success": "success_counts",
+            "failure": "failure_counts",
+            "skipped_open_circuit": "skipped_open_circuit_counts",
+        }
+        for source in sources:
+            metrics = self._provider_metrics.get(source, {})
+            before = baseline.get(source, {})
+            for metric_name in metric_names:
+                delta = int(metrics.get(metric_name, 0)) - int(
+                    before.get(metric_name, 0)
+                )
+                if delta:
+                    report[output_names[metric_name]][source] = delta
+            state = self._provider_state(source)
+            open_remaining = max(
+                0.0,
+                float(state.get("circuit_open_until") or 0.0) - now,
+            )
+            if open_remaining > 0:
+                circuit_state = "open"
+                report["circuit_open_sources"].append(source)
+            elif state.get("circuit_opened_at") is not None:
+                circuit_state = "half_open_probe_ready"
+            else:
+                circuit_state = "closed"
+            report["states"][source] = {
+                "circuit_state": circuit_state,
+                "consecutive_failures": int(
+                    state.get("consecutive_failures") or 0
+                ),
+                "cooldown_remaining_seconds": round(open_remaining, 3),
+                "last_success_at": state.get("last_success_at"),
+                "last_failure_at": state.get("last_failure_at"),
+            }
+        return report
+
     async def aggressive_search(
         self,
         queries: List[str],
@@ -268,6 +451,7 @@ class SpiderSwarm:
             文档列表
         """
         import time
+        provider_metric_baseline = self._provider_metric_snapshot()
         query_candidates = list(queries or [])
         accepted_queries: List[str] = []
         rejection_counts: Dict[str, int] = {}
@@ -301,6 +485,9 @@ class SpiderSwarm:
             )
         queries = accepted_queries
         if not queries:
+            self.last_provider_health_report = self.get_provider_health_report(
+                provider_metric_baseline
+            )
             return []
 
         if not self.network_enabled:
@@ -323,6 +510,9 @@ class SpiderSwarm:
                 "Local-only search guard: blocked network search for %s queries; cache_docs=%s",
                 len(queries),
                 len(cached_docs),
+            )
+            self.last_provider_health_report = self.get_provider_health_report(
+                provider_metric_baseline
             )
             return self._filter_documents(cached_docs)
 
@@ -401,6 +591,10 @@ class SpiderSwarm:
 
         # 过滤无效文档
         filtered_docs = self._filter_documents(all_docs)
+
+        self.last_provider_health_report = self.get_provider_health_report(
+            provider_metric_baseline
+        )
 
         return filtered_docs
 
@@ -481,54 +675,70 @@ class SpiderSwarm:
         """
         执行搜索 - 并行查询多个源，取最快返回的结果
         """
-        import time
         docs: List[Doc] = []
-        sources = sources or self.default_sources
+        sources = list(dict.fromkeys(sources or self.default_sources))
 
-        # 检查是否处于告警模式，如果是，检查是否超时需要恢复
-        if SpiderSwarm._alarm_mode:
-            elapsed = time.time() - SpiderSwarm._alarm_start_time
-            if elapsed > SpiderSwarm._alarm_timeout:
-                SpiderSwarm._alarm_mode = False
-                SpiderSwarm._consecutive_failures = 0
-                logger.info(f"Spider alarm mode auto-recovered after {elapsed:.1f}s")
-            else:
-                fallback_sources = [source for source in sources if source != 'ddg']
-                if fallback_sources:
-                    logger.warning(
-                        f"Spider in alarm mode - trying fallback sources for '{query}': {fallback_sources}"
+        async def _run_source(source_name: str, search_factory):
+            semaphore = self._provider_semaphores.setdefault(
+                source_name,
+                asyncio.Semaphore(1),
+            )
+            async with semaphore:
+                if not await self._provider_call_allowed(source_name):
+                    return []
+                try:
+                    result = await asyncio.wait_for(
+                        search_factory(),
+                        timeout=self.source_timeout,
                     )
-                    sources = fallback_sources
-                else:
-                    logger.warning(f"Spider in alarm mode - retrying configured sources for '{query}'")
-
-        async def _run_source(source_name: str, search_coro):
-            try:
-                return await asyncio.wait_for(search_coro, timeout=self.source_timeout)
-            except asyncio.TimeoutError:
-                logger.debug(f"{source_name} search timeout for '{query}' after {self.source_timeout}s")
-                return []
-            except Exception as exc:
-                logger.debug(f"{source_name} search failed: {exc}")
-                return []
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        f"{source_name} search timeout for '{query}' "
+                        f"after {self.source_timeout}s"
+                    )
+                    result = []
+                except Exception as exc:
+                    logger.debug(f"{source_name} search failed: {exc}")
+                    result = []
+                await self._record_provider_outcome(
+                    source_name,
+                    success=bool(result),
+                )
+                return result
 
         # 并行调度所有启用的源，每个源独立超时
         source_tasks = {}
         if 'ddg' in sources:
             source_tasks['ddg'] = asyncio.create_task(
-                self._ddg_search(query, max_results, deep_fetch=False)
+                _run_source(
+                    'ddg',
+                    lambda: self._ddg_search(
+                        query,
+                        max_results,
+                        deep_fetch=False,
+                    ),
+                )
             )
         if 'bing' in sources:
             source_tasks['bing'] = asyncio.create_task(
-                self._bing_search(query, max_results)
+                _run_source(
+                    'bing',
+                    lambda: self._bing_search(query, max_results),
+                )
             )
         if 'baidu' in sources:
             source_tasks['baidu'] = asyncio.create_task(
-                self._baidu_search(query, max_results)
+                _run_source(
+                    'baidu',
+                    lambda: self._baidu_search(query, max_results),
+                )
             )
         if 'sogou' in sources:
             source_tasks['sogou'] = asyncio.create_task(
-                self._sogou_search(query, max_results)
+                _run_source(
+                    'sogou',
+                    lambda: self._sogou_search(query, max_results),
+                )
             )
 
         # 并行等待所有源，每个源最多 source_timeout 秒
@@ -542,22 +752,12 @@ class SpiderSwarm:
                     docs.extend(result)
                     logger.info(f"{name.upper()} search for '{query}': found {len(result)} results")
 
-        # 3. 记录失败并更新告警状态
+        # A query may legitimately fail across every provider.  Provider-level
+        # circuits above retain the exact failing source; success from DDG no
+        # longer erases repeated Bing/Sogou failures or disables the healthy
+        # provider through an aggregate alarm.
         if not docs:
-            SpiderSwarm._consecutive_failures += 1
-            logger.warning(f"Search failed for '{query}', consecutive failures: {SpiderSwarm._consecutive_failures}")
-
-            if SpiderSwarm._consecutive_failures >= SpiderSwarm._failure_threshold:
-                SpiderSwarm._alarm_mode = True
-                SpiderSwarm._alarm_start_time = time.time()
-                logger.warning("⚠️ Search engine failure threshold reached - entering alarm mode")
-                logger.warning(f"⚠️ Will prefer fallback sources for {SpiderSwarm._alarm_timeout}s until search succeeds")
-        else:
-            # 搜索成功，重置失败计数
-            if SpiderSwarm._consecutive_failures > 0 or SpiderSwarm._alarm_mode:
-                logger.info("Search succeeded - resetting failure counter and exiting alarm mode")
-            SpiderSwarm._consecutive_failures = 0
-            SpiderSwarm._alarm_mode = False
+            logger.warning("Search failed for '%s' across available providers", query)
 
         # 去重
         seen_urls = set()

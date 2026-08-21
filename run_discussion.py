@@ -1469,6 +1469,9 @@ async def stage1_mass_search(
                 "provider_rejected_samples": list(
                     provider_gate.get("rejected_samples") or []
                 )[:3],
+                "provider_health": dict(
+                    getattr(spiders, "last_provider_health_report", {}) or {}
+                ),
                 "result_document_count": len(raw_docs),
                 "network_enabled": bool(getattr(spiders, "network_enabled", True)),
             },

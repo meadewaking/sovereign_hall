@@ -1985,6 +1985,23 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
                 f"provider_accepted={int(query_gate.get('provider_accepted_count') or 0)}，"
                 "无元指令/占位输入进入搜索 provider。"
             )
+        provider_health = dict(query_gate.get("provider_health") or {})
+        if provider_health:
+            open_sources = list(
+                provider_health.get("circuit_open_sources") or []
+            )
+            skipped_counts = dict(
+                provider_health.get("skipped_open_circuit_counts") or {}
+            )
+            if open_sources:
+                print(
+                    "   ⚠️ 搜索 provider 临时熔断："
+                    + ", ".join(open_sources)
+                    + "；健康 provider 继续联网，冷却后仅单探针自动恢复；"
+                    f"本轮跳过重复失败调用 {sum(int(v or 0) for v in skipped_counts.values())} 次。"
+                )
+            else:
+                print("   ✅ 搜索 provider 熔断状态：无 open circuit。")
     if health == "failed":
         print(
             "   ❌ 最近一轮失败；先查看 terminal_reason 和 round_events，"

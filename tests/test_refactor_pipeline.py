@@ -413,6 +413,90 @@ async def test_spider_network_boundary_rejects_meta_instruction_defense_in_depth
 
 
 @pytest.mark.asyncio
+async def test_spider_isolates_failing_provider_with_circuit_breaker(monkeypatch):
+    spider = SpiderSwarm(max_concurrent=10, timeout=1, retry_times=1)
+    spider.search_interval = 0
+    spider.provider_failure_threshold = 2
+    spider.provider_cooldown_seconds = 300
+    healthy_doc = Document(
+        id="doc_ddg",
+        title="可追溯研究资料",
+        content="这是一条足够长且可用于验证 provider 隔离行为的研究摘要。",
+        url="https://example.com/research",
+        source="duckduckgo",
+        publish_time=datetime.now(),
+        sector="TMT",
+        keywords=["云计算"],
+    )
+    ddg = AsyncMock(return_value=[healthy_doc])
+    bing = AsyncMock(return_value=[])
+    monkeypatch.setattr(spider, "_ddg_search", ddg)
+    monkeypatch.setattr(spider, "_bing_search", bing)
+
+    try:
+        for query in ("云计算 财报", "云计算 订单", "云计算 现金流"):
+            await spider._do_search(
+                query,
+                max_results=1,
+                sources=["ddg", "bing"],
+            )
+    finally:
+        await spider.close()
+
+    assert ddg.await_count == 3
+    assert bing.await_count == 2
+    provider_report = spider.get_provider_health_report()
+    assert provider_report["circuit_open_sources"] == ["bing"]
+    assert provider_report["skipped_open_circuit_counts"] == {"bing": 1}
+    assert provider_report["states"]["ddg"]["circuit_state"] == "closed"
+    assert provider_report["states"]["bing"]["consecutive_failures"] == 2
+
+
+@pytest.mark.asyncio
+async def test_spider_circuit_bounds_failures_inside_one_concurrent_batch(monkeypatch):
+    spider = SpiderSwarm(max_concurrent=20, timeout=1, retry_times=1)
+    spider.provider_failure_threshold = 2
+    spider.provider_cooldown_seconds = 300
+    healthy_doc = Document(
+        id="doc_batch_ddg",
+        title="批量查询可追溯资料",
+        content="健康搜索源持续返回足够长的摘要，失败搜索源应在同一批次内被隔离。",
+        url="https://example.com/batch-research",
+        source="duckduckgo",
+        publish_time=datetime.now(),
+        sector="TMT",
+        keywords=["算力"],
+    )
+    ddg = AsyncMock(return_value=[healthy_doc])
+    bing = AsyncMock(return_value=[])
+    monkeypatch.setattr(spider, "_ddg_search", ddg)
+    monkeypatch.setattr(spider, "_bing_search", bing)
+    queries = [f"算力 证据 {index}" for index in range(8)]
+
+    try:
+        await asyncio.gather(
+            *(
+                spider._do_search(
+                    query,
+                    max_results=1,
+                    sources=["ddg", "bing"],
+                )
+                for query in queries
+            )
+        )
+    finally:
+        await spider.close()
+
+    report = spider.get_provider_health_report()
+    assert ddg.await_count == len(queries)
+    assert 2 <= bing.await_count <= 3
+    assert report["skipped_open_circuit_counts"]["bing"] == (
+        len(queries) - bing.await_count
+    )
+    assert report["circuit_open_sources"] == ["bing"]
+
+
+@pytest.mark.asyncio
 async def test_search_query_generator_drops_numbered_placeholders_before_search():
     llm = AsyncMock()
     llm.chat.return_value = json.dumps(
