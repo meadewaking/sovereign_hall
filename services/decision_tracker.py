@@ -493,6 +493,175 @@ class DecisionRecorder:
                 raise
         return summary
 
+    async def reconcile_deferred_prediction_terminals(
+        self,
+        *,
+        limit: int = 100,
+    ) -> Dict[str, object]:
+        """Close only exact deferred predictions whose execution is terminal.
+
+        Two forward-only legacy shapes are safe to reconcile: an exact linked
+        intent already has a terminal non-fill status, or the unique linked
+        committee outcome belongs to a round already terminally marked
+        ``execution_rejected`` and no intent was ever written.  The latter is
+        recorded explicitly as a legacy missing-intent defect; no intent,
+        quote, price, fill or historical association is fabricated.
+        """
+        await self._ensure_tables()
+        summary: Dict[str, object] = {
+            "status": "completed",
+            "eligible": 0,
+            "reconciled": 0,
+            "prediction_ids": [],
+        }
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                async with db.execute(
+                    """
+                    SELECT prediction.id AS prediction_id,
+                           prediction.ticker, prediction.round_id,
+                           prediction.decision_id,
+                           intent.id AS intent_id,
+                           intent.status AS intent_status,
+                           round.terminal_code AS round_terminal_code
+                    FROM price_predictions prediction
+                    JOIN simulation_committee_outcomes outcome
+                      ON outcome.prediction_id = prediction.id
+                     AND outcome.round_id = prediction.round_id
+                     AND outcome.decision_id = prediction.decision_id
+                     AND outcome.ticker = prediction.ticker
+                    JOIN research_rounds round
+                      ON round.id = prediction.round_id
+                    LEFT JOIN execution_intents intent
+                      ON intent.round_id = prediction.round_id
+                     AND intent.decision_id = prediction.decision_id
+                     AND intent.ticker = prediction.ticker
+                    WHERE prediction.status = 'awaiting_entry_quote'
+                      AND (
+                          intent.status IN ('rejected', 'expired', 'cancelled')
+                          OR (
+                              intent.id IS NULL
+                              AND round.terminal_code = 'execution_rejected'
+                          )
+                      )
+                      AND (
+                          SELECT COUNT(*)
+                          FROM simulation_committee_outcomes exact_outcome
+                          WHERE exact_outcome.prediction_id = prediction.id
+                            AND exact_outcome.round_id = prediction.round_id
+                            AND exact_outcome.decision_id = prediction.decision_id
+                            AND exact_outcome.ticker = prediction.ticker
+                      ) = 1
+                      AND (
+                          SELECT COUNT(*)
+                          FROM execution_intents exact_intent
+                          WHERE exact_intent.round_id = prediction.round_id
+                            AND exact_intent.decision_id = prediction.decision_id
+                            AND exact_intent.ticker = prediction.ticker
+                      ) <= 1
+                    ORDER BY prediction.rowid
+                    LIMIT ?
+                    """,
+                    (max(0, int(limit)),),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                summary["eligible"] = len(rows)
+                reconciled_ids: List[str] = []
+                for row in rows:
+                    now = datetime.now().isoformat()
+                    cursor = await db.execute(
+                        """
+                        UPDATE price_predictions
+                        SET status = 'execution_rejected', result = 'unknown',
+                            validated_at = NULL
+                        WHERE id = ? AND status = 'awaiting_entry_quote'
+                        """,
+                        (row["prediction_id"],),
+                    )
+                    if not cursor.rowcount:
+                        continue
+                    previous_terminal = str(row["round_terminal_code"] or "")
+                    if row["intent_id"] and previous_terminal not in {
+                        "filled",
+                        "failed",
+                        "pipeline_exception",
+                        "cancelled",
+                        "interrupted",
+                    }:
+                        await db.execute(
+                            """
+                            UPDATE research_rounds
+                            SET terminal_code = 'execution_rejected',
+                                terminal_reason = ?, updated_at = ?
+                            WHERE id = ?
+                              AND status <> 'failed'
+                              AND COALESCE(terminal_code, '') NOT IN (
+                                  'filled', 'failed', 'pipeline_exception',
+                                  'cancelled', 'interrupted'
+                              )
+                            """,
+                            (
+                                (
+                                    "精确关联的执行裁决已终止且没有可审计入场价；"
+                                    f"intent_id={row['intent_id']}"
+                                ),
+                                now,
+                                row["round_id"],
+                            ),
+                        )
+                    async with db.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) + 1 "
+                        "FROM round_events WHERE round_id = ?",
+                        (row["round_id"],),
+                    ) as event_cursor:
+                        sequence_row = await event_cursor.fetchone()
+                    await db.execute(
+                        """
+                        INSERT INTO round_events (
+                            round_id, sequence, event_type,
+                            payload_json, created_at
+                        ) VALUES (?, ?, 'DeferredPredictionTerminalReconciled', ?, ?)
+                        """,
+                        (
+                            row["round_id"],
+                            int(sequence_row[0] if sequence_row else 1),
+                            json.dumps(
+                                {
+                                    "intent_id": row["intent_id"],
+                                    "intent_status": row["intent_status"],
+                                    "legacy_missing_intent": not bool(
+                                        row["intent_id"]
+                                    ),
+                                    "prediction_id": row["prediction_id"],
+                                    "previous_round_terminal_code": (
+                                        previous_terminal or None
+                                    ),
+                                    "price_fabricated": False,
+                                    "ticker": row["ticker"],
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            now,
+                        ),
+                    )
+                    reconciled_ids.append(str(row["prediction_id"]))
+                await db.commit()
+                summary["reconciled"] = len(reconciled_ids)
+                summary["prediction_ids"] = reconciled_ids
+            except aiosqlite.OperationalError as exc:
+                await db.rollback()
+                if "no such table" in str(exc).lower():
+                    summary["status"] = "schema_unavailable"
+                    return summary
+                raise
+            except Exception:
+                await db.rollback()
+                raise
+        return summary
+
     def _normalize_price_targets(
         self,
         decision: str,

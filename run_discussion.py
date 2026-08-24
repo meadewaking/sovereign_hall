@@ -2952,6 +2952,10 @@ def preflight_committee_decisions(
                 "code": "short_without_position",
                 "ticker": ticker,
                 "reason": "模拟账户无该持仓且禁止裸做空",
+                "decision_id": decision.get("decision_id"),
+                "direction": direction,
+                "target_position": float(decision.get("target_position") or 0.0),
+                "confidence": float(decision.get("confidence") or 0.0),
             })
             continue
         if direction == "long" and ticker in normalized_positions:
@@ -2959,6 +2963,10 @@ def preflight_committee_decisions(
                 "code": "already_held_long",
                 "ticker": ticker,
                 "reason": "已有持仓；新增提案不能替代独立生命周期复核",
+                "decision_id": decision.get("decision_id"),
+                "direction": direction,
+                "target_position": float(decision.get("target_position") or 0.0),
+                "confidence": float(decision.get("confidence") or 0.0),
             })
             continue
         raw_confidence = decision.get("confidence")
@@ -2981,6 +2989,10 @@ def preflight_committee_decisions(
                     f"{float(min_long_confidence):.1%}；不得进入闭市队列或"
                     "在开市路径绕过同一门槛"
                 ) + suffix,
+                "decision_id": decision.get("decision_id"),
+                "direction": direction,
+                "target_position": float(decision.get("target_position") or 0.0),
+                "confidence": confidence,
             })
             continue
         try:
@@ -3975,6 +3987,44 @@ async def run_committee_approved_simulation(
                 reason=reason,
             )
 
+    # Actionable committee predictions that fail a price-independent preflight
+    # still require a durable price-free intent and an atomic rejection
+    # terminal.  HOLD and malformed/non-executable directions have no execution
+    # stage and deliberately do not create an intent.
+    for preflight_rejection in redeployment_rejections:
+        rejected_direction = str(
+            preflight_rejection.get("direction") or ""
+        ).lower()
+        rejected_decision_id = preflight_rejection.get("decision_id")
+        if (
+            rejected_direction not in {"long", "short", "sell"}
+            or not rejected_decision_id
+        ):
+            continue
+        matching_decision = next(
+            (
+                decision
+                for decision in decisions
+                if decision.get("decision_id") == rejected_decision_id
+            ),
+            None,
+        )
+        if not matching_decision:
+            continue
+        await persist_rejected_intent(
+            matching_decision,
+            ticker=str(preflight_rejection.get("ticker") or ""),
+            direction=rejected_direction,
+            target_position=float(
+                preflight_rejection.get("target_position") or 0.0
+            ),
+            confidence=float(preflight_rejection.get("confidence") or 0.0),
+            code=str(
+                preflight_rejection.get("code") or "execution_rejected"
+            ),
+            reason=str(preflight_rejection.get("reason") or "执行预检否决"),
+        )
+
     def reject(code: str, reason: str, ticker: str = "") -> None:
         item = {"code": code, "ticker": ticker, "reason": reason}
         redeployment_rejections.append(item)
@@ -4295,6 +4345,30 @@ async def run_committee_approved_simulation(
             direction = decision.get('direction', 'hold')
             confidence = float(decision.get('confidence', 0.5))
             target_position = float(decision.get('target_position', 0.0))
+            intent_id = None
+            if hasattr(simulation, "create_execution_intent"):
+                # Production invariant: the committee ruling becomes a durable
+                # price-free intent before any execution quote is requested.
+                intent_id = await simulation.create_execution_intent(
+                    ticker=ticker,
+                    direction=direction,
+                    target_position=target_position,
+                    confidence=confidence,
+                    reason="投委会裁决已持久化；等待执行时段实时行情与最终仓位计算",
+                    round_id=round_id,
+                    decision_id=decision.get("decision_id"),
+                    priority=(
+                        50
+                        if str(direction).lower() in {"sell", "short"}
+                        else 100
+                    ),
+                    idempotency_key=(
+                        f"{round_id or 'standalone'}:"
+                        f"{decision.get('decision_id') or ticker}:"
+                        f"{str(direction).lower()}"
+                    ),
+                )
+                await note_execution_intent(intent_id)
             current_price, price_source = await simulation.resolve_trade_price(ticker)
             if current_price is None:
                 await persist_rejected_intent(
@@ -4421,21 +4495,12 @@ async def run_committee_approved_simulation(
                 continue
 
             if hasattr(simulation, "create_execution_intent"):
-                intent_id = await simulation.create_execution_intent(
-                    ticker=ticker,
-                    direction=direction,
-                    target_position=trade_position,
-                    confidence=confidence,
-                    reason=trade_reason,
-                    round_id=round_id,
-                    decision_id=decision.get("decision_id"),
-                    priority=50 if str(direction).lower() in {"sell", "short"} else 100,
-                    idempotency_key=(
-                        f"{round_id or 'standalone'}:"
-                        f"{decision.get('decision_id') or ticker}:"
-                        f"{str(direction).lower()}"
-                    ),
-                )
+                if intent_id and hasattr(simulation, "update_execution_intent"):
+                    await simulation.update_execution_intent(
+                        intent_id,
+                        target_position=trade_position,
+                        reason=trade_reason,
+                    )
                 result = (
                     await simulation.execute_intent(intent_id, llm=llm)
                     if intent_id
@@ -4445,7 +4510,6 @@ async def run_committee_approved_simulation(
                         "reason": "执行裁决持久化失败",
                     }
                 )
-                await note_execution_intent(intent_id)
             else:
                 result = await simulation.execute_trade(
                     ticker=ticker,
@@ -4876,6 +4940,15 @@ async def main():
                     "Recovered %s exact pending prediction lineage row(s): %s",
                     lineage_recovery["recovered"],
                     lineage_recovery["prediction_ids"],
+                )
+            terminal_reconciliation = (
+                await recorder.reconcile_deferred_prediction_terminals()
+            )
+            if terminal_reconciliation.get("reconciled", 0):
+                logger.warning(
+                    "Reconciled %s exact terminal deferred prediction row(s): %s",
+                    terminal_reconciliation["reconciled"],
+                    terminal_reconciliation["prediction_ids"],
                 )
             validation_result = await recorder.validate_pending(max_count=20)
             if validation_result.get('validated', 0) > 0:

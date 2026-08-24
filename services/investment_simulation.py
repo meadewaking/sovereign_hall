@@ -20,6 +20,7 @@ from ..application.execute_simulation_cycle import (
     DailyTradeLimitReached,
     ExecutionRejectionCommitRequest,
     TradeCommitRequest,
+    UnquotedExecutionRejectionCommitRequest,
 )
 from ..domain.common.ids import new_id
 from ..domain.portfolio.costs import CostSchedule
@@ -1097,6 +1098,30 @@ class InvestmentSimulation:
             return
         now = datetime.now().isoformat()
         resolution_text = str(resolution or "")[:1000]
+        if status == "rejected":
+            async with self.db_service._connection.execute(
+                "SELECT ticker, round_id FROM execution_intents WHERE id = ?",
+                (intent_id,),
+            ) as cursor:
+                intent_row = await cursor.fetchone()
+            if not intent_row:
+                return
+            await AtomicSimulationExecutor(
+                self.db_service,
+                max_daily_trades=self.max_daily_trades,
+                max_quote_age_seconds=self.max_realtime_quote_age_seconds,
+            ).commit_unquoted_rejection(
+                UnquotedExecutionRejectionCommitRequest(
+                    ticker=str(intent_row[0] or ""),
+                    code=str(defer_code or "execution_rejected"),
+                    reason=resolution_text,
+                    intent_id=intent_id,
+                    round_id=str(intent_row[1]) if intent_row[1] else None,
+                    pending_decision_id=pending_decision_id,
+                    deployment_gap=float(self.cash),
+                )
+            )
+            return
         async with self.db_service.transaction(immediate=True) as conn:
             await conn.execute(
                 """
@@ -1166,7 +1191,8 @@ class InvestmentSimulation:
         await self._set_execution_intent_status(
             intent_id,
             status="rejected",
-            resolution=f"{code}:{reason}",
+            resolution=reason,
+            defer_code=code,
         )
 
     async def execute_intent(
@@ -1290,15 +1316,30 @@ class InvestmentSimulation:
                 result["rejection_duplicate"] = committed.duplicate
             else:
                 # Missing/stale quotes intentionally create no quote snapshot.
-                await self._set_execution_intent_status(
-                    intent_id,
-                    status="rejected",
-                    resolution=result.get("reason") or action or "execution rejected",
-                    defer_code=str(
-                        result.get("blocker_code") or "execution_rejected"
-                    ),
-                    pending_decision_id=pending_decision_id,
-                )
+                try:
+                    await self._set_execution_intent_status(
+                        intent_id,
+                        status="rejected",
+                        resolution=(
+                            result.get("reason") or action or "execution rejected"
+                        ),
+                        defer_code=str(
+                            result.get("blocker_code") or "execution_rejected"
+                        ),
+                        pending_decision_id=pending_decision_id,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Atomic unquoted execution rejection failed for %s",
+                        item["ticker"],
+                    )
+                    return {
+                        "intent_id": intent_id,
+                        "success": False,
+                        "action": "error",
+                        "blocker_code": "execution_rejection_persistence_failed",
+                        "reason": f"无报价模拟执行拒绝事务回滚: {exc}",
+                    }
         return {"intent_id": intent_id, **result}
 
     async def replay_pending_decisions(self, max_count: int | None = None) -> Dict[str, Any]:
