@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 from datetime import date, datetime, timedelta
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, Dict, List, Optional, Set
 
 import httpx
@@ -16,6 +17,55 @@ import httpx
 from ..domain.portfolio.instruments import is_etf_ticker, normalize_ticker
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_QUOTE_RECOVERY_PASSES = 1
+MAX_QUOTE_RECOVERY_PASSES = 2
+
+
+async def collect_realtime_quote_batch(
+    tickers: Iterable[str],
+    fetch_quote: Callable[[str], Awaitable[Optional[Dict[str, Any]]]],
+    *,
+    recovery_passes: int = DEFAULT_QUOTE_RECOVERY_PASSES,
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch a portfolio quote set and retry only transiently missing symbols.
+
+    The recovery pass runs after the complete first pass.  That ordering lets a
+    short provider/network interruption clear without hammering one symbol, and
+    every successful value is still a newly fetched provider quote.  Permanent
+    failures stay absent so callers' freshness gates keep valuation and trading
+    blocked instead of falling back to historical or caller-supplied prices.
+    """
+    pending: List[str] = []
+    seen: Set[str] = set()
+    for ticker in tickers:
+        code = MarketDataService.normalize_ticker(ticker)
+        if code and code not in seen:
+            pending.append(code)
+            seen.add(code)
+
+    quotes: Dict[str, Dict[str, Any]] = {}
+    bounded_recovery_passes = max(
+        0,
+        min(int(recovery_passes or 0), MAX_QUOTE_RECOVERY_PASSES),
+    )
+    for pass_index in range(bounded_recovery_passes + 1):
+        if not pending:
+            break
+        if pass_index:
+            logger.info(
+                "Retrying transiently missing realtime quotes after portfolio pass: %s",
+                ",".join(pending),
+            )
+        still_missing: List[str] = []
+        for code in pending:
+            quote = await fetch_quote(code)
+            if isinstance(quote, dict):
+                quotes[code] = quote
+            else:
+                still_missing.append(code)
+        pending = still_missing
+    return quotes
 
 
 class MarketDataError(RuntimeError):
@@ -142,6 +192,19 @@ class MarketDataService:
         """Return the latest realtime quote price, or None when unavailable."""
         quote = await self.get_current_quote(ticker)
         return float(quote["price"]) if quote else None
+
+    async def get_current_quotes(
+        self,
+        tickers: Iterable[str],
+        *,
+        recovery_passes: int = DEFAULT_QUOTE_RECOVERY_PASSES,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return a portfolio quote set with bounded missing-symbol recovery."""
+        return await collect_realtime_quote_batch(
+            tickers,
+            self.get_current_quote,
+            recovery_passes=recovery_passes,
+        )
 
     async def get_current_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
         """Return a realtime quote with provider and retrieval timestamp."""

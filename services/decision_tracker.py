@@ -4,12 +4,17 @@
 """
 import uuid
 import logging
+import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 
 import aiosqlite
 
+from ..domain.research import (
+    HOLD_NEUTRAL_BAND as DEFAULT_HOLD_NEUTRAL_BAND,
+    normalize_prediction_price_targets,
+)
 from .prediction_store import ensure_prediction_tables
 
 logger = logging.getLogger(__name__)
@@ -48,7 +53,7 @@ class DecisionRecorder:
 
     MIN_EXPECTED_DAYS = 3
     MAX_EXPECTED_DAYS = 180
-    HOLD_NEUTRAL_BAND = 0.05
+    HOLD_NEUTRAL_BAND = DEFAULT_HOLD_NEUTRAL_BAND
 
     def __init__(self, db_path: str = None):
         from ..core import DATA_DIR
@@ -93,16 +98,20 @@ class DecisionRecorder:
         expected_days: int = 30,
         round_id: str | None = None,
         decision_id: str | None = None,
+        defer_quote_until_execution: bool = False,
     ) -> str:
-        """记录一次决策"""
+        """记录一次决策，必要时先保存无价格、待执行行情锚定的预测。"""
         await self._ensure_tables()
 
         from .market_data import get_market_data
 
         market = get_market_data()
-        if entry_price is None:
+        if entry_price is None and not defer_quote_until_execution:
             quote = await market.get_current_quote(ticker) or {}
             current_price = quote.get("price")
+        elif entry_price is None:
+            quote = {}
+            current_price = None
         else:
             current_price = entry_price
             quote = {
@@ -112,7 +121,32 @@ class DecisionRecorder:
                 "fetched_at": datetime.now().isoformat(),
             }
         if current_price is None or current_price <= 0:
-            raise ValueError(f"无法获取 {ticker} 的真实入场价格，拒绝记录不可验证决策")
+            if not defer_quote_until_execution:
+                raise ValueError(
+                    f"无法获取 {ticker} 的真实入场价格，拒绝记录不可验证决策"
+                )
+            if not round_id or not decision_id:
+                raise ValueError(
+                    f"{ticker} 无行情预测必须带有round_id和decision_id，拒绝孤立记录"
+                )
+            prediction_id = await self._record_deferred_prediction(
+                ticker=ticker,
+                decision=decision,
+                confidence=confidence,
+                target_price=float(target_price or 0),
+                stop_loss=float(stop_loss or 0),
+                discussion_context=discussion_context,
+                expected_days=expected_days,
+                round_id=round_id,
+                decision_id=decision_id,
+            )
+            logger.info(
+                "决策预测已无价格持久化，等待执行时段行情锚定: %s %s %s",
+                ticker,
+                decision,
+                prediction_id,
+            )
+            return prediction_id
         quote_source = str(quote.get("source") or "").strip()
         quote_fetched_at = str(quote.get("fetched_at") or "").strip()
         if not quote_source or not quote_fetched_at:
@@ -234,6 +268,231 @@ class DecisionRecorder:
                 row = await cursor.fetchone()
                 return row[0] if row else None
 
+    async def _record_deferred_prediction(
+        self,
+        *,
+        ticker: str,
+        decision: str,
+        confidence: float,
+        target_price: float,
+        stop_loss: float,
+        discussion_context: str,
+        expected_days: int,
+        round_id: str,
+        decision_id: str,
+    ) -> str:
+        """Persist prediction lineage without inventing a closed-market price."""
+        expected_days = self.normalize_expected_days(
+            expected_days,
+            discussion_context,
+        )
+        now = datetime.now().isoformat()
+        prediction_id = str(uuid.uuid4())
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT id
+                FROM price_predictions
+                WHERE round_id = ? AND decision_id = ?
+                ORDER BY rowid
+                LIMIT 1
+                """,
+                (round_id, decision_id),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing:
+                return str(existing[0])
+            await db.execute(
+                """
+                INSERT INTO price_predictions (
+                    id, ticker, current_price, target_price, stop_loss, direction,
+                    confidence, predicted_at, expected_days,
+                    discussion_context, status, result, accuracy_score,
+                    created_at, entry_date, quote_source, quote_fetched_at,
+                    round_id, decision_id
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?,
+                          'awaiting_entry_quote', 'unknown', 0.0, ?, NULL,
+                          NULL, NULL, ?, ?)
+                """,
+                (
+                    prediction_id,
+                    ticker,
+                    target_price,
+                    stop_loss,
+                    decision,
+                    confidence,
+                    now,
+                    expected_days,
+                    discussion_context[:1000],
+                    now,
+                    round_id,
+                    decision_id,
+                ),
+            )
+            await db.commit()
+        return prediction_id
+
+    async def recover_deferred_prediction_lineage(
+        self,
+        *,
+        limit: int = 100,
+    ) -> Dict[str, object]:
+        """Recover only exact, still-pending committee prediction lineage.
+
+        Historical rows with ambiguous proposal or committee associations are
+        intentionally untouched. The recovered row remains price-free until a
+        fresh execution quote anchors it inside the atomic execution unit.
+        """
+        await self._ensure_tables()
+        summary: Dict[str, object] = {
+            "status": "completed",
+            "eligible": 0,
+            "recovered": 0,
+            "prediction_ids": [],
+        }
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                async with db.execute(
+                    """
+                    SELECT intent.id AS intent_id, intent.round_id,
+                           intent.decision_id, intent.ticker,
+                           outcome.id AS outcome_id,
+                           outcome.direction, outcome.confidence,
+                           outcome.created_at AS predicted_at,
+                           proposal.take_profit, proposal.stop_loss,
+                           proposal.holding_period, proposal.thesis
+                    FROM execution_intents intent
+                    JOIN simulation_pending_decisions pending
+                      ON pending.intent_id = intent.id
+                     AND pending.status = 'pending_next_trading_session'
+                    JOIN simulation_committee_outcomes outcome
+                      ON outcome.round_id = intent.round_id
+                     AND outcome.decision_id = intent.decision_id
+                     AND outcome.ticker = intent.ticker
+                    JOIN proposals proposal
+                      ON proposal.round_id = intent.round_id
+                     AND proposal.ticker = intent.ticker
+                    LEFT JOIN price_predictions prediction
+                      ON prediction.round_id = intent.round_id
+                     AND prediction.decision_id = intent.decision_id
+                    WHERE intent.status IN ('pending', 'deferred')
+                      AND intent.round_id IS NOT NULL
+                      AND intent.decision_id IS NOT NULL
+                      AND prediction.id IS NULL
+                      AND trim(COALESCE(outcome.prediction_id, '')) = ''
+                      AND (
+                          SELECT COUNT(*) FROM proposals candidate
+                          WHERE candidate.round_id = intent.round_id
+                            AND candidate.ticker = intent.ticker
+                      ) = 1
+                      AND (
+                          SELECT COUNT(*)
+                          FROM simulation_committee_outcomes candidate_outcome
+                          WHERE candidate_outcome.round_id = intent.round_id
+                            AND candidate_outcome.decision_id = intent.decision_id
+                            AND candidate_outcome.ticker = intent.ticker
+                      ) = 1
+                    ORDER BY pending.id
+                    LIMIT ?
+                    """,
+                    (max(0, int(limit)),),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                summary["eligible"] = len(rows)
+                prediction_ids: List[str] = []
+                for row in rows:
+                    now = datetime.now().isoformat()
+                    prediction_id = str(uuid.uuid4())
+                    expected_days = self.normalize_expected_days(
+                        row["holding_period"],
+                        str(row["thesis"] or ""),
+                    )
+                    await db.execute(
+                        """
+                        INSERT INTO price_predictions (
+                            id, ticker, current_price, target_price, stop_loss,
+                            direction, confidence, predicted_at, expected_days,
+                            discussion_context, status, result, accuracy_score,
+                            created_at, entry_date, quote_source,
+                            quote_fetched_at, round_id, decision_id
+                        ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?,
+                                  'awaiting_entry_quote', 'unknown', 0.0, ?,
+                                  NULL, NULL, NULL, ?, ?)
+                        """,
+                        (
+                            prediction_id,
+                            row["ticker"],
+                            float(row["take_profit"] or 0.0),
+                            float(row["stop_loss"] or 0.0),
+                            row["direction"],
+                            float(row["confidence"] or 0.0),
+                            row["predicted_at"] or now,
+                            expected_days,
+                            (
+                                f"lineage_recovered_for_pending_intent="
+                                f"{row['intent_id']}; "
+                                f"{str(row['thesis'] or '')[:850]}"
+                            ),
+                            now,
+                            row["round_id"],
+                            row["decision_id"],
+                        ),
+                    )
+                    await db.execute(
+                        """
+                        UPDATE simulation_committee_outcomes
+                        SET prediction_id = ?
+                        WHERE id = ?
+                          AND trim(COALESCE(prediction_id, '')) = ''
+                        """,
+                        (prediction_id, int(row["outcome_id"])),
+                    )
+                    async with db.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) + 1 "
+                        "FROM round_events WHERE round_id = ?",
+                        (row["round_id"],),
+                    ) as event_cursor:
+                        sequence_row = await event_cursor.fetchone()
+                    await db.execute(
+                        """
+                        INSERT INTO round_events (
+                            round_id, sequence, event_type,
+                            payload_json, created_at
+                        ) VALUES (?, ?, 'PredictionLineageRecovered', ?, ?)
+                        """,
+                        (
+                            row["round_id"],
+                            int(sequence_row[0] if sequence_row else 1),
+                            json.dumps(
+                                {
+                                    "intent_id": row["intent_id"],
+                                    "prediction_id": prediction_id,
+                                    "price_deferred": True,
+                                    "ticker": row["ticker"],
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            now,
+                        ),
+                    )
+                    prediction_ids.append(prediction_id)
+                await db.commit()
+                summary["recovered"] = len(prediction_ids)
+                summary["prediction_ids"] = prediction_ids
+            except aiosqlite.OperationalError as exc:
+                await db.rollback()
+                if "no such table" in str(exc).lower():
+                    summary["status"] = "schema_unavailable"
+                    return summary
+                raise
+            except Exception:
+                await db.rollback()
+                raise
+        return summary
+
     def _normalize_price_targets(
         self,
         decision: str,
@@ -242,62 +501,12 @@ class DecisionRecorder:
         stop_loss: float,
     ) -> tuple[float, float]:
         """Convert percent-style targets into absolute prices when needed."""
-        direction = (decision or "").lower()
-        if direction in ("hold", "neutral", "watch", "观望"):
-            band = self.HOLD_NEUTRAL_BAND
-            return (
-                round(entry_price * (1 + band), 4),
-                round(entry_price * (1 - band), 4),
-            )
-
-        # Stage-2 proposals often emit take_profit=15.0 and stop_loss=5.0 to
-        # mean +15% / -5%. Detect that paired shape before treating values as
-        # absolute prices.
-        if (
-            target_price > 1
-            and stop_loss > 1
-            and target_price <= 100
-            and stop_loss <= 100
-            and (
-                (direction in ("sell", "short") and target_price < entry_price < stop_loss)
-                or (direction not in ("sell", "short") and stop_loss < entry_price < target_price)
-            )
-            and (abs(target_price - entry_price) / entry_price > 0.3 or abs(entry_price - stop_loss) / entry_price > 0.3)
-        ):
-            if direction in ("sell", "short"):
-                return round(entry_price * (1 - target_price / 100), 4), round(entry_price * (1 + stop_loss / 100), 4)
-            return round(entry_price * (1 + target_price / 100), 4), round(entry_price * (1 - stop_loss / 100), 4)
-
-        def as_take_profit(value: float) -> float:
-            if value <= 0:
-                return entry_price * (0.92 if direction in ("sell", "short") else 1.08)
-            if value <= 1:
-                return entry_price * (1 - value if direction in ("sell", "short") else 1 + value)
-            # LLM proposals often use 15.0 to mean +15%. If the target is on the
-            # wrong side of entry, treat it as a percentage.
-            if direction in ("sell", "short") and value >= entry_price:
-                return entry_price * (1 - value / 100)
-            if direction not in ("sell", "short") and value <= entry_price:
-                return entry_price * (1 + value / 100)
-            if entry_price < 10 and value > entry_price * 3 and value <= 100:
-                return entry_price * (1 - value / 100 if direction in ("sell", "short") else 1 + value / 100)
-            return value
-
-        def as_stop(value: float) -> float:
-            if value <= 0:
-                return entry_price * (1.05 if direction in ("sell", "short") else 0.95)
-            if value <= 1:
-                return entry_price * (1 + value if direction in ("sell", "short") else 1 - value)
-            if direction in ("sell", "short") and value <= entry_price:
-                return entry_price * (1 + value / 100)
-            if direction not in ("sell", "short") and value >= entry_price:
-                return entry_price * (1 - value / 100)
-            # For low-priced ETFs, values like 5.0 are almost certainly percent.
-            if entry_price < 10 and value > entry_price:
-                return entry_price * (1.05 if direction in ("sell", "short") else 0.95)
-            return value
-
-        return round(as_take_profit(target_price), 4), round(as_stop(stop_loss), 4)
+        return normalize_prediction_price_targets(
+            decision=decision,
+            entry_price=entry_price,
+            target_price=target_price,
+            stop_loss=stop_loss,
+        )
 
     async def get_pending_decisions(self, limit: int = 100) -> List[Dict]:
         """获取待验证的决策列表"""

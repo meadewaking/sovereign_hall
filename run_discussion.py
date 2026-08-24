@@ -3561,6 +3561,9 @@ async def stage3_ic_discussion(
                         expected_days=expected_days,
                         round_id=round_id,
                         decision_id=committee_decision["decision_id"],
+                        defer_quote_until_execution=(
+                            committee_decision.get("direction") in {"long", "short"}
+                        ),
                     )
                     committee_decision["prediction_id"] = prediction_id
                     if committee_decision.get("direction") == "hold":
@@ -4867,6 +4870,13 @@ async def main():
         # 初始化验证（处理之前的待验证决策）
         try:
             recorder = DecisionRecorder(str(db_path))
+            lineage_recovery = await recorder.recover_deferred_prediction_lineage()
+            if lineage_recovery.get("recovered", 0):
+                logger.warning(
+                    "Recovered %s exact pending prediction lineage row(s): %s",
+                    lineage_recovery["recovered"],
+                    lineage_recovery["prediction_ids"],
+                )
             validation_result = await recorder.validate_pending(max_count=20)
             if validation_result.get('validated', 0) > 0:
                 logger.info(f"启动时验证了 {validation_result['validated']} 条历史决策")

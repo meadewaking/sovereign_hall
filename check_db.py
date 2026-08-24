@@ -51,16 +51,19 @@ def get_realtime_prices(tickers: list) -> dict:
     async def fetch():
         md = get_market_data()
         prices = {}
-        for ticker in tickers:
-            if hasattr(md, "get_current_quote"):
-                quote = await md.get_current_quote(ticker)
-            else:
+        if hasattr(md, "get_current_quotes"):
+            quotes = await md.get_current_quotes(tickers)
+        else:
+            quotes = {}
+            for ticker in tickers:
                 price = await md.get_current_price(ticker)
-                quote = {
+                quotes[ticker] = {
                     "price": price,
                     "source": "realtime_quote",
                     "fetched_at": datetime.now().isoformat(),
                 } if price else None
+        for ticker in tickers:
+            quote = quotes.get(ticker)
             if is_fresh_realtime_quote(quote):
                 prices[ticker] = quote
         return prices
@@ -890,6 +893,7 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
         "direction_counts": {},
         "quorum_failure_count": 0,
         "prediction_linked_count": 0,
+        "prediction_awaiting_quote_count": 0,
         "hold_prediction_linked_count": 0,
         "hold_evidence_gap_count": 0,
         "hold_reconsider_count": 0,
@@ -965,6 +969,17 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
                     "AND trim(prediction_id) <> ''"
                 ).fetchone()[0]
             )
+            prediction_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='price_predictions'"
+            ).fetchone()
+            if prediction_table:
+                diagnostics["prediction_awaiting_quote_count"] = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM price_predictions "
+                        "WHERE status = 'awaiting_entry_quote'"
+                    ).fetchone()[0]
+                )
         if "evidence_gaps" in columns:
             diagnostics["hold_evidence_gap_count"] = int(
                 conn.execute(
@@ -1068,6 +1083,24 @@ def committee_outcome_diagnostics(conn, limit: int = 5):
                 (limit,),
             ).fetchall()
         ]
+        if "prediction_id" in columns:
+            for outcome in diagnostics["recent"]:
+                outcome["prediction_status"] = None
+                outcome["prediction_current_price"] = None
+                prediction_id = str(outcome.get("prediction_id") or "").strip()
+                if not prediction_id:
+                    continue
+                try:
+                    prediction = conn.execute(
+                        "SELECT status, current_price FROM price_predictions "
+                        "WHERE id = ?",
+                        (prediction_id,),
+                    ).fetchone()
+                except sqlite3.Error:
+                    prediction = None
+                if prediction:
+                    outcome["prediction_status"] = prediction[0]
+                    outcome["prediction_current_price"] = prediction[1]
     except sqlite3.Error:
         return diagnostics
     return diagnostics
@@ -1545,7 +1578,13 @@ def show_investment_status(db_path) -> dict[str, Any]:
     else:
         print("   最近裁决结果: 尚无已解决裁决")
     if latest_execution_intent:
-        quote_text = "quote=N/A（该历史执行拒绝没有可审计报价快照）"
+        intent_status = str(latest_execution_intent.get("status") or "")
+        if intent_status in {"pending", "deferred", "executing"}:
+            quote_text = "quote=N/A（price-free裁决等待交易时段新鲜行情）"
+        elif intent_status == "rejected":
+            quote_text = "quote=N/A（缺失或陈旧行情未生成报价快照）"
+        else:
+            quote_text = "quote=N/A（legacy记录没有可审计报价快照）"
         if latest_execution_intent.get("quote_price") is not None:
             quote_text = (
                 f"quote={float(latest_execution_intent['quote_price']):.4f}"
@@ -1759,6 +1798,12 @@ def show_investment_status(db_path) -> dict[str, Any]:
             f"{committee_diagnostics['hold_prediction_linked_count']}/"
             f"{counts.get('hold', 0)}"
         )
+        if committee_diagnostics.get("prediction_awaiting_quote_count"):
+            print(
+                "   待行情锚定预测: "
+                f"{committee_diagnostics['prediction_awaiting_quote_count']}；"
+                "未使用旧价或调用方价格，首次新鲜执行行情将在原子事务内补锚"
+            )
         print(
             "   逐角色票型审计: "
             f"{committee_diagnostics['individual_vote_audit_count']}/"
@@ -1826,7 +1871,8 @@ def show_investment_status(db_path) -> dict[str, Any]:
                 f"有效票={int(outcome.get('parsed_vote_count') or 0)}/"
                 f"{int(outcome.get('vote_count') or 0)} "
                 f"(门槛{int(outcome.get('quorum_required') or 0)}) | "
-                f"prediction={outcome.get('prediction_id') or '未链接'} | "
+                f"prediction={outcome.get('prediction_id') or '未链接'}"
+                f"/{outcome.get('prediction_status') or 'N/A'} | "
                 f"{outcome.get('created_at')}"
             )
             evidence_gaps = _decode_text_list(outcome.get("evidence_gaps"))

@@ -50,7 +50,10 @@ from sovereign_hall.services.heuristic_policy import (
     recent_prediction_observation_count,
     sanitize_candidate_rejection_reason,
 )
-from sovereign_hall.services.market_data import MarketDataService
+from sovereign_hall.services.market_data import (
+    MarketDataService,
+    collect_realtime_quote_batch,
+)
 from sovereign_hall.services.llm_client import LLMClient
 from sovereign_hall.services.spider_service import SearchQueryGenerator, SpiderSwarm
 from sovereign_hall.services.learning_engine import LearningEngine
@@ -2505,6 +2508,65 @@ def test_market_data_ticker_mapping():
     assert svc.infer_market("600519") == "sh"
     assert svc.infer_market("159995") == "sz"
     assert svc.eastmoney_secid("512880") == "1.512880"
+
+
+@pytest.mark.asyncio
+async def test_realtime_quote_batch_retries_only_missing_after_full_pass():
+    calls = []
+    attempts = {"516510": 0, "562950": 0}
+
+    async def fetch_quote(ticker):
+        calls.append(ticker)
+        attempts[ticker] += 1
+        if ticker == "516510" and attempts[ticker] == 1:
+            return None
+        return {
+            "ticker": ticker,
+            "price": 1.5,
+            "source": "controlled_realtime_quote",
+            "fetched_at": datetime.now().isoformat(),
+        }
+
+    quotes = await collect_realtime_quote_batch(
+        ["516510", "562950", "516510"],
+        fetch_quote,
+    )
+
+    assert calls == ["516510", "562950", "516510"]
+    assert set(quotes) == {"516510", "562950"}
+
+
+@pytest.mark.asyncio
+async def test_calculate_assets_recovers_transient_quote_without_caller_fallback(
+    monkeypatch,
+):
+    sim = InvestmentSimulation()
+    sim.cash = 100.0
+    sim.positions = {
+        "516510": {"shares": 100, "avg_cost": 1.0},
+        "562950": {"shares": 100, "avg_cost": 1.0},
+    }
+    attempts = {"516510": 0, "562950": 0}
+
+    async def fetch_quote(ticker):
+        attempts[ticker] += 1
+        if ticker == "516510" and attempts[ticker] == 1:
+            return None
+        return {
+            "ticker": ticker,
+            "price": 2.0,
+            "source": "controlled_realtime_quote",
+            "fetched_at": datetime.now().isoformat(),
+        }
+
+    monkeypatch.setattr(sim, "get_current_quote", fetch_quote)
+
+    assets = await sim.calculate_assets(prices={"516510": 999.0, "562950": 999.0})
+
+    assert assets["valuation_complete"] is True
+    assert assets["total_assets"] == pytest.approx(500.0)
+    assert assets["position_prices"] == {"516510": 2.0, "562950": 2.0}
+    assert attempts == {"516510": 2, "562950": 1}
 
 
 def test_llm_client_uses_configured_defaults():
@@ -5853,6 +5915,59 @@ async def test_prediction_fetches_and_persists_realtime_quote_metadata(tmp_path,
 
     assert row == (10.0, "test_realtime_quote", "2026-07-25T10:00:00")
     fake_market.get_current_quote.assert_awaited_once_with("600519")
+
+
+@pytest.mark.asyncio
+async def test_committee_prediction_defers_quote_without_inventing_price(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "test.db"
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {"get_current_quote": AsyncMock(return_value=None)},
+    )()
+    monkeypatch.setattr(
+        "sovereign_hall.services.market_data.get_market_data",
+        lambda: fake_market,
+    )
+
+    prediction_id = await DecisionRecorder(str(db_path)).record_decision(
+        ticker="520500",
+        decision="long",
+        confidence=0.65,
+        target_price=15.0,
+        stop_loss=5.0,
+        expected_days=30,
+        round_id="round-closed-market",
+        decision_id="decision-closed-market",
+        defer_quote_until_execution=True,
+    )
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        """
+        SELECT current_price, target_price, stop_loss, status, entry_date,
+               quote_source, quote_fetched_at, round_id, decision_id
+        FROM price_predictions WHERE id = ?
+        """,
+        (prediction_id,),
+    ).fetchone()
+    conn.close()
+
+    assert row == (
+        None,
+        15.0,
+        5.0,
+        "awaiting_entry_quote",
+        None,
+        None,
+        None,
+        "round-closed-market",
+        "decision-closed-market",
+    )
+    fake_market.get_current_quote.assert_not_awaited()
 
 
 def test_hold_feedback_does_not_enter_offline_long_allocator():

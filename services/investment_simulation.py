@@ -2392,6 +2392,8 @@ class InvestmentSimulation:
 
     async def calculate_assets(self, prices: Dict[str, float] = None) -> Dict:
         """按实时现价计算资产；任一行情缺失时明确标记估值不完整。"""
+        from .market_data import collect_realtime_quote_batch
+
         known_total_assets = self.cash
         # Keep the argument for API compatibility, but never trust caller-supplied
         # marks for current account valuation.
@@ -2399,14 +2401,19 @@ class InvestmentSimulation:
         position_values: Dict[str, float] = {}
         quote_details: Dict[str, Dict[str, Any]] = {}
         missing_price_tickers: List[str] = []
+        realtime_quotes: Dict[str, Dict[str, Any]] = {}
+        if self.realtime_quotes_enabled():
+            realtime_quotes = await collect_realtime_quote_batch(
+                self.positions,
+                self.get_current_quote,
+            )
         for ticker, pos in self.positions.items():
             code = self._normalize_ticker(ticker)
             price = None
-            if self.realtime_quotes_enabled():
-                quote = await self.get_current_quote(code)
-                if self._quote_is_fresh(quote):
-                    price = float(quote["price"])
-                    quote_details[code] = dict(quote)
+            quote = realtime_quotes.get(code)
+            if self._quote_is_fresh(quote):
+                price = float(quote["price"])
+                quote_details[code] = dict(quote)
             if not price:
                 missing_price_tickers.append(code)
                 continue
