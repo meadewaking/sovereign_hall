@@ -566,17 +566,16 @@ async def run_with_graceful_shutdown(
 
 
 async def persist_sigterm_round_terminal(round_coordinator, round_id: str) -> None:
-    """Write the one canonical SIGTERM terminal for an active round.
+    """Persist SIGTERM while preserving an already-written business terminal.
 
     Inner pipeline cancellation handlers must not pre-empt this write with a
-    generic ``failed`` terminal: ``ResearchRoundCoordinator.fail`` is
-    intentionally idempotent and preserves the first terminal it sees.
+    generic ``failed`` terminal. If the execution/research outcome is already
+    durable, SIGTERM interrupted only reflection/finalization and is appended
+    as separate audit metadata. Otherwise shutdown is the canonical failure.
     """
-    await round_coordinator.fail(
+    await round_coordinator.interrupt_for_shutdown(
         round_id,
-        code="failed",
-        reason="研究轮失败：生产进程收到终止信号",
-        payload={"shutdown_signal": "SIGTERM"},
+        signal_name="SIGTERM",
     )
 
 

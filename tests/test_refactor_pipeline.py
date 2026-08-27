@@ -1246,6 +1246,92 @@ async def test_sigterm_terminal_is_single_idempotent_and_carries_exact_signal(tm
     await db.close()
 
 
+@pytest.mark.asyncio
+async def test_sigterm_preserves_business_terminal_and_records_finalization_interrupt(
+    tmp_path,
+):
+    from sovereign_hall.application.get_system_status import get_system_status
+    from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
+    from sovereign_hall.services.database import DatabaseService
+    from sovereign_hall.run_discussion import persist_sigterm_round_terminal
+
+    db = DatabaseService(str(tmp_path / "sigterm-after-terminal.db"))
+    await db._init_db()
+    coordinator = ResearchRoundCoordinator(db)
+    round_state = await coordinator.start(
+        base_topic="no evidence before replacement",
+        research_objective="preserve the business outcome",
+    )
+    await coordinator.advance(
+        round_state.id,
+        ResearchRoundStatus.MEMORY_LOADED,
+    )
+    await coordinator.advance(
+        round_state.id,
+        ResearchRoundStatus.NO_EVIDENCE,
+        event_type="NoEvidenceTerminal",
+        terminal_code="no_evidence",
+        terminal_reason="no qualified proposal",
+    )
+
+    await persist_sigterm_round_terminal(coordinator, round_state.id)
+    await persist_sigterm_round_terminal(coordinator, round_state.id)
+
+    terminal = await coordinator.get(round_state.id)
+    assert terminal.status == ResearchRoundStatus.NO_EVIDENCE
+    assert terminal.terminal_code == "no_evidence"
+    assert terminal.terminal_reason == "no qualified proposal"
+    conn = await db._get_connection()
+    async with conn.execute(
+        """
+        SELECT event_type, payload_json
+        FROM round_events
+        WHERE round_id = ?
+          AND event_type IN ('RoundFailed', 'RoundFinalizationInterrupted')
+        ORDER BY sequence
+        """,
+        (round_state.id,),
+    ) as cursor:
+        events = await cursor.fetchall()
+    assert [row[0] for row in events] == ["RoundFinalizationInterrupted"]
+    payload = json.loads(events[0][1])
+    assert payload["shutdown_signal"] == "SIGTERM"
+    assert payload["business_terminal_code"] == "no_evidence"
+
+    status = await get_system_status(db)
+    assert status["pipeline_health"] == "completed_no_evidence"
+    assert status["round_finalization_pending"] is False
+    assert status["finalization_interruption"]["shutdown_signal"] == "SIGTERM"
+
+    filled_round = await coordinator.start(
+        base_topic="fill before replacement",
+        research_objective="preserve a stronger execution terminal",
+    )
+    await coordinator.advance(
+        filled_round.id,
+        ResearchRoundStatus.MEMORY_LOADED,
+    )
+    await coordinator.advance(
+        filled_round.id,
+        ResearchRoundStatus.SOURCES_PERSISTED,
+    )
+    await coordinator.advance(
+        filled_round.id,
+        ResearchRoundStatus.FILLED,
+        event_type="SimulationPipelineTerminal",
+        terminal_code="filled",
+        terminal_reason="atomic fill committed",
+    )
+    await persist_sigterm_round_terminal(coordinator, filled_round.id)
+    filled_status = await get_system_status(db)
+    assert filled_status["pipeline_health"] == "completed_filled"
+    assert filled_status["round_finalization_pending"] is False
+    assert filled_status["finalization_interruption"][
+        "business_terminal_code"
+    ] == "filled"
+    await db.close()
+
+
 def test_vote_context_balances_all_deliberation_stages():
     context = build_balanced_vote_context(
         {

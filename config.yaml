@@ -13,7 +13,7 @@ llm:
   max_tokens: 22500
   timeout: 600
 
-  # Embedding 配置
+  # Embedding 配
   embedding_model: "bge-large-zh-v1.5"
   embedding_uuid: "ec85af59-12aa-4cba-9090-74cc48c39eda"
   embedding_dim: 1024

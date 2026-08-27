@@ -2048,7 +2048,15 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
                 )
             else:
                 print("   ✅ 搜索 provider 熔断状态：无 open circuit。")
-    if health == "failed":
+    interruption = status.get("finalization_interruption") or {}
+    if interruption:
+        print(
+            "   🧾 本轮业务终态已保留："
+            f"{interruption.get('business_terminal_code') or 'unknown'}；"
+            f"{interruption.get('shutdown_signal') or '进程终止'} 仅中断反思/收尾，"
+            "未改写为研究失败。"
+        )
+    elif health == "failed":
         print(
             "   ❌ 最近一轮失败；先查看 terminal_reason 和 round_events，"
             "不得用离线回测收益替代。"
