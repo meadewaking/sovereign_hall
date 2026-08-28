@@ -1902,6 +1902,47 @@ def test_check_db_values_positions_from_realtime_quote(tmp_path, monkeypatch, ca
     assert performance["score"] == pytest.approx(0.023)
 
 
+def test_check_db_one_lot_boundary_includes_minimum_commission(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "one_lot_boundary.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE system_stats (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO system_stats VALUES ('simulation_cash', '57.14928')")
+    conn.execute(
+        "CREATE TABLE simulation_positions (ticker TEXT, shares INTEGER, avg_cost REAL)"
+    )
+    conn.execute("INSERT INTO simulation_positions VALUES ('510300', 100, 97.72)")
+    conn.execute(
+        "CREATE TABLE simulation_trades "
+        "(ticker TEXT, direction TEXT, shares INTEGER, price REAL, reason TEXT, traded_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        check_db,
+        "get_realtime_prices",
+        lambda tickers: {
+            "510300": {
+                "price": 97.72,
+                "source": "test_realtime_quote",
+                "fetched_at": datetime.now().isoformat(),
+            }
+        },
+    )
+
+    check_db.show_investment_status(db_path)
+    output = capsys.readouterr().out
+
+    assert "新建仓一手要求交易时实时价<=0.5212元" in output
+    assert "已计最低佣金5.00元与滑点" in output
+    assert "<=0.5710元" not in output
+
+
 def test_check_db_lifecycle_review_surfaces_complete_position_evidence(
     tmp_path,
     monkeypatch,

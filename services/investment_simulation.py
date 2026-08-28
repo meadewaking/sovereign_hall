@@ -397,19 +397,21 @@ class InvestmentSimulation:
                 self.config.get("max_single_position", 0.10) or 0.10
             )
             one_lot_market_value_budget = total_assets * max_single_position
-            max_quote_by_position = (
-                one_lot_market_value_budget / int(self.min_unit)
+            max_executable_one_lot_quote = (
+                self.cost_schedule.one_lot_execution_quote_ceiling(
+                    "510300",
+                    cash=available_cash,
+                    total_assets=total_assets,
+                    max_single_position=max_single_position,
+                    lot_size=int(self.min_unit),
+                )
                 if self.min_unit > 0
                 else 0.0
             )
-            max_quote_by_cash = self._max_affordable_quote(
-                available_cash,
+            max_quote_by_cash = self.cost_schedule.max_affordable_quote(
                 "510300",
-                int(self.min_unit),
-            )
-            max_executable_one_lot_quote = min(
-                max_quote_by_position,
-                max_quote_by_cash,
+                cash=available_cash,
+                shares=int(self.min_unit),
             )
             if total_assets > 0 and max_executable_one_lot_quote > 0:
                 performance_lines.extend([
@@ -419,7 +421,7 @@ class InvestmentSimulation:
                         f"每手{int(self.min_unit)}股；新建仓一手要求交易时实时价<="
                         f"{max_executable_one_lot_quote:.4f}元"
                         f"（目标市值预算{one_lot_market_value_budget:.2f}元，"
-                        "另须覆盖佣金和滑点）。"
+                        f"现金含最低佣金/滑点边界{max_quote_by_cash:.4f}元）。"
                     ),
                     (
                         "- 研究/投委会不得批准结构上无法买入一手的多头后再以泛化"
@@ -507,18 +509,12 @@ class InvestmentSimulation:
         max_single_position = float(
             self.config.get("max_single_position", 0.10) or 0.10
         )
-        position_budget = total_assets * max_single_position
-        max_quote_by_position = position_budget / int(self.min_unit)
-        # Screening uses the candidate's own asset type below when available;
-        # this common ceiling is a conservative ETF one-lot cash boundary.
-        max_quote_by_cash = self._max_affordable_quote(
-            cash,
+        executable_quote_ceiling = self.cost_schedule.one_lot_execution_quote_ceiling(
             "510300",
-            int(self.min_unit),
-        )
-        executable_quote_ceiling = min(
-            max_quote_by_position,
-            max_quote_by_cash,
+            cash=cash,
+            total_assets=total_assets,
+            max_single_position=max_single_position,
+            lot_size=int(self.min_unit),
         )
 
         feasible: List[Dict[str, Any]] = []
@@ -1596,17 +1592,11 @@ class InvestmentSimulation:
         ticker: str,
         shares: int,
     ) -> float:
-        if cash <= 0 or shares <= 0:
-            return 0.0
-        low, high = 0.0, cash / shares
-        for _ in range(64):
-            middle = (low + high) / 2.0
-            trade_cost = self._trade_cost(ticker, "buy", price=middle, shares=shares)
-            if trade_cost.notional + trade_cost.total <= cash:
-                low = middle
-            else:
-                high = middle
-        return low
+        return self.cost_schedule.max_affordable_quote(
+            ticker,
+            cash=cash,
+            shares=shares,
+        )
 
     @staticmethod
     def realtime_quotes_enabled() -> bool:

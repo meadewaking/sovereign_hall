@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from sovereign_hall.core.config import get_config
+from sovereign_hall.domain.portfolio.costs import CostSchedule
 from sovereign_hall.domain.portfolio.instruments import normalize_ticker
 from sovereign_hall.services.heuristic_policy import (
     prepare_candidate_rejection_feedback,
@@ -1642,26 +1643,19 @@ def show_investment_status(db_path) -> dict[str, Any]:
                 simulation_config.get("max_single_position", 0.10) or 0.10
             )
             min_unit = int(simulation_config.get("min_unit", 100) or 100)
-            buy_cost_rate = float(
-                simulation_config.get("trading_fee", 0.0003) or 0.0003
-            ) + float(
-                simulation_config.get("slippage_rate", 0.0005) or 0.0005
+            cost_schedule = CostSchedule.from_mapping(simulation_config)
+            max_one_lot_quote = cost_schedule.one_lot_execution_quote_ceiling(
+                "510300",
+                cash=cash,
+                total_assets=total_value,
+                max_single_position=max_single_position,
+                lot_size=min_unit,
             )
-            max_quote_by_position = (
-                total_value * max_single_position / min_unit
-                if min_unit > 0
-                else 0.0
-            )
-            max_quote_by_cash = (
-                cash / min_unit / (1 + buy_cost_rate)
-                if min_unit > 0
-                else 0.0
-            )
-            max_one_lot_quote = min(max_quote_by_position, max_quote_by_cash)
             print(
                 "   当前整手可执行边界: "
                 f"静态单标的上限{max_single_position:.1%}、每手{min_unit}股，"
                 f"新建仓一手要求交易时实时价<={max_one_lot_quote:.4f}元；"
+                f"已计最低佣金{cost_schedule.minimum_commission:.2f}元与滑点；"
                 "成交时仍须重新取价并重过全部硬门"
             )
 
