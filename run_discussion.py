@@ -3851,13 +3851,19 @@ async def run_committee_approved_simulation(
     # Lifecycle exits belong to the active round because their price-free
     # intents were created during its mandatory pre-research review.  Count
     # only newly committed fills; a duplicate idempotent replay is not a fill.
-    lifecycle_fill_count = sum(
+    lifecycle_entry_fill_count = sum(
         1
         for review in position_reviews
-        if str((review.get("execution") or {}).get("action") or "")
-        in {"buy", "sell"}
+        if str((review.get("execution") or {}).get("action") or "") == "buy"
         and (review.get("execution") or {}).get("success") is not False
     )
+    lifecycle_exit_fill_count = sum(
+        1
+        for review in position_reviews
+        if str((review.get("execution") or {}).get("action") or "") == "sell"
+        and (review.get("execution") or {}).get("success") is not False
+    )
+    lifecycle_fill_count = lifecycle_entry_fill_count + lifecycle_exit_fill_count
 
     pending_replay = (
         await simulation.replay_pending_decisions()
@@ -3880,12 +3886,19 @@ async def run_committee_approved_simulation(
                 f"{replayed.get('action', 'unknown')}；{replayed.get('reason', '')}"
             )
     replay_fill_count = int(pending_replay.get("executed") or 0)
+    replay_entry_fill_count = int(pending_replay.get("executed_buys") or 0)
+    replay_exit_fill_count = int(pending_replay.get("executed_sells") or 0)
     if lifecycle_fill_count or replay_fill_count:
         logger.info(
             "SIMULATION_CYCLE_EXISTING_INTENT_FILLS lifecycle_fills=%s "
-            "replay_fills=%s cycle_fills_before_new_candidates=%s",
+            "lifecycle_buys=%s lifecycle_sells=%s replay_fills=%s "
+            "replay_buys=%s replay_sells=%s cycle_fills_before_new_candidates=%s",
             lifecycle_fill_count,
+            lifecycle_entry_fill_count,
+            lifecycle_exit_fill_count,
             replay_fill_count,
+            replay_entry_fill_count,
+            replay_exit_fill_count,
             lifecycle_fill_count + replay_fill_count,
         )
 
@@ -3931,6 +3944,8 @@ async def run_committee_approved_simulation(
         else 0
     )
     trade_count = 0
+    committee_entry_fill_count = 0
+    committee_exit_fill_count = 0
     print(f"   交易频率纪律: 今日已成交{prior_trade_count}/{max_daily_trades}笔；硬上限不允许绕过")
     redeployment_blockers: List[str] = []
     trade_candidates, redeployment_rejections = preflight_committee_decisions(
@@ -4556,6 +4571,7 @@ async def run_committee_approved_simulation(
             elif result.get('action') == 'buy':
                 print(f"   📈 买入 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
                 trade_count += 1
+                committee_entry_fill_count += 1
                 logger.info(
                     "SIMULATION_FILL action=buy ticker=%s shares=%s price=%.6f "
                     "source=%s reason=%s",
@@ -4568,6 +4584,7 @@ async def run_committee_approved_simulation(
             elif result.get('action') == 'sell':
                 print(f"   📉 卖出 {ticker} {result['shares']}股 @ {result['price']:.2f} ({trade_reason})")
                 trade_count += 1
+                committee_exit_fill_count += 1
                 logger.info(
                     "SIMULATION_FILL action=sell ticker=%s shares=%s price=%.6f "
                     "source=%s reason=%s",
@@ -4618,11 +4635,23 @@ async def run_committee_approved_simulation(
     final_assets = await simulation.calculate_assets()
     round_fill_count = lifecycle_fill_count + trade_count
     cycle_fill_count = round_fill_count + replay_fill_count
+    entry_fill_count = (
+        lifecycle_entry_fill_count
+        + replay_entry_fill_count
+        + committee_entry_fill_count
+    )
+    exit_fill_count = (
+        lifecycle_exit_fill_count
+        + replay_exit_fill_count
+        + committee_exit_fill_count
+    )
     if hasattr(simulation, "record_redeployment_attempt"):
         state = await simulation.record_redeployment_attempt(
             final_assets,
             candidate_count=len(deployable_new_longs),
             trade_count=cycle_fill_count,
+            entry_trade_count=entry_fill_count,
+            exit_trade_count=exit_fill_count,
             blockers=redeployment_blockers,
             rejections=redeployment_rejections,
         )
@@ -4663,11 +4692,14 @@ async def run_committee_approved_simulation(
         )
     logger.info(
         "SIMULATION_PIPELINE_END fills=%s replay_fills=%s cycle_fills=%s "
+        "entry_fills=%s exit_fills=%s "
         "candidates=%s rejections=%s "
         "valuation_complete=%s invested_ratio=%s net_total_return=%s health=%s",
         round_fill_count,
         replay_fill_count,
         cycle_fill_count,
+        entry_fill_count,
+        exit_fill_count,
         len(trade_candidates),
         len(redeployment_rejections),
         final_assets.get("valuation_complete"),
@@ -4696,6 +4728,8 @@ async def run_committee_approved_simulation(
         "fills": round_fill_count,
         "replay_fills": replay_fill_count,
         "cycle_fills": cycle_fill_count,
+        "entry_fills": entry_fill_count,
+        "exit_fills": exit_fill_count,
         "pending": 0,
         "candidate_count": len(trade_candidates),
         "rejections": redeployment_rejections,

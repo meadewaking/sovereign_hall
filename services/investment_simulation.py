@@ -305,6 +305,7 @@ class InvestmentSimulation:
                 SELECT status, deployment_gap, blocker_code, blocker_reason,
                        next_action, source, attempt_count, last_attempt_at,
                        last_candidate_count, last_trade_count,
+                       last_entry_trade_count, last_exit_trade_count,
                        last_rejection_counts, rejection_counts_total,
                        created_at, updated_at, completed_at
                 FROM simulation_redeployment_state WHERE id = 1
@@ -734,6 +735,8 @@ class InvestmentSimulation:
         increment_attempt: bool = False,
         candidate_count: int = 0,
         trade_count: int = 0,
+        entry_trade_count: int = 0,
+        exit_trade_count: int = 0,
         rejection_counts: Dict[str, int] | None = None,
     ) -> None:
         if not self.db_service:
@@ -769,9 +772,11 @@ class InvestmentSimulation:
             INSERT INTO simulation_redeployment_state (
                 id, status, deployment_gap, blocker_code, blocker_reason,
                 next_action, source, attempt_count, last_attempt_at,
-                last_candidate_count, last_trade_count, last_rejection_counts,
-                rejection_counts_total, created_at, updated_at, completed_at
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_candidate_count, last_trade_count,
+                last_entry_trade_count, last_exit_trade_count,
+                last_rejection_counts, rejection_counts_total, created_at,
+                updated_at, completed_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 deployment_gap = excluded.deployment_gap,
@@ -783,6 +788,8 @@ class InvestmentSimulation:
                 last_attempt_at = CASE WHEN ? THEN excluded.last_attempt_at ELSE simulation_redeployment_state.last_attempt_at END,
                 last_candidate_count = CASE WHEN ? THEN excluded.last_candidate_count ELSE simulation_redeployment_state.last_candidate_count END,
                 last_trade_count = CASE WHEN ? THEN excluded.last_trade_count ELSE simulation_redeployment_state.last_trade_count END,
+                last_entry_trade_count = CASE WHEN ? THEN excluded.last_entry_trade_count ELSE simulation_redeployment_state.last_entry_trade_count END,
+                last_exit_trade_count = CASE WHEN ? THEN excluded.last_exit_trade_count ELSE simulation_redeployment_state.last_exit_trade_count END,
                 last_rejection_counts = CASE WHEN ? THEN excluded.last_rejection_counts ELSE simulation_redeployment_state.last_rejection_counts END,
                 rejection_counts_total = excluded.rejection_counts_total,
                 updated_at = excluded.updated_at,
@@ -792,8 +799,11 @@ class InvestmentSimulation:
                 status, deployment_gap, blocker_code, blocker_reason, next_action,
                 source, 1 if increment_attempt else 0,
                 now if increment_attempt else None, candidate_count, trade_count,
+                entry_trade_count, exit_trade_count,
                 last_rejections_json, cumulative_rejections_json,
                 now, now, completed_at,
+                1 if increment_attempt else 0,
+                1 if increment_attempt else 0,
                 1 if increment_attempt else 0,
                 1 if increment_attempt else 0,
                 1 if increment_attempt else 0,
@@ -822,12 +832,23 @@ class InvestmentSimulation:
         *,
         candidate_count: int,
         trade_count: int,
+        entry_trade_count: int | None = None,
+        exit_trade_count: int = 0,
         pending_count: int = 0,
         blockers: List[str] | None = None,
         rejections: List[Dict[str, Any]] | None = None,
         source: str = "run_discussion",
     ) -> Dict[str, Any]:
         """Persist one committee redeployment attempt and its exact blocker."""
+        total_trade_count = max(0, int(trade_count or 0))
+        entry_count = (
+            total_trade_count
+            if entry_trade_count is None
+            else max(0, int(entry_trade_count or 0))
+        )
+        exit_count = max(0, int(exit_trade_count or 0))
+        if entry_count + exit_count > total_trade_count:
+            total_trade_count = entry_count + exit_count
         blockers = [str(item) for item in (blockers or []) if str(item).strip()]
         rejection_counts: Dict[str, int] = {}
         for item in rejections or []:
@@ -850,10 +871,16 @@ class InvestmentSimulation:
                 blocker_code = ""
                 blocker_reason = "资金部署达到100%目标"
                 next_action = "继续逐仓生命周期复核"
-            elif trade_count > 0:
+            elif entry_count > 0:
                 status = "partially_redeployed"
                 blocker_code = "residual_operational_cash"
-                blocker_reason = "已完成部分再配置；" + ("；".join(blockers) or "余款受整手/手续费约束")
+                direction_summary = f"本轮买入成交{entry_count}笔"
+                if exit_count:
+                    direction_summary += f"、退出成交{exit_count}笔"
+                blocker_reason = (
+                    f"已完成部分再配置（{direction_summary}）；"
+                    + ("；".join(blockers) or "余款受整手/手续费约束")
+                )
                 next_action = "下一轮继续消费剩余部署缺口"
             elif pending_count > 0:
                 status = "pending_market_session"
@@ -866,7 +893,16 @@ class InvestmentSimulation:
             elif candidate_count <= 0:
                 status = "blocked_no_approved_candidates"
                 blocker_code = "missing_approved_candidates"
-                blocker_reason = "投委会没有批准可执行的多头候选；" + "；".join(blockers)
+                release_reason = (
+                    f"本轮仅有{exit_count}笔退出成交，释放现金尚未完成买入再配置；"
+                    if exit_count
+                    else ""
+                )
+                blocker_reason = (
+                    release_reason
+                    + "投委会没有批准可执行的多头候选；"
+                    + "；".join(blockers)
+                )
                 next_action = (
                     f"下一轮优先处理拒绝码: {rejection_summary}；补齐对应证据或输入后再提交候选"
                     if rejection_summary
@@ -875,7 +911,16 @@ class InvestmentSimulation:
             else:
                 status = "blocked_candidate_execution"
                 blocker_code = "candidate_execution_blocked"
-                blocker_reason = "候选未能成交；" + ("；".join(blockers) or "未返回可执行成交")
+                release_reason = (
+                    f"本轮{exit_count}笔退出成交仅释放现金、没有完成再配置；"
+                    if exit_count
+                    else ""
+                )
+                blocker_reason = (
+                    release_reason
+                    + "候选未能成交；"
+                    + ("；".join(blockers) or "未返回可执行成交")
+                )
                 next_action = "按记录的实时行情/证据/整手阻塞逐项重试"
         await self._write_redeployment_state(
             status=status,
@@ -886,7 +931,9 @@ class InvestmentSimulation:
             source=source,
             increment_attempt=True,
             candidate_count=candidate_count,
-            trade_count=trade_count,
+            trade_count=total_trade_count,
+            entry_trade_count=entry_count,
+            exit_trade_count=exit_count,
             rejection_counts=rejection_counts,
         )
         return await self.get_redeployment_state()
@@ -1421,6 +1468,8 @@ class InvestmentSimulation:
             "pending_before": 0,
             "attempted": 0,
             "executed": 0,
+            "executed_buys": 0,
+            "executed_sells": 0,
             "rejected": 0,
             "expired": 0,
             "remaining": 0,
@@ -1551,6 +1600,10 @@ class InvestmentSimulation:
             action = str(result.get("action") or "")
             if action in {"buy", "sell"} and result.get("success"):
                 summary["executed"] += 1
+                if action == "buy":
+                    summary["executed_buys"] += 1
+                else:
+                    summary["executed_sells"] += 1
                 # The fill transaction already resolved this pending row
                 # together with quote, fill, ledger, cash, position, intent,
                 # redeployment state, round terminal and append-only event.
@@ -2110,6 +2163,11 @@ class InvestmentSimulation:
                             new_cash=new_cash,
                             new_positions=new_positions,
                             idempotency_key=stable_key,
+                            deployment_gap_after=max(
+                                (total_assets - total_fee) * self.target_invested_ratio
+                                - (invested_value + cost),
+                                0.0,
+                            ),
                             round_id=round_id,
                             intent_id=intent_id,
                             pending_decision_id=pending_decision_id,
@@ -2255,6 +2313,11 @@ class InvestmentSimulation:
                             new_cash=new_cash,
                             new_positions=new_positions,
                             idempotency_key=stable_key,
+                            deployment_gap_after=max(
+                                (total_assets - total_fee) * self.target_invested_ratio
+                                - (invested_value - proceeds),
+                                0.0,
+                            ),
                             round_id=round_id,
                             intent_id=intent_id,
                             pending_decision_id=pending_decision_id,
@@ -2882,6 +2945,8 @@ class InvestmentSimulation:
                 last_attempt_at TEXT,
                 last_candidate_count INTEGER NOT NULL DEFAULT 0,
                 last_trade_count INTEGER NOT NULL DEFAULT 0,
+                last_entry_trade_count INTEGER NOT NULL DEFAULT 0,
+                last_exit_trade_count INTEGER NOT NULL DEFAULT 0,
                 last_rejection_counts TEXT NOT NULL DEFAULT '{}',
                 rejection_counts_total TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
@@ -3014,11 +3079,17 @@ class InvestmentSimulation:
 
         async with conn.execute("PRAGMA table_info(simulation_redeployment_state)") as cursor:
             redeployment_columns = {row[1] for row in await cursor.fetchall()}
-        for column in ("last_rejection_counts", "rejection_counts_total"):
+        redeployment_migrations = {
+            "last_entry_trade_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_exit_trade_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_rejection_counts": "TEXT NOT NULL DEFAULT '{}'",
+            "rejection_counts_total": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, definition in redeployment_migrations.items():
             if column not in redeployment_columns:
                 await conn.execute(
                     f"ALTER TABLE simulation_redeployment_state "
-                    f"ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'"
+                    f"ADD COLUMN {column} {definition}"
                 )
 
         await conn.commit()

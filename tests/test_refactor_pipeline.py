@@ -1943,6 +1943,57 @@ def test_check_db_one_lot_boundary_includes_minimum_commission(
     assert "<=0.5710元" not in output
 
 
+def test_check_db_distinguishes_redeployment_buys_from_exit_cash(
+    tmp_path,
+    capsys,
+):
+    import sovereign_hall.check_db as check_db
+
+    db_path = tmp_path / "redeployment_direction.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE system_stats (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO system_stats VALUES ('simulation_cash', '2684.53')")
+    conn.execute(
+        "CREATE TABLE simulation_positions (ticker TEXT, shares INTEGER, avg_cost REAL)"
+    )
+    conn.execute(
+        "CREATE TABLE simulation_trades "
+        "(ticker TEXT, direction TEXT, shares INTEGER, price REAL, reason TEXT, traded_at TEXT)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE simulation_redeployment_state (
+            id INTEGER PRIMARY KEY, status TEXT, deployment_gap REAL,
+            blocker_code TEXT, blocker_reason TEXT, next_action TEXT,
+            source TEXT, attempt_count INTEGER, last_attempt_at TEXT,
+            last_candidate_count INTEGER, last_trade_count INTEGER,
+            last_entry_trade_count INTEGER, last_exit_trade_count INTEGER,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO simulation_redeployment_state VALUES (
+            1, 'blocked_no_approved_candidates', 2684.53,
+            'missing_approved_candidates',
+            '本轮仅有3笔退出成交，释放现金尚未完成买入再配置',
+            '继续研究合格候选', 'run_discussion', 1,
+            '2026-08-31T09:30:46', 0, 3, 0, 3, '2026-08-31T09:30:46'
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    check_db.show_investment_status(db_path)
+    output = capsys.readouterr().out
+
+    assert "成交=3" in output
+    assert "买入再配置=0 | 退出释放现金=3" in output
+    assert "释放现金尚未完成买入再配置" in output
+
+
 def test_check_db_lifecycle_review_surfaces_complete_position_evidence(
     tmp_path,
     monkeypatch,
@@ -3322,6 +3373,8 @@ async def test_pending_replay_fills_count_in_cycle_without_reassigning_current_r
         "pending_before": 3,
         "attempted": 3,
         "executed": 3,
+        "executed_buys": 0,
+        "executed_sells": 3,
         "rejected": 0,
         "expired": 0,
         "remaining": 0,
@@ -3330,9 +3383,9 @@ async def test_pending_replay_fills_count_in_cycle_without_reassigning_current_r
     simulation.record_committee_outcomes = AsyncMock()
     simulation.count_trades_on_date = AsyncMock(return_value=3)
     simulation.record_redeployment_attempt = AsyncMock(return_value={
-        "status": "partially_redeployed",
+        "status": "blocked_no_approved_candidates",
         "deployment_gap": 4_300.0,
-        "blocker_code": "residual_operational_cash",
+        "blocker_code": "missing_approved_candidates",
     })
     simulation.daily_reflection = AsyncMock(return_value="")
     simulation.save_snapshot = AsyncMock()
@@ -3366,6 +3419,38 @@ async def test_pending_replay_fills_count_in_cycle_without_reassigning_current_r
     assert result["cycle_fills"] == 3
     attempt = simulation.record_redeployment_attempt.await_args.kwargs
     assert attempt["trade_count"] == 3
+    assert attempt["entry_trade_count"] == 0
+    assert attempt["exit_trade_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_exit_only_fills_release_cash_without_claiming_partial_redeployment(
+    tmp_path,
+):
+    db = DatabaseService(str(tmp_path / "exit_only_redeployment.db"))
+    await db._init_db()
+    simulation = InvestmentSimulation(db)
+    await simulation.init_tables()
+
+    state = await simulation.record_redeployment_attempt(
+        {
+            "valuation_complete": True,
+            "deployment_gap": 2_684.53,
+        },
+        candidate_count=0,
+        trade_count=3,
+        entry_trade_count=0,
+        exit_trade_count=3,
+    )
+
+    assert state["status"] == "blocked_no_approved_candidates"
+    assert state["blocker_code"] == "missing_approved_candidates"
+    assert state["last_trade_count"] == 3
+    assert state["last_entry_trade_count"] == 0
+    assert state["last_exit_trade_count"] == 3
+    assert "3笔退出成交" in state["blocker_reason"]
+    assert "尚未完成买入再配置" in state["blocker_reason"]
+    await db.close()
 
 
 def test_pending_replay_fill_resets_empty_backoff_without_reassigning_round_terminal():

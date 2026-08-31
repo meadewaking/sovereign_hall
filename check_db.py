@@ -1315,13 +1315,26 @@ def show_investment_status(db_path) -> dict[str, Any]:
             name for name in ("last_rejection_counts", "rejection_counts_total")
             if name in state_columns
         ]
-        rejection_select = ", " + ", ".join(rejection_columns) if rejection_columns else ""
+        optional_state_columns = [
+            name
+            for name in (
+                "last_entry_trade_count",
+                "last_exit_trade_count",
+                *rejection_columns,
+            )
+            if name in state_columns
+        ]
+        optional_state_select = (
+            ", " + ", ".join(optional_state_columns)
+            if optional_state_columns
+            else ""
+        )
         c.execute(
             f"""
             SELECT status, deployment_gap, blocker_code, blocker_reason,
                    next_action, source, attempt_count, last_attempt_at,
                    last_candidate_count, last_trade_count, updated_at
-                   {rejection_select}
+                   {optional_state_select}
             FROM simulation_redeployment_state WHERE id = 1
             """
         )
@@ -1672,6 +1685,15 @@ def show_investment_status(db_path) -> dict[str, Any]:
             f"候选={int(redeployment_state.get('last_candidate_count') or 0)} | "
             f"成交={int(redeployment_state.get('last_trade_count') or 0)}"
         )
+        if (
+            "last_entry_trade_count" in redeployment_state
+            or "last_exit_trade_count" in redeployment_state
+        ):
+            print(
+                "   成交方向: "
+                f"买入再配置={int(redeployment_state.get('last_entry_trade_count') or 0)} | "
+                f"退出释放现金={int(redeployment_state.get('last_exit_trade_count') or 0)}"
+            )
         if redeployment_state.get("blocker_code"):
             raw_blocker_reason = str(redeployment_state.get('blocker_reason') or '')
             blocker_reason, superseded_blockers = sanitize_candidate_rejection_reason(

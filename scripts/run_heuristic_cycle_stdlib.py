@@ -15,6 +15,8 @@ import json
 import math
 import re
 import sqlite3
+import struct
+import zlib
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -848,6 +850,42 @@ def attach_live_iteration_attribution(
     return attributed
 
 
+def load_iteration_fill_audit(db_path: Path, window_start: str) -> dict[str, Any]:
+    """Load direction-aware fills for the same authoritative iteration window."""
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, ticker, direction, shares, price, gross_amount, fee,
+                       commission, stamp_duty, slippage_cost, traded_at,
+                       round_id, intent_id, quote_snapshot_id, quote_provider,
+                       quote_fetched_at, cost_model_version
+                FROM simulation_trades
+                WHERE traded_at >= ?
+                ORDER BY traded_at, id
+                """,
+                (window_start,),
+            ).fetchall()
+        ]
+    direction_counts: dict[str, int] = {"buy": 0, "sell": 0, "other": 0}
+    for row in rows:
+        direction = str(row.get("direction") or "").strip().lower()
+        key = direction if direction in {"buy", "sell"} else "other"
+        direction_counts[key] += 1
+    return {
+        "window_start": window_start,
+        "fill_count": len(rows),
+        "direction_counts": direction_counts,
+        "fills": rows,
+        "rule": (
+            "Only persisted simulation_trades inside the authoritative live "
+            "iteration window are counted; buys and sells are never conflated."
+        ),
+    }
+
+
 def live_failure_suspected_reason(metrics: dict[str, Any]) -> str:
     """Describe live deployment state without contradicting the measured ratio."""
     fill_count = int(metrics.get("trades_since_window_start") or 0)
@@ -1648,13 +1686,126 @@ def write_policy_snapshot(path: Path, policy: PolicyConfig, costs: CostConfig) -
     )
 
 
-def write_plot(path: Path) -> None:
-    path.write_bytes(
-        bytes.fromhex(
-            "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
-            "0000000c49444154789c6360f8ffff3f0005fe02fea73581e20000000049454e44ae426082"
+def write_plot(path: Path, trials: list[dict[str, Any]]) -> None:
+    """Write a dependency-free sample-efficiency chart instead of a placeholder.
+
+    Red points are each offline-diagnostic trial score.  The blue line is the
+    running best diagnostic score as more policy trials are consumed.  This is
+    deliberately diagnostic-only and is never a live-policy promotion chart.
+    """
+    width, height = 1200, 700
+    left, right, top, bottom = 92, 54, 54, 82
+    pixels = bytearray([255, 255, 255] * width * height)
+
+    def set_pixel(x: int, y: int, color: tuple[int, int, int]) -> None:
+        if 0 <= x < width and 0 <= y < height:
+            offset = (y * width + x) * 3
+            pixels[offset : offset + 3] = bytes(color)
+
+    def line(
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+        color: tuple[int, int, int],
+        thickness: int = 1,
+    ) -> None:
+        dx = abs(x1 - x0)
+        sx = 1 if x0 < x1 else -1
+        dy = -abs(y1 - y0)
+        sy = 1 if y0 < y1 else -1
+        error = dx + dy
+        while True:
+            radius = max(0, thickness // 2)
+            for ox in range(-radius, radius + 1):
+                for oy in range(-radius, radius + 1):
+                    set_pixel(x0 + ox, y0 + oy, color)
+            if x0 == x1 and y0 == y1:
+                break
+            twice = 2 * error
+            if twice >= dy:
+                error += dy
+                x0 += sx
+            if twice <= dx:
+                error += dx
+                y0 += sy
+
+    def dot(x: int, y: int, radius: int, color: tuple[int, int, int]) -> None:
+        for oy in range(-radius, radius + 1):
+            for ox in range(-radius, radius + 1):
+                if ox * ox + oy * oy <= radius * radius:
+                    set_pixel(x + ox, y + oy, color)
+
+    scores = [safe_float(row.get("score")) for row in trials]
+    if not scores:
+        scores = [0.0]
+    running_best: list[float] = []
+    best = -math.inf
+    for score in scores:
+        best = max(best, score)
+        running_best.append(best)
+
+    low = min(min(scores), 0.0)
+    high = max(max(scores), 0.0)
+    padding = max((high - low) * 0.08, 0.01)
+    low -= padding
+    high += padding
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    def x_of(index: int) -> int:
+        return left + round(index * plot_width / max(len(scores) - 1, 1))
+
+    def y_of(score: float) -> int:
+        ratio = (score - low) / max(high - low, 1e-12)
+        return top + round((1.0 - ratio) * plot_height)
+
+    grid = (221, 226, 232)
+    axis = (55, 65, 81)
+    for step in range(11):
+        x = left + round(step * plot_width / 10)
+        y = top + round(step * plot_height / 10)
+        line(x, top, x, height - bottom, grid)
+        line(left, y, width - right, y, grid)
+    if low <= 0.0 <= high:
+        line(left, y_of(0.0), width - right, y_of(0.0), (140, 148, 160), 2)
+    line(left, top, left, height - bottom, axis, 3)
+    line(left, height - bottom, width - right, height - bottom, axis, 3)
+
+    for index, score in enumerate(scores):
+        dot(x_of(index), y_of(score), 5, (210, 67, 67))
+    for index in range(1, len(running_best)):
+        line(
+            x_of(index - 1),
+            y_of(running_best[index - 1]),
+            x_of(index),
+            y_of(running_best[index]),
+            (35, 99, 190),
+            4,
         )
-    )
+    for index, score in enumerate(running_best):
+        dot(x_of(index), y_of(score), 4, (35, 99, 190))
+
+    def png_chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    raw = b"".join(b"\x00" + bytes(pixels[y * width * 3 : (y + 1) * width * 3]) for y in range(height))
+    description = (
+        "Offline diagnostic only. X=policy trials consumed; red=trial score; "
+        "blue=running best score. Not authoritative and not promotion eligible."
+    ).encode("latin-1")
+    png = b"\x89PNG\r\n\x1a\n"
+    png += png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += png_chunk(b"tEXt", b"Title\x00Sample Efficiency - Offline Diagnostic")
+    png += png_chunk(b"tEXt", b"Description\x00" + description)
+    png += png_chunk(b"IDAT", zlib.compress(raw, level=9))
+    png += png_chunk(b"IEND", b"")
+    path.write_bytes(png)
 
 
 def write_readme(
@@ -1949,6 +2100,22 @@ def write_live_readme(
         if improvement is None
         else f"{float(improvement):+.6f} realtime score delta"
     )
+    direction_counts = dict(
+        (metrics.get("iteration_fill_audit") or {}).get("direction_counts") or {}
+    )
+    entry_fill_count = int(direction_counts.get("buy") or 0)
+    exit_fill_count = int(direction_counts.get("sell") or 0)
+    if exit_fill_count:
+        reallocation_text = (
+            f"{exit_fill_count} exit fills released cash atomically; "
+            f"{entry_fill_count} entry fills redeployed it. Any unreinvested "
+            "balance remains an explicit deployment blocker."
+        )
+    else:
+        reallocation_text = (
+            "No exit fill occurred in this iteration; existing undeployed cash "
+            "remains an explicit deployment blocker."
+        )
     path.write_text(
         f"""# Heuristic Learning Cycle — Live Simulation Authority
 
@@ -1989,7 +2156,7 @@ def write_live_readme(
 - Current invested ratio is
   {invested_text}, deployment gap is {gap_text}, and undeployed cash is a
   deployment blocker rather than risk cash.
-- Exit cash reallocation: no exit in this cycle; undeployed cash is not risk cash.
+- Exit cash reallocation: {reallocation_text}
 
 ## Reproduce
 ```bash
@@ -2099,6 +2266,10 @@ def main() -> int:
         ),
         baseline_score=previous_live_score,
     )
+    live_metrics["iteration_fill_audit"] = load_iteration_fill_audit(
+        db_path,
+        iteration_window_start,
+    )
 
     previous_score, previous_path = previous_best_score(runs_root)
     predictions = load_predictions(db_path)
@@ -2119,7 +2290,10 @@ def main() -> int:
         "scripts/backfill_daily_prices.py",
         "research_interactive.py",
         "run_discussion.py",
+        "application/execute_simulation_cycle.py",
+        "infrastructure/sqlite/migrations.py",
         "tests/test_refactor_pipeline.py",
+        "tests/test_architecture_refactor.py",
     ]
 
     results: dict[str, dict[str, Any]] = {}
@@ -2226,7 +2400,9 @@ def main() -> int:
     price_readiness["backfill_plan"] = backfill_plan_summary
     price_readiness["backfill_plan_path"] = backfill_plan_summary.get("plan_csv", "")
     price_readiness["backfill_plan_summary_path"] = backfill_plan_summary.get("plan_json", "")
-    from services.heuristic_policy import build_price_readiness_stall_report
+    from sovereign_hall.services.heuristic_policy import (
+        build_price_readiness_stall_report,
+    )
 
     price_readiness_stall = build_price_readiness_stall_report(
         runs_root,
@@ -2352,7 +2528,7 @@ def main() -> int:
             "promotion_eligible",
         ],
     )
-    write_plot(run_dir / "sample_efficiency.png")
+    write_plot(run_dir / "sample_efficiency.png", trials)
     write_policy_snapshot(
         run_dir / "offline_diagnostic_policy_snapshot.py", best_policy, costs
     )
