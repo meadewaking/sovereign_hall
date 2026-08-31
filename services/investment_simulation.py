@@ -931,13 +931,28 @@ class InvestmentSimulation:
         conn = self.db_service._connection
         if conn is None:
             return None
+        normalized_ticker = self._normalize_ticker(ticker)
+        normalized_direction = str(direction or "hold").lower()
+        # A sell ruling for an existing position is a durable lifecycle
+        # obligation, not a time-limited entry thesis.  It must survive long
+        # closures and quote outages until a fresh open-session quote can
+        # execute it (or the position is independently gone).  Entry rulings
+        # keep the configured expiry window so stale committee views cannot
+        # turn into future buys.
+        durable_exit = bool(
+            intent_id and normalized_direction in {"sell", "short"}
+        )
         now_dt = datetime.now()
         now = now_dt.isoformat()
-        expires_at = (now_dt + timedelta(days=self.pending_decision_max_age_days)).isoformat()
+        expires_at = (
+            None
+            if durable_exit
+            else (
+                now_dt + timedelta(days=self.pending_decision_max_age_days)
+            ).isoformat()
+        )
         try:
             if existing_id is None:
-                normalized_ticker = self._normalize_ticker(ticker)
-                normalized_direction = str(direction or "hold").lower()
                 if intent_id:
                     lookup_sql = (
                         "SELECT id FROM simulation_pending_decisions "
@@ -965,20 +980,23 @@ class InvestmentSimulation:
                     SET ticker = ?, direction = ?, target_position = ?, confidence = ?,
                         reason = ?, defer_code = ?, source = ?,
                         status = 'pending_next_trading_session', updated_at = ?,
-                        expires_at = COALESCE(expires_at, ?), resolution = ?,
+                        expires_at = CASE WHEN ? = 1 THEN NULL
+                                          ELSE COALESCE(expires_at, ?) END,
+                        resolution = ?,
                         round_id = COALESCE(?, round_id),
                         intent_id = COALESCE(?, intent_id)
                     WHERE id = ?
                     """,
                     (
-                        self._normalize_ticker(ticker),
-                        str(direction or "hold").lower(),
+                        normalized_ticker,
+                        normalized_direction,
                         max(0.0, min(float(target_position or 0.0), 1.0)),
                         confidence,
                         str(reason or "")[:2000],
                         str(defer_code or "execution_deferred"),
                         str(source or "investment_simulation"),
                         now,
+                        int(durable_exit),
                         expires_at,
                         f"replay_deferred:{defer_code}"[:500],
                         round_id,
@@ -997,8 +1015,8 @@ class InvestmentSimulation:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_next_trading_session', ?, ?, ?, ?, ?)
                 """,
                 (
-                    self._normalize_ticker(ticker),
-                    str(direction or "hold").lower(),
+                    normalized_ticker,
+                    normalized_direction,
                     max(0.0, min(float(target_position or 0.0), 1.0)),
                     confidence,
                     str(reason or "")[:2000],
@@ -1245,6 +1263,56 @@ class InvestmentSimulation:
             intent_id=intent_id,
             idempotency_key=item["idempotency_key"],
         )
+        if (
+            str(item.get("direction") or "").lower() in {"sell", "short"}
+            and str(result.get("blocker_code") or "")
+            == "realtime_quote_unavailable"
+        ):
+            # A mandatory lifecycle exit is a durable ruling, not a one-shot
+            # quote request.  A transient open-session quote miss must keep the
+            # same price-free intent retryable; permanently rejecting it would
+            # strand an already-expired holding because the position episode's
+            # stable idempotency key would only ever resolve to that rejection.
+            # No quote snapshot or fill is created here.  Replay still has to
+            # pass market hours, quote freshness, portfolio and daily-fill gates.
+            pending_id = await self.record_pending_decision(
+                ticker=str(item["ticker"]),
+                direction=str(item["direction"]),
+                target_position=float(item["target_position"]),
+                confidence=item.get("confidence"),
+                reason=str(item.get("reason") or "生命周期退出等待实时行情"),
+                defer_code="realtime_quote_unavailable",
+                source="lifecycle_exit_quote_retry",
+                existing_id=pending_decision_id,
+                round_id=item.get("round_id"),
+                intent_id=intent_id,
+            )
+            if pending_id is None:
+                return {
+                    "intent_id": intent_id,
+                    "success": False,
+                    "action": "error",
+                    "blocker_code": "pending_persistence_failed",
+                    "reason": "生命周期退出缺价，且待执行裁决持久化失败；intent保持可重试",
+                }
+            retry_reason = (
+                "生命周期退出缺少新鲜实时行情，保留同一price-free intent等待重放；"
+                "未创建quote snapshot或fill"
+            )
+            await self._set_execution_intent_status(
+                intent_id,
+                status="deferred",
+                resolution=retry_reason,
+                defer_code="realtime_quote_unavailable",
+                pending_decision_id=pending_id,
+            )
+            result = {
+                **result,
+                "success": False,
+                "action": "pending",
+                "pending_decision_id": pending_id,
+                "reason": retry_reason,
+            }
         action = str(result.get("action") or "")
         if action == "pending":
             await self._set_execution_intent_status(
@@ -1408,10 +1476,24 @@ class InvestmentSimulation:
         eligible: List[Dict[str, Any]] = []
         for row in rows:
             expiry_text = str(row.get("expires_at") or "")
-            try:
-                expired = bool(expiry_text and datetime.fromisoformat(expiry_text) < now)
-            except ValueError:
-                expired = True
+            durable_exit = bool(
+                row.get("intent_id")
+                and str(row.get("direction") or "").lower()
+                in {"sell", "short"}
+            )
+            if durable_exit:
+                # Defensive compatibility for a database created by an older
+                # runner before the non-expiring-exit migration.  Never discard
+                # a mandatory exit merely because its old queue TTL elapsed.
+                expired = False
+            else:
+                try:
+                    expired = bool(
+                        expiry_text
+                        and datetime.fromisoformat(expiry_text) < now
+                    )
+                except ValueError:
+                    expired = True
             if expired:
                 await conn.execute(
                     """
@@ -2361,7 +2443,7 @@ class InvestmentSimulation:
                 pos["peak_price"] = max(float(pos.get("peak_price") or diagnostic_price), float(diagnostic_price))
 
             result = review.as_dict()
-            if review.action == "exit" and executable_price:
+            if review.action == "exit":
                 # A lifecycle exit belongs to the open-position episode, not to
                 # whichever research round happened to observe the same breach.
                 # Using round_id here used to create one deferred sell intent per
@@ -2399,7 +2481,7 @@ class InvestmentSimulation:
                             "reason": "生命周期退出裁决持久化失败",
                         }
                     )
-                else:
+                elif executable_price:
                     # Production exits use ExecutionIntent. The in-memory seam
                     # remains for pure policy unit tests only.
                     execution = await self.execute_trade(
@@ -2410,6 +2492,16 @@ class InvestmentSimulation:
                         reason=execution_reason,
                         risk_cap_already_applied=True,
                     )
+                else:
+                    execution = {
+                        "success": False,
+                        "action": "pending",
+                        "blocker_code": "realtime_quote_unavailable",
+                        "reason": (
+                            "生命周期退出已触发，但纯内存测试路径没有可持久化的ExecutionIntent；"
+                            "禁止使用旧价成交"
+                        ),
+                    }
                 result["execution"] = execution
                 if not execution.get("success") and ticker in self.positions:
                     pos["review_status"] = "exit_pending_execution"
@@ -2894,6 +2986,12 @@ class InvestmentSimulation:
             "expires_at": "TEXT",
             "replayed_at": "TEXT",
             "replay_count": "INTEGER NOT NULL DEFAULT 0",
+            # A fresh DatabaseService can apply architecture migrations before
+            # this legacy-owned table exists.  Add lineage locally before any
+            # query uses it; the second architecture pass then installs the
+            # canonical guards and indexes.
+            "round_id": "TEXT",
+            "intent_id": "TEXT",
         }
         for column, definition in pending_migrations.items():
             if column not in pending_columns:
@@ -2904,7 +3002,12 @@ class InvestmentSimulation:
             """
             UPDATE simulation_pending_decisions
             SET expires_at = datetime(created_at, ?)
-            WHERE status = 'pending_next_trading_session' AND expires_at IS NULL
+            WHERE status = 'pending_next_trading_session'
+              AND expires_at IS NULL
+              AND NOT (
+                  direction IN ('sell', 'short')
+                  AND intent_id IS NOT NULL
+              )
             """,
             (f"+{self.pending_decision_max_age_days} days",),
         )

@@ -3043,7 +3043,7 @@ def test_position_review_blocks_non_realtime_price_instead_of_fabricating_exit()
     review = review_position(
         ticker="512660",
         avg_cost=1.483,
-        opened_at="2026-05-12T06:02:08",
+        opened_at="2026-07-08T06:02:08",
         price=1.278,
         price_at="2026-06-05",
         price_source="stale local prediction current_price",
@@ -3052,8 +3052,27 @@ def test_position_review_blocks_non_realtime_price_instead_of_fabricating_exit()
     )
 
     assert review.action == "blocked_non_realtime_price"
-    assert review.holding_days == 62
+    assert review.holding_days == 5
     assert review.price_age_days == 38
+
+
+def test_position_review_persists_price_free_max_duration_exit_without_a_quote():
+    review = review_position(
+        ticker="512660",
+        avg_cost=1.483,
+        opened_at="2026-05-12T06:02:08",
+        price=None,
+        price_at="",
+        price_source="realtime_quote_unavailable",
+        now=datetime.fromisoformat("2026-07-13T09:00:00"),
+        max_holding_days=30,
+    )
+
+    assert review.action == "exit"
+    assert review.holding_days == 62
+    assert review.pnl_pct is None
+    assert "最大持有期触发" in review.reason
+    assert "price-free退出裁决" in review.reason
 
 
 def test_position_review_exits_fresh_stop_or_max_holding_breach():
@@ -3108,7 +3127,9 @@ async def test_simulation_reviews_every_position_and_only_executes_fresh_exit():
 
     reviews = await sim.review_open_positions()
 
-    assert [row["action"] for row in reviews] == ["blocked_realtime_price", "exit"]
+    assert [row["action"] for row in reviews] == ["exit_pending_execution", "exit"]
+    assert reviews[0]["execution"]["blocker_code"] == "realtime_quote_unavailable"
+    assert "禁止使用旧价成交" in reviews[0]["execution"]["reason"]
     sim.execute_trade.assert_awaited_once()
     assert sim.execute_trade.await_args.kwargs["ticker"] == "600050"
 
@@ -5284,7 +5305,7 @@ async def test_pending_replay_is_exit_first_and_resolves_each_row_once(tmp_path,
                 """
                 UPDATE simulation_pending_decisions
                 SET status = 'executed', resolved_at = ?, updated_at = ?,
-                    resolution = 'simulation_trade:test'
+                    resolution = 'simulation_trade:test', defer_code = ''
                 WHERE id = ?
                 """,
                 (now, now, kwargs["pending_decision_id"]),
@@ -5381,6 +5402,81 @@ async def test_pending_replay_expires_stale_ruling_without_trade(tmp_path, monke
     assert result["expired"] == 1
     assert tuple(row) == ("expired", "expired_without_open-session_replay")
     sim.execute_trade.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_linked_exit_pending_ignores_legacy_expiry_and_stays_retryable(
+    tmp_path,
+    monkeypatch,
+):
+    db = DatabaseService(str(tmp_path / "pending_exit_legacy_expiry.db"))
+    await db._init_db()
+    sim = InvestmentSimulation(db)
+    await sim.init_tables()
+    intent_id = await sim.create_execution_intent(
+        ticker="588860",
+        direction="sell",
+        target_position=0.0,
+        reason="mandatory max-duration exit",
+        idempotency_key="lifecycle:588860:exit:legacy-expiry",
+    )
+    pending_id = await sim.record_pending_decision(
+        ticker="588860",
+        direction="sell",
+        target_position=0.0,
+        reason="wait for fresh quote",
+        defer_code="realtime_quote_unavailable",
+        intent_id=intent_id,
+    )
+    # Simulate a pre-migration database row.  The defensive replay check must
+    # preserve the durable exit even before startup reconciliation runs.
+    await db._connection.executescript(
+        """
+        DROP TRIGGER simulation_pending_exit_expiry_guard_insert;
+        DROP TRIGGER simulation_pending_exit_expiry_guard_update;
+        """
+    )
+    await db._connection.execute(
+        "UPDATE simulation_pending_decisions SET expires_at = ? WHERE id = ?",
+        ((datetime.now() - timedelta(days=1)).isoformat(), pending_id),
+    )
+    await db._connection.commit()
+    fake_market = type(
+        "FakeMarket",
+        (),
+        {
+            "is_trading_day": AsyncMock(return_value=True),
+            "is_market_open": AsyncMock(return_value=True),
+        },
+    )()
+    monkeypatch.setattr(
+        "sovereign_hall.services.market_data.get_market_data",
+        lambda: fake_market,
+    )
+    sim.count_trades_on_date = AsyncMock(return_value=0)
+    sim.execute_intent = AsyncMock(
+        return_value={
+            "success": False,
+            "action": "error",
+            "reason": "injected atomic failure",
+        }
+    )
+
+    result = await sim.replay_pending_decisions()
+    row = await (await db._connection.execute(
+        "SELECT status, replay_count FROM simulation_pending_decisions WHERE id = ?",
+        (pending_id,),
+    )).fetchone()
+    await db.close()
+
+    assert result["attempted"] == 1
+    assert result["expired"] == 0
+    assert result["remaining"] == 1
+    assert tuple(row) == ("pending_next_trading_session", 1)
+    sim.execute_intent.assert_awaited_once_with(
+        intent_id,
+        pending_decision_id=pending_id,
+    )
 
 
 @pytest.mark.asyncio

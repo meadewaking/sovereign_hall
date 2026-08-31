@@ -1079,6 +1079,21 @@ def prioritize_deployment_research(
     if status == "blocked_valuation_incomplete":
         return topic
 
+    # When the residual cash is too small to buy even one lot of any plausible
+    # new candidate, forcing every sector topic into "candidate-comparison"
+    # mode only makes the LLM correctly return [] because no executable new
+    # candidate exists. That locks the loop into endless empty rounds. Held
+    # positions are not "new candidates" for this research path, so the floor
+    # uses a market-level constant (1.0 yuan/share covers fees+slippage on
+    # the cheapest liquid A-share/ETF lots). Treat sub-lot residual cash as
+    # fully deployed and let the research run with the original sector topic.
+    from sovereign_hall.core.config import get_config
+    min_unit = int(get_config().get("simulation", {}).get("min_unit", 100) or 100)
+    new_candidate_floor_price = 1.0
+    cheapest_new_lot_cost = min_unit * new_candidate_floor_price
+    if deployment_gap > 0 and deployment_gap < cheapest_new_lot_cost:
+        return topic
+
     # The 80% invested-ratio threshold is a health/failure boundary, not the
     # portfolio's deployment target.  Once the durable redeployment queue says
     # that otherwise usable cash is blocked only by the absence of an approved
