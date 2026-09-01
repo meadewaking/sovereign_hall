@@ -631,8 +631,8 @@ class InvestmentSimulation:
                         review_depth, prediction_id, evidence_gaps, reconsider_if,
                         individual_votes, stage_execution_audit, deadlock_review,
                         initial_committee_decision, source, created_at, round_id,
-                        decision_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        decision_id, meeting_id, outcome_code
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         self._normalize_ticker(str(decision.get("ticker") or "")),
@@ -676,6 +676,8 @@ class InvestmentSimulation:
                         now,
                         effective_round_id,
                         decision.get("decision_id"),
+                        decision.get("meeting_id"),
+                        str(decision.get("outcome_code") or "") or None,
                     ),
                 )
                 if (
@@ -3010,6 +3012,8 @@ class InvestmentSimulation:
                 stage_execution_audit TEXT NOT NULL DEFAULT '[]',
                 deadlock_review TEXT NOT NULL DEFAULT '{}',
                 initial_committee_decision TEXT NOT NULL DEFAULT '{}',
+                meeting_id TEXT,
+                outcome_code TEXT,
                 source TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
@@ -3037,6 +3041,8 @@ class InvestmentSimulation:
             "stage_execution_audit": "TEXT NOT NULL DEFAULT '[]'",
             "deadlock_review": "TEXT NOT NULL DEFAULT '{}'",
             "initial_committee_decision": "TEXT NOT NULL DEFAULT '{}'",
+            "meeting_id": "TEXT",
+            "outcome_code": "TEXT",
         }
         for column, definition in committee_migrations.items():
             if column not in committee_columns:

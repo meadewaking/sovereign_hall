@@ -184,6 +184,12 @@ research:
   committee_vote_max_tokens: 3500
   committee_summary_chars: 1200
   committee_vote_context_chars: 6000
+  # Committee-specific backpressure: queued seats do not consume their own
+  # role timeout until they actually enter an LLM slot.
+  committee_max_concurrent_tasks: 3
+  # Bump this value whenever committee prompts or the final-vote JSON contract
+  # changes; durable checkpoints only resume an identical version and input.
+  committee_prompt_version: "committee_roundtable_v1"
   # Independent deadlines preserve completed roles; timeout is an audited
   # absence, never a synthetic HOLD vote.
   committee_round1_role_timeout_seconds: 240

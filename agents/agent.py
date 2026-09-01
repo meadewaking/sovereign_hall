@@ -137,7 +137,7 @@ class Agent:
         )
 
         # 构建用户消息（包含历史记忆）
-        user_message = self._build_user_message(task)
+        user_message = self._build_user_message(task, include_memory=use_memory)
 
         # 调用LLM
         try:
@@ -426,7 +426,7 @@ class Agent:
             use_memory=False,
         )
 
-    def _build_user_message(self, task: str) -> str:
+    def _build_user_message(self, task: str, *, include_memory: bool = True) -> str:
         """构建用户消息"""
         messages = []
 
@@ -434,7 +434,7 @@ class Agent:
         messages.append(f"【任务】\n{task}")
 
         # 添加历史记忆
-        if self.memory:
+        if include_memory and self.memory:
             memory_text = "\n【历史对话】\n" + self._format_memory()
             messages.append(memory_text)
 

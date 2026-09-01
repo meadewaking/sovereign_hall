@@ -16,6 +16,7 @@ import pytest
 from sovereign_hall.core import AgentRole, Document, PlaybookEntry
 from sovereign_hall.core.config import get_config
 from sovereign_hall.agents import get_persona
+from sovereign_hall.agents.agent import Agent
 from sovereign_hall.services.database import DatabaseService
 from sovereign_hall.services.decision_tracker import DecisionRecorder
 from sovereign_hall.services.investment_simulation import InvestmentSimulation
@@ -86,6 +87,7 @@ from sovereign_hall.run_discussion import (
     kill_existing_run_discussion_instances,
     merge_committee_deadlock_review,
     parse_committee_vote,
+    parse_strict_committee_vote,
     parse_args,
     preflight_committee_decisions,
     merge_documents_prefer_richer,
@@ -546,6 +548,13 @@ def test_rejected_candidate_is_not_classified_as_no_evidence():
         decisions=[],
         rejections=[{"code": "system_failure_no_live_deployment"}],
     ) == "no_evidence"
+    assert select_simulation_terminal(
+        round_fill_count=0,
+        pending_count=0,
+        trade_candidates=[],
+        decisions=[{"direction": "hold", "vote_quorum_met": False}],
+        rejections=[{"code": "committee_incomplete"}],
+    ) == "committee_incomplete"
 
 
 def test_source_persisted_round_accepts_rejected_candidate_terminal():
@@ -3487,6 +3496,18 @@ def test_incomplete_round_cannot_reuse_previous_cycle_fill_activity():
         {"fills": 0, "replay_fills": 1, "cycle_fills": 1},
     )
 
+    committee_incomplete = ResearchRound(
+        base_topic="committee outage",
+        research_objective="retry missing seats",
+        status=ResearchRoundStatus.COMPLETED,
+        current_stage=ResearchRoundStatus.COMPLETED.value,
+        terminal_code="committee_incomplete",
+    )
+    assert not round_has_operational_result(
+        committee_incomplete,
+        {"fills": 0, "replay_fills": 0, "cycle_fills": 0},
+    )
+
 
 def test_weaker_research_terminal_cannot_overwrite_atomic_fill_terminal():
     filled_during_lifecycle = ResearchRound(
@@ -6057,6 +6078,30 @@ def test_committee_votes_can_defer_to_hold():
     assert committee_decision_is_predictable(decision) is True
 
 
+@pytest.mark.asyncio
+async def test_agent_use_memory_false_creates_a_fresh_one_shot_prompt():
+    class CaptureLLM:
+        def __init__(self):
+            self.users = []
+
+        async def chat(self, **kwargs):
+            self.users.append(str(kwargs.get("user") or ""))
+            return "fresh vote"
+
+    llm = CaptureLLM()
+    agent = Agent(AgentRole.CIO, llm)
+    agent.set_topic("memory isolation")
+    agent._add_to_memory("old task", "old answer")
+
+    result = await agent.think("final independent vote", use_memory=False)
+
+    assert result == "fresh vote"
+    assert len(llm.users) == 1
+    assert "final independent vote" in llm.users[0]
+    assert "历史对话" not in llm.users[0]
+    assert "old task" not in llm.users[0]
+
+
 def test_deployment_deadlock_review_can_adopt_only_strong_quorate_direction():
     proposal = {
         "ticker": "600515",
@@ -6328,6 +6373,28 @@ def test_committee_vote_accepts_structured_json():
     assert vote["invalid_if"] == "跌破支撑"
 
 
+def test_final_committee_vote_requires_exact_json_schema():
+    valid = parse_strict_committee_vote(
+        '{"direction":"hold","confidence":0.4,"position":0.0,'
+        '"key_evidence":["缺少订单明细"],"risk_flags":["需求不确定"],'
+        '"invalid_if":"订单明细可追溯"}'
+    )
+    missing_fields = parse_strict_committee_vote(
+        '{"direction":"hold","confidence":0.4,"position":0.0}'
+    )
+    fenced = parse_strict_committee_vote(
+        '```json\n{"direction":"hold","confidence":0.4,"position":0.0,'
+        '"key_evidence":[],"risk_flags":[],"invalid_if":"补证"}\n```'
+    )
+
+    assert valid["schema_valid"] is True
+    assert valid["parse_mode"] == "structured_json"
+    assert missing_fields["schema_valid"] is False
+    assert missing_fields["schema_error"] == "missing_required_fields"
+    assert fenced["schema_valid"] is False
+    assert fenced["schema_error"] == "not_a_single_json_object"
+
+
 def test_committee_vote_accepts_auditable_abstention():
     vote = parse_committee_vote(
         '{"direction":"abstain","confidence":0.2,"position":0,'
@@ -6535,7 +6602,7 @@ def test_invalid_committee_votes_abstain_and_fail_quorum():
         normalize_ticker=lambda ticker: ticker,
     )
     assert executable == []
-    assert rejected[0]["code"] == "committee_vote_quorum_failed"
+    assert rejected[0]["code"] == "committee_incomplete"
     assert "parsed_votes=1/3" in rejected[0]["reason"]
 
 

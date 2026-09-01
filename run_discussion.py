@@ -2169,6 +2169,99 @@ def parse_committee_vote(text: str) -> Dict:
     }
 
 
+def parse_strict_committee_vote(text: str) -> Dict[str, Any]:
+    """Validate the final-vote wire format without changing legacy parsers."""
+    parsed = parse_committee_vote(text)
+    try:
+        payload = json.loads(str(text or "").strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+
+    reason = ""
+    required = {
+        "direction",
+        "confidence",
+        "position",
+        "key_evidence",
+        "risk_flags",
+        "invalid_if",
+    }
+    if not isinstance(payload, dict):
+        reason = "not_a_single_json_object"
+    elif not required.issubset(payload):
+        reason = "missing_required_fields"
+    elif str(payload.get("direction") or "").strip().lower() not in {
+        "long",
+        "short",
+        "hold",
+        "abstain",
+    }:
+        reason = "invalid_direction_enum"
+    elif isinstance(payload.get("confidence"), bool) or not isinstance(
+        payload.get("confidence"),
+        (int, float),
+    ):
+        reason = "confidence_not_number"
+    elif isinstance(payload.get("position"), bool) or not isinstance(
+        payload.get("position"),
+        (int, float),
+    ):
+        reason = "position_not_number"
+    elif not isinstance(payload.get("key_evidence"), list):
+        reason = "key_evidence_not_array"
+    elif not isinstance(payload.get("risk_flags"), list):
+        reason = "risk_flags_not_array"
+    elif not isinstance(payload.get("invalid_if"), str):
+        reason = "invalid_if_not_string"
+    elif not 0.0 <= float(payload["confidence"]) <= 1.0:
+        reason = "confidence_out_of_range"
+    elif not 0.0 <= float(payload["position"]) <= 1.0:
+        reason = "position_out_of_range"
+
+    schema_valid = not reason and bool(parsed.get("is_valid"))
+    return {
+        **parsed,
+        "is_valid": schema_valid,
+        "schema_valid": schema_valid,
+        "schema_error": reason,
+        "parse_mode": (
+            "structured_json" if schema_valid else "schema_invalid"
+        ),
+    }
+
+
+def enforce_strict_committee_vote_results(
+    results: List[str],
+    audit: Dict[str, Any],
+    labels: List[str],
+    *,
+    stage: str,
+) -> tuple[List[str], Dict[str, Any]]:
+    """Turn schema-invalid final responses into explicit absences.
+
+    Raw responses remain untouched in ``committee_turns``. Only the aggregation
+    input is replaced, so an invalid payload can never silently become HOLD.
+    """
+    strict_results = list(results)
+    schema_errors: List[Dict[str, str]] = []
+    for index, result in enumerate(results):
+        parsed = parse_strict_committee_vote(result)
+        if parsed.get("schema_valid"):
+            continue
+        label = labels[index] if index < len(labels) else f"vote_{index + 1}"
+        reason = str(parsed.get("schema_error") or "schema_validation_failed")
+        schema_errors.append({"label": label, "reason": reason})
+        strict_results[index] = (
+            f"[committee_task_absent] stage={stage} role={label} "
+            f"reason=schema_invalid schema_error={reason}"
+        )
+    return strict_results, {
+        **audit,
+        "schema_invalid_count": len(schema_errors),
+        "schema_invalid_tasks": schema_errors,
+    }
+
+
 def normalize_vote_direction(value: Any) -> str:
     """Normalize structured or natural-language vote direction."""
     text = str(value or "").strip().lower()
@@ -2433,6 +2526,7 @@ async def collect_committee_results(
     *,
     timeout_seconds: float,
     stage: str,
+    max_concurrency: int | None = None,
 ) -> tuple[List[str], Dict[str, Any]]:
     """Collect concurrent committee work with an independent task deadline.
 
@@ -2440,31 +2534,34 @@ async def collect_committee_results(
     explicit, non-directional absences and therefore cannot count as HOLD.
     """
     timeout = max(0.001, float(timeout_seconds))
+    concurrency = max(1, int(max_concurrency or len(tasks) or 1))
+    limiter = asyncio.Semaphore(concurrency)
 
     async def run_one(label: str, awaitable: Awaitable[str]) -> tuple[str, Dict[str, Any]]:
-        started = asyncio.get_running_loop().time()
-        status = "completed"
-        error = ""
-        try:
-            value = await asyncio.wait_for(awaitable, timeout=timeout)
-            result = str(value or "")
-        except asyncio.TimeoutError:
-            status = "timeout"
-            error = f"timeout_after_{timeout:g}s"
-            result = (
-                f"[committee_task_absent] stage={stage} role={label} "
-                f"reason=timeout timeout_seconds={timeout:g}"
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            status = "error"
-            error = f"{type(exc).__name__}: {str(exc)[:160]}"
-            result = (
-                f"[committee_task_absent] stage={stage} role={label} "
-                f"reason=error error_type={type(exc).__name__}"
-            )
-        elapsed = asyncio.get_running_loop().time() - started
+        async with limiter:
+            started = asyncio.get_running_loop().time()
+            status = "completed"
+            error = ""
+            try:
+                value = await asyncio.wait_for(awaitable, timeout=timeout)
+                result = str(value or "")
+            except asyncio.TimeoutError:
+                status = "timeout"
+                error = f"timeout_after_{timeout:g}s"
+                result = (
+                    f"[committee_task_absent] stage={stage} role={label} "
+                    f"reason=timeout timeout_seconds={timeout:g}"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                status = "error"
+                error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                result = (
+                    f"[committee_task_absent] stage={stage} role={label} "
+                    f"reason=error error_type={type(exc).__name__}"
+                )
+            elapsed = asyncio.get_running_loop().time() - started
         return result, {
             "label": str(label),
             "status": status,
@@ -2480,6 +2577,7 @@ async def collect_committee_results(
     audit = {
         "stage": str(stage),
         "timeout_seconds": timeout,
+        "max_concurrency": concurrency,
         "task_count": len(task_audit),
         "completed_count": sum(item["status"] == "completed" for item in task_audit),
         "timeout_count": sum(item["status"] == "timeout" for item in task_audit),
@@ -2502,33 +2600,207 @@ async def collect_committee_results(
     return results, audit
 
 
-async def retry_absent_committee_results(
-    results: List[str],
-    audit: Dict[str, Any],
-    retry_factories: List[tuple[str, Callable[[], Awaitable[str]]]],
+async def execute_durable_committee_stage(
+    task_specs: List[Dict[str, Any]],
     *,
     timeout_seconds: float,
     stage: str,
+    max_concurrency: int,
+    meeting_store: Any = None,
+    meeting_id: str | None = None,
+    prompt_version: str = "committee_roundtable_v1",
+    parse_output: Callable[[str], Dict[str, Any]] | None = None,
 ) -> tuple[List[str], Dict[str, Any]]:
-    """Retry only absent roles once while preserving every completed result."""
-    absent = {
-        str(item.get("label") or "")
-        for item in (audit.get("tasks") or [])
-        if item.get("status") != "completed"
-    }
-    retry_specs = [
-        (label, factory)
-        for label, factory in retry_factories
-        if label in absent
-    ]
-    if not retry_specs:
-        return results, audit
+    """Execute or resume one bounded committee DAG stage.
 
-    retry_results, retry_audit = await collect_committee_results(
-        [(label, factory()) for label, factory in retry_specs],
-        timeout_seconds=timeout_seconds,
-        stage=f"{stage}_retry",
+    ``task_specs`` contain factories rather than already-created coroutines so
+    a completed checkpoint can be reused without leaking un-awaited work.
+    Every durable task gets its own opaque session id; model calls remain
+    stateless, while the database retains the task/turn lifecycle and raw text.
+    """
+    from sovereign_hall.services.committee_meeting_store import (
+        committee_content_hash,
     )
+
+    timeout = max(0.001, float(timeout_seconds))
+    concurrency = max(1, int(max_concurrency or 1))
+    limiter = asyncio.Semaphore(concurrency)
+    prepared: List[Dict[str, Any]] = []
+    cached_count = 0
+
+    for index, raw_spec in enumerate(task_specs):
+        spec = dict(raw_spec)
+        label = str(spec.get("label") or f"task_{index + 1}")
+        input_material = spec.get("input_material")
+        if input_material is None:
+            input_material = label
+        input_hash = str(spec.get("input_hash") or committee_content_hash(input_material))
+        attempt = int(spec.get("attempt") or 0)
+        cached = None
+        if meeting_store is not None and meeting_id:
+            cached = await meeting_store.load_task(
+                meeting_id=meeting_id,
+                stage=stage,
+                seat_label=label,
+                input_hash=input_hash,
+                attempt=attempt,
+            )
+        if cached is not None:
+            cached_count += 1
+        prepared.append(
+            {
+                **spec,
+                "label": label,
+                "input_hash": input_hash,
+                "attempt": attempt,
+                "cached": cached,
+            }
+        )
+
+    async def run_one(spec: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+        label = spec["label"]
+        cached = spec.get("cached")
+        if cached is not None:
+            return str(cached.get("raw_output") or ""), {
+                "label": label,
+                "status": str(cached.get("status") or "completed"),
+                "elapsed_seconds": float(cached.get("elapsed_seconds") or 0.0),
+                "error": str(cached.get("error") or ""),
+                "task_id": str(cached.get("task_id") or ""),
+                "session_id": str(cached.get("session_id") or ""),
+                "checkpoint_resumed": True,
+                "parse_mode": str(cached.get("parse_mode") or ""),
+            }
+
+        session_id = new_id("committee_session")
+        task_id = ""
+        if meeting_store is not None and meeting_id:
+            task_id = await meeting_store.begin_task(
+                meeting_id=meeting_id,
+                stage=stage,
+                seat_role=str(spec.get("seat_role") or label),
+                seat_label=label,
+                session_id=session_id,
+                input_hash=spec["input_hash"],
+                prompt_version=prompt_version,
+                model=str(spec.get("model") or ""),
+                provider=str(spec.get("provider") or ""),
+                attempt=int(spec.get("attempt") or 0),
+            )
+
+        async with limiter:
+            started = asyncio.get_running_loop().time()
+            status = "completed"
+            error = ""
+            try:
+                factory = spec.get("factory")
+                if not callable(factory):
+                    raise TypeError(f"committee task {label} has no callable factory")
+                value = await asyncio.wait_for(factory(), timeout=timeout)
+                result = str(value or "")
+            except asyncio.TimeoutError:
+                status = "timeout"
+                error = f"timeout_after_{timeout:g}s"
+                result = (
+                    f"[committee_task_absent] stage={stage} role={label} "
+                    f"reason=timeout timeout_seconds={timeout:g}"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                status = "error"
+                error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                result = (
+                    f"[committee_task_absent] stage={stage} role={label} "
+                    f"reason=error error_type={type(exc).__name__}"
+                )
+            elapsed = asyncio.get_running_loop().time() - started
+
+        parsed_output: Dict[str, Any] = {}
+        parse_mode = ""
+        if parse_output is not None:
+            try:
+                parsed_output = parse_output(result) or {}
+                parse_mode = str(parsed_output.get("parse_mode") or "unknown")
+            except Exception as exc:
+                parsed_output = {
+                    "is_valid": False,
+                    "parse_mode": "parser_error",
+                    "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                }
+                parse_mode = "parser_error"
+
+        if meeting_store is not None and meeting_id:
+            await meeting_store.finish_task(
+                task_id=task_id,
+                meeting_id=meeting_id,
+                stage=stage,
+                seat_label=label,
+                status=status,
+                raw_output=result,
+                parsed_output=parsed_output,
+                parse_mode=parse_mode,
+                error=error,
+                elapsed_seconds=elapsed,
+                token_usage={
+                    "input_chars": len(str(spec.get("input_material") or "")),
+                    "output_chars": len(result),
+                },
+            )
+        return result, {
+            "label": label,
+            "status": status,
+            "elapsed_seconds": round(elapsed, 3),
+            "error": error,
+            "task_id": task_id,
+            "session_id": session_id,
+            "checkpoint_resumed": False,
+            "parse_mode": parse_mode,
+        }
+
+    collected = await asyncio.gather(*(run_one(spec) for spec in prepared))
+    results = [item[0] for item in collected]
+    task_audit = [item[1] for item in collected]
+    audit = {
+        "stage": str(stage),
+        "meeting_id": meeting_id,
+        "prompt_version": prompt_version,
+        "timeout_seconds": timeout,
+        "max_concurrency": concurrency,
+        "task_count": len(task_audit),
+        "completed_count": sum(item["status"] == "completed" for item in task_audit),
+        "timeout_count": sum(item["status"] == "timeout" for item in task_audit),
+        "error_count": sum(item["status"] == "error" for item in task_audit),
+        "checkpoint_resumed_count": cached_count,
+        "absent_labels": [
+            item["label"] for item in task_audit if item["status"] != "completed"
+        ],
+        "tasks": task_audit,
+    }
+    if audit["timeout_count"] or audit["error_count"]:
+        logger.warning(
+            "Durable committee stage %s preserved %s/%s results; "
+            "timeout=%s error=%s resumed=%s",
+            stage,
+            audit["completed_count"],
+            audit["task_count"],
+            audit["timeout_count"],
+            audit["error_count"],
+            cached_count,
+        )
+    return results, audit
+
+
+def merge_committee_retry_results(
+    results: List[str],
+    audit: Dict[str, Any],
+    retry_labels: List[str],
+    retry_results: List[str],
+    retry_audit: Dict[str, Any],
+    *,
+    stage: str,
+) -> tuple[List[str], Dict[str, Any]]:
+    """Merge one durable retry without overwriting completed first attempts."""
     merged_results = list(results)
     merged_tasks = [dict(item) for item in (audit.get("tasks") or [])]
     index_by_label = {
@@ -2536,8 +2808,8 @@ async def retry_absent_committee_results(
         for index, item in enumerate(merged_tasks)
     }
     recovered = 0
-    for (label, _factory), retry_result, retry_task in zip(
-        retry_specs,
+    for label, retry_result, retry_task in zip(
+        retry_labels,
         retry_results,
         retry_audit.get("tasks") or [],
     ):
@@ -2570,15 +2842,53 @@ async def retry_absent_committee_results(
             for item in merged_tasks
             if item.get("status") != "completed"
         ],
-        "retry_attempted_count": len(retry_specs),
+        "retry_attempted_count": len(retry_labels),
         "retry_recovered_count": recovered,
         "initial_attempt": audit,
         "retry_attempt": retry_audit,
     }
+    return merged_results, final_audit
+
+
+async def retry_absent_committee_results(
+    results: List[str],
+    audit: Dict[str, Any],
+    retry_factories: List[tuple[str, Callable[[], Awaitable[str]]]],
+    *,
+    timeout_seconds: float,
+    stage: str,
+) -> tuple[List[str], Dict[str, Any]]:
+    """Retry only absent roles once while preserving every completed result."""
+    absent = {
+        str(item.get("label") or "")
+        for item in (audit.get("tasks") or [])
+        if item.get("status") != "completed"
+    }
+    retry_specs = [
+        (label, factory)
+        for label, factory in retry_factories
+        if label in absent
+    ]
+    if not retry_specs:
+        return results, audit
+
+    retry_results, retry_audit = await collect_committee_results(
+        [(label, factory()) for label, factory in retry_specs],
+        timeout_seconds=timeout_seconds,
+        stage=f"{stage}_retry",
+    )
+    merged_results, final_audit = merge_committee_retry_results(
+        results,
+        audit,
+        [label for label, _factory in retry_specs],
+        retry_results,
+        retry_audit,
+        stage=stage,
+    )
     logger.info(
         "Committee stage %s retry recovered %s/%s absent roles; final=%s/%s",
         stage,
-        recovered,
+        final_audit["retry_recovered_count"],
         len(retry_specs),
         final_audit["completed_count"],
         final_audit["task_count"],
@@ -2940,7 +3250,7 @@ def preflight_committee_decisions(
         if direction in {"hold", "neutral", "watch", "观望"}:
             quorum_met = bool(decision.get("vote_quorum_met", True))
             rejections.append({
-                "code": "committee_hold" if quorum_met else "committee_vote_quorum_failed",
+                "code": "committee_hold" if quorum_met else "committee_incomplete",
                 "ticker": ticker,
                 "reason": (
                     "投委会证据未形成多头/退出裁决"
@@ -3040,6 +3350,7 @@ async def stage3_ic_discussion(
     lessons_prompt: str = "",
     round_id: str | None = None,
     decision_callback: Callable[[Dict[str, Any]], Awaitable[None]] | None = None,
+    committee_store: Any = None,
 ):
     """阶段3：投委会审议"""
     if not proposals:
@@ -3094,6 +3405,17 @@ async def stage3_ic_discussion(
     deadlock_review_timeout = float(
         research_config.get("committee_deadlock_role_timeout_seconds", 90) or 90
     )
+    committee_max_concurrency = max(
+        1,
+        int(research_config.get("committee_max_concurrent_tasks", 3) or 3),
+    )
+    committee_prompt_version = str(
+        research_config.get(
+            "committee_prompt_version",
+            "committee_roundtable_v1",
+        )
+        or "committee_roundtable_v1"
+    )
 
     logger.info("========== 阶段3：投委会审议 ==========")
     print("\n" + "="*60)
@@ -3141,6 +3463,74 @@ async def stage3_ic_discussion(
 
         print(f"\n### 提案 {i+1}: {ticker} ({proposal.get('direction')}) | 置信度: {proposal.get('confidence', 0):.0%} | 深度: {review_depth} | score={priority_score:.2f}")
         stage_execution_audit: List[Dict[str, Any]] = []
+        meeting_id = None
+        if committee_store is not None:
+            if not round_id:
+                raise CommitteeDecisionPersistenceError(
+                    "durable committee meeting requires round_id"
+                )
+            meeting_id = await committee_store.start_or_resume(
+                round_id=round_id,
+                proposal=proposal,
+                review_depth=review_depth,
+                prompt_version=committee_prompt_version,
+            )
+
+        async def persist_incomplete_committee_decision(
+            reason: str,
+        ) -> Dict[str, Any]:
+            incomplete = {
+                "decision_id": new_id("decision"),
+                "meeting_id": meeting_id,
+                "round_id": round_id,
+                "ticker": ticker,
+                "thesis": thesis,
+                "direction": "hold",
+                "confidence": 0.0,
+                "target_position": 0.0,
+                "vote_summary": {
+                    "long": 0.0,
+                    "short": 0.0,
+                    "hold": 0.0,
+                    "abstain": 0.0,
+                },
+                "vote_margin": 0.0,
+                "direction_support": 0.0,
+                "vote_count": 0,
+                "parsed_vote_count": 0,
+                "invalid_vote_count": 0,
+                "vote_quorum_required": 2,
+                "vote_quorum_met": False,
+                "participation_quorum_met": False,
+                "directional_vote_count": 0,
+                "directional_quorum_required": 2,
+                "directional_quorum_met": False,
+                "individual_votes": [],
+                "risk_flags": ["committee_execution_incomplete"],
+                "evidence_gaps": [str(reason)[:500]],
+                "reconsider_if": ["重新执行投委会并取得满足法定人数的独立结构化投票"],
+                "outcome_code": "committee_incomplete",
+                "review_depth": review_depth,
+                "priority_score": priority_score,
+                "target_price": proposal.get("take_profit", 15.0),
+                "stop_loss": proposal.get("stop_loss", 5.0),
+                "take_profit": proposal.get("take_profit", 15.0),
+                "expected_days": normalize_proposal_holding_period(proposal, topic),
+                "holding_period_reason": proposal.get("holding_period_reason", ""),
+                "sector": sector,
+                "discussion_excerpt": "\n".join(all_discussions[-4:])[-24000:],
+                "stage_execution_audit": list(stage_execution_audit),
+            }
+            if decision_callback is not None:
+                await decision_callback(incomplete)
+            if committee_store is not None and meeting_id:
+                await committee_store.finish_meeting(
+                    meeting_id=meeting_id,
+                    status="incomplete",
+                    decision_id=incomplete["decision_id"],
+                    outcome_code="committee_incomplete",
+                )
+            return incomplete
 
         # ============================================================
         # 第一轮：按审议深度并发分析
@@ -3177,24 +3567,45 @@ async def stage3_ic_discussion(
         print(f"   📝 第一轮：{len(round1_tasks)}路并发分析...")
 
         try:
-            round1_results, round1_audit = await collect_committee_results(
+            round1_results, round1_audit = await execute_durable_committee_stage(
                 [
-                    (
-                        name,
-                        committee_think_from_persisted_evidence(
-                            agent,
-                            task=task,
-                            proposal=proposal,
-                            discussion_context=thesis,
-                            temperature=0.8,
-                            max_tokens=round1_max_tokens,
-                            round_id=round_id,
+                    {
+                        "label": name,
+                        "seat_role": getattr(
+                            getattr(agent, "role", None),
+                            "value",
+                            str(getattr(agent, "role", name)),
                         ),
-                    )
+                        "model": getattr(getattr(agent, "llm", None), "model", ""),
+                        "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "input_material": {
+                            "task": task,
+                            "proposal": proposal,
+                            "discussion_context": thesis,
+                            "round_id": round_id,
+                        },
+                        "factory": (
+                            lambda agent=agent, task=task: (
+                                committee_think_from_persisted_evidence(
+                                    agent,
+                                    task=task,
+                                    proposal=proposal,
+                                    discussion_context=thesis,
+                                    temperature=0.8,
+                                    max_tokens=round1_max_tokens,
+                                    round_id=round_id,
+                                )
+                            )
+                        ),
+                    }
                     for agent, name, task, _queries in round1_tasks
                 ],
                 timeout_seconds=round1_role_timeout,
                 stage="round1_independent_analysis",
+                max_concurrency=committee_max_concurrency,
+                meeting_store=committee_store,
+                meeting_id=meeting_id,
+                prompt_version=committee_prompt_version,
             )
             round1_audit.update({
                 "input_lineage": "persisted_round_proposal",
@@ -3238,26 +3649,47 @@ async def stage3_ic_discussion(
             round2_results = []
             if debate_tasks:
                 print(f"   📝 第二轮：深度辩论 ({len(debate_tasks)}路)...")
-                round2_results, round2_audit = await collect_committee_results(
+                round2_results, round2_audit = await execute_durable_committee_stage(
                     [
-                        (
-                            name,
-                            committee_think_from_persisted_evidence(
-                                agent,
-                                task=task,
-                                proposal=proposal,
-                                discussion_context=round1_summary[
-                                    :vote_context_chars
-                                ],
-                                temperature=0.7,
-                                max_tokens=round2_max_tokens,
-                                round_id=round_id,
+                        {
+                            "label": name,
+                            "seat_role": getattr(
+                                getattr(agent, "role", None),
+                                "value",
+                                str(getattr(agent, "role", name)),
                             ),
-                        )
+                            "model": getattr(getattr(agent, "llm", None), "model", ""),
+                            "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                            "input_material": {
+                                "task": task,
+                                "proposal": proposal,
+                                "discussion_context": round1_summary[:vote_context_chars],
+                                "round_id": round_id,
+                            },
+                            "factory": (
+                                lambda agent=agent, task=task: (
+                                    committee_think_from_persisted_evidence(
+                                        agent,
+                                        task=task,
+                                        proposal=proposal,
+                                        discussion_context=round1_summary[
+                                            :vote_context_chars
+                                        ],
+                                        temperature=0.7,
+                                        max_tokens=round2_max_tokens,
+                                        round_id=round_id,
+                                    )
+                                )
+                            ),
+                        }
                         for agent, name, task, _queries in debate_tasks
                     ],
                     timeout_seconds=round2_role_timeout,
                     stage="round2_cross_challenge",
+                    max_concurrency=committee_max_concurrency,
+                    meeting_store=committee_store,
+                    meeting_id=meeting_id,
+                    prompt_version=committee_prompt_version,
                 )
                 round2_audit.update({
                     "input_lineage": "persisted_round_proposal",
@@ -3313,20 +3745,43 @@ async def stage3_ic_discussion(
                     task for task in revision_tasks
                     if task[1] in {"CIO-最终修正", "风控-否决清单"}
                 ]
-            revision_results, revision_audit = await collect_committee_results(
+            revision_results, revision_audit = await execute_durable_committee_stage(
                 [
-                    (
-                        name,
-                        agent.think(
-                            task=f"{task}\n\n提案：{ticker}\n核心观点：{thesis}\n\n讨论材料：\n{revision_context[:vote_context_chars]}{analysis_format}",
-                            temperature=0.6,
-                            max_tokens=revision_max_tokens,
+                    {
+                        "label": name,
+                        "seat_role": getattr(
+                            getattr(agent, "role", None),
+                            "value",
+                            str(getattr(agent, "role", name)),
                         ),
-                    )
+                        "model": getattr(getattr(agent, "llm", None), "model", ""),
+                        "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "input_material": (
+                            f"{task}\n\n提案：{ticker}\n核心观点：{thesis}\n\n"
+                            f"讨论材料：\n{revision_context[:vote_context_chars]}"
+                            f"{analysis_format}"
+                        ),
+                        "factory": (
+                            lambda agent=agent, task=task: agent.think(
+                                task=(
+                                    f"{task}\n\n提案：{ticker}\n核心观点：{thesis}\n\n"
+                                    f"讨论材料：\n{revision_context[:vote_context_chars]}"
+                                    f"{analysis_format}"
+                                ),
+                                temperature=0.6,
+                                max_tokens=revision_max_tokens,
+                                use_memory=False,
+                            )
+                        ),
+                    }
                     for agent, name, task in revision_tasks
                 ],
                 timeout_seconds=revision_role_timeout,
                 stage="round3_counterfactual_revision",
+                max_concurrency=committee_max_concurrency,
+                meeting_store=committee_store,
+                meeting_id=meeting_id,
+                prompt_version=committee_prompt_version,
             )
             stage_execution_audit.append(revision_audit)
             revision_names = [name for _, name, _ in revision_tasks]
@@ -3374,43 +3829,97 @@ async def stage3_ic_discussion(
             # 第四轮投票：逐角色超时，缺席不伪装成HOLD。
             print("      🔄 等待投票结果...")
             vote_names = [name for _, _, name, _ in vote_tasks]
-            vote_results, vote_audit = await collect_committee_results(
+            vote_results, vote_audit = await execute_durable_committee_stage(
                 [
-                    (
-                        name,
-                        agent.think(
-                            task=prompt,
-                            temperature=0.4,
-                            max_tokens=vote_max_tokens,
+                    {
+                        "label": name,
+                        "seat_role": role.value,
+                        "model": getattr(getattr(agent, "llm", None), "model", ""),
+                        "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "input_material": prompt,
+                        "factory": (
+                            lambda agent=agent, prompt=prompt: agent.think(
+                                task=prompt,
+                                temperature=0.4,
+                                max_tokens=vote_max_tokens,
+                                use_memory=False,
+                            )
                         ),
-                    )
-                    for (agent, _, name, _), prompt in zip(vote_tasks, vote_prompts)
+                    }
+                    for (agent, role, name, _), prompt in zip(vote_tasks, vote_prompts)
                 ],
                 timeout_seconds=vote_role_timeout,
                 stage="round4_vote",
+                max_concurrency=committee_max_concurrency,
+                meeting_store=committee_store,
+                meeting_id=meeting_id,
+                prompt_version=committee_prompt_version,
+                parse_output=parse_strict_committee_vote,
             )
-            vote_retry_factories: List[
-                tuple[str, Callable[[], Awaitable[str]]]
-            ] = []
-            for (agent, _role, name, _weight), prompt in zip(
-                vote_tasks,
-                vote_prompts,
-            ):
-                vote_retry_factories.append(
-                    (
-                        name,
+            retry_vote_labels = {
+                str(item.get("label") or "")
+                for item in (vote_audit.get("tasks") or [])
+                if item.get("status") != "completed"
+            }
+            retry_vote_labels.update(
+                name
+                for name, result in zip(vote_names, vote_results)
+                if not parse_strict_committee_vote(result).get("schema_valid")
+            )
+            retry_vote_specs = [
+                {
+                    "label": name,
+                    "seat_role": role.value,
+                    "model": getattr(getattr(agent, "llm", None), "model", ""),
+                    "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                    "input_material": {
+                        "prompt": prompt,
+                        "retry": "strict_json_repair",
+                    },
+                    "attempt": 1,
+                    "factory": (
                         lambda agent=agent, prompt=prompt: agent.think(
-                            task=prompt,
+                            task=(
+                                f"{prompt}\n\n上一次输出缺席或未通过JSON结构校验。"
+                                "本次不得输出解释、Markdown或代码围栏，只输出符合上述字段约束的单个JSON对象。"
+                            ),
                             temperature=0.1,
                             max_tokens=vote_retry_max_tokens,
-                        ),
+                            use_memory=False,
+                        )
+                    ),
+                }
+                for (agent, role, name, _weight), prompt in zip(
+                    vote_tasks,
+                    vote_prompts,
+                )
+                if name in retry_vote_labels
+            ]
+            if retry_vote_specs:
+                retry_vote_results, retry_vote_audit = (
+                    await execute_durable_committee_stage(
+                        retry_vote_specs,
+                        timeout_seconds=vote_retry_timeout,
+                        stage="round4_vote_retry",
+                        max_concurrency=committee_max_concurrency,
+                        meeting_store=committee_store,
+                        meeting_id=meeting_id,
+                        prompt_version=committee_prompt_version,
+                        parse_output=parse_strict_committee_vote,
                     )
                 )
-            vote_results, vote_audit = await retry_absent_committee_results(
+                vote_results, vote_audit = merge_committee_retry_results(
+                    vote_results,
+                    vote_audit,
+                    [str(spec["label"]) for spec in retry_vote_specs],
+                    retry_vote_results,
+                    retry_vote_audit,
+                    stage="round4_vote",
+                )
+            vote_results, vote_audit = enforce_strict_committee_vote_results(
                 vote_results,
                 vote_audit,
-                vote_retry_factories,
-                timeout_seconds=vote_retry_timeout,
+                vote_names,
                 stage="round4_vote",
             )
             stage_execution_audit.append(vote_audit)
@@ -3460,55 +3969,119 @@ async def stage3_ic_discussion(
                     ),
                 ]
                 review_names = [item[1] for item in review_specs]
-                review_results, review_audit = await collect_committee_results(
+                review_prompts = [
+                    build_deployment_deadlock_review_prompt(
+                        ticker,
+                        role_view,
+                        proposal,
+                        committee_decision,
+                        full_context,
+                    )
+                    for _agent, role_view, _weight in review_specs
+                ]
+                review_results, review_audit = await execute_durable_committee_stage(
                     [
-                        (
-                            role_view,
-                            agent.think(
-                                task=build_deployment_deadlock_review_prompt(
-                                    ticker,
-                                    role_view,
-                                    proposal,
-                                    committee_decision,
-                                    full_context,
-                                ),
-                                temperature=0.2,
-                                max_tokens=vote_max_tokens,
+                        {
+                            "label": role_view,
+                            "seat_role": getattr(
+                                getattr(agent, "role", None),
+                                "value",
+                                role_view,
                             ),
+                            "model": getattr(getattr(agent, "llm", None), "model", ""),
+                            "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                            "input_material": prompt,
+                            "factory": (
+                                lambda agent=agent, prompt=prompt: agent.think(
+                                    task=prompt,
+                                    temperature=0.2,
+                                    max_tokens=vote_max_tokens,
+                                    use_memory=False,
+                                )
+                            ),
+                        }
+                        for (agent, role_view, _weight), prompt in zip(
+                            review_specs,
+                            review_prompts,
                         )
-                        for agent, role_view, _weight in review_specs
                     ],
                     timeout_seconds=deadlock_review_timeout,
                     stage="deployment_deadlock_review",
+                    max_concurrency=committee_max_concurrency,
+                    meeting_store=committee_store,
+                    meeting_id=meeting_id,
+                    prompt_version=committee_prompt_version,
+                    parse_output=parse_strict_committee_vote,
                 )
-                review_retry_factories: List[
-                    tuple[str, Callable[[], Awaitable[str]]]
-                ] = []
-                for (agent, role_view, _weight) in review_specs:
-                    review_retry_factories.append(
-                        (
+                retry_review_labels = {
+                    str(item.get("label") or "")
+                    for item in (review_audit.get("tasks") or [])
+                    if item.get("status") != "completed"
+                }
+                retry_review_labels.update(
+                    name
+                    for name, result in zip(review_names, review_results)
+                    if not parse_strict_committee_vote(result).get("schema_valid")
+                )
+                retry_review_specs = [
+                    {
+                        "label": role_view,
+                        "seat_role": getattr(
+                            getattr(agent, "role", None),
+                            "value",
                             role_view,
-                            lambda agent=agent, role_view=role_view: agent.think(
-                                task=build_deployment_deadlock_review_prompt(
-                                    ticker,
-                                    role_view,
-                                    proposal,
-                                    committee_decision,
-                                    full_context,
+                        ),
+                        "model": getattr(getattr(agent, "llm", None), "model", ""),
+                        "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "input_material": {
+                            "prompt": prompt,
+                            "retry": "strict_json_repair",
+                        },
+                        "attempt": 1,
+                        "factory": (
+                            lambda agent=agent, prompt=prompt: agent.think(
+                                task=(
+                                    f"{prompt}\n\n上一次输出缺席或未通过JSON结构校验。"
+                                    "本次只输出单个JSON对象。"
                                 ),
                                 temperature=0.1,
                                 max_tokens=vote_retry_max_tokens,
-                            ),
+                                use_memory=False,
+                            )
+                        ),
+                    }
+                    for (agent, role_view, _weight), prompt in zip(
+                        review_specs,
+                        review_prompts,
+                    )
+                    if role_view in retry_review_labels
+                ]
+                if retry_review_specs:
+                    retry_review_results, retry_review_audit = (
+                        await execute_durable_committee_stage(
+                            retry_review_specs,
+                            timeout_seconds=vote_retry_timeout,
+                            stage="deployment_deadlock_review_retry",
+                            max_concurrency=committee_max_concurrency,
+                            meeting_store=committee_store,
+                            meeting_id=meeting_id,
+                            prompt_version=committee_prompt_version,
+                            parse_output=parse_strict_committee_vote,
                         )
                     )
-                review_results, review_audit = (
-                    await retry_absent_committee_results(
+                    review_results, review_audit = merge_committee_retry_results(
                         review_results,
                         review_audit,
-                        review_retry_factories,
-                        timeout_seconds=vote_retry_timeout,
+                        [str(spec["label"]) for spec in retry_review_specs],
+                        retry_review_results,
+                        retry_review_audit,
                         stage="deployment_deadlock_review",
                     )
+                review_results, review_audit = enforce_strict_committee_vote_results(
+                    review_results,
+                    review_audit,
+                    review_names,
+                    stage="deployment_deadlock_review",
                 )
                 stage_execution_audit.append(review_audit)
                 review_decision = aggregate_committee_decision(
@@ -3546,8 +4119,18 @@ async def stage3_ic_discussion(
                 else:
                     print("      ➖ 死锁复核未通过，保留HOLD并记录具体缺口")
             expected_days = normalize_proposal_holding_period(proposal, topic)
+            committee_outcome_code = (
+                "committee_incomplete"
+                if not committee_decision.get("vote_quorum_met")
+                else (
+                    "committee_hold"
+                    if committee_decision.get("direction") == "hold"
+                    else "committee_directional"
+                )
+            )
             committee_decision.update({
                 'decision_id': new_id("decision"),
+                'meeting_id': meeting_id,
                 'round_id': round_id,
                 'ticker': ticker,
                 'thesis': thesis,
@@ -3562,6 +4145,7 @@ async def stage3_ic_discussion(
                 'sector': sector,
                 'discussion_excerpt': full_context[:24000],
                 'stage_execution_audit': stage_execution_audit,
+                'outcome_code': committee_outcome_code,
             })
             # 记录到决策追踪器
             try:
@@ -3612,6 +4196,23 @@ async def stage3_ic_discussion(
                         f"committee decision persistence failed for {ticker}: "
                         f"{type(exc).__name__}: {exc}"
                     ) from exc
+            if committee_store is not None and meeting_id:
+                try:
+                    await committee_store.finish_meeting(
+                        meeting_id=meeting_id,
+                        status=(
+                            "completed"
+                            if committee_decision.get("vote_quorum_met")
+                            else "incomplete"
+                        ),
+                        decision_id=committee_decision["decision_id"],
+                        outcome_code=committee_outcome_code,
+                    )
+                except Exception as exc:
+                    raise CommitteeDecisionPersistenceError(
+                        f"committee meeting finalization failed for {ticker}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
             final_decisions.append(committee_decision)
 
             print(
@@ -3625,15 +4226,49 @@ async def stage3_ic_discussion(
         except asyncio.TimeoutError:
             print(f"      ⏰ 讨论超时，跳过")
             all_discussions.append(f"\n【{ticker}】讨论超时")
+            try:
+                final_decisions.append(
+                    await persist_incomplete_committee_decision("投委会讨论整体超时")
+                )
+            except Exception as exc:
+                raise CommitteeDecisionPersistenceError(
+                    f"committee incomplete persistence failed for {ticker}: {exc}"
+                ) from exc
         except asyncio.CancelledError:
             print(f"      ⚠️ 讨论被取消")
             all_discussions.append(f"\n【{ticker}】讨论被取消")
+            if committee_store is not None and meeting_id:
+                with contextlib.suppress(Exception):
+                    await committee_store.finish_meeting(
+                        meeting_id=meeting_id,
+                        status="cancelled",
+                        decision_id=None,
+                        outcome_code="committee_cancelled",
+                    )
             raise  # 重新抛出 CancelledError，让上层处理
         except CommitteeDecisionPersistenceError:
+            if committee_store is not None and meeting_id:
+                with contextlib.suppress(Exception):
+                    await committee_store.finish_meeting(
+                        meeting_id=meeting_id,
+                        status="failed",
+                        decision_id=None,
+                        outcome_code="committee_persistence_failed",
+                    )
             raise
         except Exception as e:
             print(f"      ❌ 错误: {str(e)[:50]}")
             all_discussions.append(f"\n【{ticker}】错误: {str(e)[:100]}")
+            try:
+                final_decisions.append(
+                    await persist_incomplete_committee_decision(
+                        f"{type(e).__name__}: {str(e)[:400]}"
+                    )
+                )
+            except Exception as exc:
+                raise CommitteeDecisionPersistenceError(
+                    f"committee incomplete persistence failed for {ticker}: {exc}"
+                ) from exc
 
     # 议题结束时清理记忆，防止跨议题污染
     for agent in agents.values():
@@ -3672,6 +4307,26 @@ async def stage4_final_conclusion(
             'confidence': 0,
             'key_reasons': [],
             'action': '观望',
+        }
+
+    if not any(bool(item.get("vote_quorum_met")) for item in decisions):
+        tickers = "、".join(
+            str(item.get("ticker") or "")
+            for item in decisions
+            if str(item.get("ticker") or "")
+        )
+        return {
+            "topic": topic,
+            "conclusion": (
+                f"投委会未完成：{tickers or '本轮候选'}未取得满足法定人数的"
+                "独立结构化投票。本轮不是证据型观望结论，不进入预测或交易；"
+                "应从持久化会议检查点重试缺席/无效席位。"
+            ),
+            "key_ticker": str(decisions[0].get("ticker") or ""),
+            "direction": "hold",
+            "confidence": 0.0,
+            "key_reasons": ["committee_incomplete"],
+            "action": "等待重审",
         }
 
     # 提取关键信息
@@ -4773,6 +5428,8 @@ def select_simulation_terminal(
     ):
         return "execution_rejected"
     if decisions:
+        if any(not bool(item.get("vote_quorum_met")) for item in decisions):
+            return "committee_incomplete"
         return "committee_hold"
     return "no_evidence"
 
@@ -4799,7 +5456,7 @@ def round_has_operational_result(
     return bool(
         cycle_fills > 0
         or getattr(final_round, "terminal_code", None)
-        not in {"no_evidence", "failed"}
+        not in {"no_evidence", "committee_incomplete", "failed"}
     )
 
 
@@ -4957,9 +5614,11 @@ async def main():
 
     # 初始化投资模拟
     from sovereign_hall.services.investment_simulation import InvestmentSimulation
+    from sovereign_hall.services.committee_meeting_store import CommitteeMeetingStore
     simulation = InvestmentSimulation(db_service)
     await simulation.initialize()
     await simulation.init_tables()
+    committee_store = CommitteeMeetingStore(db_service)
     print(f"   ✅ 投资模拟已初始化 (初始资金: {simulation.initial_capital}元)")
 
     query_gen = SearchQueryGenerator(llm)
@@ -5494,6 +6153,7 @@ async def main():
                             lessons_prompt=prompt_lessons,
                             round_id=active_round_id,
                             decision_callback=persist_committee_decision,
+                            committee_store=committee_store,
                         )
                         logger.info(f"阶段3完成，讨论长度: {len(discussions)}, 决策数: {len(decisions)}")
                     except Exception as e:
@@ -5567,7 +6227,9 @@ async def main():
                     try:
                         from sovereign_hall.utils import generate_id
                         await db_service.add_meeting_record(
-                            meeting_id=generate_id("meeting"),
+                            meeting_id=str(
+                                decision.get("meeting_id") or generate_id("meeting")
+                            ),
                             proposal_id=str(proposal.get("proposal_id") or ""),
                             ticker=ticker_key,
                             decision=str(decision.get("direction") or "hold"),
@@ -5684,6 +6346,7 @@ async def main():
                     "market_closed_pending": ResearchRoundStatus.MARKET_CLOSED_PENDING,
                     "execution_rejected": ResearchRoundStatus.EXECUTION_REJECTED,
                     "committee_hold": ResearchRoundStatus.COMMITTEE_HOLD,
+                    "committee_incomplete": ResearchRoundStatus.COMMITTEE_INCOMPLETE,
                     "filled": ResearchRoundStatus.FILLED,
                     "no_evidence": ResearchRoundStatus.NO_EVIDENCE,
                 }
