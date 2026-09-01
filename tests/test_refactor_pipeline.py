@@ -62,12 +62,14 @@ from sovereign_hall.services.research_discussion import ResearchDiscussionSystem
 from sovereign_hall.services.prediction_tracker import PredictionTracker
 from sovereign_hall.services.backtest_engine import get_backtest_engine
 from sovereign_hall.services.prediction_store import ensure_prediction_tables
+from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
 from sovereign_hall.utils import format_cost_breakdown, format_token, format_token_breakdown
 from sovereign_hall.run_discussion import (
     TOPIC_POOL,
     aggregate_committee_decision,
     build_balanced_vote_context,
     choose_review_depth,
+    classify_search_source_availability,
     build_proposal_thesis,
     build_lessons_with_heuristic_context,
     bound_round_source_lineage,
@@ -207,6 +209,116 @@ async def test_spider_local_only_hard_gate_blocks_network(monkeypatch):
     assert docs == []
     network_call.assert_not_awaited()
     await spider.close()
+
+
+def test_search_source_availability_separates_provider_outage_from_no_evidence():
+    outage = {
+        "network_enabled": True,
+        "submitted_query_count": 17,
+        "provider_accepted_count": 17,
+        "result_document_count": 0,
+        "provider_health": {
+            "attempted_counts": {"ddg": 1, "bing": 1, "sogou": 1},
+            "success_counts": {},
+            "failure_counts": {"ddg": 1, "bing": 1, "sogou": 1},
+            "skipped_open_circuit_counts": {
+                "ddg": 16,
+                "bing": 16,
+                "sogou": 16,
+            },
+        },
+    }
+    filtered_results = {
+        **outage,
+        "provider_health": {
+            **outage["provider_health"],
+            "success_counts": {"ddg": 2},
+        },
+    }
+
+    assert (
+        classify_search_source_availability(outage)
+        == "external_search_unavailable"
+    )
+    assert (
+        classify_search_source_availability(filtered_results)
+        == "provider_results_filtered_out"
+    )
+    assert classify_search_source_availability(
+        {**outage, "network_enabled": False}
+    ) == "network_disabled"
+    assert classify_search_source_availability(
+        {**outage, "submitted_query_count": 0, "provider_accepted_count": 0}
+    ) == "search_query_generation_failed"
+    assert classify_search_source_availability(
+        {**outage, "provider_accepted_count": 0}
+    ) == "search_query_gate_blocked_all"
+
+
+@pytest.mark.asyncio
+async def test_check_db_reports_source_outage_as_failed_not_no_evidence(
+    tmp_path,
+    capsys,
+):
+    import sovereign_hall.check_db as check_db_module
+
+    db_path = tmp_path / "source_outage.db"
+    db = DatabaseService(str(db_path))
+    await db._init_db()
+    coordinator = ResearchRoundCoordinator(db)
+    round_state = await coordinator.start(
+        base_topic="source outage",
+        research_objective="do not reuse stale evidence",
+    )
+    await coordinator.advance(
+        round_state.id,
+        ResearchRoundStatus.MEMORY_LOADED,
+    )
+    await coordinator.record_event(
+        round_state.id,
+        "SearchQueriesValidated",
+        {
+            "submitted_query_count": 15,
+            "provider_accepted_count": 15,
+            "result_document_count": 0,
+            "availability_status": "external_search_unavailable",
+            "network_enabled": True,
+            "provider_health": {
+                "configured_sources": ["ddg", "bing", "sogou"],
+                "circuit_open_sources": ["ddg", "bing", "sogou"],
+                "skipped_open_circuit_counts": {
+                    "ddg": 14,
+                    "bing": 14,
+                    "sogou": 14,
+                },
+            },
+        },
+    )
+    await coordinator.persist_sources(
+        round_state.id,
+        document_ids=[],
+        presented_document_count=0,
+        traceable_document_count=0,
+        untraceable_document_count=0,
+    )
+    await coordinator.fail(
+        round_state.id,
+        code="failed",
+        reason="研究轮失败：联网资料源不可用；旧本地资料未作为本轮新证据",
+    )
+    await db.close()
+
+    await asyncio.to_thread(
+        check_db_module.show_canonical_pipeline_status,
+        db_path,
+    )
+    output = capsys.readouterr().out
+
+    assert "terminal=failed" in output
+    assert "availability=external_search_unavailable" in output
+    assert "本轮全部搜索 provider 不可用" in output
+    assert "旧本地资料未冒充新证据" in output
+    assert "no_evidence 终态" not in output
 
 
 @pytest.mark.asyncio

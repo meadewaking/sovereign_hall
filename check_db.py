@@ -2056,12 +2056,32 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
                 provider_health.get("skipped_open_circuit_counts") or {}
             )
             if open_sources:
-                print(
-                    "   ⚠️ 搜索 provider 临时熔断："
-                    + ", ".join(open_sources)
-                    + "；健康 provider 继续联网，冷却后仅单探针自动恢复；"
-                    f"本轮跳过重复失败调用 {sum(int(v or 0) for v in skipped_counts.values())} 次。"
+                configured_sources = {
+                    str(value)
+                    for value in provider_health.get("configured_sources") or []
+                }
+                all_configured_open = bool(
+                    configured_sources
+                    and configured_sources.issubset({str(value) for value in open_sources})
                 )
+                if (
+                    query_gate.get("availability_status")
+                    == "external_search_unavailable"
+                    and all_configured_open
+                ):
+                    print(
+                        "   ❌ 本轮全部搜索 provider 不可用："
+                        + ", ".join(open_sources)
+                        + "；旧本地资料未冒充本轮新证据；冷却后主循环自动探针重试；"
+                        f"本轮跳过重复失败调用 {sum(int(v or 0) for v in skipped_counts.values())} 次。"
+                    )
+                else:
+                    print(
+                        "   ⚠️ 搜索 provider 临时熔断："
+                        + ", ".join(open_sources)
+                        + "；其余健康 provider 继续联网，冷却后仅单探针自动恢复；"
+                        f"本轮跳过重复失败调用 {sum(int(v or 0) for v in skipped_counts.values())} 次。"
+                    )
             else:
                 print("   ✅ 搜索 provider 熔断状态：无 open circuit。")
     interruption = status.get("finalization_interruption") or {}
@@ -2073,10 +2093,23 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
             "未改写为研究失败。"
         )
     elif health == "failed":
-        print(
-            "   ❌ 最近一轮失败；先查看 terminal_reason 和 round_events，"
-            "不得用离线回测收益替代。"
-        )
+        search_failure_statuses = {
+            "search_query_generation_failed",
+            "search_query_gate_blocked_all",
+            "external_search_unavailable",
+        }
+        if (status.get("search_query_gate") or {}).get(
+            "availability_status"
+        ) in search_failure_statuses:
+            print(
+                "   ❌ 最近一轮在联网资料获取阶段失败；旧本地资料未冒充新证据，"
+                "逐仓复核与已有执行裁决仍保留，下轮由主循环自动联网重试。"
+            )
+        else:
+            print(
+                "   ❌ 最近一轮失败；先查看 terminal_reason 和 round_events，"
+                "不得用离线回测收益替代。"
+            )
     elif health == "incomplete":
         print(
             "   ⚠️ 最近一轮没有完成；可能被中断或仍在运行，"

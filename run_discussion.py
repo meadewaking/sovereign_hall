@@ -1357,6 +1357,59 @@ async def record_proposal_lot_screening_event(
 # ============================================================================
 # 阶段1：海量信息搜索（高并发）
 # ============================================================================
+SEARCH_PIPELINE_FAILURE_STATUSES = frozenset(
+    {
+        "search_query_generation_failed",
+        "search_query_gate_blocked_all",
+        "external_search_unavailable",
+    }
+)
+
+
+def classify_search_source_availability(audit: Dict[str, Any]) -> str:
+    """Classify whether a production round actually reached usable web sources.
+
+    An empty result is not automatically ``no_evidence``.  When no provider
+    succeeded (or no safe query could reach a provider), the research system
+    failed before evidence collection.  Keeping that case separate prevents a
+    stale local-vector fallback from being presented as this round's fresh
+    network research.
+    """
+    if not bool(audit.get("network_enabled", True)):
+        return "network_disabled"
+
+    result_count = int(audit.get("result_document_count") or 0)
+    if result_count > 0:
+        return "sources_available"
+
+    submitted = int(audit.get("submitted_query_count") or 0)
+    accepted = int(audit.get("provider_accepted_count") or 0)
+    if submitted <= 0:
+        return "search_query_generation_failed"
+    if accepted <= 0:
+        return "search_query_gate_blocked_all"
+
+    provider_health = dict(audit.get("provider_health") or {})
+
+    def metric_total(name: str) -> int:
+        return sum(
+            int(value or 0)
+            for value in dict(provider_health.get(name) or {}).values()
+        )
+
+    successful_calls = metric_total("success_counts")
+    attempted_calls = metric_total("attempted_counts")
+    failed_calls = metric_total("failure_counts")
+    circuit_skips = metric_total("skipped_open_circuit_counts")
+    if successful_calls > 0:
+        # Providers returned results, but the document validity filter removed
+        # all of them.  This is an evidence-quality outcome, not connectivity.
+        return "provider_results_filtered_out"
+    if attempted_calls > 0 or failed_calls > 0 or circuit_skips > 0:
+        return "external_search_unavailable"
+    return "empty_without_provider_diagnostics"
+
+
 async def stage1_mass_search(
     llm,
     spiders,
@@ -1456,39 +1509,46 @@ async def stage1_mass_search(
     )
     generator_gate = dict(getattr(query_gen, "last_validation_report", {}) or {})
     provider_gate = dict(getattr(spiders, "last_query_gate_report", {}) or {})
+    search_audit = {
+        "generated_candidate_count": int(
+            generator_gate.get("candidate_count") or 0
+        ),
+        "generated_accepted_count": int(
+            generator_gate.get("accepted_count") or 0
+        ),
+        "generator_rejection_counts": dict(
+            generator_gate.get("rejection_counts") or {}
+        ),
+        "generator_rejected_samples": list(
+            generator_gate.get("rejected_samples") or []
+        )[:3],
+        "submitted_query_count": len(all_queries),
+        "provider_accepted_count": int(
+            provider_gate.get("accepted_count") or 0
+        ),
+        "provider_rejection_counts": dict(
+            provider_gate.get("rejection_counts") or {}
+        ),
+        "provider_rejected_samples": list(
+            provider_gate.get("rejected_samples") or []
+        )[:3],
+        "provider_health": dict(
+            getattr(spiders, "last_provider_health_report", {}) or {}
+        ),
+        "result_document_count": len(raw_docs),
+        "network_enabled": bool(getattr(spiders, "network_enabled", True)),
+    }
+    search_audit["availability_status"] = (
+        classify_search_source_availability(search_audit)
+    )
+    # The orchestrator consumes the same bounded audit that is appended to the
+    # durable round.  Do not infer availability again from old local documents.
+    spiders.last_round_search_audit = dict(search_audit)
     if round_coordinator is not None and round_id:
         await round_coordinator.record_event(
             round_id,
             "SearchQueriesValidated",
-            {
-                "generated_candidate_count": int(
-                    generator_gate.get("candidate_count") or 0
-                ),
-                "generated_accepted_count": int(
-                    generator_gate.get("accepted_count") or 0
-                ),
-                "generator_rejection_counts": dict(
-                    generator_gate.get("rejection_counts") or {}
-                ),
-                "generator_rejected_samples": list(
-                    generator_gate.get("rejected_samples") or []
-                )[:3],
-                "submitted_query_count": len(all_queries),
-                "provider_accepted_count": int(
-                    provider_gate.get("accepted_count") or 0
-                ),
-                "provider_rejection_counts": dict(
-                    provider_gate.get("rejection_counts") or {}
-                ),
-                "provider_rejected_samples": list(
-                    provider_gate.get("rejected_samples") or []
-                )[:3],
-                "provider_health": dict(
-                    getattr(spiders, "last_provider_health_report", {}) or {}
-                ),
-                "result_document_count": len(raw_docs),
-                "network_enabled": bool(getattr(spiders, "network_enabled", True)),
-            },
+            search_audit,
         )
     if deployment_research and raw_docs:
         evidence_queries = build_deployment_evidence_queries(raw_docs)
@@ -5725,6 +5785,9 @@ async def main():
             # Reset every iteration so an exception cannot reuse the previous
             # round's fill activity when deciding empty-round backoff.
             simulation_result: Dict[str, Any] = {}
+            round_search_audit: Dict[str, Any] = {}
+            round_search_availability = "not_attempted"
+            research_source_failure = False
             round_start = datetime.now()
             round_start_stats = llm.get_stats()
             round_record = await round_coordinator.start(
@@ -5873,6 +5936,13 @@ async def main():
                         round_coordinator=round_coordinator,
                         round_id=active_round_id,
                     )
+                    round_search_audit = dict(
+                        getattr(spiders, "last_round_search_audit", {}) or {}
+                    )
+                    round_search_availability = str(
+                        round_search_audit.get("availability_status")
+                        or "empty_without_provider_diagnostics"
+                    )
                 elif existing_docs and len(existing_docs) >= 10 and not force_search_due:
                     print(f"\n📚 阶段1：使用本地数据 ({len(existing_docs)} 条相关文档)")
                     docs = existing_docs
@@ -5886,13 +5956,32 @@ async def main():
                         round_coordinator=round_coordinator,
                         round_id=active_round_id,
                     )
+                    round_search_audit = dict(
+                        getattr(spiders, "last_round_search_audit", {}) or {}
+                    )
+                    round_search_availability = str(
+                        round_search_audit.get("availability_status")
+                        or "empty_without_provider_diagnostics"
+                    )
                     if not docs and existing_docs:
-                        logger.warning(
-                            "阶段1：外部搜索返回0篇，回退使用本地数据 %s 条，避免后续阶段空转",
-                            len(existing_docs),
-                        )
-                        print(f"⚠️ 外部搜索返回0篇，回退使用本地数据 ({len(existing_docs)} 条)")
-                        docs = existing_docs
+                        if round_search_availability in SEARCH_PIPELINE_FAILURE_STATUSES:
+                            logger.error(
+                                "阶段1：联网研究在资料获取前失败 (%s)；"
+                                "禁止把%s条旧本地资料冒充本轮新证据",
+                                round_search_availability,
+                                len(existing_docs),
+                            )
+                            print(
+                                "❌ 联网研究来源不可用；旧本地资料不作为本轮新证据，"
+                                "本轮将在逐仓/模拟执行收尾后记录 failed"
+                            )
+                        else:
+                            logger.warning(
+                                "阶段1：外部搜索返回0篇，回退使用本地数据 %s 条，避免后续阶段空转",
+                                len(existing_docs),
+                            )
+                            print(f"⚠️ 外部搜索返回0篇，回退使用本地数据 ({len(existing_docs)} 条)")
+                            docs = existing_docs
                     elif docs and existing_docs:
                         seen_doc_keys = {
                             (getattr(doc, "url", "") or getattr(doc, "id", "") or getattr(doc, "doc_id", ""))
@@ -5909,6 +5998,35 @@ async def main():
                                 break
                         if added_local_docs:
                             logger.info("阶段1：搜索结果较少时追加本地数据 %s 条", added_local_docs)
+
+                research_source_failure = bool(
+                    round_search_availability in SEARCH_PIPELINE_FAILURE_STATUSES
+                )
+                if research_source_failure:
+                    # SearchQueriesValidated already contains the exact provider
+                    # counters.  This named event makes the earliest failed
+                    # stage explicit without stopping lifecycle/pending replay.
+                    await round_coordinator.record_event(
+                        active_round_id,
+                        "ResearchSourceUnavailable",
+                        {
+                            "failure_mode": round_search_availability,
+                            "submitted_query_count": int(
+                                round_search_audit.get("submitted_query_count") or 0
+                            ),
+                            "provider_accepted_count": int(
+                                round_search_audit.get("provider_accepted_count") or 0
+                            ),
+                            "result_document_count": int(
+                                round_search_audit.get("result_document_count") or 0
+                            ),
+                            "provider_health": dict(
+                                round_search_audit.get("provider_health") or {}
+                            ),
+                            "local_fallback_used": False,
+                            "next_action": "retry_network_research_next_round",
+                        },
+                    )
 
                 # 保存文档
                 if docs:
@@ -6206,7 +6324,7 @@ async def main():
                                 ),
                             },
                         )
-                    else:
+                    elif not research_source_failure:
                         await round_coordinator.advance(
                             active_round_id,
                             ResearchRoundStatus.NO_EVIDENCE,
@@ -6214,6 +6332,16 @@ async def main():
                             payload={"source_count": len(docs), "proposal_count": 0},
                             terminal_code="no_evidence",
                             terminal_reason="阶段2没有形成满足证据约束的结构化提案",
+                        )
+                    else:
+                        await round_coordinator.record_event(
+                            active_round_id,
+                            "NoProposalBecauseResearchSourceFailed",
+                            {
+                                "failure_mode": round_search_availability,
+                                "proposal_count": 0,
+                                "local_fallback_used": False,
+                            },
                         )
 
                 # 投委会原始讨论是独立记忆，不依赖后续综合结论是否成功。
@@ -6315,7 +6443,12 @@ async def main():
                     question=base_topic,
                     previous_conclusions=research_memory_prompt[:8000],
                     reflection_text=(
-                        "本轮使用新检索资料经过独立分析、交叉质疑、反事实修正和投票后形成结论。"
+                        (
+                            "本轮联网资料源在证据获取前失败；旧本地资料未冒充本轮新证据。"
+                            "逐仓复核和模拟执行链路仍完成收尾，下轮继续联网重试。"
+                        )
+                        if research_source_failure
+                        else "本轮使用新检索资料经过独立分析、交叉质疑、反事实修正和投票后形成结论。"
                     ),
                     verification_results=json.dumps(
                         {
@@ -6351,6 +6484,11 @@ async def main():
                     "no_evidence": ResearchRoundStatus.NO_EVIDENCE,
                 }
                 terminal_name = str(simulation_result.get("terminal") or "failed")
+                if research_source_failure and terminal_name == "no_evidence":
+                    # The round failed before evidence existed.  A real fill,
+                    # pending market ruling, or execution rejection remains a
+                    # stronger operational terminal and is never rewritten.
+                    terminal_name = "failed"
                 target_terminal_status = terminal_map.get(
                     terminal_name,
                     ResearchRoundStatus.FAILED,
@@ -6360,45 +6498,66 @@ async def main():
                     and current_round.status != ResearchRoundStatus.NO_EVIDENCE
                     and current_round.status != target_terminal_status
                 ):
+                    if target_terminal_status == ResearchRoundStatus.FAILED:
+                        await round_coordinator.fail(
+                            active_round_id,
+                            code="failed",
+                            reason=(
+                                "研究轮失败：联网资料源不可用；"
+                                f"failure_mode={round_search_availability}; "
+                                "旧本地资料未作为本轮新证据"
+                            ),
+                            payload={
+                                "failure_mode": round_search_availability,
+                                "search_audit": round_search_audit,
+                                "local_fallback_used": False,
+                                "simulation_terminal_before_override": "no_evidence",
+                            },
+                        )
+                    else:
+                        await round_coordinator.advance(
+                            active_round_id,
+                            target_terminal_status,
+                            event_type="SimulationPipelineTerminal",
+                            payload={
+                                "terminal": terminal_name,
+                                "fills": simulation_result.get("fills", 0),
+                                "replay_fills": simulation_result.get("replay_fills", 0),
+                                "cycle_fills": simulation_result.get("cycle_fills", 0),
+                                "pending": simulation_result.get("pending", 0),
+                                "candidate_count": simulation_result.get("candidate_count", 0),
+                            },
+                            terminal_code=terminal_name,
+                            terminal_reason=(
+                                "模拟投资管线已持久化明确终态；"
+                                f"fills={simulation_result.get('fills', 0)}"
+                            ),
+                        )
+                if target_terminal_status != ResearchRoundStatus.FAILED:
                     await round_coordinator.advance(
                         active_round_id,
-                        target_terminal_status,
-                        event_type="SimulationPipelineTerminal",
+                        ResearchRoundStatus.REFLECTED,
+                        event_type="RoundReflectionPersisted",
+                        payload={"reflection_saved": True},
+                    )
+                    await round_coordinator.advance(
+                        active_round_id,
+                        ResearchRoundStatus.COMPLETED,
+                        event_type="RoundCompleted",
                         payload={
-                            "terminal": terminal_name,
+                            "simulation_terminal": terminal_name,
                             "fills": simulation_result.get("fills", 0),
                             "replay_fills": simulation_result.get("replay_fills", 0),
                             "cycle_fills": simulation_result.get("cycle_fills", 0),
-                            "pending": simulation_result.get("pending", 0),
-                            "candidate_count": simulation_result.get("candidate_count", 0),
                         },
-                        terminal_code=terminal_name,
-                        terminal_reason=(
-                            "模拟投资管线已持久化明确终态；"
-                            f"fills={simulation_result.get('fills', 0)}"
-                        ),
                     )
-                await round_coordinator.advance(
-                    active_round_id,
-                    ResearchRoundStatus.REFLECTED,
-                    event_type="RoundReflectionPersisted",
-                    payload={"reflection_saved": True},
-                )
-                await round_coordinator.advance(
-                    active_round_id,
-                    ResearchRoundStatus.COMPLETED,
-                    event_type="RoundCompleted",
-                    payload={
-                        "simulation_terminal": terminal_name,
-                        "fills": simulation_result.get("fills", 0),
-                        "replay_fills": simulation_result.get("replay_fills", 0),
-                        "cycle_fills": simulation_result.get("cycle_fills", 0),
-                    },
-                )
 
-                # 更新已完成议题
-                completed_topics.add(base_topic)
-                save_completed_topics(completed_topics)
+                # A source-stage failure is not a completed topic.  Leaving it
+                # out of this set lets the scheduler retry after the normal
+                # recent-topic cooldown instead of treating outage as success.
+                if target_terminal_status != ResearchRoundStatus.FAILED:
+                    completed_topics.add(base_topic)
+                    save_completed_topics(completed_topics)
 
                 # 打印结论
                 print("\n" + "="*60)
