@@ -198,6 +198,7 @@ class LLMClient:
         max_tokens: int = 4000,
         use_cache: bool = True,
         stream: bool = False,
+        json_output: bool = False,
     ) -> str:
         """
         单次对话（带重试机制）
@@ -225,6 +226,9 @@ class LLMClient:
                 messages.append({"role": "user", "content": user})
 
             # 缓存检查
+            # Structured votes must never reuse an unconstrained or truncated
+            # response, including one generated with a different token budget.
+            use_cache = use_cache and not json_output
             if use_cache:
                 cache_key = self._get_cache_key(messages, temperature)
                 cached = self._get_cached(cache_key)
@@ -241,7 +245,10 @@ class LLMClient:
                 if self.provider == 'anthropic' and getattr(self, '_use_anthropic_sdk', False):
                     result, usage = await self._anthropic_chat(system, user, temperature, max_tokens)
                 else:
-                    result, usage = await self._openai_chat(messages, temperature, max_tokens)
+                    output_options = {"json_output": True} if json_output else {}
+                    result, usage = await self._openai_chat(
+                        messages, temperature, max_tokens, **output_options
+                    )
                 return result, usage
 
             # 带重试的执行调用
@@ -388,6 +395,7 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float,
         max_tokens: int,
+        json_output: bool = False,
     ) -> Tuple[str, Dict]:
         """OpenAI兼容API调用"""
         try:
@@ -416,6 +424,8 @@ class LLMClient:
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
+            if json_output:
+                payload["response_format"] = {"type": "json_object"}
 
             # 流式调用：read 超时作用于 chunk 间隔，而非整体响应
             # 首 chunk 超时：90s 内必须收到第一个 chunk，否则认为服务卡死
@@ -488,6 +498,17 @@ class LLMClient:
                         finish_reason = fr
 
             content = "".join(content_parts).strip()
+            if json_output and (not content or finish_reason != "stop"):
+                # A reasoning-only or truncated stream is not a final vote.
+                # Keep it absent; never extract a direction from deliberation.
+                return (
+                    "[committee_task_absent] reason=structured_output_incomplete "
+                    f"finish_reason={finish_reason or 'missing'}; "
+                    f"final_content_present={bool(content)}\n"
+                    f"[final_content]\n{content}\n"
+                    f"[reasoning_content]\n{''.join(reasoning_parts)}",
+                    usage,
+                )
             if not content:
                 # 与旧逻辑保持一致：content 为空时回退到 reasoning
                 reasoning = "".join(reasoning_parts).strip()

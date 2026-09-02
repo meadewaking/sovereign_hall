@@ -1902,6 +1902,12 @@ def show_investment_status(db_path) -> dict[str, Any]:
                 for vote in individual_votes[:7]:
                     if not isinstance(vote, dict):
                         continue
+                    if vote.get("is_valid") is False:
+                        compact_votes.append(
+                            f"{vote.get('role', '?')}=无效/缺席@0.00"
+                            f"({vote.get('parse_mode') or 'unknown'})"
+                        )
+                        continue
                     compact_votes.append(
                         f"{vote.get('role', '?')}={vote.get('direction', '?')}"
                         f"@{float(vote.get('effective_weight') or 0):.2f}"
@@ -1919,10 +1925,12 @@ def show_investment_status(db_path) -> dict[str, Any]:
                         continue
                     timeout_count = int(stage.get("timeout_count") or 0)
                     error_count = int(stage.get("error_count") or 0)
-                    if timeout_count or error_count:
+                    schema_invalid_count = int(stage.get("schema_invalid_count") or 0)
+                    if timeout_count or error_count or schema_invalid_count:
                         absent_stages.append(
                             f"{stage.get('stage', '?')}: "
                             f"timeout={timeout_count}, error={error_count}, "
+                            f"schema_invalid={schema_invalid_count}, "
                             f"absent={stage.get('absent_labels') or []}"
                         )
             if absent_stages:

@@ -2876,7 +2876,14 @@ def merge_committee_retry_results(
         original_index = index_by_label.get(label)
         if original_index is None:
             continue
-        if retry_task.get("status") == "completed":
+        requires_final_vote = stage.startswith(
+            ("round4_vote", "deployment_deadlock_review")
+        )
+        valid_retry = retry_task.get("status") == "completed" and (
+            not requires_final_vote
+            or parse_strict_committee_vote(retry_result).get("schema_valid")
+        )
+        if valid_retry:
             merged_results[original_index] = retry_result
             merged_tasks[original_index] = {
                 **retry_task,
@@ -3072,7 +3079,8 @@ def aggregate_committee_decision(
                 "confidence": vote.get("confidence"),
                 "position": vote.get("position"),
                 "effective_weight": (
-                    weights[index] if index < len(weights) else 1.0
+                    (weights[index] if index < len(weights) else 1.0)
+                    if vote.get("is_valid") else 0.0
                 ),
                 "is_valid": bool(vote.get("is_valid")),
                 "parse_mode": str(vote.get("parse_mode") or "unknown"),
@@ -3896,12 +3904,13 @@ async def stage3_ic_discussion(
                         "seat_role": role.value,
                         "model": getattr(getattr(agent, "llm", None), "model", ""),
                         "provider": getattr(getattr(agent, "llm", None), "provider", ""),
-                        "input_material": prompt,
+                        "input_material": {"prompt": prompt, "output_contract": "final_json_v1"},
                         "factory": (
                             lambda agent=agent, prompt=prompt: agent.think(
                                 task=prompt,
                                 temperature=0.4,
                                 max_tokens=vote_max_tokens,
+                                json_output=True,
                                 use_memory=False,
                             )
                         ),
@@ -3935,6 +3944,7 @@ async def stage3_ic_discussion(
                     "input_material": {
                         "prompt": prompt,
                         "retry": "strict_json_repair",
+                        "output_contract": "final_json_v1",
                     },
                     "attempt": 1,
                     "factory": (
@@ -3945,6 +3955,7 @@ async def stage3_ic_discussion(
                             ),
                             temperature=0.1,
                             max_tokens=vote_retry_max_tokens,
+                            json_output=True,
                             use_memory=False,
                         )
                     ),
@@ -4050,12 +4061,13 @@ async def stage3_ic_discussion(
                             ),
                             "model": getattr(getattr(agent, "llm", None), "model", ""),
                             "provider": getattr(getattr(agent, "llm", None), "provider", ""),
-                            "input_material": prompt,
+                            "input_material": {"prompt": prompt, "output_contract": "final_json_v1"},
                             "factory": (
                                 lambda agent=agent, prompt=prompt: agent.think(
                                     task=prompt,
                                     temperature=0.2,
                                     max_tokens=vote_max_tokens,
+                                    json_output=True,
                                     use_memory=False,
                                 )
                             ),
@@ -4096,6 +4108,7 @@ async def stage3_ic_discussion(
                         "input_material": {
                             "prompt": prompt,
                             "retry": "strict_json_repair",
+                            "output_contract": "final_json_v1",
                         },
                         "attempt": 1,
                         "factory": (
@@ -4106,6 +4119,7 @@ async def stage3_ic_discussion(
                                 ),
                                 temperature=0.1,
                                 max_tokens=vote_retry_max_tokens,
+                                json_output=True,
                                 use_memory=False,
                             )
                         ),
@@ -5489,7 +5503,7 @@ def select_simulation_terminal(
         return "execution_rejected"
     if decisions:
         if any(not bool(item.get("vote_quorum_met")) for item in decisions):
-            return "committee_incomplete"
+            return "failed"
         return "committee_hold"
     return "no_evidence"
 
@@ -6479,7 +6493,6 @@ async def main():
                     "market_closed_pending": ResearchRoundStatus.MARKET_CLOSED_PENDING,
                     "execution_rejected": ResearchRoundStatus.EXECUTION_REJECTED,
                     "committee_hold": ResearchRoundStatus.COMMITTEE_HOLD,
-                    "committee_incomplete": ResearchRoundStatus.COMMITTEE_INCOMPLETE,
                     "filled": ResearchRoundStatus.FILLED,
                     "no_evidence": ResearchRoundStatus.NO_EVIDENCE,
                 }
@@ -6499,6 +6512,10 @@ async def main():
                     and current_round.status != target_terminal_status
                 ):
                     if target_terminal_status == ResearchRoundStatus.FAILED:
+                        failure_mode = (
+                            round_search_availability if research_source_failure
+                            else "committee_incomplete"
+                        )
                         await round_coordinator.fail(
                             active_round_id,
                             code="failed",
@@ -6506,12 +6523,19 @@ async def main():
                                 "研究轮失败：联网资料源不可用；"
                                 f"failure_mode={round_search_availability}; "
                                 "旧本地资料未作为本轮新证据"
+                                if research_source_failure else
+                                "研究轮失败：投委会有效终票未达法定人数；"
+                                "failure_mode=committee_incomplete; "
+                                "保留缺席/无效席位及原始回答，下一轮重新审议"
                             ),
                             payload={
-                                "failure_mode": round_search_availability,
+                                "failure_mode": failure_mode,
                                 "search_audit": round_search_audit,
                                 "local_fallback_used": False,
-                                "simulation_terminal_before_override": "no_evidence",
+                                "simulation_terminal_before_override": simulation_result.get("terminal"),
+                                "committee_decision_ids": [
+                                    item.get("decision_id") for item in decisions
+                                ],
                             },
                         )
                     else:

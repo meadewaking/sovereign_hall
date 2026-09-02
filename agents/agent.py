@@ -107,6 +107,7 @@ class Agent:
         max_tokens: int = None,
         use_memory: bool = True,
         additional_rules: List[str] = None,
+        json_output: bool = False,
     ) -> str:
         """
         深度思考
@@ -141,11 +142,13 @@ class Agent:
 
         # 调用LLM
         try:
+            output_options = {"json_output": True} if json_output else {}
             response = await self.llm.chat(
                 system=system_prompt,
                 user=user_message,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **output_options,
             )
 
             # 记录到记忆

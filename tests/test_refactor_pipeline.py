@@ -346,13 +346,13 @@ async def test_committee_retry_recovers_only_absent_roles():
         (
             "risk",
             lambda: AsyncMock(
-                return_value='{"direction":"long","confidence":0.7,"position":0.08}'
+                return_value='{"direction":"long","confidence":0.7,"position":0.08,"key_evidence":["filing"],"risk_flags":[],"invalid_if":"revenue reverses"}'
             )(),
         ),
         (
             "quant",
             lambda: AsyncMock(
-                return_value='{"direction":"hold","confidence":0.6,"position":0}'
+                return_value='{"direction":"hold","confidence":0.6,"position":0,"key_evidence":["missing filing"],"risk_flags":[],"invalid_if":"obtain filing"}'
             )(),
         ),
     ]
@@ -666,7 +666,7 @@ def test_rejected_candidate_is_not_classified_as_no_evidence():
         trade_candidates=[],
         decisions=[{"direction": "hold", "vote_quorum_met": False}],
         rejections=[{"code": "committee_incomplete"}],
-    ) == "committee_incomplete"
+    ) == "failed"
 
 
 def test_source_persisted_round_accepts_rejected_candidate_terminal():
