@@ -117,27 +117,64 @@ def safe_parse_json(text: str, default: Any = None) -> Any:
     if match:
         text = match.group(1).strip()
 
-    # 尝试提取数组或对象
-    match = re.search(r'[\{\[].*[\}\]]', text, re.DOTALL)
-    if match:
-        text = match.group(0).strip()
-
-    # 尝试解析
+    # 尝试直接解析(处理 text 本身就是合法 JSON 的情况)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # 最后的尝试：修复常见错误
-    try:
-        fixed = text
-        fixed = re.sub(r'(\w+):', r'"\1":', fixed)  # 给key加引号
-        fixed = fixed.replace("'", '"')  # 单引号转双引号
-        fixed = fixed.replace("True", "true").replace("False", "false")
-        fixed = fixed.replace("None", "null")
-        return json.loads(fixed)
-    except (json.JSONDecodeError, AttributeError):
-        pass
+    # 用 JSONDecoder.raw_decode 找到第一个合法的 JSON 数组/对象
+    # 这比贪婪正则更准确:正则 [\{\[].*[\}\]] 会贪婪到文本里最后一个括号,
+    # 把后续散文内容也包进来导致解析失败。raw_decode 从当前位置尝试解析,
+    # 失败就前进一个字符,能精确定位合法 JSON 边界。
+    def _looks_like_data(value):
+        if isinstance(value, dict):
+            return bool(value)
+        if isinstance(value, list):
+            if value and all(isinstance(item, dict) for item in value):
+                return True
+            return len(value) >= 2
+        return False
+
+    decoder = json.JSONDecoder()
+    for i, char in enumerate(text):
+        if char not in '[{':
+            continue
+        try:
+            value, end = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, (list, dict)):
+            continue
+        trailing = text[i + end:].strip()
+        # 整段就是 JSON 的情况:直接返回。
+        if not trailing:
+            return value
+        # 后面还有散文,但解析出的值"看起来像数据"(非空 dict、dict 列表、
+        # 或多元素列表)时也接受——这是 stage2 常见的 "JSON + 解说" 形态。
+        # 反之 [1] 这种单元素原始列表后跟散文,几乎都是引用标记 [1][2],
+        # 不应当作 JSON 返回。
+        if _looks_like_data(value):
+            return value
+
+    # 兜底:用贪婪正则提取(可能包含多余内容,最后尝试)
+    match = re.search(r'[\{\[].*[\}\]]', text, re.DOTALL)
+    if match:
+        candidate = match.group(0).strip()
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        # 最后的尝试：修复常见错误
+        try:
+            fixed = candidate
+            fixed = re.sub(r'(\w+):', r'"\1":', fixed)  # 给key加引号
+            fixed = fixed.replace("'", '"')  # 单引号转双引号
+            fixed = fixed.replace("True", "true").replace("False", "false")
+            fixed = fixed.replace("None", "null")
+            return json.loads(fixed)
+        except (json.JSONDecodeError, AttributeError):
+            pass
 
     return default
 

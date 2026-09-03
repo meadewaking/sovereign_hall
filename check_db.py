@@ -2057,6 +2057,19 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
             )
         provider_health = dict(query_gate.get("provider_health") or {})
         if provider_health:
+            if "empty_success_counts" in provider_health:
+                empty_counts = dict(provider_health.get("empty_success_counts") or {})
+                print(
+                    "   搜索正常零结果次数: "
+                    f"{sum(int(v or 0) for v in empty_counts.values())}（不计入网络故障）"
+                )
+            failure_details = [
+                f"{source}={state['last_failure_code']}@{state.get('last_failure_at') or 'N/A'}"
+                for source, state in dict(provider_health.get("states") or {}).items()
+                if isinstance(state, dict) and state.get("last_failure_code")
+            ]
+            if failure_details:
+                print("   最近搜索故障审计: " + "; ".join(failure_details))
             open_sources = list(
                 provider_health.get("circuit_open_sources") or []
             )

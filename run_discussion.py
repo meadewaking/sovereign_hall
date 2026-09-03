@@ -1402,8 +1402,10 @@ def classify_search_source_availability(audit: Dict[str, Any]) -> str:
     failed_calls = metric_total("failure_counts")
     circuit_skips = metric_total("skipped_open_circuit_counts")
     if successful_calls > 0:
+        if metric_total("empty_success_counts") == successful_calls:
+            return "provider_no_results"
         # Providers returned results, but the document validity filter removed
-        # all of them.  This is an evidence-quality outcome, not connectivity.
+        # all of them. Legacy reports lack the empty-result counter.
         return "provider_results_filtered_out"
     if attempted_calls > 0 or failed_calls > 0 or circuit_skips > 0:
         return "external_search_unavailable"
@@ -1433,15 +1435,34 @@ async def stage1_mass_search(
     print(f"📡 阶段1：海量信息搜索 - 议题: {topic}")
     print("="*60)
 
-    # 清理议题关键词
-    topic_keyword = (
-        topic.split("｜", 1)[0]
-        .replace("分析", "")
-        .replace("研究", "")
-        .replace("投资机会", "")
-        .replace("行业", "")
-        .strip()
+    # 清理议题关键词:取议题主体（"｜"前的部分），剥离抽象后缀，
+    # 让搜索词聚焦在具体行业/主题名词上。否则像 "有色金属供需格局"
+    # 这样的 8 字短语作为前缀拼到每条查询上，会把 Bing/DDG 的结果
+    # 偏到泛行业分析文章，stage2 拿不到具体的公司/ETF 财务证据。
+    raw_topic_head = topic.split("｜", 1)[0].strip()
+    abstract_suffixes = (
+        "供需格局", "供需", "格局", "前景", "景气度",
+        "投资逻辑", "投资机会", "发展趋势", "趋势",
+        "现状", "展望", "分析", "研究", "行业", "板块",
+        "周期", "基本面",
     )
+    topic_keyword = raw_topic_head
+    # 循环剥除复合后缀（例如 "新能源车产业链投资机会研究" 需要先剥 "研究"
+    # 再剥 "投资机会"），但保留至少 2 字的核心词，避免把短议题剥光。
+    changed = True
+    while changed and len(topic_keyword) > 2:
+        changed = False
+        for suffix in abstract_suffixes:
+            if (
+                topic_keyword.endswith(suffix)
+                and len(topic_keyword) > len(suffix)
+            ):
+                topic_keyword = topic_keyword[: -len(suffix)].strip()
+                changed = True
+                break
+    if not topic_keyword:
+        topic_keyword = raw_topic_head
+
     deployment_research = "资金部署候选证据比较" in topic
 
     # 构建更丰富的种子词
@@ -1460,8 +1481,18 @@ async def stage1_mass_search(
         f"{topic_keyword} 龙头",
     ]
     if deployment_research:
-        extra_queries = [
-            f"{topic_keyword} 集采结果 中标企业",
+        # "集采" 只在医药/器械行业有意义，对有色金属/新能源/TMT 等行业
+        # 是浪费查询槽且会污染结果（搜不到对应内容，provider 还可能因为
+        # 0 结果被误判失败）。改成按行业关键词条件性添加。
+        medical_sectors = ("医药", "医疗", "器械", "耗材", "药品", "生物",
+                           "疫苗", "CXO", "体外诊断")
+        is_medical = any(tag in topic_keyword for tag in medical_sectors)
+
+        deployment_extra: List[str] = []
+        if is_medical:
+            deployment_extra.append(f"{topic_keyword} 集采结果 中标企业")
+
+        deployment_extra.extend([
             f"{topic_keyword} 上市公司 营收 毛利率",
             f"{topic_keyword} 龙头 财报 现金流",
             f"{topic_keyword} 候选公司 估值对比",
@@ -1471,8 +1502,9 @@ async def stage1_mass_search(
             f"{topic_keyword} 业绩催化 验证时间",
             f"{topic_keyword} 风险 失效条件",
             f"{topic_keyword} 资金流向",
-            *extra_queries,
-        ]
+        ])
+        # 把通用变体放到最后，让具体证据查询优先占满查询槽
+        extra_queries = [*deployment_extra, *extra_queries]
 
     # 生成搜索词
     from sovereign_hall.services.spider_service import SearchQueryGenerator
@@ -2024,6 +2056,16 @@ async def stage2_deep_research(
             len(proposals),
             parse_mode,
         )
+        if parse_mode == "unparsed" and response:
+            try:
+                dump_path = project_root / "data" / "logs" / "stage2_unparsed_dump.txt"
+                with dump_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"\n=== {datetime.now().isoformat()} mode={parse_mode} "
+                        f"len={len(response)} ===\n{response}\n"
+                    )
+            except Exception:
+                pass
 
         # 清洗数据（同时过滤黑名单）
         cleaned = []
@@ -3904,7 +3946,7 @@ async def stage3_ic_discussion(
                         "seat_role": role.value,
                         "model": getattr(getattr(agent, "llm", None), "model", ""),
                         "provider": getattr(getattr(agent, "llm", None), "provider", ""),
-                        "input_material": {"prompt": prompt, "output_contract": "final_json_v1"},
+                        "input_material": {"prompt": prompt, "output_contract": "final_json_v2_system"},
                         "factory": (
                             lambda agent=agent, prompt=prompt: agent.think(
                                 task=prompt,
@@ -3944,7 +3986,7 @@ async def stage3_ic_discussion(
                     "input_material": {
                         "prompt": prompt,
                         "retry": "strict_json_repair",
-                        "output_contract": "final_json_v1",
+                        "output_contract": "final_json_v2_system",
                     },
                     "attempt": 1,
                     "factory": (
@@ -4061,7 +4103,7 @@ async def stage3_ic_discussion(
                             ),
                             "model": getattr(getattr(agent, "llm", None), "model", ""),
                             "provider": getattr(getattr(agent, "llm", None), "provider", ""),
-                            "input_material": {"prompt": prompt, "output_contract": "final_json_v1"},
+                            "input_material": {"prompt": prompt, "output_contract": "final_json_v2_system"},
                             "factory": (
                                 lambda agent=agent, prompt=prompt: agent.think(
                                     task=prompt,
@@ -4108,7 +4150,7 @@ async def stage3_ic_discussion(
                         "input_material": {
                             "prompt": prompt,
                             "retry": "strict_json_repair",
-                            "output_contract": "final_json_v1",
+                            "output_contract": "final_json_v2_system",
                         },
                         "attempt": 1,
                         "factory": (

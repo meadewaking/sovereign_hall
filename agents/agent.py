@@ -134,7 +134,8 @@ class Agent:
         # 构建系统提示词
         system_prompt = self.persona.get_system_prompt(
             task_context=context,
-            additional_rules=additional_rules
+            additional_rules=additional_rules,
+            json_output=json_output,
         )
 
         # 构建用户消息（包含历史记忆）

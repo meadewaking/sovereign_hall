@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 MAX_STORED_CONTENT_CHARS = 50000
 MAX_SEARCH_QUERY_CHARS = 80
 
+
+class SearchProviderUnavailable(ConnectionError):
+    """A blocked provider response must never count as an empty successful search."""
+
 _SEARCH_QUERY_PLACEHOLDER_PATTERNS = [
     "查询词", "示例", "占位", "xxx", "test",
     "投资机会", "股票推荐", "a股市场",
@@ -325,6 +329,8 @@ class SpiderSwarm:
         source: str,
         *,
         success: bool,
+        empty_result: bool = False,
+        failure_code: str = "",
     ) -> None:
         async with self._provider_health_lock:
             state = self._provider_state(source)
@@ -332,6 +338,8 @@ class SpiderSwarm:
             self._provider_metric(source, "attempted")
             if success:
                 self._provider_metric(source, "success")
+                if empty_result:
+                    self._provider_metric(source, "empty_success")
                 recovered = state.get("circuit_opened_at") is not None
                 state.update(
                     {
@@ -350,6 +358,7 @@ class SpiderSwarm:
             failures = int(state.get("consecutive_failures") or 0) + 1
             state["consecutive_failures"] = failures
             state["last_failure_at"] = observed_at
+            state["last_failure_code"] = failure_code or "provider_unavailable"
             state["half_open_in_flight"] = False
             if failures >= self.provider_failure_threshold:
                 newly_opened = state.get("circuit_opened_at") is None
@@ -384,6 +393,7 @@ class SpiderSwarm:
             "configured_sources": list(self.default_sources),
             "attempted_counts": {},
             "success_counts": {},
+            "empty_success_counts": {},
             "failure_counts": {},
             "skipped_open_circuit_counts": {},
             "circuit_open_sources": [],
@@ -392,12 +402,14 @@ class SpiderSwarm:
         metric_names = (
             "attempted",
             "success",
+            "empty_success",
             "failure",
             "skipped_open_circuit",
         )
         output_names = {
             "attempted": "attempted_counts",
             "success": "success_counts",
+            "empty_success": "empty_success_counts",
             "failure": "failure_counts",
             "skipped_open_circuit": "skipped_open_circuit_counts",
         }
@@ -430,6 +442,7 @@ class SpiderSwarm:
                 "cooldown_remaining_seconds": round(open_remaining, 3),
                 "last_success_at": state.get("last_success_at"),
                 "last_failure_at": state.get("last_failure_at"),
+                "last_failure_code": state.get("last_failure_code"),
             }
         return report
 
@@ -686,23 +699,38 @@ class SpiderSwarm:
             async with semaphore:
                 if not await self._provider_call_allowed(source_name):
                     return []
+                call_succeeded = False
+                failure_code = ""
                 try:
                     result = await asyncio.wait_for(
                         search_factory(),
                         timeout=self.source_timeout,
                     )
+                    call_succeeded = True
                 except asyncio.TimeoutError:
+                    failure_code = "provider_timeout"
                     logger.debug(
                         f"{source_name} search timeout for '{query}' "
                         f"after {self.source_timeout}s"
                     )
                     result = []
                 except Exception as exc:
+                    failure_code = (
+                        str(exc) if isinstance(exc, SearchProviderUnavailable)
+                        else type(exc).__name__
+                    )
                     logger.debug(f"{source_name} search failed: {exc}")
                     result = []
+                # Empty results from a successful call are NOT a provider
+                # failure: niche queries legitimately return 0 hits, and
+                # counting those against the circuit breaker would trip it
+                # even when the provider is healthy. Only timeouts/exceptions
+                # advance the failure counter.
                 await self._record_provider_outcome(
                     source_name,
-                    success=bool(result),
+                    success=call_succeeded,
+                    empty_result=call_succeeded and not result,
+                    failure_code=failure_code,
                 )
                 return result
 
@@ -757,7 +785,7 @@ class SpiderSwarm:
         # longer erases repeated Bing/Sogou failures or disables the healthy
         # provider through an aggregate alarm.
         if not docs:
-            logger.warning("Search failed for '%s' across available providers", query)
+            logger.info("Search returned no documents for '%s'; see provider health for availability", query)
 
         # 去重
         seen_urls = set()
@@ -789,8 +817,7 @@ class SpiderSwarm:
                 # 检测 CAPTCHA / 反爬页面
                 text_lower = resp.text[:3000].lower()
                 if 'captcha' in text_lower or 'class="captcha"' in resp.text:
-                    logger.debug(f"Bing CAPTCHA triggered for '{query}', skipping silently")
-                    return []
+                    raise SearchProviderUnavailable("bing_captcha")
 
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 results = soup.find_all('li', class_='b_algo')
@@ -835,10 +862,10 @@ class SpiderSwarm:
                     await asyncio.sleep(0.5)
                     continue
                 logger.warning(f"Bing connection failed (DNS/network): {e}")
-                return []
+                raise
             except httpx.TimeoutException:
                 logger.warning(f"Bing search timeout for: {query}")
-                return []
+                raise
         return []
 
     async def _baidu_search(self, query: str, max_results: int) -> List[Doc]:
@@ -979,8 +1006,7 @@ class SpiderSwarm:
             # 检测反爬重定向：Sogou 会把请求重定向到 /antispider/ 页面
             final_url = str(resp.url) if hasattr(resp, 'url') else ''
             if 'antispider' in final_url or 'antispider' in resp.text[:2000].lower():
-                logger.debug(f"Sogou anti-spider triggered for '{query}', skipping silently")
-                return []
+                raise SearchProviderUnavailable("sogou_antispider")
 
             resp.raise_for_status()
 
@@ -1040,7 +1066,7 @@ class SpiderSwarm:
 
         except Exception as e:
             logger.warning(f"Sogou search failed: {e}")
-            return []
+            raise
 
     async def _ddg_search(self, query: str, max_results: int, deep_fetch: bool = True) -> List[Doc]:
         """
@@ -1171,7 +1197,7 @@ class SpiderSwarm:
 
         except Exception as e:
             logger.warning(f"DuckDuckGO search failed: {e}")
-            return []
+            raise
 
     def _generate_fallback_docs(self, query: str, max_results: int) -> List[Doc]:
         """当所有搜索引擎失败时，生成基于主题的备用文档"""

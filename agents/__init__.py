@@ -200,7 +200,10 @@ class AgentPersona:
 
         return personas.get(role)
 
-    def get_system_prompt(self, task_context: str = "", additional_rules: List[str] = None) -> str:
+    def get_system_prompt(
+        self, task_context: str = "", additional_rules: List[str] = None,
+        *, json_output: bool = False,
+    ) -> str:
         """
         获取完整的系统提示词
 
@@ -208,18 +211,27 @@ class AgentPersona:
             task_context: 当前任务上下文
             additional_rules: 额外规则列表
         """
-        prompt = f"""{self.prompt_prefix}
-
-【当前任务上下文】
-{task_context if task_context else '暂无特定任务，按照你的专业判断进行分析。'}
-
-【输出要求】
+        if json_output:
+            output_requirements = """【最终JSON裁决要求】
+1. 仅输出任务指定字段的单个完整JSON对象，禁止Markdown、代码围栏和对象外的说明。
+2. 保留本角色的独立判断，在key_evidence、risk_flags和invalid_if内简洁区分已验证事实、推断和缺口。
+3. 仅引用任务材料中可追溯的证据，不得补造事实、来源或行情；没有新增证据也必须返回完整JSON。
+4. 证据不足、反证成立或超出能力圈时，遵循任务中的hold/abstain规则；不得为满足格式或部署目标改变方向。
+5. direction、confidence、position与证据和否决条件保持一致；输出前完成字段校验。"""
+        else:
+            output_requirements = """【输出要求】
 1. 只输出对当前任务有新增价值的内容，不复述题目、背景和其他人的原话
 2. 明确区分：已验证事实、基于证据的推断、仍不确定的信息
 3. 引用具体数据、来源标题或案例支持观点；没有证据时直接标注“证据不足”
 4. 如没有新增信息，直接回答“无新增证据”，并给出是否维持原判断
 5. 结尾必须给出可执行判断：买入/卖出/观望、置信度、关键触发条件或否决条件
 6. 输出使用Markdown；不要为了节省token删减能提升判断质量的证据、反例、压力测试或交叉验证"""
+        prompt = f"""{self.prompt_prefix}
+
+【当前任务上下文】
+{task_context if task_context else '暂无特定任务，按照你的专业判断进行分析。'}
+
+{output_requirements}"""
 
         if additional_rules:
             prompt += "\n\n【额外规则】"

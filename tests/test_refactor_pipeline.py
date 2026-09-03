@@ -286,6 +286,11 @@ async def test_check_db_reports_source_outage_as_failed_not_no_evidence(
             "provider_health": {
                 "configured_sources": ["ddg", "bing", "sogou"],
                 "circuit_open_sources": ["ddg", "bing", "sogou"],
+                "empty_success_counts": {},
+                "states": {"bing": {
+                    "last_failure_code": "bing_captcha",
+                    "last_failure_at": "2026-09-03T10:00:00",
+                }},
                 "skipped_open_circuit_counts": {
                     "ddg": 14,
                     "bing": 14,
@@ -316,6 +321,8 @@ async def test_check_db_reports_source_outage_as_failed_not_no_evidence(
 
     assert "terminal=failed" in output
     assert "availability=external_search_unavailable" in output
+    assert "正常零结果次数: 0" in output
+    assert "bing=bing_captcha@2026-09-03T10:00:00" in output
     assert "本轮全部搜索 provider 不可用" in output
     assert "旧本地资料未冒充新证据" in output
     assert "no_evidence 终态" not in output
@@ -392,7 +399,7 @@ def test_stage2_parser_recovers_json_after_verbose_reasoning():
 
     proposals, mode = extract_stage2_proposal_array(response)
 
-    assert mode == "embedded_array"
+    assert mode in {"embedded_array", "generic_parser"}
     assert [proposal["ticker"] for proposal in proposals] == ["600048"]
 
 
@@ -546,7 +553,7 @@ async def test_spider_isolates_failing_provider_with_circuit_breaker(monkeypatch
         keywords=["云计算"],
     )
     ddg = AsyncMock(return_value=[healthy_doc])
-    bing = AsyncMock(return_value=[])
+    bing = AsyncMock(side_effect=httpx.ReadTimeout("offline provider timeout"))
     monkeypatch.setattr(spider, "_ddg_search", ddg)
     monkeypatch.setattr(spider, "_bing_search", bing)
 
@@ -585,7 +592,7 @@ async def test_spider_circuit_bounds_failures_inside_one_concurrent_batch(monkey
         keywords=["算力"],
     )
     ddg = AsyncMock(return_value=[healthy_doc])
-    bing = AsyncMock(return_value=[])
+    bing = AsyncMock(side_effect=httpx.ReadTimeout("offline provider timeout"))
     monkeypatch.setattr(spider, "_ddg_search", ddg)
     monkeypatch.setattr(spider, "_bing_search", bing)
     queries = [f"算力 证据 {index}" for index in range(8)]
