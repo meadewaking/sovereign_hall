@@ -1340,6 +1340,44 @@ async def test_sigterm_cancellation_reaches_round_cleanup():
 
 
 @pytest.mark.asyncio
+async def test_repeated_sigterm_redelivers_cancel_if_first_is_consumed():
+    callback_holder = {}
+    main_started = asyncio.Event()
+    first_cancel_consumed = asyncio.Event()
+    second_wait_started = asyncio.Event()
+
+    def fake_install(_loop, callback):
+        callback_holder["callback"] = callback
+        return lambda: None
+
+    async def cancellation_resistant_main():
+        main_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            first_cancel_consumed.set()
+        second_wait_started.set()
+        await asyncio.Event().wait()
+
+    wrapper = asyncio.create_task(
+        run_with_graceful_shutdown(
+            cancellation_resistant_main,
+            install_handler=fake_install,
+        )
+    )
+    while "callback" not in callback_holder:
+        await asyncio.sleep(0)
+    await main_started.wait()
+    callback_holder["callback"]()
+    await first_cancel_consumed.wait()
+    await second_wait_started.wait()
+    assert not wrapper.done()
+
+    callback_holder["callback"]()
+    await asyncio.wait_for(wrapper, timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_sigterm_terminal_is_single_idempotent_and_carries_exact_signal(tmp_path):
     from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
     from sovereign_hall.services.database import DatabaseService

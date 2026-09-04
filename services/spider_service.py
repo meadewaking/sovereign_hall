@@ -199,6 +199,23 @@ class SpiderSwarm:
             1.0,
             float(spider_config.get('provider_cooldown_seconds', 300)),
         )
+        # Some failure codes indicate the provider has permanently blocked this
+        # client (e.g. Sogou antispider).  Re-probing every 5 minutes only
+        # generates noise and guarantees another 3 failures before re-opening
+        # the circuit.  Use a long cooldown for these codes so the provider
+        # stays parked for the rest of the day; a successful probe (manual
+        # restart, IP change) still clears the state via _record_provider_outcome.
+        self.provider_long_cooldown_seconds = max(
+            self.provider_cooldown_seconds,
+            float(spider_config.get('provider_long_cooldown_seconds', 86400)),
+        )
+        self.provider_long_cooldown_codes = frozenset(
+            str(code).strip().lower()
+            for code in spider_config.get(
+                'provider_long_cooldown_codes',
+                ['sogou_antispider', 'antispider', 'ip_blocked', 'captcha_required'],
+            )
+        )
         provider_max_concurrent = max(
             1,
             int(spider_config.get('provider_max_concurrent', 3)),
@@ -358,21 +375,33 @@ class SpiderSwarm:
             failures = int(state.get("consecutive_failures") or 0) + 1
             state["consecutive_failures"] = failures
             state["last_failure_at"] = observed_at
+            normalized_code = (failure_code or "provider_unavailable").lower()
             state["last_failure_code"] = failure_code or "provider_unavailable"
             state["half_open_in_flight"] = False
             if failures >= self.provider_failure_threshold:
                 newly_opened = state.get("circuit_opened_at") is None
+                # Antispider / IP-block codes are not transient: the provider
+                # will keep refusing this client until something external
+                # changes (IP, headers, account).  Use a long cooldown so we
+                # stop probing every few minutes and letting it fail again.
+                is_hard_block = normalized_code in self.provider_long_cooldown_codes
+                cooldown_seconds = (
+                    self.provider_long_cooldown_seconds
+                    if is_hard_block
+                    else self.provider_cooldown_seconds
+                )
                 state["circuit_opened_at"] = observed_at
                 state["circuit_open_until"] = (
-                    time.monotonic() + self.provider_cooldown_seconds
+                    time.monotonic() + cooldown_seconds
                 )
                 if newly_opened:
                     logger.warning(
                         "Search provider circuit opened: provider=%s "
-                        "failures=%s cooldown=%.0fs",
+                        "failures=%s cooldown=%.0fs code=%s",
                         source,
                         failures,
-                        self.provider_cooldown_seconds,
+                        cooldown_seconds,
+                        state["last_failure_code"],
                     )
 
     def get_provider_health_report(

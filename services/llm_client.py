@@ -421,11 +421,73 @@ class LLMClient:
                 "messages": messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
-                "stream": True,
-                "stream_options": {"include_usage": True},
+                # Structured committee votes need an explicit terminal response.
+                # Several OpenAI-compatible reasoning servers omit the final
+                # finish_reason chunk or split a JSON object between content and
+                # reasoning when streaming.  A non-stream response gives us one
+                # atomic message/finish_reason pair to validate without ever
+                # promoting reasoning text into a vote.
+                "stream": not json_output,
             }
             if json_output:
                 payload["response_format"] = {"type": "json_object"}
+            else:
+                payload["stream_options"] = {"include_usage": True}
+
+            if json_output:
+                resp = await self._http_client.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                )
+                if resp.status_code >= 400:
+                    raise httpx.HTTPStatusError(
+                        f"HTTP {resp.status_code}: {resp.content[:500]!r}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                try:
+                    body = resp.json()
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("Structured LLM response was not JSON") from exc
+
+                choices = body.get("choices") or []
+                choice = choices[0] if choices else {}
+                message = choice.get("message") or {}
+                raw_content = message.get("content")
+                if isinstance(raw_content, str):
+                    content = raw_content.strip()
+                elif raw_content is None:
+                    content = ""
+                else:
+                    content = json.dumps(raw_content, ensure_ascii=False)
+                raw_reasoning = (
+                    message.get("reasoning")
+                    or message.get("reasoning_content")
+                    or ""
+                )
+                reasoning = (
+                    raw_reasoning
+                    if isinstance(raw_reasoning, str)
+                    else json.dumps(raw_reasoning, ensure_ascii=False)
+                )
+                finish_reason = str(choice.get("finish_reason") or "")
+                raw_usage = body.get("usage") or {}
+                usage = {
+                    "prompt_tokens": raw_usage.get("prompt_tokens", 0),
+                    "completion_tokens": raw_usage.get("completion_tokens", 0),
+                    "total_tokens": raw_usage.get("total_tokens", 0),
+                }
+                if not content or finish_reason != "stop":
+                    return (
+                        "[committee_task_absent] reason=structured_output_incomplete "
+                        f"finish_reason={finish_reason or 'missing'}; "
+                        f"final_content_present={bool(content)}\n"
+                        f"[final_content]\n{content}\n"
+                        f"[reasoning_content]\n{reasoning}",
+                        usage,
+                    )
+                return content, usage
 
             # 流式调用：read 超时作用于 chunk 间隔，而非整体响应
             # 首 chunk 超时：90s 内必须收到第一个 chunk，否则认为服务卡死

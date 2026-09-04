@@ -544,21 +544,32 @@ async def run_with_graceful_shutdown(
     """Run the canonical loop and turn SIGTERM into one orderly cancellation."""
     loop = asyncio.get_running_loop()
     main_task = asyncio.create_task(main_factory())
-    shutdown_requested = False
+    shutdown_request_count = 0
 
     def request_shutdown() -> None:
-        nonlocal shutdown_requested
-        if shutdown_requested or main_task.done():
+        nonlocal shutdown_request_count
+        if main_task.done():
             return
-        shutdown_requested = True
-        logger.warning("SIGTERM received; finalizing the active research round")
+        shutdown_request_count += 1
+        if shutdown_request_count == 1:
+            logger.warning("SIGTERM received; finalizing the active research round")
+        else:
+            # A long-running adapter may catch/cancel its own child and consume
+            # the first CancelledError.  Re-deliver cancellation on a repeated
+            # cooperative signal so a stale runner cannot retain the singleton
+            # lock forever.  Durable terminal writes remain idempotent.
+            logger.warning(
+                "Repeated SIGTERM received; re-delivering cancellation "
+                "(request=%s)",
+                shutdown_request_count,
+            )
         main_task.cancel()
 
     cleanup = install_handler(loop, request_shutdown)
     try:
         await main_task
     except asyncio.CancelledError:
-        if not shutdown_requested:
+        if not shutdown_request_count:
             raise
         logger.info("Canonical runner finished cooperative SIGTERM shutdown")
     finally:
@@ -1757,7 +1768,13 @@ async def stage2_deep_research(
    明显无法买入一手的个股不得进入投委会，应比较资料中已有代码的可执行ETF或低价候选
 6. 黑名单标的一律排除
 
-请直接输出JSON数组格式（不要输出思考过程，只要JSON）：
+【输出格式——硬约束】
+回答的第一个字符必须是 `[` 或 `]`，最后一个字符必须是 `]`。
+禁止输出任何思考过程、分析、解释、Markdown 标题、前后缀文字。
+模型在内部完成推理后，只把最终提案数组输出到 content。
+若证据不足，第一个字符就是 `]` 之前没有任何文字。
+
+JSON数组结构：
 [
     {{
         "ticker": "推荐标的代码",
@@ -1781,16 +1798,17 @@ async def stage2_deep_research(
 重要：holding_period 必须根据投资逻辑动态决定，范围3-180天，不要一律填30。
 重要：同一标的近期重复被拒绝时，缺少resolved_rejection、evidence_delta和evidence任一项都不得重提。
 重要：无法从资料确定具体标的时必须少输出或输出空数组，不得用预设ticker、模板ETF或常识猜测补位。
+重要：第一个字符不是 `[` 或 `]` 的回答会被丢弃并触发格式重修，请勿输出任何分析文字。
 """
 
     try:
         logger.info(f"[diag] stage2 LLM call begin")
         response = await asyncio.wait_for(
             llm.chat(
-                system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；证据不足时输出空数组。",
+                system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；证据不足时输出空数组。回答第一个字符必须是 [ 或 ]。",
                 user=prompt,
                 temperature=0.3,
-                max_tokens=8000
+                max_tokens=16000
             ),
             timeout=600
         )
@@ -1836,10 +1854,11 @@ async def stage2_deep_research(
                         system=(
                             "你是格式修复器，只能结构化已有提案，不能生成新提案或补造证据。"
                             "没有明确且有证据的提案时只输出[]。"
+                            "回答第一个字符必须是 [ 或 ]。"
                         ),
                         user=repair_prompt,
                         temperature=0.0,
-                        max_tokens=5000,
+                        max_tokens=8000,
                         use_cache=False,
                     ),
                     timeout=300,
@@ -5809,10 +5828,15 @@ async def main():
                 await asyncio.sleep(storage_pressure_pause)
                 continue
 
-            # 连续无结果时增加延迟，防止空转
-            if empty_rounds >= 3:
-                wait_seconds = min(60, 10 * (empty_rounds - 2))  # 最多等60秒
-                logger.warning(f"连续{empty_rounds}轮无结果，等待{wait_seconds}秒...")
+            # 连续无结果时：末尾已经按 empty_rounds 做了指数退避或长休眠。
+            # 这里只保留一个低阈值的短延迟，避免在议题切换瞬间重复打 LLM。
+            if 3 <= empty_rounds < 10:
+                wait_seconds = min(30, 5 * (empty_rounds - 2))
+                logger.info(
+                    "连续%s轮无可执行提案，下一轮开始前等待%s秒",
+                    empty_rounds,
+                    wait_seconds,
+                )
                 await asyncio.sleep(wait_seconds)
 
             # 选择议题
@@ -6749,9 +6773,28 @@ async def main():
                 print(f"\n💤 休息 1 秒后继续...")
                 await asyncio.sleep(1)
             else:
-                wait_time = min(10, 2 ** (empty_rounds - 1))
-                print(f"\n💤 搜索失败，休息 {wait_time} 秒后重试...")
-                await asyncio.sleep(wait_time)
+                # 连续无结果时不要立刻重试——如果是约束导致的（账户余额/整手价格
+                # 上限/黑名单），市场情况没变之前再跑也是同样的结果，徒增 LLM
+                # 成本和日志噪声。连续空轮到达阈值后进入长休眠，等市场或约束
+                # 变化（下一交易日、新报价、外部状态更新）。
+                if empty_rounds >= 10:
+                    long_pause = min(3600, 300 + 60 * (empty_rounds - 9))
+                    print(
+                        f"\n💤 连续 {empty_rounds} 轮无可执行提案（约束/候选不足），"
+                        f"进入长休眠 {long_pause} 秒等待市场变化..."
+                    )
+                    logger.warning(
+                        "连续%s轮无可执行提案，长休眠%s秒避免空转",
+                        empty_rounds,
+                        long_pause,
+                    )
+                    await asyncio.sleep(long_pause)
+                else:
+                    wait_time = min(10, 2 ** (empty_rounds - 1))
+                    print(
+                        f"\n💤 本轮无可执行提案，休息 {wait_time} 秒后继续..."
+                    )
+                    await asyncio.sleep(wait_time)
 
     except asyncio.CancelledError:
         if active_round_id:
