@@ -1243,7 +1243,7 @@ def filter_repeated_rejection_proposals(
     *,
     now: Optional[datetime] = None,
     rejection_threshold: int = 3,
-    cooldown_days: int = 3,
+    cooldown_days: int = 1,
 ) -> tuple[List[Dict], List[Dict[str, str]]]:
     """Hard-stop unchanged, repeatedly rejected research candidates.
 
