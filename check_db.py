@@ -2022,6 +2022,16 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
         )
         return
     health = status.get("pipeline_health")
+    time_context = status.get("evidence_time_context") or {}
+    if time_context:
+        print(
+            "   资料时标: 来源报告日期可追溯="
+            f"{time_context.get('publication_time_known_count', 0)}/"
+            f"{time_context.get('excerpt_document_count', 0)}；"
+            f"未知={time_context.get('publication_time_unknown_count', 0)}；"
+            f"研究时点={time_context.get('research_as_of') or 'N/A'}；"
+            "抓取时间不是发布时间"
+        )
     lineage = status.get("source_lineage") or {}
     if lineage and not lineage.get("consistent"):
         print(

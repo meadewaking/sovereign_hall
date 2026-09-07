@@ -30,6 +30,7 @@ from ..utils import (
     retry_with_backoff,
 )
 from .llm_client import LLMClient
+from .evidence_time import source_time_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -875,7 +876,7 @@ class SpiderSwarm:
                                         content=snippet,
                                         url=link_url,
                                         source='bing',
-                                        publish_time=datetime.now(),
+                                        metadata=source_time_metadata(snippet=snippet),
                                         sector=self._infer_sector(query),
                                         keywords=[query],
                                     )
@@ -969,7 +970,7 @@ class SpiderSwarm:
                                     content=snippet,
                                     url=link_url,
                                     source='baidu',
-                                    publish_time=datetime.now(),
+                                    metadata=source_time_metadata(snippet=snippet),
                                     sector=self._infer_sector(query),
                                     keywords=[query],
                                 )
@@ -992,7 +993,7 @@ class SpiderSwarm:
                                 content=f"关于{query}的搜索结果",
                                 url=href,
                                 source='baidu',
-                                publish_time=datetime.now(),
+                                metadata=source_time_metadata(),
                                 sector=self._infer_sector(query),
                                 keywords=[query],
                             )
@@ -1082,7 +1083,7 @@ class SpiderSwarm:
                                     content=snippet,
                                     url=link_url,
                                     source='sogou',
-                                    publish_time=datetime.now(),
+                                    metadata=source_time_metadata(snippet=snippet),
                                     sector=self._infer_sector(query),
                                     keywords=[query],
                                 )
@@ -1154,7 +1155,7 @@ class SpiderSwarm:
                                 content=body or f"关于{query}的搜索结果",
                                 url=url,
                                 source='duckduckgo',
-                                publish_time=datetime.now(),
+                                metadata=source_time_metadata(snippet=body),
                                 sector=self._infer_sector(query),
                                 keywords=[query],
                             )
@@ -1188,7 +1189,7 @@ class SpiderSwarm:
                             content=full_doc.content[:MAX_STORED_CONTENT_CHARS],
                             url=url,
                             source='duckduckgo',
-                            publish_time=datetime.now(),
+                            metadata=dict(full_doc.metadata),
                             sector=self._infer_sector(query),
                             keywords=[query],
                         )
@@ -1204,7 +1205,7 @@ class SpiderSwarm:
                     content=fallback_body or f"关于{query}的搜索结果",
                     url=url,
                     source='duckduckgo',
-                    publish_time=datetime.now(),
+                    metadata=source_time_metadata(snippet=fallback_body),
                     sector=self._infer_sector(query),
                     keywords=[query],
                 )
@@ -1248,7 +1249,7 @@ class SpiderSwarm:
                 content=f"关于{topic}的深度分析报告。当前市场环境下，{query}领域面临新的发展机遇。",
                 url=f"fallback://{query}/{i}",
                 source='fallback',
-                publish_time=datetime.now(),
+                metadata=source_time_metadata(),
                 sector=self._infer_sector(query),
                 keywords=[query],
             )
@@ -1322,7 +1323,7 @@ class SpiderSwarm:
                     content=content[:MAX_STORED_CONTENT_CHARS],
                     url=url,
                     source=self._extract_domain(url),
-                    publish_time=datetime.now(),
+                    metadata=source_time_metadata(html=resp.text),
                     sector=sector,
                     keywords=tickers,
                 )

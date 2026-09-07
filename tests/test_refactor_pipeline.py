@@ -1332,7 +1332,7 @@ def test_runner_cleanup_signals_python_before_reaping_screen_wrapper(monkeypatch
     assert kill_existing_run_discussion_instances() == [801]
     assert (801, 15) in signals
     assert not any(pid == 800 for pid, _sig in signals)
-    assert ["screen", "-S", "old_prod", "-X", "quit"] in subprocess_calls
+    assert ["screen", "-S", "800.old_prod", "-X", "quit"] in subprocess_calls
 
 
 @pytest.mark.asyncio

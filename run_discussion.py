@@ -307,6 +307,9 @@ def format_stage2_diagnostic_context(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+from sovereign_hall.services.evidence_time import document_time_audit, format_document_time
+
+
 def stage2_document_evidence_score(doc: Any) -> float:
     """Rank existing documents for concrete, auditable proposal extraction."""
     title = str(getattr(doc, "title", "") or "")
@@ -658,11 +661,14 @@ def kill_existing_run_discussion_instances() -> list[int]:
         if executable == "screen":
             for index, token in enumerate(tokens[:-1]):
                 if token in {"-S", "-dmS"}:
-                    screen_sessions.add(tokens[index + 1])
+                    screen_sessions.add(f"{pid}.{tokens[index + 1]}")
                     break
                 if token.startswith("-S") and len(token) > 2:
-                    screen_sessions.add(token[2:])
+                    screen_sessions.add(f"{pid}.{token[2:]}")
                     break
+            # screen -S accepts partial names. Pin the old PID as well so an
+            # already-exited wrapper cannot match a replacement with the same
+            # name or prefix and terminate our own runner during startup.
             # Signalling the wrapper first may SIGHUP its Python child before
             # that child can persist the SIGTERM terminal.  The real runner is
             # signalled below; the wrapper is reaped only after the grace wait.
@@ -1503,7 +1509,10 @@ async def stage1_mass_search(
                            "疫苗", "CXO", "体外诊断")
         is_medical = any(tag in topic_keyword for tag in medical_sectors)
 
-        deployment_extra: List[str] = []
+        deployment_extra: List[str] = [
+            f"{topic_keyword} {datetime.now():%Y年%m月} 最新公告 业绩",
+            f"{topic_keyword} {datetime.now():%Y年%m月} ETF 规模 资金流向",
+        ]
         if is_medical:
             deployment_extra.append(f"{topic_keyword} 集采结果 中标企业")
 
@@ -1746,8 +1755,22 @@ async def stage2_deep_research(
         title = getattr(doc, 'title', '') or ''
         url = getattr(doc, 'url', '') or ''
         if len(content) > 50:
-            doc_contents.append(f"【{title}】\n{content[:stage2_doc_chars]}\n来源: {url}")
+            doc_contents.append(
+                f"【{title}】\n{format_document_time(doc)}\n"
+                f"{content[:stage2_doc_chars]}\n来源: {url}"
+            )
 
+    if db_service is not None and round_id:
+        from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
+        await ResearchRoundCoordinator(db_service).record_event(
+            round_id, "EvidenceTimeContextPrepared", {
+                "contract": "source_publication_time_v1",
+                "research_as_of": datetime.now().astimezone().isoformat(),
+                "documents": [document_time_audit(doc) for doc in valid_docs[:stage2_max_docs]],
+                "context_chars_limit": stage2_context_chars,
+                "retrieval_is_publication": False,
+            },
+        )
     content_text = "\n\n".join(doc_contents)
     logger.info(f"[diag] stage2 content_text len={len(content_text)}, doc_contents={len(doc_contents)}")
 
@@ -1756,6 +1779,11 @@ async def stage2_deep_research(
 作为资深行业投资分析师，基于以下新闻/研报资料，提取3-5个具体的投资提案。
 
 研究议题：{topic}
+研究时点：{datetime.now().astimezone().isoformat()}（本轮日期，禁止按模型记忆猜测“当前”）
+时效规则：抓取时间不是发布时间；来源报告日期不等于事件/财报所属期。
+日期N/A或legacy_unverified表示发布时间不可核验，不能声称“今日新增”。
+旧资料可用于历史背景；当前催化必须核对原文事件日期和本轮时点，并在evidence中保留日期与来源。
+不得把跨月孤立数据拼成当前持续趋势；时效证据不足时保留缺口或输出[]。
 {blacklist_prompt}
 {lessons_prompt}
 
@@ -2604,6 +2632,9 @@ def build_persisted_committee_evidence_context(
     return (
         "【本轮持久化提案证据（只能审计、交叉质疑，不得补造事实）】\n"
         f"- round_id: {round_id or proposal.get('round_id') or 'N/A'}\n"
+        f"- 研究时点: {datetime.now().astimezone().date().isoformat()}\n"
+        "- 时效核验: 抓取时间不是发布时间；历史宏观状态不得从模型记忆冒充当前事实。"
+        "逐项核对证据日期，区分历史背景、当前事实和待补证缺口。\n"
         f"- ticker: {proposal.get('ticker') or 'N/A'}\n"
         f"- direction/confidence/target: "
         f"{proposal.get('direction') or 'N/A'} / "

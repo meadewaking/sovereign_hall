@@ -149,6 +149,7 @@ class Document:
                 "sentiment_score": data.get("sentiment_score", 0.0),
                 "importance_score": data.get("importance_score", 0.0),
                 "publish_time": data.get("publish_time"),
+                "publish_time_source": data.get("publish_time_source"),
                 "crawled_at": data.get("crawled_at"),
             }
 

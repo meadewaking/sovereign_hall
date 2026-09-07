@@ -259,6 +259,7 @@ class DatabaseService:
 
         await self._add_column_if_missing(conn, "documents", "crawled_at", "TEXT")
         await self._add_column_if_missing(conn, "documents", "content_hash", "TEXT")
+        await self._add_column_if_missing(conn, "documents", "publish_time_source", "TEXT")
         await self._backfill_document_hashes(conn)
 
         # 创建索引
@@ -485,6 +486,8 @@ class DatabaseService:
                 return doc.get(name, default)
             return getattr(doc, name, default)
 
+        publish_time_source = (_attr('metadata', {}) or {}).get('publish_time_source')
+        crawled_at = _attr('crawled_at') or datetime.now().astimezone().isoformat()
         publish_time = _attr('publish_time')
         if isinstance(publish_time, datetime):
             publish_time = publish_time.isoformat()
@@ -541,6 +544,8 @@ class DatabaseService:
             publish_time,
             json.dumps(_attr('embedding')) if _attr('embedding') else None,
             content_hash,
+            publish_time_source,
+            crawled_at,
         )
 
         if existing:
@@ -578,7 +583,7 @@ class DatabaseService:
                     UPDATE documents
                     SET title = ?, content = ?, url = ?, source = ?, sector = ?,
                         keywords = ?, publish_time = ?, embedding = ?, content_hash = ?,
-                        crawled_at = CURRENT_TIMESTAMP
+                        publish_time_source = ?, crawled_at = ?
                     WHERE id = ?
                     """,
                     values[1:] + (existing["id"],),
@@ -594,8 +599,8 @@ class DatabaseService:
         await conn.execute("""
             INSERT INTO documents
             (id, title, content, url, source, sector, keywords, publish_time,
-             embedding, content_hash, crawled_at, round_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+             embedding, content_hash, publish_time_source, crawled_at, round_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, values + (round_id,))
         await self._link_round_document(conn, round_id, str(doc_id))
         await conn.commit()
