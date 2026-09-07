@@ -1790,8 +1790,8 @@ def show_investment_status(db_path) -> dict[str, Any]:
                 print(f"        原因: {str(row.get('reason'))[:300]}")
         if stage2_diagnostics["candidate_bearing_empty_count"]:
             print(
-                "   自动修复路径: 下一轮会回灌这些解析终态，并对原回答已出现且"
-                "原资料独立支持的ticker做一次证据审计；仍不合格则保持[]。"
+                "   自动修复路径: 历史解析终态与ticker仅保留审计，不回灌为下一轮"
+                "候选；下一轮只从新资料独立抽取，仍不合格则保持[]。"
             )
     elif stage2_diagnostics["available"]:
         print("   0 条；下一轮 run_discussion 会开始追加保存每次阶段2终态")

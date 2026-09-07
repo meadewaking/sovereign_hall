@@ -51,6 +51,8 @@ class Config:
                 'temperature': 0.7,
                 'max_tokens': 4000,
                 'timeout': 120,
+                'structured_output_reasoning_effort': 'none',
+                'structured_output_use_response_format': False,
                 'embedding_model': 'text-embedding-3-small',
                 'embedding_dim': 1536,
                 'embedding_input_per_1k': 0.0,

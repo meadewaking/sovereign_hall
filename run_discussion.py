@@ -289,16 +289,20 @@ def format_stage2_diagnostic_context(rows: List[Dict[str, Any]]) -> str:
                 repair_modes = json.loads(repair_modes)
             except (TypeError, ValueError, json.JSONDecodeError):
                 repair_modes = [repair_modes]
+        diagnostic_reason = STAGE2_TICKER_RE.sub(
+            "<durable_candidate>",
+            str(row.get("reason") or ""),
+        )
         lines.append(
             f"- {row.get('created_at') or 'unknown'} status={row.get('status') or 'unknown'} "
             f"parse={row.get('parse_mode') or 'unknown'} "
             f"repair={','.join(str(item) for item in repair_modes) or 'none'} "
-            f"tickers={','.join(str(item) for item in tickers) or 'none'}；"
-            f"{str(row.get('reason') or '')[:300]}"
+            f"candidate_code_count={len(tickers)}；"
+            f"{diagnostic_reason[:300]}"
         )
     lines.append(
-        "本轮若资料重新出现上述标的，必须输出合法JSON并保留证据/否决条件；"
-        "若证据仍不足则保持[]，不得把这段审计记忆当作推荐。"
+        "历史候选代码只保留在durable审计中，不在提示里回灌；本轮只能从新资料"
+        "独立发现ticker。证据不足则保持[]，不得把这段审计记忆当作推荐。"
     )
     return "\n".join(lines)
 
@@ -1764,15 +1768,16 @@ async def stage2_deep_research(
 3. 必须把“已验证事实”和“推断”分开写入thesis
 4. ETF是空仓部署的一等候选，不是低置信度替代品；若资料能验证其跟踪指数、
    规模、流动性、折溢价和行业暴露，可按与个股相同的证据门给出confidence
-5. 若上文“当前整手可执行边界”存在，多头候选必须优先满足该参考价边界；
-   明显无法买入一手的个股不得进入投委会，应比较资料中已有代码的可执行ETF或低价候选
+5. 不得用模型记忆、常识或猜测的价格判断整手可执行性，也不得因资料未给当前价格而
+   丢弃有证据的候选；提案抽取后、投委会前会由统一行情服务重新取得新鲜实时报价并
+   执行整手硬门。资料中已有可执行ETF或低价候选时仍应优先比较
 6. 黑名单标的一律排除
 
 【输出格式——硬约束】
-回答的第一个字符必须是 `[` 或 `]`，最后一个字符必须是 `]`。
+回答的第一个字符必须是 `[`，最后一个字符必须是 `]`。
 禁止输出任何思考过程、分析、解释、Markdown 标题、前后缀文字。
 模型在内部完成推理后，只把最终提案数组输出到 content。
-若证据不足，第一个字符就是 `]` 之前没有任何文字。
+证据不足时输出空数组 `[]`；此时不得附加任何解释或前后缀。
 
 JSON数组结构：
 [
@@ -1798,14 +1803,14 @@ JSON数组结构：
 重要：holding_period 必须根据投资逻辑动态决定，范围3-180天，不要一律填30。
 重要：同一标的近期重复被拒绝时，缺少resolved_rejection、evidence_delta和evidence任一项都不得重提。
 重要：无法从资料确定具体标的时必须少输出或输出空数组，不得用预设ticker、模板ETF或常识猜测补位。
-重要：第一个字符不是 `[` 或 `]` 的回答会被丢弃并触发格式重修，请勿输出任何分析文字。
+重要：第一个字符不是 `[` 的回答会被丢弃并触发格式重修，请勿输出任何分析文字。
 """
 
     try:
         logger.info(f"[diag] stage2 LLM call begin")
         response = await asyncio.wait_for(
             llm.chat(
-                system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；证据不足时输出空数组。回答第一个字符必须是 [ 或 ]。",
+                system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；证据不足时只输出[]。回答第一个字符必须是 [。",
                 user=prompt,
                 temperature=0.3,
                 max_tokens=16000
@@ -3965,7 +3970,7 @@ async def stage3_ic_discussion(
                         "seat_role": role.value,
                         "model": getattr(getattr(agent, "llm", None), "model", ""),
                         "provider": getattr(getattr(agent, "llm", None), "provider", ""),
-                        "input_material": {"prompt": prompt, "output_contract": "final_json_v2_system"},
+                        "input_material": {"prompt": prompt, "output_contract": "final_json_v3_no_reasoning"},
                         "factory": (
                             lambda agent=agent, prompt=prompt: agent.think(
                                 task=prompt,
@@ -4005,7 +4010,7 @@ async def stage3_ic_discussion(
                     "input_material": {
                         "prompt": prompt,
                         "retry": "strict_json_repair",
-                        "output_contract": "final_json_v2_system",
+                        "output_contract": "final_json_v3_no_reasoning",
                     },
                     "attempt": 1,
                     "factory": (
@@ -4122,7 +4127,7 @@ async def stage3_ic_discussion(
                             ),
                             "model": getattr(getattr(agent, "llm", None), "model", ""),
                             "provider": getattr(getattr(agent, "llm", None), "provider", ""),
-                            "input_material": {"prompt": prompt, "output_contract": "final_json_v2_system"},
+                            "input_material": {"prompt": prompt, "output_contract": "final_json_v3_no_reasoning"},
                             "factory": (
                                 lambda agent=agent, prompt=prompt: agent.think(
                                     task=prompt,
@@ -4169,7 +4174,7 @@ async def stage3_ic_discussion(
                         "input_material": {
                             "prompt": prompt,
                             "retry": "strict_json_repair",
-                            "output_contract": "final_json_v2_system",
+                            "output_contract": "final_json_v3_no_reasoning",
                         },
                         "attempt": 1,
                         "factory": (

@@ -75,6 +75,12 @@ class LLMClient:
         self.api_key = api_key or llm_config.get('api_key', 'empty')
         self.base_url = base_url or llm_config.get('base_url')
         self.model_uuid = llm_config.get('model_uuid')  # 用于本地API的Host header
+        self.structured_output_reasoning_effort = str(
+            llm_config.get('structured_output_reasoning_effort') or ''
+        ).strip()
+        self.structured_output_use_response_format = bool(
+            llm_config.get('structured_output_use_response_format', True)
+        )
 
         # 并发控制
         self.max_concurrent = int(max_concurrent if max_concurrent is not None else llm_config.get('max_concurrent', 16))
@@ -430,7 +436,23 @@ class LLMClient:
                 "stream": not json_output,
             }
             if json_output:
-                payload["response_format"] = {"type": "json_object"}
+                if bool(getattr(
+                    self,
+                    "structured_output_use_response_format",
+                    True,
+                )):
+                    payload["response_format"] = {"type": "json_object"}
+                reasoning_effort = str(
+                    getattr(self, "structured_output_reasoning_effort", "") or ""
+                ).strip()
+                if reasoning_effort:
+                    # Earlier committee stages already perform independent
+                    # analysis, cross-challenge and counterfactual revision.
+                    # Repeating deep reasoning for the final wire response can
+                    # consume the whole completion budget without producing
+                    # auditable JSON.  This controls transport only; evidence,
+                    # direction, quorum and execution gates remain unchanged.
+                    payload["reasoning_effort"] = reasoning_effort
             else:
                 payload["stream_options"] = {"include_usage": True}
 

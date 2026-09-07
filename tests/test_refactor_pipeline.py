@@ -850,6 +850,33 @@ async def test_stage2_scalar_evidence_cannot_reach_committee_or_storage():
 
 
 @pytest.mark.asyncio
+async def test_stage2_prompt_uses_valid_empty_array_and_defers_price_to_quote_gate():
+    class EmptyProposalLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return "[]"
+
+    doc = Document(
+        title="可追溯行业资料",
+        content="公司公告披露经营活动现金流同比改善，但尚不足以形成提案。" * 4,
+        url="https://example.com/auditable-source",
+        source="unit",
+    )
+    llm = EmptyProposalLLM()
+
+    assert await stage2_deep_research(llm, [doc], "证据提案抽取") == []
+    prompt = llm.calls[0]["user"]
+    assert "证据不足时输出空数组 `[]`" in prompt
+    assert "回答的第一个字符必须是 `[`" in prompt
+    assert "第一个字符必须是 `[` 或 `]`" not in prompt
+    assert "第一个字符不是 `[` 或 `]`" not in prompt
+    assert "不得用模型记忆、常识或猜测的价格" in prompt
+
+
+@pytest.mark.asyncio
 async def test_stage2_repairs_reasoning_only_response_without_fallback_ticker():
     class ReasoningThenRepairLLM:
         def __init__(self):
@@ -1168,7 +1195,9 @@ async def test_stage2_persists_candidate_bearing_empty_for_next_round(tmp_path):
     assert json.loads(diagnostics[0]["detected_tickers"]) == ["600515"]
     context = format_stage2_diagnostic_context(diagnostics)
     assert "不是当前市场事实" in context
-    assert "600515" in context
+    assert "candidate_code_count=1" in context
+    assert "600515" not in context
+    assert "不在提示里回灌" in context
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,13 @@ llm:
   temperature: 0.7
   max_tokens: 22500
   timeout: 600
+  # 正式结构化裁决只需要终态 JSON。GLM 的默认深度推理会在
+  # committee deadline / completion budget 内耗尽全部 token，留下
+  # reasoning_content 而没有可计票的 final content。
+  structured_output_reasoning_effort: "none"
+  # 当前GLM端点在 reasoning_effort=none 与泛化 json_object grammar 同用、
+  # 且终票提示较复杂时返回HTTP 500。本地仍逐字段严格校验，失败席位不计票。
+  structured_output_use_response_format: false
 
   # Embedding 配
   embedding_model: "bge-large-zh-v1.5"
@@ -189,7 +196,7 @@ research:
   committee_max_concurrent_tasks: 3
   # Bump this value whenever committee prompts or the final-vote JSON contract
   # changes; durable checkpoints only resume an identical version and input.
-  committee_prompt_version: "committee_roundtable_v1"
+  committee_prompt_version: "committee_roundtable_v2_no_reasoning_final"
   # Independent deadlines preserve completed roles; timeout is an audited
   # absence, never a synthetic HOLD vote.
   committee_round1_role_timeout_seconds: 240
