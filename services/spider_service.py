@@ -1458,6 +1458,7 @@ class SearchQueryGenerator:
         seeds: Dict[str, List[str]] = None,
         _retry_count: int = 0,
         topic: str = None,
+        research_as_of: datetime = None,
     ) -> List[str]:
         """生成搜索查询词
 
@@ -1468,6 +1469,7 @@ class SearchQueryGenerator:
             topic: 当前研究议题，用于生成议题相关的查询词
         """
         MAX_RETRIES = 3  # 最大重试次数
+        research_as_of = research_as_of or datetime.now().astimezone()
         seeds = seeds or self.DEFAULT_SEEDS
         validation_candidate_count = 0
         validation_rejection_counts: Dict[str, int] = {}
@@ -1486,6 +1488,8 @@ class SearchQueryGenerator:
                 "accepted_count": int(accepted_count),
                 "rejection_counts": dict(validation_rejection_counts),
                 "rejected_samples": list(validation_rejected_samples),
+                "research_as_of": research_as_of.isoformat(),
+                "time_contract": "research_query_time_v1",
             }
 
         def parse_query_list(raw_response: str) -> List[str]:
@@ -1526,6 +1530,11 @@ class SearchQueryGenerator:
         )
         prompt = f"""
 针对议题「{topic_str}」，生成{count}个具体的搜索引擎查询词，用于发现相关投资机会。
+研究时点：{research_as_of.isoformat()}。这是当前日期，不得用模型记忆猜测当前年份。
+当前证据查询优先使用{research_as_of:%Y年%m月}最新公告、经营数据和资金流向；
+财报查询应寻找截至研究时点已披露的最新报告，不能假定未结束季度/年度的报告已经发布。
+历史年度数据只能作为明确的同比/历史对比查询，不能替代当前证据。
+不要把模型记忆中的政策、产品版本、市场传闻写成已发生的当前事件；用中性待核验问题检索。
 
 【种子词参考】
 宏观：{', '.join(seeds.get('macro', []))}
@@ -1536,7 +1545,7 @@ class SearchQueryGenerator:
 1. 每个查询词必须与议题「{topic_str}」直接相关，禁止生成通用词
 2. 覆盖：政策/异动/财报/技术突破/产业链/龙头个股/估值/资金流向
 3. 中英文混合，优先中文
-4. 每个5-15字，精确描述可检索事件
+4. 每个查询简短且不超过80字，保留必要日期、主体和数据字段
 5. 不重复；不用"查询词1"这类占位符
 6. 个股查询词必须带具体股票代码或名称
 
@@ -1570,6 +1579,7 @@ class SearchQueryGenerator:
                         seeds=seeds,
                         _retry_count=_retry_count + 1,
                         topic=topic,
+                        research_as_of=research_as_of,
                     )
                 else:
                     logger.warning(f"Max retries reached for query generation, using fallback")

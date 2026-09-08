@@ -341,12 +341,7 @@ class DatabaseService:
             await self._add_column_if_missing(conn, "blacklist", "failure_count", "INTEGER DEFAULT 1")
             await self._add_column_if_missing(conn, "blacklist", "added_at", "TEXT")
             await self._add_column_if_missing(conn, "blacklist", "expires_at", "TEXT")
-            columns = await self._get_table_columns(conn, "blacklist")
-            if "created_at" in columns:
-                await conn.execute(
-                    "UPDATE blacklist SET added_at = COALESCE(added_at, created_at) WHERE added_at IS NULL"
-                )
-            await conn.execute("UPDATE blacklist SET failure_count = 1 WHERE failure_count IS NULL")
+            await self._backfill_blacklist_fields(conn)
 
         # system_stats 表
         if 'system_stats' not in existing_tables:
@@ -458,6 +453,27 @@ class DatabaseService:
     async def _ensure_initialized(self):
         if not self._initialized:
             await self._init_db()
+
+    async def _backfill_blacklist_fields(self, conn):
+        """Do not acquire a writer lock for already-migrated blacklist rows.
+
+        Even UPDATE ... WHERE with zero matching rows takes SQLite's writer
+        lock. Holding it through the remaining schema checks made concurrent
+        account readers fail startup despite having nothing to migrate.
+        Unknown legacy timestamps remain NULL when no source date exists.
+        """
+        columns = await self._get_table_columns(conn, "blacklist")
+        repairs = [("failure_count IS NULL", "failure_count = 1")]
+        if "created_at" in columns:
+            repairs.append(("added_at IS NULL AND created_at IS NOT NULL",
+                            "added_at = created_at"))
+        for condition, assignment in repairs:
+            async with conn.execute(
+                f"SELECT 1 FROM blacklist WHERE {condition} LIMIT 1"
+            ) as cursor:
+                needed = await cursor.fetchone()
+            if needed:
+                await conn.execute(f"UPDATE blacklist SET {assignment} WHERE {condition}")
 
     async def _backfill_document_hashes(self, conn):
         columns = await self._get_table_columns(conn, "documents")

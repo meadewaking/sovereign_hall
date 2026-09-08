@@ -2032,6 +2032,14 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
             f"研究时点={time_context.get('research_as_of') or 'N/A'}；"
             "抓取时间不是发布时间"
         )
+        if time_context.get("context_chars_used") is not None:
+            print(
+                "   实际资料上下文: "
+                f"{time_context['context_chars_used']}/"
+                f"{time_context.get('context_chars_limit')}字符；"
+                f"未入上下文={time_context.get('excluded_counts')}；"
+                "审计仅计入模型实际收到的摘要与完整来源"
+            )
     lineage = status.get("source_lineage") or {}
     if lineage and not lineage.get("consistent"):
         print(

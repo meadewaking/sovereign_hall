@@ -307,7 +307,7 @@ def format_stage2_diagnostic_context(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-from sovereign_hall.services.evidence_time import document_time_audit, format_document_time
+from sovereign_hall.services.evidence_time import document_time_audit, format_document_time, build_evidence_context
 
 
 def stage2_document_evidence_score(doc: Any) -> float:
@@ -1485,6 +1485,7 @@ async def stage1_mass_search(
         topic_keyword = raw_topic_head
 
     deployment_research = "资金部署候选证据比较" in topic
+    research_as_of = datetime.now().astimezone()
 
     # 构建更丰富的种子词
     seeds = {
@@ -1510,8 +1511,8 @@ async def stage1_mass_search(
         is_medical = any(tag in topic_keyword for tag in medical_sectors)
 
         deployment_extra: List[str] = [
-            f"{topic_keyword} {datetime.now():%Y年%m月} 最新公告 业绩",
-            f"{topic_keyword} {datetime.now():%Y年%m月} ETF 规模 资金流向",
+            f"{topic_keyword} {research_as_of:%Y年%m月} 最新公告 业绩",
+            f"{topic_keyword} {research_as_of:%Y年%m月} ETF 规模 资金流向",
         ]
         if is_medical:
             deployment_extra.append(f"{topic_keyword} 集采结果 中标企业")
@@ -1538,6 +1539,7 @@ async def stage1_mass_search(
         count=query_count,
         seeds=seeds,
         topic=topic_keyword,
+        research_as_of=research_as_of,
     )
 
     print(f"\n生成 {len(queries)} 个搜索词")
@@ -1566,6 +1568,9 @@ async def stage1_mass_search(
     generator_gate = dict(getattr(query_gen, "last_validation_report", {}) or {})
     provider_gate = dict(getattr(spiders, "last_query_gate_report", {}) or {})
     search_audit = {
+        "research_as_of": research_as_of.isoformat(),
+        "time_contract": "research_query_time_v1",
+        "submitted_queries": list(all_queries),
         "generated_candidate_count": int(
             generator_gate.get("candidate_count") or 0
         ),
@@ -1749,37 +1754,39 @@ async def stage2_deep_research(
     # 构建文档摘要。联网返回顺序受查询完成顺序影响；先按“明确代码 +
     # 可核查经营数据”排序，避免有限上下文被泛行业摘要或垃圾页占满。
     valid_docs = rank_stage2_documents(valid_docs)
-    doc_contents = []
-    for doc in valid_docs[:stage2_max_docs]:
-        content = getattr(doc, 'content', '') or ''
-        title = getattr(doc, 'title', '') or ''
-        url = getattr(doc, 'url', '') or ''
-        if len(content) > 50:
-            doc_contents.append(
-                f"【{title}】\n{format_document_time(doc)}\n"
-                f"{content[:stage2_doc_chars]}\n来源: {url}"
-            )
+    content_text, context_audit = build_evidence_context(
+        valid_docs, max_docs=stage2_max_docs, doc_chars=stage2_doc_chars,
+        context_chars=stage2_context_chars,
+    )
+    doc_contents = [content_text[row['context_start']:row['context_end']]
+                    for row in context_audit['documents']]
+    research_as_of = datetime.now().astimezone().isoformat()
 
     if db_service is not None and round_id:
         from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
         await ResearchRoundCoordinator(db_service).record_event(
             round_id, "EvidenceTimeContextPrepared", {
-                "contract": "source_publication_time_v1",
-                "research_as_of": datetime.now().astimezone().isoformat(),
-                "documents": [document_time_audit(doc) for doc in valid_docs[:stage2_max_docs]],
+                "contract": "source_publication_time_v2_exact_context",
+                "research_as_of": research_as_of,
+                **context_audit,
                 "context_chars_limit": stage2_context_chars,
                 "retrieval_is_publication": False,
             },
         )
-    content_text = "\n\n".join(doc_contents)
-    logger.info(f"[diag] stage2 content_text len={len(content_text)}, doc_contents={len(doc_contents)}")
+    logger.info(f"[diag] stage2 content_text len={len(content_text)}, doc_contents={len(context_audit['documents'])}")
+    if not content_text:
+        await record_stage2_diagnostic(
+            status="empty_no_documents", parse_mode="context_budget_empty",
+            reason="No complete source excerpt fits the configured evidence context budget",
+        )
+        return []
 
     # 一次性生成多个提案
     prompt = f"""
 作为资深行业投资分析师，基于以下新闻/研报资料，提取3-5个具体的投资提案。
 
 研究议题：{topic}
-研究时点：{datetime.now().astimezone().isoformat()}（本轮日期，禁止按模型记忆猜测“当前”）
+研究时点：{research_as_of}（本轮日期，禁止按模型记忆猜测“当前”）
 时效规则：抓取时间不是发布时间；来源报告日期不等于事件/财报所属期。
 日期N/A或legacy_unverified表示发布时间不可核验，不能声称“今日新增”。
 旧资料可用于历史背景；当前催化必须核对原文事件日期和本轮时点，并在evidence中保留日期与来源。
@@ -1788,7 +1795,7 @@ async def stage2_deep_research(
 {lessons_prompt}
 
 资料：
-{content_text[:stage2_context_chars]}
+{content_text}
 
 筛选规则：
 1. 只推荐资料中有明确新增证据支持的标的；证据不足时宁可少输出
