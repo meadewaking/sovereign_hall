@@ -1459,6 +1459,7 @@ class SearchQueryGenerator:
         _retry_count: int = 0,
         topic: str = None,
         research_as_of: datetime = None,
+        _attempts: List[Dict[str, Any]] = None,
     ) -> List[str]:
         """生成搜索查询词
 
@@ -1474,6 +1475,8 @@ class SearchQueryGenerator:
         validation_candidate_count = 0
         validation_rejection_counts: Dict[str, int] = {}
         validation_rejected_samples: List[str] = []
+        attempts = _attempts if _attempts is not None else []
+        generation_mode = "fallback"
 
         def reject_query(query: str, code: str) -> None:
             validation_rejection_counts[code] = (
@@ -1490,22 +1493,20 @@ class SearchQueryGenerator:
                 "rejected_samples": list(validation_rejected_samples),
                 "research_as_of": research_as_of.isoformat(),
                 "time_contract": "research_query_time_v1",
+                "output_contract": "query_array_final_content_v1",
+                "generation_mode": generation_mode,
+                "attempts": list(attempts),
             }
 
         def parse_query_list(raw_response: str) -> List[str]:
             nonlocal validation_candidate_count
-            parsed = safe_parse_json(raw_response, [])
-            if not parsed:
-                try:
-                    import ast
-                    parsed = ast.literal_eval(raw_response)
-                except Exception as exc:
-                    logger.debug("解析查询词列表失败: %s", exc)
-                    parsed = []
-            if not parsed:
-                matches = re.findall(r'"([^"]+)"', raw_response)
-                parsed = matches[:30] if matches else []
-            if not isinstance(parsed, list):
+            # Never salvage quoted phrases or partial arrays from reasoning,
+            # truncated final content, or a transport diagnostic envelope.
+            try:
+                parsed = json.loads(raw_response)
+            except (ValueError, TypeError):
+                return []
+            if not isinstance(parsed, list) or any(not isinstance(q, str) for q in parsed):
                 return []
             accepted: List[str] = []
             for query in parsed:
@@ -1519,6 +1520,25 @@ class SearchQueryGenerator:
                     continue
                 accepted.append(normalized)
             return accepted
+
+        def audit_response(raw_response: str, phase: str) -> None:
+            import hashlib
+            incomplete = raw_response.startswith("[committee_task_absent]")
+            try:
+                value = json.loads(raw_response)
+                valid = isinstance(value, list) and all(isinstance(q, str) for q in value)
+            except (ValueError, TypeError):
+                valid = False
+            attempts.append({
+                "phase": phase,
+                "status": "incomplete" if incomplete else ("array_valid" if valid else "invalid_array"),
+                "response_chars": len(raw_response),
+                "response_sha256": hashlib.sha256(raw_response.encode()).hexdigest(),
+            })
+            if incomplete:
+                # The envelope may include plausible queries in reasoning or
+                # unfinished content. Neither is input to a repair request.
+                raise ValueError("Query final content incomplete; using bounded topic queries")
 
         topic_str = topic or "当前A股投资机会"
         format_example = json.dumps(
@@ -1560,6 +1580,8 @@ class SearchQueryGenerator:
                 user=prompt,
                 temperature=0.8,
                 max_tokens=2000,
+                json_array_output=True,
+                use_cache=False,
             )
 
             # 安全解析JSON，增加空值检查
@@ -1569,6 +1591,7 @@ class SearchQueryGenerator:
 
             # 清理响应
             response = response.strip()
+            audit_response(response, "primary")
             # 检查截断响应
             if "输出被截断" in response or "缩短输入" in response:
                 logger.warning(f"LLM response truncated, reducing count")
@@ -1580,6 +1603,7 @@ class SearchQueryGenerator:
                         _retry_count=_retry_count + 1,
                         topic=topic,
                         research_as_of=research_as_of,
+                        _attempts=attempts,
                     )
                 else:
                     logger.warning(f"Max retries reached for query generation, using fallback")
@@ -1588,6 +1612,7 @@ class SearchQueryGenerator:
                 raise ValueError(f"Empty response after strip: '{response[:100]}'")
 
             queries = parse_query_list(response)
+            generation_mode = "primary"
             if not queries:
                 # Reasoning models sometimes list explicit company/code search
                 # ideas in prose but omit the requested final array.  One
@@ -1609,8 +1634,11 @@ class SearchQueryGenerator:
                     temperature=0.0,
                     max_tokens=2000,
                     use_cache=False,
+                    json_array_output=True,
                 )
+                audit_response(str(repair_response or "").strip(), "repair")
                 queries = parse_query_list(str(repair_response or "").strip())
+                generation_mode = "repaired"
                 logger.info(
                     "Query JSON repair: response_len=%s parsed=%s",
                     len(repair_response or ""),
@@ -1645,6 +1673,7 @@ class SearchQueryGenerator:
             logger.error(f"Failed to generate queries: {e}")
 
         # 降级：基于议题生成简单查询词
+        generation_mode = "fallback"
         fallback = []
         if topic:
             fallback = [

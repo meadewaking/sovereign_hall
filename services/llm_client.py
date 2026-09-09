@@ -205,6 +205,7 @@ class LLMClient:
         use_cache: bool = True,
         stream: bool = False,
         json_output: bool = False,
+        json_array_output: bool = False,
     ) -> str:
         """
         单次对话（带重试机制）
@@ -220,6 +221,9 @@ class LLMClient:
         Returns:
             模型响应文本
         """
+        # Arrays require completed final content too, but an object-only
+        # provider grammar cannot represent their top-level shape.
+        json_output = json_output or json_array_output
         # 速率限制
         wait_time = self.rate_limiter.acquire()
         if wait_time > 0:
@@ -252,6 +256,8 @@ class LLMClient:
                     result, usage = await self._anthropic_chat(system, user, temperature, max_tokens)
                 else:
                     output_options = {"json_output": True} if json_output else {}
+                    if json_array_output:
+                        output_options["json_array_output"] = True
                     result, usage = await self._openai_chat(
                         messages, temperature, max_tokens, **output_options
                     )
@@ -402,11 +408,13 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         json_output: bool = False,
+        json_array_output: bool = False,
     ) -> Tuple[str, Dict]:
         """OpenAI兼容API调用"""
         try:
             import httpx
 
+            json_output = json_output or json_array_output
             # 准备请求
             url = f"{self.base_url}/chat/completions" if self.base_url else "https://api.openai.com/v1/chat/completions"
 
@@ -436,7 +444,7 @@ class LLMClient:
                 "stream": not json_output,
             }
             if json_output:
-                if bool(getattr(
+                if not json_array_output and bool(getattr(
                     self,
                     "structured_output_use_response_format",
                     True,

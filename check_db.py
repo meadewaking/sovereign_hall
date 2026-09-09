@@ -2055,6 +2055,17 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
         )
     query_gate = status.get("search_query_gate") or {}
     if query_gate:
+        if query_gate.get("generator_output_contract"):
+            attempt_summary = ", ".join(
+                f"{item.get('phase', 'N/A')}:{item.get('status', 'N/A')}"
+                for item in query_gate.get("generator_attempts") or []
+            )
+            print(
+                "   查询生成终态: "
+                f"{query_gate.get('generator_mode') or 'N/A'} | "
+                f"contract={query_gate['generator_output_contract']} | "
+                f"attempts={attempt_summary or 'N/A'}"
+            )
         rejected_count = int(query_gate.get("rejected_count") or 0)
         rejection_counts = dict(query_gate.get("rejection_counts") or {})
         if rejected_count:

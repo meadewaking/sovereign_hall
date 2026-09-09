@@ -1571,6 +1571,9 @@ async def stage1_mass_search(
         "research_as_of": research_as_of.isoformat(),
         "time_contract": "research_query_time_v1",
         "submitted_queries": list(all_queries),
+        "generator_output_contract": generator_gate.get("output_contract"),
+        "generator_mode": generator_gate.get("generation_mode"),
+        "generator_attempts": list(generator_gate.get("attempts") or []),
         "generated_candidate_count": int(
             generator_gate.get("candidate_count") or 0
         ),
