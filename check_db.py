@@ -2086,6 +2086,13 @@ def show_canonical_pipeline_status(db_path: Path) -> None:
             )
         provider_health = dict(query_gate.get("provider_health") or {})
         if provider_health:
+            if "cancelled_counts" in provider_health:
+                cancelled = dict(provider_health.get("cancelled_counts") or {})
+                print(
+                    "   搜索调用取消: "
+                    f"{sum(int(v or 0) for v in cancelled.values())}"
+                    "（已释放探针名额，不计作成功/提供方故障；空结果不缓存）"
+                )
             if "empty_success_counts" in provider_health:
                 empty_counts = dict(provider_health.get("empty_success_counts") or {})
                 print(

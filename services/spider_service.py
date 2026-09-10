@@ -405,6 +405,17 @@ class SpiderSwarm:
                         state["last_failure_code"],
                     )
 
+    async def _record_provider_cancellation(self, source: str) -> None:
+        """Release a cancelled probe without inventing a provider outcome.
+
+        The outer query deadline includes semaphore queue time and may cancel
+        a half-open call before its own timeout. Cancellation is neither a
+        successful empty response nor evidence that the provider failed.
+        """
+        async with self._provider_health_lock:
+            self._provider_state(source)["half_open_in_flight"] = False
+            self._provider_metric(source, "cancelled")
+
     def get_provider_health_report(
         self,
         baseline: Optional[Dict[str, Dict[str, int]]] = None,
@@ -420,10 +431,12 @@ class SpiderSwarm:
             )
         )
         report: Dict[str, Any] = {
+            "recovery_contract": "uncached_empty_cancel_safe_probe_v1",
             "configured_sources": list(self.default_sources),
             "attempted_counts": {},
             "success_counts": {},
             "empty_success_counts": {},
+            "cancelled_counts": {},
             "failure_counts": {},
             "skipped_open_circuit_counts": {},
             "circuit_open_sources": [],
@@ -433,6 +446,7 @@ class SpiderSwarm:
             "attempted",
             "success",
             "empty_success",
+            "cancelled",
             "failure",
             "skipped_open_circuit",
         )
@@ -440,6 +454,7 @@ class SpiderSwarm:
             "attempted": "attempted_counts",
             "success": "success_counts",
             "empty_success": "empty_success_counts",
+            "cancelled": "cancelled_counts",
             "failure": "failure_counts",
             "skipped_open_circuit": "skipped_open_circuit_counts",
         }
@@ -460,6 +475,8 @@ class SpiderSwarm:
             if open_remaining > 0:
                 circuit_state = "open"
                 report["circuit_open_sources"].append(source)
+            elif state.get("half_open_in_flight"):
+                circuit_state = "half_open_probe_in_flight"
             elif state.get("circuit_opened_at") is not None:
                 circuit_state = "half_open_probe_ready"
             else:
@@ -609,19 +626,22 @@ class SpiderSwarm:
                 continue
 
             query = queries_to_search[i]
-            query_docs = []
 
             for doc in result:
                 if doc.url not in seen_urls:
                     seen_urls.add(doc.url)
                     all_docs.append(doc)
-                    query_docs.append(doc)
                     self.success_count.increment()
 
-            # 缓存搜索结果
-            if query_docs:
+            # An empty list also represents circuit skips, timeout and errors;
+            # it is not proof of a successful zero-hit search. Never cache it
+            # and postpone a recovery probe beyond the provider cooldown.
+            # Cache this query's full results, before cross-query deduplication.
+            if result:
                 newly_cached += 1
-            self._search_cache[query] = (query_docs, current_time)
+                self._search_cache[query] = (list(result), time.time())
+            else:
+                self._search_cache.pop(query, None)
 
         # 添加缓存结果到最终结果（去重）
         for query, docs in cached_results.items():
@@ -744,6 +764,9 @@ class SpiderSwarm:
                         f"after {self.source_timeout}s"
                     )
                     result = []
+                except asyncio.CancelledError:
+                    await self._record_provider_cancellation(source_name)
+                    raise
                 except Exception as exc:
                     failure_code = (
                         str(exc) if isinstance(exc, SearchProviderUnavailable)
