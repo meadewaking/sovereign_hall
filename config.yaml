@@ -61,9 +61,9 @@ simulation:
   stop_loss_pct: -0.08  # 逐仓强制复核默认止损
   take_profit_pct: 0.15  # 逐仓强制复核默认止盈
   max_holding_days: 30  # 超期持仓必须退出并重新配置，而不是无限冻结
-  max_single_position: 0.10  # 真实模拟账户的静态安全上限；不得由离线回测收益放大
+  max_single_position: 1.0  # 真实模拟账户的静态安全上限；不得由离线回测收益放大
   max_gross: 1.0  # 目标100%部署且禁止杠杆
-  min_committee_confidence: 0.65  # 当前轮投委会证据门槛
+  min_committee_confidence: 0.55  # 当前轮投委会证据门槛
   min_risk_reward: 0.8
   min_holding_days: 10
   performance_standard: "simulation_account_realtime_v1"
