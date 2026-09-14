@@ -388,6 +388,7 @@ async def test_stage2_deep_research_consumes_wiki_documents(tmp_path, sample_doc
         docs,
         "半导体投资机会",
         db_service=type("FakeDb", (), {"get_blacklist": lambda self: []})(),
+        require_publication_time=False,
     )
 
     assert proposals

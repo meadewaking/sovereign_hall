@@ -167,7 +167,11 @@ research:
   reflection_limit: 5
   rounds: 6
   conclusion_max_length: 20000
-  search_query_count: 30
+  # Lowered from 30: 600 queries over 20 rounds produced 0 qualified
+  # candidates (decision_funnel.json 2026-09-14). Fewer, sharper queries
+  # let the search circuit recover and keep LLM context focused on
+  # relevant material instead of diluted noise.
+  search_query_count: 8
   search_results_per_query: 10
   force_search_interval: 1
   stage2_max_docs: 30

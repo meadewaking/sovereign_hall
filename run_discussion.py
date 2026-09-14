@@ -1658,6 +1658,8 @@ async def stage2_deep_research(
     db_service=None,
     lessons_prompt: str = "",
     round_id: str | None = None,
+    *,
+    require_publication_time: bool | None = None,
 ) -> list:
     """阶段2：从文档中提取投资提案"""
     from sovereign_hall.core.config import get_config
@@ -1751,6 +1753,54 @@ async def stage2_deep_research(
             reason=f"阶段1返回{len(docs)}篇文档，但正文超过50字符的有效文档为0",
         )
         return []
+
+    # PR-pre-search-cleanup: stage2 entry requires documents to carry a
+    # source-reported publication time. decision_funnel.json 2026-09-14
+    # showed known_publication_dates=13/99 (87% of sources had no time
+    # anchor), and these untraceable sources dominated the context window
+    # without supporting a verifiable candidate. The gate is configurable
+    # so a fully offline/local-only round can still proceed.
+    require_publication_time = bool(
+        research_config.get("stage2_require_publication_time", True)
+        if require_publication_time is None
+        else require_publication_time
+    )
+    if require_publication_time:
+        before_count = len(valid_docs)
+        filtered_docs = []
+        for doc in valid_docs:
+            audit = document_time_audit(doc)
+            if audit.get("publication_time_known"):
+                filtered_docs.append(doc)
+        filtered_out = before_count - len(filtered_docs)
+        if filtered_docs:
+            valid_docs = filtered_docs
+            logger.info(
+                "[diag] stage2 publication_time gate: kept=%s/%s (filtered_out=%s)",
+                len(valid_docs), before_count, filtered_out,
+            )
+            if round_coordinator is not None and round_id:
+                await round_coordinator.record_event(
+                    round_id,
+                    "Stage2PublicationTimeGateApplied",
+                    {
+                        "before_count": before_count,
+                        "after_count": len(valid_docs),
+                        "filtered_out": filtered_out,
+                        "gate": "stage2_require_publication_time",
+                    },
+                )
+        else:
+            await record_stage2_diagnostic(
+                "empty_no_publication_time_documents",
+                reason=(
+                    f"阶段1返回{before_count}篇有效文档，"
+                    f"但{filtered_out}篇均无可核查的发布时间"
+                    "（stage2_require_publication_time=true）；"
+                    "候选必须基于有时效锚点的证据，未通过则丢弃"
+                ),
+            )
+            return []
 
     AgentCls = _get_agent()
 

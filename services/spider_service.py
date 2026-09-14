@@ -1464,6 +1464,15 @@ class SearchQueryGenerator:
         "macro": ["美联储议息", "央行政策", "经济数据", "CPI", "PPI", "社融"],
         "sector": ["AI芯片", "新能源汽车", "光伏", "医药创新", "消费升级"],
         "stocks": ["宁德时代", "比亚迪", "茅台", "英伟达", "特斯拉"],
+        # PR-search-cleanup: event-type seeds. The downstream stage2 gate
+        # requires documents to carry a source-reported publication time;
+        # event-type queries (公告/财报/调研/中标/业绩预告) target pages
+        # that publish with metadata timestamps, instead of generic
+        # industry overviews that lack a publication date.
+        "event_types": [
+            "公告", "财报", "业绩预告", "机构调研",
+            "中标", "回购", "股权激励", "业绩快报",
+        ],
     }
 
     def __init__(self, llm_client: LLMClient):
@@ -1566,15 +1575,20 @@ class SearchQueryGenerator:
         topic_str = topic or "当前A股投资机会"
         format_example = json.dumps(
             [
-                f"{topic_str} 政策进展",
-                f"{topic_str} 财务数据",
+                f"{topic_str} 公告 {research_as_of:%Y年%m月}",
+                f"{topic_str} 业绩预告 {research_as_of.year}年",
+                f"{topic_str} 机构调研 {research_as_of:%Y-%m}",
             ],
             ensure_ascii=False,
         )
         prompt = f"""
-针对议题「{topic_str}」，生成{count}个具体的搜索引擎查询词，用于发现相关投资机会。
+针对议题「{topic_str}」，生成{count}个搜索引擎查询词。
+
+目标：定位可验证证据（公告/财报/事件催化），不是发现泛行业机会。
+理由：下游stage2只保留带发布时间的资料；研报、新闻摘要、行业展望类页面通常没有可解析的发布时间元数据，会被丢弃。
+
 研究时点：{research_as_of.isoformat()}。这是当前日期，不得用模型记忆猜测当前年份。
-当前证据查询优先使用{research_as_of:%Y年%m月}最新公告、经营数据和资金流向；
+当前证据查询优先使用{research_as_of:%Y年%m月}最新公告、经营数据；
 财报查询应寻找截至研究时点已披露的最新报告，不能假定未结束季度/年度的报告已经发布。
 历史年度数据只能作为明确的同比/历史对比查询，不能替代当前证据。
 不要把模型记忆中的政策、产品版本、市场传闻写成已发生的当前事件；用中性待核验问题检索。
@@ -1583,14 +1597,21 @@ class SearchQueryGenerator:
 宏观：{', '.join(seeds.get('macro', []))}
 行业：{', '.join(seeds.get('sector', []))}
 个股：{', '.join(seeds.get('stocks', []))}
+事件类型（优先使用）：{', '.join(seeds.get('event_types', []))}
 
 【要求】
 1. 每个查询词必须与议题「{topic_str}」直接相关，禁止生成通用词
-2. 覆盖：政策/异动/财报/技术突破/产业链/龙头个股/估值/资金流向
+2. 覆盖维度（4类，不强制平均）：
+   - 公告/财报：定期报告、业绩预告/快报、临时公告
+   - 事件催化：中标、回购、股权激励、机构调研、订单
+   - 估值锚：最新PE/PB、机构目标价、业绩预期
+   - 主营跟踪：月度销量/出货/价格数据、产能进展
 3. 中英文混合，优先中文
 4. 每个查询简短且不超过80字，保留必要日期、主体和数据字段
 5. 不重复；不用"查询词1"这类占位符
 6. 个股查询词必须带具体股票代码或名称
+7. 每个查询至少包含以下要素之一：具体公司/代码 + 事件类型 + 时间窗
+   （三者缺二的查询会被丢弃）
 
 【输出格式】
 仅返回JSON数组，不要其他文字。当前议题的格式示例：

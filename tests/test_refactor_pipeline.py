@@ -799,7 +799,9 @@ async def test_search_query_generator_repairs_reasoning_without_inventing_ticker
     assert queries == ["中国中免601888财报", "海南机场600515现金流"]
     assert len(llm.calls) == 2
     assert "银行 股息率 2025" not in llm.calls[0]["user"]
-    assert "免税店竞争格局 政策进展" in llm.calls[0]["user"]
+    # The new prompt targets verifiable evidence (公告/财报/事件催化) instead
+    # of generic industry overviews; the format example reflects that.
+    assert "免税店竞争格局 公告" in llm.calls[0]["user"]
     assert llm.calls[1]["temperature"] == 0.0
     assert llm.calls[1]["use_cache"] is False
 
@@ -916,6 +918,7 @@ async def test_stage2_scalar_evidence_cannot_reach_committee_or_storage():
         [doc],
         "银行股高股息价值",
         db_service=db,
+        require_publication_time=False,
     )
 
     assert proposals == []
@@ -942,7 +945,7 @@ async def test_stage2_prompt_uses_valid_empty_array_and_defers_price_to_quote_ga
     )
     llm = EmptyProposalLLM()
 
-    assert await stage2_deep_research(llm, [doc], "证据提案抽取") == []
+    assert await stage2_deep_research(llm, [doc], "证据提案抽取", require_publication_time=False) == []
     prompt = llm.calls[0]["user"]
     assert "时效证据不足时保留缺口或输出[]" in prompt
     assert "无法从资料确定具体标的时必须少输出或输出空数组" in prompt
@@ -992,7 +995,7 @@ async def test_stage2_repairs_reasoning_only_response_without_fallback_ticker():
     )
     llm = ReasoningThenRepairLLM()
 
-    proposals = await stage2_deep_research(llm, [doc], "现金流验证")
+    proposals = await stage2_deep_research(llm, [doc], "现金流验证", require_publication_time=False)
 
     assert [proposal["ticker"] for proposal in proposals] == ["600519"]
     assert len(llm.calls) == 2
@@ -1040,7 +1043,7 @@ async def test_stage2_repairs_candidate_text_even_when_response_ends_with_empty_
     )
     llm = CandidateThenEmptyLLM()
 
-    proposals = await stage2_deep_research(llm, [doc], "订单验证")
+    proposals = await stage2_deep_research(llm, [doc], "订单验证", require_publication_time=False)
 
     assert [proposal["ticker"] for proposal in proposals] == ["002920"]
     assert len(llm.calls) == 2
@@ -1098,6 +1101,7 @@ async def test_stage2_adjudicates_candidate_after_format_repair_stays_empty():
         [doc],
         "空仓资金部署候选证据比较",
         db_service=db,
+        require_publication_time=False,
     )
 
     assert [proposal["ticker"] for proposal in proposals] == ["600515"]
@@ -1184,6 +1188,7 @@ async def test_stage2_repairs_candidate_adjudicator_format_loss_without_new_tick
         [doc],
         "空仓资金部署候选证据比较",
         db_service=db,
+        require_publication_time=False,
     )
 
     assert [proposal["ticker"] for proposal in proposals] == ["600515"]
@@ -1230,7 +1235,7 @@ async def test_stage2_format_repair_cannot_introduce_unseen_ticker():
     )
     llm = InventingRepairLLM()
 
-    proposals = await stage2_deep_research(llm, [doc], "行业分析")
+    proposals = await stage2_deep_research(llm, [doc], "行业分析", require_publication_time=False)
 
     assert proposals == []
     assert llm.calls == 2
@@ -1262,6 +1267,7 @@ async def test_stage2_persists_candidate_bearing_empty_for_next_round(tmp_path):
         [doc],
         "空仓资金部署候选证据比较",
         db_service=db,
+        require_publication_time=False,
     )
     diagnostics = await db.get_recent_research_stage_diagnostics(limit=1)
     await db.close()
@@ -6324,6 +6330,7 @@ async def test_stage2_empty_model_output_does_not_inject_canned_ticker():
         EmptyProposalLLM(),
         [doc],
         "半导体景气验证",
+        require_publication_time=False,
     )
 
     assert proposals == []
