@@ -5,7 +5,9 @@
 import uuid
 import logging
 import json
-from datetime import datetime, timedelta
+import math
+from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 
@@ -826,25 +828,93 @@ class DecisionRecorder:
         from .market_data import get_market_data
 
         market = get_market_data()
-        predicted_at = datetime.fromisoformat(record['predicted_at'])
-        current_price = await market.get_current_price(record['ticker'])
-        if current_price is None:
-            return {"error": "无法获取当前价格"}
+        if record['status'] != 'pending':
+            return {"result": record['result'], "accuracy": record['accuracy_score'],
+                    "actual_return": record.get('actual_return'), "unchanged": True}
+
+        def local_time(value):
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+            return parsed
+
+        try:
+            # Execution may anchor a prediction later than its committee decision.
+            window_start = max(local_time(record['predicted_at']),
+                               local_time(record.get('entry_date') or record['predicted_at']))
+            window_end = window_start + timedelta(days=int(record.get('expected_days') or 30))
+            if window_end <= window_start:
+                raise ValueError("invalid horizon")
+        except (ValueError, TypeError):
+            return {"error": "invalid_prediction_window"}
+        if datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None) < window_end:
+            return {"error": "prediction_window_not_matured"}
 
         decision = record['direction']
         target = record['target_price']
         stop = record['stop_loss']
-        entry = record.get('entry_price', record.get('current_price', target * 0.95))
+        entry = record.get('current_price')
+        try:
+            entry, target, stop = float(entry), float(target), float(stop)
+            if not all(math.isfinite(value) and value > 0 for value in (entry, target, stop)):
+                raise ValueError("invalid anchor or barriers")
+        except (ValueError, TypeError):
+            return {"error": "invalid_prediction_anchor"}
 
         result = "unknown"
         accuracy = 0.0
-        hit_price = current_price
+        hit_price = None
         hit_date = None
         hit_type = None
         max_price = None
         min_price = None
 
-        bars = await market.get_ohlc(record['ticker'], predicted_at, datetime.now())
+        raw_bars = await market.get_ohlc(record['ticker'], window_start, window_end)
+        if not raw_bars:
+            return {"error": "prediction_window_data_unavailable"}
+        calendar = await market.get_trading_calendar(window_start, window_end)
+        if not calendar:
+            return {"error": "prediction_window_calendar_unavailable"}
+        # Daily bars cannot resolve which part of an intraday boundary crossed a
+        # barrier. Full pre-entry/post-expiry sessions must never enter feedback.
+        bars = []
+        ambiguous_start = False
+        ambiguous_end = False
+        try:
+            for bar in sorted(raw_bars, key=lambda item: item['date']):
+                day = datetime.fromisoformat(str(bar['date'])[:10]).date()
+                opened = datetime.combine(day, time(9, 30))
+                closed = datetime.combine(day, time(15))
+                if closed <= window_start or opened >= window_end:
+                    continue
+                if opened < window_start:
+                    ambiguous_start |= (float(bar['high']) >= max(target, stop)
+                                        or float(bar['low']) <= min(target, stop))
+                    continue
+                if closed > window_end:
+                    ambiguous_end = True
+                    continue
+                if not all(math.isfinite(float(bar[key])) and float(bar[key]) > 0 for key in ('open', 'high', 'low', 'close')):
+                    return {"error": "invalid_prediction_window_bar"}
+                bars.append(bar)
+        except (ValueError, TypeError, KeyError):
+            return {"error": "invalid_prediction_window_bar"}
+        entry_session_open = any(
+            str(item['trade_date'])[:10] == window_start.date().isoformat()
+            and item.get('is_open') and time(9, 30) < window_start.time() < time(15)
+            for item in calendar
+        )
+        if entry_session_open and not any(
+            str(bar['date'])[:10] == window_start.date().isoformat()
+            for bar in raw_bars
+        ):
+            return {"error": "prediction_entry_session_incomplete"}
+        if ambiguous_start:
+            return {"error": "prediction_entry_session_ambiguous"}
+        if not bars:
+            return {"error": "prediction_window_data_unavailable"}
+        current_price = float(bars[-1]['close'])  # bounded endpoint, never today's quote
+        hit_price = current_price
         if bars:
             max_price = max(bar["high"] for bar in bars)
             min_price = min(bar["low"] for bar in bars)
@@ -887,6 +957,7 @@ class DecisionRecorder:
                         accuracy = 0.5
                         hit_price = current_price
                         hit_date = bar["date"]
+                        hit_price = float(bar["close"])
                         hit_type = "neutral_band_both_sides"
                         break
                     if crossed_up:
@@ -903,6 +974,31 @@ class DecisionRecorder:
                         hit_date = bar["date"]
                         hit_type = "avoided_downside"
                         break
+
+        evidence_end = hit_date or bars[-1]['date']
+        expected_dates = {
+            str(item['trade_date'])[:10] for item in calendar
+            if item.get('is_open') and
+            datetime.combine(datetime.fromisoformat(str(item['trade_date'])[:10]).date(), time(9, 30)) >= window_start and
+            datetime.combine(datetime.fromisoformat(str(item['trade_date'])[:10]).date(), time(15)) <= window_end
+        }
+        if not expected_dates or not {day for day in expected_dates if day <= evidence_end}.issubset(
+                {str(bar['date'])[:10] for bar in bars}):
+            return {"error": "prediction_window_incomplete"}
+        ambiguous_end |= any(
+            str(item['trade_date'])[:10] == window_end.date().isoformat()
+            and item.get('is_open') and time(9, 30) < window_end.time() < time(15)
+            for item in calendar
+        )
+        if hit_date is None and (ambiguous_end or bars[-1]['date'] != max(expected_dates)):
+            return {"error": "prediction_expiry_evidence_incomplete"}
+        validation_window = {
+            "version": "feedback_session_window_v2",
+            "start": window_start.isoformat(), "end": window_end.isoformat(),
+            "endpoint_date": evidence_end,
+            "bars": [bar for bar in bars if bar['date'] <= evidence_end],
+            "calendar": calendar,
+        }
 
         if result == "unknown" and decision in ("buy", "long"):
             if current_price >= target:
@@ -951,7 +1047,9 @@ class DecisionRecorder:
         )
 
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
+            await db.execute("PRAGMA busy_timeout = 5000")
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute("""
                 UPDATE price_predictions
                 SET status = 'validated',
                     result = ?,
@@ -963,27 +1061,45 @@ class DecisionRecorder:
                     max_price_reached = ?,
                     min_price_reached = ?,
                     actual_return = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'pending'
             """, (
                 result,
                 accuracy,
                 datetime.now().isoformat(),
                 hit_price,
-                hit_date,
+                hit_date or evidence_end,
                 hit_type,
                 max_price,
                 min_price,
                 actual_return,
                 record_id,
             ))
+            if not cursor.rowcount:
+                async with db.execute("SELECT result, accuracy_score, actual_return FROM price_predictions WHERE id = ?", (record_id,)) as existing:
+                    prior = await existing.fetchone()
+                await db.rollback()
+                return {"result": prior[0], "accuracy": prior[1], "actual_return": prior[2], "unchanged": True}
+            if record.get('round_id'):
+                async with db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='round_events'") as probe:
+                    has_events = await probe.fetchone()
+                if has_events:
+                    async with db.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM round_events WHERE round_id = ?", (record['round_id'],)) as seq:
+                        sequence = (await seq.fetchone())[0]
+                    await db.execute(
+                        "INSERT INTO round_events(round_id, sequence, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (record['round_id'], sequence, 'PredictionValidationWindowApplied',
+                         json.dumps({"prediction_id": record_id, "result": result, **validation_window}, ensure_ascii=False),
+                         datetime.now().isoformat()),
+                    )
             await db.commit()
 
-        logger.info(f"决策验证: {record['ticker']} {result}")
+        logger.info("决策验证: %s %s window=%s", record['ticker'], result, json.dumps(validation_window, ensure_ascii=False))
         return {
             "result": result,
             "accuracy": accuracy,
             "current_price": current_price,
             "actual_return": actual_return,
+            "validation_window": validation_window,
         }
 
     async def validate_pending(self, max_count: int = 50) -> Dict:
@@ -994,7 +1110,7 @@ class DecisionRecorder:
             async with db.execute("""
                 SELECT id, predicted_at, expected_days FROM price_predictions
                 WHERE status = 'pending'
-                AND datetime(predicted_at, '+' || COALESCE(expected_days, 30) || ' days') <= datetime('now', 'localtime')
+                AND datetime(MAX(predicted_at, COALESCE(entry_date, predicted_at)), '+' || COALESCE(expected_days, 30) || ' days') <= datetime('now', 'localtime')
                 ORDER BY predicted_at ASC
                 LIMIT ?
             """, (max_count,)) as cursor:

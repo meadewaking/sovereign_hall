@@ -869,8 +869,9 @@ async def test_stage2_prompt_uses_valid_empty_array_and_defers_price_to_quote_ga
 
     assert await stage2_deep_research(llm, [doc], "证据提案抽取") == []
     prompt = llm.calls[0]["user"]
-    assert "证据不足时输出空数组 `[]`" in prompt
-    assert "回答的第一个字符必须是 `[`" in prompt
+    assert "时效证据不足时保留缺口或输出[]" in prompt
+    assert "无法从资料确定具体标的时必须少输出或输出空数组" in prompt
+    assert "第一个字符不是 `[` 的回答会被丢弃并触发格式重修" in prompt
     assert "第一个字符必须是 `[` 或 `]`" not in prompt
     assert "第一个字符不是 `[` 或 `]`" not in prompt
     assert "不得用模型记忆、常识或猜测的价格" in prompt
@@ -6370,14 +6371,20 @@ async def test_hold_prediction_records_quote_lineage_and_missed_upside(tmp_path,
         expected_days=7,
     )
 
+    # This is a matured, post-close signal; earlier bars must not grade it.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE price_predictions SET predicted_at = ?, entry_date = ? WHERE id = ?",
+                     ("2026-07-23T16:00:00", "2026-07-23T16:00:00", decision_id))
+
     fake_market = type(
         "FakeMarket",
         (),
         {
             "get_current_price": AsyncMock(return_value=10.7),
+            "get_trading_calendar": AsyncMock(return_value=[{"trade_date": "2026-07-24", "is_open": 1}]),
             "get_ohlc": AsyncMock(return_value=[
                 {
-                    "date": "2026-07-25",
+                    "date": "2026-07-24",
                     "open": 10.0,
                     "high": 10.6,
                     "low": 9.9,
@@ -7021,7 +7028,8 @@ def test_core_discussion_prompts_are_evidence_rich_and_machine_readable():
     stage3_source = inspect.getsource(stage3_ic_discussion)
 
     assert "只输出合法JSON" in stage2_source
-    assert "证据不足时输出空数组" in stage2_source
+    assert "时效证据不足时保留缺口或输出[]" in stage2_source
+    assert "无法从资料确定具体标的时必须少输出或输出空数组" in stage2_source
     assert "max_tokens=8000" in stage2_source
     assert "build_structured_vote_prompt" in stage3_source
     assert "committee_think_from_persisted_evidence" in stage3_source
