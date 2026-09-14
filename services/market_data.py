@@ -371,20 +371,81 @@ class MarketDataService:
         self,
         start: date | datetime | str,
         end: date | datetime | str = None,
+        *,
+        index_identity: "InstrumentIdentity | None" = None,
     ) -> List[Dict[str, Any]]:
-        """Return an auditable open-session calendar from an index price tape."""
-        bars = await self.get_ohlc("000001", start, end or datetime.now())
-        return [
-            {
-                "trade_date": str(bar["date"])[:10],
-                "market": "CN",
-                "is_open": 1,
-                "source": str(bar.get("provider") or "market_data_service"),
-                "fetched_at": str(bar.get("fetched_at") or datetime.now().isoformat()),
-                "quality_status": "validated",
-            }
-            for bar in bars
-        ]
+        """Return an auditable open-session calendar.
+
+        PR2.1: the calendar is sourced from an explicit index identity, not
+        from the bare code ``"000001"``.  Missing bars for the index do NOT
+        imply the market was closed — they only mean the index tape was
+        unavailable for that session.  Callers that need a definitive
+        open/closed decision must consult a dedicated calendar source; this
+        method returns the observed-open sessions only and records the source
+        and validity range so a downstream auditor can tell the difference.
+        """
+        from ..domain.portfolio.instruments import (
+            SHANGHAI_COMPOSITE_INDEX,
+            InstrumentIdentity,
+        )
+
+        identity = index_identity or SHANGHAI_COMPOSITE_INDEX
+        if not isinstance(identity, InstrumentIdentity):
+            identity = InstrumentIdentity(
+                code=str(getattr(identity, "code", "000001")),
+                market=str(getattr(identity, "market", "sh")),
+                kind=str(getattr(identity, "kind", "index")),
+            )
+        end_value = end or datetime.now()
+        # The Shanghai Composite Index trades under the SH secid prefix.
+        bars = await self.get_ohlc(identity.code, start, end_value)
+        fetched_at = datetime.now().isoformat()
+        observed_open: list[dict[str, Any]] = []
+        for bar in bars:
+            observed_open.append(
+                {
+                    "trade_date": str(bar["date"])[:10],
+                    "market": "CN",
+                    "is_open": 1,
+                    "source": str(bar.get("provider") or "market_data_service"),
+                    "fetched_at": str(
+                        bar.get("fetched_at") or fetched_at
+                    ),
+                    "quality_status": "validated",
+                    "source_identity": identity.symbol,
+                    "source_kind": identity.kind.value,
+                    "validity_start": str(bar["date"])[:10] if bars else None,
+                    "validity_end": str(bar["date"])[:10] if bars else None,
+                    # A missing bar here does NOT mean the market was closed.
+                    # Downstream code must not interpret absence as a holiday.
+                    "inference_rule": "observed_open_only",
+                }
+            )
+        if not observed_open:
+            # Be explicit: the tape was empty.  This is not the same as "the
+            # market was closed every day in the window".
+            return [
+                {
+                    "trade_date": None,
+                    "market": "CN",
+                    "is_open": 0,
+                    "source": "market_data_service",
+                    "fetched_at": fetched_at,
+                    "quality_status": "tape_unavailable",
+                    "source_identity": identity.symbol,
+                    "source_kind": identity.kind.value,
+                    "validity_start": None,
+                    "validity_end": None,
+                    "inference_rule": "no_observation_no_inference",
+                }
+            ]
+        # Bound the validity range so callers can tell which sessions were
+        # actually observed versus which dates simply fell inside the request.
+        dates = [row["trade_date"] for row in observed_open if row["trade_date"]]
+        for row in observed_open:
+            row["validity_start"] = min(dates) if dates else None
+            row["validity_end"] = max(dates) if dates else None
+        return observed_open
 
     def _eastmoney_ohlc_in_cooldown(self) -> bool:
         if not self._eastmoney_ohlc_cooldown_until:

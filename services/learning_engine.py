@@ -20,7 +20,16 @@ class LearningEngine:
         self.db_path = db_path or str(DATA_DIR / "sovereign_hall.db")
 
     async def analyze_errors(self, limit: int = 20) -> List[Dict]:
-        """分析错误决策的特征，返回教训列表"""
+        """Describe features of the *known-error subset* only.
+
+        PR5.1: this method must not output an overall accuracy.  The
+        denominator (correct + partial + wrong, with unknown / expired /
+        execution-rejected feedback kept separate) is reported by
+        ``get_accuracy_stats`` and the dedicated error-profile analysis.
+        Here we only describe what the wrong/partial rows in the queried
+        window share, so a downstream prompt cannot misread a subset
+        metric as a population accuracy.
+        """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("""
@@ -35,8 +44,8 @@ class LearningEngine:
         if not rows:
             return []
 
-        lessons = []
-        confidence_groups = defaultdict(list)
+        lessons: List[Dict] = []
+        confidence_groups: Dict[str, List[Dict]] = defaultdict(list)
         for row in rows:
             conf = row['confidence']
             if conf >= 0.8:
@@ -50,15 +59,25 @@ class LearningEngine:
         for group, decisions in confidence_groups.items():
             if group == "high" and decisions:
                 wrong_count = sum(1 for d in decisions if d['result'] == 'wrong')
-                scores = [d['accuracy_score'] or 0 for d in decisions]
-                avg_accuracy = sum(scores) / len(scores)
+                partial_count = sum(1 for d in decisions if d['result'] == 'partial')
+                # PR5.1: do NOT compute or output avg_accuracy here.  The
+                # description only states the size of the known-error subset
+                # and its composition; the population denominator lives in
+                # get_accuracy_stats and must be queried separately.
                 lessons.append({
-                    "type": "high_confidence_error",
-                    "count": len(decisions),
-                    "wrong_count": wrong_count,
-                    "avg_accuracy": avg_accuracy,
-                    "description": f"高置信度决策({len(decisions)}次)中{wrong_count}次错误，准确率仅{avg_accuracy:.0%}，需谨慎评估",
+                    "type": "high_confidence_error_subset",
+                    "subset_size": len(decisions),
+                    "subset_wrong_count": wrong_count,
+                    "subset_partial_count": partial_count,
+                    "description": (
+                        f"已知错误子集：高置信度预测在最近{limit}条验证中"
+                        f"出现{len(decisions)}条wrong/partial"
+                        f"（wrong={wrong_count}, partial={partial_count}）。"
+                        "这只是错误子集的特征，不代表总体准确率；"
+                        "完整分母请查 get_accuracy_stats"
+                    ),
                     "avg_confidence": sum(d['confidence'] for d in decisions) / len(decisions),
+                    "subset_only": True,
                 })
 
         return lessons[:10]

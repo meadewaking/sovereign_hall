@@ -5787,6 +5787,89 @@ async def main():
     await db_service.init_report_tables()
     round_coordinator = ResearchRoundCoordinator(db_service)
     recovered_rounds = await round_coordinator.recover_abandoned_rounds()
+    # PR1.3 — register an immutable policy snapshot once at production start.
+    # The snapshot captures the actually loaded decision code, effective
+    # config, prompt versions and model settings.  Each natural round links
+    # to this snapshot via policy_snapshot_id so a future replay can recover
+    # the exact policy version that produced a decision.
+    from sovereign_hall.services.policy_snapshot_service import (
+        PolicyManifest,
+        PolicySnapshotService,
+    )
+
+    def _snapshot_code_artifacts() -> dict[str, str]:
+        # Hash the source files that materially drive production decisions.
+        # Missing files are skipped silently; the snapshot remains valid.
+        from pathlib import Path as _Path
+
+        from sovereign_hall.services.policy_snapshot_service import hash_file
+
+        repo_root = _Path(__file__).resolve().parent
+        candidates = [
+            repo_root / "services" / "portfolio_policy.py",
+            repo_root / "services" / "investment_simulation.py",
+            repo_root / "services" / "heuristic_policy.py",
+            repo_root / "services" / "learning_engine.py",
+            repo_root / "domain" / "portfolio" / "execution_policy.py",
+            repo_root / "domain" / "portfolio" / "instruments.py",
+        ]
+        artifacts: dict[str, str] = {}
+        for path in candidates:
+            if path.exists():
+                artifacts[str(path.relative_to(repo_root))] = hash_file(path)
+        return artifacts
+
+    policy_snapshot_service = PolicySnapshotService(str(db_path))
+    policy_snapshot_manifest = PolicyManifest(
+        policy_family="run_discussion",
+        version="run_discussion_canonical_v1",
+        code_artifacts=_snapshot_code_artifacts(),
+        effective_config=(
+            config.to_dict() if hasattr(config, "to_dict") else {}
+        ),
+        prompt_versions={
+            "committee": {
+                "version": str(config.get("investment", {}).get("committee_prompt_version", "committee_roundtable_v1")),
+            },
+            "run_discussion": {
+                "version": "run_discussion_canonical_v1",
+            },
+        },
+        model_versions={
+            "committee": {
+                "model": str(llm_config.get("model") or "unknown"),
+                "provider": str(llm_config.get("provider") or "unknown"),
+                "temperature": float(llm_config.get("temperature", 0.0) or 0.0),
+            },
+        },
+        policy_module_versions={
+            "portfolio_policy": "v1",
+            "execution_policy": "v1",
+            "heuristic_policy": "v1",
+        },
+        source_manifest_path=__file__,
+        change_reason="production startup",
+        changes_behavior=False,
+    )
+    try:
+        policy_snapshot = await policy_snapshot_service.register(
+            policy_snapshot_manifest
+        )
+        policy_snapshot_id = policy_snapshot.snapshot_id
+        logger.info(
+            "Registered policy snapshot %s (content_hash=%s)",
+            policy_snapshot_id,
+            policy_snapshot.content_hash,
+        )
+    except Exception as snapshot_error:
+        # A failed snapshot registration must not block production.  Round
+        # creation will record a NULL policy_snapshot_id and an audit event
+        # so the gap is visible.
+        policy_snapshot_id = None
+        logger.warning(
+            "Policy snapshot registration failed; rounds will record NULL: %s",
+            snapshot_error,
+        )
     if recovered_rounds:
         logger.warning(
             "Recovered %s abandoned research round(s) before production resumed: %s",
@@ -5930,6 +6013,7 @@ async def main():
                 base_topic=base_topic,
                 research_objective=topic,
                 prompt_version="run_discussion_canonical_v1",
+                policy_snapshot_id=policy_snapshot_id,
             )
             active_round_id = round_record.id
             logger.info(f"🔥 第 {iteration} 轮开始 | 议题: {topic}")
@@ -6276,6 +6360,36 @@ async def main():
                     resolved_source_count_before_limit=lineage_audit[
                         "resolved_source_count_before_limit"
                     ],
+                )
+                # PR1.3 — once sources are linked, the actual evidence input
+                # package is fixed.  Record its content hash so a future
+                # replay can prove it consumed the same inputs.  The hash is
+                # computed over the sorted linked document ids; richer input
+                # packages can extend the payload without breaking callers.
+                import hashlib as _hashlib
+                import json as _json
+
+                input_payload = {
+                    "linked_document_ids": sorted(linked_document_ids),
+                    "policy_snapshot_id": policy_snapshot_id,
+                    "prompt_version": "run_discussion_canonical_v1",
+                }
+                input_package_hash = _hashlib.sha256(
+                    _json.dumps(
+                        input_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                await round_coordinator.record_event(
+                    active_round_id,
+                    "ResearchInputFrozen",
+                    {
+                        "input_package_hash": input_package_hash,
+                        "linked_document_count": len(linked_document_ids),
+                        "policy_snapshot_id": policy_snapshot_id,
+                    },
                 )
 
                 redeployment_context = (

@@ -198,6 +198,81 @@ def test_incomplete_realtime_valuation_never_falls_back_to_offline_return():
     assert metrics["missing_price_tickers"] == ["600519"]
 
 
+def test_simulation_performance_splits_status_dimensions_and_account_changes():
+    """PR1.1/PR1.2: status dimensions are orthogonal; account movements and
+    strategy improvement are reported separately. A missing realtime price
+    must surface as NULL, not 0%."""
+    metrics = build_simulation_performance(
+        initial_capital=10000.0,
+        assets={
+            "valuation_complete": True,
+            "total_assets": 10250.0,
+            "cash": 10250.0,
+            "positions_value": 0.0,
+            "invested_ratio": 0.0,
+            "deployment_gap": 10250.0,
+        },
+        trade_count=10,
+        recorded_fees=8.0,
+        latest_trade_at="2026-09-12T09:57:44",
+        now=datetime.fromisoformat("2026-09-14T15:00:00"),
+        prev_total_assets=10100.0,
+        external_flow=0.0,
+        candidate_net_return=0.04,
+        control_net_return=0.015,
+        research_status="ready",
+        execution_status="no_approved_intent",
+        capital_status="awaiting_candidates",
+        evaluation_status="insufficient_samples",
+        correct_count=7,
+        judgeable_total=12,
+        partial_count=2,
+    )
+    # PR1.1 — five orthogonal dimensions present alongside the legacy field.
+    assert metrics["health_status_role"] == "legacy_display_only"
+    assert metrics["research_status"] == "ready"
+    assert metrics["execution_status"] == "no_approved_intent"
+    assert metrics["capital_status"] == "awaiting_candidates"
+    assert metrics["evaluation_status"] == "insufficient_samples"
+    assert metrics["profit_status"] == "positive"
+
+    # PR1.2 — account movement split. NAV rose; cost is recorded; the
+    # candidate-minus-control delta is reported only when both arms exist.
+    assert metrics["account_nav_change"] == pytest.approx(150.0)
+    assert metrics["price_pnl_change"] == pytest.approx(150.0)
+    assert metrics["cash_paid_cost_change"] == pytest.approx(8.0)
+    assert metrics["candidate_minus_control_net_return"] == pytest.approx(0.025)
+
+    # PR1.2 — strict correct ratio uses only the strict numerator; partial
+    # hits are reported separately with half weight.
+    assert metrics["strict_correct_ratio"] == pytest.approx(7 / 12)
+    assert metrics["partial_count"] == 2
+    assert metrics["partial_half_weight_total"] == pytest.approx(1.0)
+
+
+def test_simulation_performance_missing_price_is_null_not_zero():
+    """PR1.2: a missing realtime price must not be reported as 0% return."""
+    metrics = build_simulation_performance(
+        initial_capital=10000.0,
+        assets={
+            "valuation_complete": False,
+            "cash": 5000.0,
+            "missing_price_tickers": ["600519"],
+        },
+        trade_count=1,
+        recorded_fees=1.0,
+        latest_trade_at="2026-09-14T09:45:00",
+    )
+    assert metrics["score"] is None
+    assert metrics["net_total_return"] is None
+    assert metrics["account_nav_change"] is None
+    assert metrics["price_pnl_change"] is None
+    assert metrics["external_flow"] is None
+    assert metrics["candidate_minus_control_net_return"] is None
+    assert metrics["profit_status"] == "unavailable"
+    assert metrics["strict_correct_ratio"] is None
+
+
 @pytest.mark.asyncio
 async def test_spider_local_only_hard_gate_blocks_network(monkeypatch):
     spider = SpiderSwarm(network_enabled=False)
