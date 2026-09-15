@@ -641,6 +641,150 @@ class DatabaseService:
             (round_id, document_id, usage, datetime.now().isoformat()),
         )
 
+    async def add_documents_batch(
+        self,
+        docs: List[Any],
+        *,
+        round_id: str | None = None,
+    ) -> int:
+        """Persist up to ``len(docs)`` documents in a single transaction.
+
+        The per-document de-dup and update logic mirrors ``add_document`` so
+        semantics are identical, but the WAL fsync cost is paid once for the
+        whole batch instead of once per row.  This is the save_docs hot path:
+        a 100-doc round drops from ~85s to a few seconds.
+        """
+        if not docs:
+            return 0
+        from ..core import Document
+
+        conn = await self._get_connection()
+        await self._ensure_initialized()
+        saved = 0
+        # Single shared transaction: commit once at the end.  Per-row commits
+        # dominated the old ~0.85s/doc cost via WAL fsync.
+        async with conn.execute("BEGIN"):
+            pass
+        try:
+            for doc in docs:
+                if isinstance(doc, dict):
+                    doc = Document.from_dict(doc)
+
+                def _attr(name: str, default=None):
+                    if isinstance(doc, dict):
+                        return doc.get(name, default)
+                    return getattr(doc, name, default)
+
+                publish_time_source = (_attr('metadata', {}) or {}).get('publish_time_source')
+                crawled_at = _attr('crawled_at') or datetime.now().astimezone().isoformat()
+                publish_time = _attr('publish_time')
+                if isinstance(publish_time, datetime):
+                    publish_time = publish_time.isoformat()
+
+                title = normalize_document_text(_attr('title', ''))
+                content = normalize_document_text(_attr('content', ''))
+                url = normalize_document_url(_attr('url', ''))
+                source = str(_attr('source', '') or '').strip()
+                sector = str(_attr('sector', '') or '').strip()
+                content_hash = document_content_hash(content)
+                doc_id = _attr('id') or _attr('doc_id') or f"doc_{content_hash[:16]}"
+
+                if not is_storable_document(title, content, source, doc_id):
+                    continue
+
+                async with conn.execute(
+                    """
+                    SELECT id, LENGTH(COALESCE(content, '')) AS content_len
+                    FROM documents
+                    WHERE id = ?
+                       OR (? <> '' AND url = ?)
+                       OR content_hash = ?
+                    ORDER BY
+                        CASE
+                            WHEN id = ? THEN 0
+                            WHEN ? <> '' AND url = ? THEN 1
+                            ELSE 2
+                        END
+                    LIMIT 1
+                    """,
+                    (doc_id, url, url, content_hash, doc_id, url, url),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+
+                keywords = _attr('keywords', [])
+                if isinstance(keywords, str):
+                    try:
+                        keywords = json.loads(keywords)
+                    except json.JSONDecodeError:
+                        keywords = [keywords] if keywords.strip() else []
+
+                values = (
+                    doc_id,
+                    title,
+                    content,
+                    url,
+                    source,
+                    sector,
+                    json.dumps(keywords, ensure_ascii=False) if keywords else None,
+                    publish_time,
+                    json.dumps(_attr('embedding')) if _attr('embedding') else None,
+                    content_hash,
+                    publish_time_source,
+                    crawled_at,
+                )
+
+                if existing:
+                    if len(content) > int(existing["content_len"] or 0):
+                        async with conn.execute(
+                            """
+                            SELECT id
+                            FROM documents
+                            WHERE content_hash = ? AND id <> ?
+                            LIMIT 1
+                            """,
+                            (content_hash, existing["id"]),
+                        ) as cursor:
+                            hash_owner = await cursor.fetchone()
+                        if hash_owner:
+                            await self._link_round_document(
+                                conn,
+                                round_id,
+                                str(hash_owner["id"]),
+                            )
+                            continue
+                        await conn.execute(
+                            """
+                            UPDATE documents
+                            SET title = ?, content = ?, url = ?, source = ?, sector = ?,
+                                keywords = ?, publish_time = ?, embedding = ?, content_hash = ?,
+                                publish_time_source = ?, crawled_at = ?
+                            WHERE id = ?
+                            """,
+                            values[1:] + (existing["id"],),
+                        )
+                        await self._link_round_document(conn, round_id, str(existing["id"]))
+                        saved += 1
+                        continue
+                    await self._link_round_document(conn, round_id, str(existing["id"]))
+                    continue
+
+                await conn.execute(
+                    """
+                    INSERT INTO documents
+                    (id, title, content, url, source, sector, keywords, publish_time,
+                     embedding, content_hash, publish_time_source, crawled_at, round_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values + (round_id,),
+                )
+                await self._link_round_document(conn, round_id, str(doc_id))
+                saved += 1
+            await conn.commit()
+        except Exception:
+            await conn.execute("ROLLBACK")
+            raise
+        return saved
+
     async def resolve_document_lineage(
         self,
         docs: List[Any],

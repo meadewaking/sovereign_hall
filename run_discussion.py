@@ -1779,17 +1779,6 @@ async def stage2_deep_research(
                 "[diag] stage2 publication_time gate: kept=%s/%s (filtered_out=%s)",
                 len(valid_docs), before_count, filtered_out,
             )
-            if round_coordinator is not None and round_id:
-                await round_coordinator.record_event(
-                    round_id,
-                    "Stage2PublicationTimeGateApplied",
-                    {
-                        "before_count": before_count,
-                        "after_count": len(valid_docs),
-                        "filtered_out": filtered_out,
-                        "gate": "stage2_require_publication_time",
-                    },
-                )
         else:
             await record_stage2_diagnostic(
                 "empty_no_publication_time_documents",
@@ -2247,7 +2236,9 @@ JSON数组结构：
             else:
                 reject_cleaning("unsupported_ticker")
 
-        logger.info(f"[diag] stage2 cleaned={len(cleaned)} (after blacklist filter)")
+        logger.info(
+            f"[diag] stage2 cleaned={len(cleaned)}; rejections={cleaning_rejections}"
+        )
         if not cleaned:
             logger.warning(f"[diag] stage2 produced 0 proposals. Raw response (first 500): {(response or '')[:500]}")
         for p in cleaned:
@@ -2396,10 +2387,24 @@ def parse_committee_vote(text: str) -> Dict:
 def parse_strict_committee_vote(text: str) -> Dict[str, Any]:
     """Validate the final-vote wire format without changing legacy parsers."""
     parsed = parse_committee_vote(text)
-    try:
-        payload = json.loads(str(text or "").strip())
-    except (TypeError, ValueError, json.JSONDecodeError):
-        payload = None
+    raw_text = str(text or "").strip()
+    payload = None
+    if raw_text:
+        try:
+            payload = json.loads(raw_text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            stripped = raw_text
+            if stripped.startswith("```"):
+                stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+                stripped = re.sub(r"\s*```\s*$", "", stripped)
+            # Match the LAST balanced {...} block: LLM responses often wrap
+            # JSON in prose like "投票如下: {...} 以上是判断".
+            match = re.search(r"\{[\s\S]*\}", stripped)
+            if match:
+                try:
+                    payload = json.loads(match.group(0))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = None
 
     reason = ""
     required = {
@@ -3185,7 +3190,7 @@ def aggregate_committee_decision(
             if vote.get("confidence") is not None)
         / confidence_weight
         if confidence_weight
-        else float(proposal.get("confidence", 0.5))
+        else float(proposal.get("confidence") or 0.5)
     )
     position_weight = sum(
         weight for vote, weight in selected_votes
@@ -3196,7 +3201,7 @@ def aggregate_committee_decision(
             if vote.get("position") is not None)
         / position_weight
         if position_weight
-        else float(proposal.get("target_position", 0.1))
+        else float(proposal.get("target_position") or 0.1)
     )
     if direction == "hold":
         target_position = 0.0
@@ -3714,6 +3719,8 @@ async def stage3_ic_discussion(
         async def persist_incomplete_committee_decision(
             reason: str,
         ) -> Dict[str, Any]:
+            fallback_confidence = float(proposal.get("confidence") or 0.0)
+            fallback_confidence = max(0.0, min(1.0, fallback_confidence))
             incomplete = {
                 "decision_id": new_id("decision"),
                 "meeting_id": meeting_id,
@@ -3721,7 +3728,7 @@ async def stage3_ic_discussion(
                 "ticker": ticker,
                 "thesis": thesis,
                 "direction": "hold",
-                "confidence": 0.0,
+                "confidence": fallback_confidence,
                 "target_position": 0.0,
                 "vote_summary": {
                     "long": 0.0,
@@ -4498,8 +4505,15 @@ async def stage3_ic_discussion(
                     )
             raise
         except Exception as e:
-            print(f"      ❌ 错误: {str(e)[:50]}")
-            all_discussions.append(f"\n【{ticker}】错误: {str(e)[:100]}")
+            logger.warning(
+                "committee stage3 unhandled error for %s: %s: %s",
+                ticker,
+                type(e).__name__,
+                str(e)[:400],
+                exc_info=True,
+            )
+            print(f"      ❌ 错误({type(e).__name__}): {str(e)[:80]}")
+            all_discussions.append(f"\n【{ticker}】错误({type(e).__name__}): {str(e)[:200]}")
             try:
                 final_decisions.append(
                     await persist_incomplete_committee_decision(
@@ -6310,22 +6324,16 @@ async def main():
                     logger.info(f"[diag] save_docs begin: external={len(external_docs)} skipped={skipped_docs}")
                     sys.stdout.flush()
                     saved_docs = 0
-                    # 先保存到数据库
-                    for i, doc in enumerate(external_docs):
-                        try:
-                            if await asyncio.wait_for(
-                                # Raw documents may be globally durable before
-                                # the research phase commits, but round links
-                                # must only be written by ``persist_sources``
-                                # together with the stage/event transition.
-                                db_service.add_document(doc),
-                                timeout=30,
-                            ):
-                                saved_docs += 1
-                        except asyncio.TimeoutError:
-                            logger.warning(f"保存文档超时 (30s): doc #{i} {getattr(doc, 'title', '')[:50]}")
-                        except Exception as e:
-                            logger.warning(f"保存文档失败: {e}")
+                    # 先保存到数据库（批量单事务，避免每条 WAL fsync）
+                    try:
+                        saved_docs = await asyncio.wait_for(
+                            db_service.add_documents_batch(external_docs),
+                            timeout=120,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"批量保存文档超时 (120s): external={len(external_docs)}")
+                    except Exception as e:
+                        logger.warning(f"批量保存文档失败: {e}")
 
                     # 批量添加到 VectorDB（带 embedding）
                     wiki_docs = bounded_sync_index_batch(
@@ -6350,7 +6358,7 @@ async def main():
                         logger.error(f"[diag] add_documents_batch failed: {e}")
                         vector_saved = 0
                     logger.info(f"[diag] save_docs done in {(datetime.now()-t0).total_seconds():.1f}s, "
-                                f"DB={saved_docs}, Wiki={vector_saved}, WikiDeferred={deferred_wiki_docs}")
+                                f"DB={saved_docs}, Wiki={vector_saved}, DroppedFromWikiBatch={deferred_wiki_docs}")
 
                     print(
                         f"   ✅ 文档已保存 (DB新增: {saved_docs}, Wiki同步: {vector_saved}, "

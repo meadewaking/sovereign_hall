@@ -89,6 +89,14 @@ class MarketDataService:
     def normalize_ticker(ticker: str) -> str:
         return normalize_ticker(ticker)
 
+    _SUPPORTED_PREFIXES = (
+        "600", "601", "603", "605", "688",
+        "000", "001", "002", "003", "300", "301",
+        "510", "511", "512", "513", "515", "516", "517", "518",
+        "560", "561", "562", "563", "588",
+        "159",
+    )
+
     @classmethod
     def is_supported_ticker(cls, ticker: str) -> bool:
         """Return whether ``ticker`` can identify an A-share/ETF quote.
@@ -99,7 +107,9 @@ class MarketDataService:
         market-data boundary rather than in prompt-only cleanup.
         """
         code = cls.normalize_ticker(ticker)
-        return len(code) == 6 and code.isdigit()
+        if len(code) != 6 or not code.isdigit():
+            return False
+        return code.startswith(cls._SUPPORTED_PREFIXES)
 
     @classmethod
     def infer_market(cls, ticker: str) -> Optional[str]:

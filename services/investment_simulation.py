@@ -520,11 +520,29 @@ class InvestmentSimulation:
 
         feasible: List[Dict[str, Any]] = []
         rejections: List[Dict[str, Any]] = []
+        from .market_data import MarketDataService
         for proposal in proposals or []:
             direction = str(proposal.get("direction") or "long").lower()
             ticker = self._normalize_ticker(str(proposal.get("ticker") or ""))
             if direction != "long" or not ticker:
                 feasible.append(proposal)
+                continue
+            if not MarketDataService.is_supported_ticker(ticker):
+                rejections.append({
+                    "ticker": ticker,
+                    "code": "proposal_ticker_unverifiable",
+                    "reason": (
+                        f"标的代码 {ticker} 不在 A 股/ETF 合法前缀白名单内，"
+                        "无法获取真实行情。LLM 输出的 ticker 必须是 6 位 A 股或 ETF "
+                        "代码（如 600xxx/000xxx/300xxx/159xxx/510xxx/588xxx 等）。"
+                        "请下一轮研究有独立证据且代码可验证的标的。"
+                    ),
+                    "reference_price": 0.0,
+                    "quote_source": "",
+                    "quote_fetched_at": "",
+                    "quote_purpose": "proposal_lot_feasibility_screening",
+                    "max_executable_quote": executable_quote_ceiling,
+                })
                 continue
             try:
                 quote = await self.get_current_quote(ticker)
@@ -543,6 +561,22 @@ class InvestmentSimulation:
                 reference_price = 0.0
                 quote = None
                 quote_is_fresh = False
+            if quote is None and reference_price <= 0:
+                rejections.append({
+                    "ticker": ticker,
+                    "code": "proposal_ticker_unverifiable",
+                    "reason": (
+                        f"标的代码 {ticker} 通过白名单校验但无法从任何行情源获取报价，"
+                        "疑似不存在的代码或行情源异常。拒绝进入投委会以避免"
+                        "记录不可验证的决策。请下一轮研究有独立证据且代码可验证的标的。"
+                    ),
+                    "reference_price": 0.0,
+                    "quote_source": "",
+                    "quote_fetched_at": "",
+                    "quote_purpose": "proposal_lot_feasibility_screening",
+                    "max_executable_quote": executable_quote_ceiling,
+                })
+                continue
             if quote and not quote_is_fresh:
                 logger.warning(
                     "Proposal lot-feasibility quote unavailable/stale for %s; "

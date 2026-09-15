@@ -930,6 +930,42 @@ class WikiSearchIndex:
         self.llm_client = llm_client
         self.embedding_enabled = embedding_enabled
         self._page_embeddings: Dict[str, List[float]] = {}
+        self._embeddings_dirty = False
+        self._embeddings_loaded = False
+        self._embeddings_path = store.state_dir / "page_embeddings.json"
+
+    def _load_disk_embeddings(self) -> None:
+        if self._embeddings_loaded:
+            return
+        self._embeddings_loaded = True
+        try:
+            if self._embeddings_path.exists():
+                data = json.loads(self._embeddings_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    for key, vec in data.items():
+                        if isinstance(vec, list):
+                            self._page_embeddings[key] = vec
+                    logger.info(
+                        "wiki page embeddings loaded from disk: %s entries",
+                        len(self._page_embeddings),
+                    )
+        except Exception as exc:
+            logger.warning("wiki page embeddings load failed: %s", exc)
+
+    def _flush_disk_embeddings(self) -> None:
+        if not self._embeddings_dirty:
+            return
+        try:
+            self.store.state_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._embeddings_path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(self._page_embeddings),
+                encoding="utf-8",
+            )
+            tmp_path.replace(self._embeddings_path)
+            self._embeddings_dirty = False
+        except Exception as exc:
+            logger.warning("wiki page embeddings flush failed: %s", exc)
 
     async def search(
         self,
@@ -1049,9 +1085,14 @@ class WikiSearchIndex:
         key = f"{page.rel_path}:{stable_hash(page.body, 16)}"
         if key in self._page_embeddings:
             return self._page_embeddings[key]
+        self._load_disk_embeddings()
+        if key in self._page_embeddings:
+            return self._page_embeddings[key]
         text = f"{page.title}\n{page.body[:8000]}"
         vector = await self.llm_client.get_embedding(text)
         self._page_embeddings[key] = vector
+        self._embeddings_dirty = True
+        self._flush_disk_embeddings()
         return vector
 
     def _merge_hits(
@@ -1216,7 +1257,12 @@ class WikiKnowledgeBase:
         await self._ensure_initialized(llm_client)
         assert self.search_index is not None
         hits = await self.search_index.search(query, top_k=top_k, filter_sector=filter_sector, min_similarity=min_similarity)
-        if len(hits) < min(self.min_wiki_hits, top_k):
+        # Lazy migration brings new wiki pages online, but if vector enrichment
+        # already timed out in the first search the second call would re-embed
+        # the same pages and stack another ~20s timeout. Skip the retry when the
+        # first pass returned only lexical hits due to enrichment timeout.
+        first_vector_hit_count = sum(1 for h in hits if h.vector_score is not None)
+        if len(hits) < min(self.min_wiki_hits, top_k) and first_vector_hit_count > 0:
             migrated = await self._lazy_migrate(query, filter_sector=filter_sector)
             if migrated:
                 hits = await self.search_index.search(query, top_k=top_k, filter_sector=filter_sector, min_similarity=min_similarity)
@@ -1256,11 +1302,14 @@ class WikiKnowledgeBase:
             await self.initialize(llm_client or self.llm_client)
         elif llm_client and llm_client is not self.llm_client:
             self.llm_client = llm_client
-            self.search_index = WikiSearchIndex(
-                self.store,
-                llm_client=llm_client,
-                embedding_enabled=self.embedding_enabled,
-            )
+            if self.search_index is not None:
+                self.search_index.llm_client = llm_client
+            else:
+                self.search_index = WikiSearchIndex(
+                    self.store,
+                    llm_client=llm_client,
+                    embedding_enabled=self.embedding_enabled,
+                )
 
     async def _lazy_migrate(self, query: str, filter_sector: str = None) -> int:
         db = await self._resolve_database_service()

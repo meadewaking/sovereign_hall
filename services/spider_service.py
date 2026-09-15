@@ -899,7 +899,7 @@ class SpiderSwarm:
                                         content=snippet,
                                         url=link_url,
                                         source='bing',
-                                        metadata=source_time_metadata(snippet=snippet),
+                                        metadata=source_time_metadata(snippet=snippet, url=link_url),
                                         sector=self._infer_sector(query),
                                         keywords=[query],
                                     )
@@ -993,7 +993,7 @@ class SpiderSwarm:
                                     content=snippet,
                                     url=link_url,
                                     source='baidu',
-                                    metadata=source_time_metadata(snippet=snippet),
+                                    metadata=source_time_metadata(snippet=snippet, url=link_url),
                                     sector=self._infer_sector(query),
                                     keywords=[query],
                                 )
@@ -1016,7 +1016,7 @@ class SpiderSwarm:
                                 content=f"关于{query}的搜索结果",
                                 url=href,
                                 source='baidu',
-                                metadata=source_time_metadata(),
+                                metadata=source_time_metadata(url=href),
                                 sector=self._infer_sector(query),
                                 keywords=[query],
                             )
@@ -1106,7 +1106,7 @@ class SpiderSwarm:
                                     content=snippet,
                                     url=link_url,
                                     source='sogou',
-                                    metadata=source_time_metadata(snippet=snippet),
+                                    metadata=source_time_metadata(snippet=snippet, url=link_url),
                                     sector=self._infer_sector(query),
                                     keywords=[query],
                                 )
@@ -1178,7 +1178,7 @@ class SpiderSwarm:
                                 content=body or f"关于{query}的搜索结果",
                                 url=url,
                                 source='duckduckgo',
-                                metadata=source_time_metadata(snippet=body),
+                                metadata=source_time_metadata(snippet=body, url=url),
                                 sector=self._infer_sector(query),
                                 keywords=[query],
                             )
@@ -1228,7 +1228,7 @@ class SpiderSwarm:
                     content=fallback_body or f"关于{query}的搜索结果",
                     url=url,
                     source='duckduckgo',
-                    metadata=source_time_metadata(snippet=fallback_body),
+                    metadata=source_time_metadata(snippet=fallback_body, url=url),
                     sector=self._infer_sector(query),
                     keywords=[query],
                 )
@@ -1346,7 +1346,7 @@ class SpiderSwarm:
                     content=content[:MAX_STORED_CONTENT_CHARS],
                     url=url,
                     source=self._extract_domain(url),
-                    metadata=source_time_metadata(html=resp.text),
+                    metadata=source_time_metadata(html=resp.text, url=url),
                     sector=sector,
                     keywords=tickers,
                 )

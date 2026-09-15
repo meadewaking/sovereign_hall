@@ -86,7 +86,7 @@ class LLMClient:
         self.max_concurrent = int(max_concurrent if max_concurrent is not None else llm_config.get('max_concurrent', 16))
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
         # embedding 服务并发过高会整体超时，单独限流
-        self._embedding_semaphore = asyncio.Semaphore(4)
+        self._embedding_semaphore = asyncio.Semaphore(16)
 
         # 统计
         self.token_stats = TokenStats()
@@ -155,7 +155,9 @@ class LLMClient:
             trust_env=False,
         )
         # 用于 embedding 的内网客户端（使用 AsyncHTTPTransport，不走代理）
-        transport = httpx.AsyncHTTPTransport(retries=3)
+        # retries=1: 多次重试会吞掉外层 asyncio.wait_for 的取消信号,
+        # 让单次 embedding 请求在外层 15s timeout 后仍持续 30-60s 才返回。
+        transport = httpx.AsyncHTTPTransport(retries=1)
         self._embedding_client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=10.0,
