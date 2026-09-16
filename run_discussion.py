@@ -3185,13 +3185,21 @@ def aggregate_committee_decision(
         weight for vote, weight in selected_votes
         if vote.get("confidence") is not None
     )
-    confidence = (
+    raw_confidence = (
         sum(float(vote["confidence"]) * weight for vote, weight in selected_votes
             if vote.get("confidence") is not None)
         / confidence_weight
         if confidence_weight
         else float(proposal.get("confidence") or 0.5)
     )
+    # LLM 投 hold 时常把 confidence 写成 0.0(误以为 hold 不需要置信度),
+    # 导致加权平均为 0,下游记录"hold 0%"掩盖了真实证据强度。当方向是
+    # hold 且聚合 confidence 为 0 时,fallback 到 proposal.confidence,
+    # 让"观望"决策也能反映阶段2 的证据强度(0.55-0.62)。
+    if direction == "hold" and raw_confidence <= 0.0:
+        confidence = float(proposal.get("confidence") or 0.5)
+    else:
+        confidence = raw_confidence
     position_weight = sum(
         weight for vote, weight in selected_votes
         if vote.get("position") is not None

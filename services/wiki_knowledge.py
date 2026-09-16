@@ -621,7 +621,25 @@ class WikiStore:
         existing = path.read_text(encoding="utf-8") if path.exists() else None
         merged = merge_markdown_page(existing, content)
         self.write_text(path, self._bound_aggregate_page(merged))
-        self._pages_cache = None
+        # Incremental cache update: re-reading 114k+ md files on every write
+        # dominated vector_db.search (~90s per round). Update only the
+        # affected page in-place.
+        if self._pages_cache is None:
+            return
+        frontmatter, body = parse_frontmatter(merged)
+        new_page = WikiPage(
+            path=path,
+            rel_path=normalize_path(path.relative_to(self.root)),
+            title=str(frontmatter.get("title") or path.stem),
+            page_type=str(frontmatter.get("type") or "page"),
+            body=body,
+            frontmatter=frontmatter,
+        )
+        for index, existing_page in enumerate(self._pages_cache):
+            if existing_page.path == path:
+                self._pages_cache[index] = new_page
+                return
+        self._pages_cache.append(new_page)
 
     def rebuild_index(self) -> None:
         topics = self._index_links(self.topics_dir)
@@ -1070,6 +1088,10 @@ class WikiSearchIndex:
 
         page_vecs = await asyncio.gather(*[_safe_page_vec(p) for p in pages])
 
+        # Persist any newly computed embeddings in a single batch write,
+        # instead of writing the 6MB+ JSON file on every embedding call.
+        self._flush_disk_embeddings()
+
         results: List[Tuple[str, float]] = []
         for page, page_vec in zip(pages, page_vecs):
             if page_vec is None:
@@ -1092,8 +1114,14 @@ class WikiSearchIndex:
         vector = await self.llm_client.get_embedding(text)
         self._page_embeddings[key] = vector
         self._embeddings_dirty = True
-        self._flush_disk_embeddings()
+        # Do NOT flush on every embedding: a 200-page search would write the
+        # 6MB+ JSON file 200 times. Flush once at the end of the batch via
+        # flush_disk_embeddings_if_dirty(), called by the search caller.
         return vector
+
+    def flush_disk_embeddings_if_dirty(self) -> None:
+        """Public hook for batch callers to persist embeddings once per batch."""
+        self._flush_disk_embeddings()
 
     def _merge_hits(
         self,

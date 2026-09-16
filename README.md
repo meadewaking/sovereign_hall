@@ -10,7 +10,7 @@ Sovereign Hall 模拟一个买方投研机构：自动选择议题、检索资�
 
 系统的主循环是：持续联网检索新资料，结合数据库中的旧结论、预测期限和真实验证结果，由多 agent 独立分析、交叉质疑、反事实修正并投票，最后把资料、提案、会议、结论、预测、模拟交易和反思写回数据库。下一次讨论必须把这些历史结果作为“待重新验证的先验”带回讨论，而不是把旧结论当成当前事实。
 
-Heuristic Learning 是维护系统的 coding agent 使用的非梯度优化方法。唯一有效的 reward/score 是按受控实时行情估值后的模拟账户累计净收益；佣金、卖出印花税和滑点已经通过真实模拟成交写入现金与净值。离线回测、OOS、Sharpe 和 leaderboard 只用于诊断失败模式，不能产生 best、不能晋升策略、不能替代模拟账户没有成交的事实。Heuristic Learning coding agent 不得通过外部网页搜索替代本地实验；这项限制不约束交易系统本身。`run_discussion` 和 `research_interactive` 默认可以联网研究。
+Heuristic Learning 是维护系统的 coding agent 使用的非梯度优化方法。HL的更新者是coding agent，被更新的HS是整个研究、决策和执行系统。工作循环是“运行与观察→定位机制→修改代码/状态表示/测试/记忆→受控重跑→保留或回退→压缩经验”；内部LLM反思仅是其中一个组件。快速本地诊断与长期收益晋升分开，工程修复可属于HL，但不能自动证明收益改善。具体执行设定见 [HL任务提示词](docs/heuristic_learning_prompt.md)。唯一有效的 reward/score 是按受控实时行情估值后的模拟账户累计净收益；佣金、卖出印花税和滑点已经通过真实模拟成交写入现金与净值。离线回测、OOS、Sharpe 和 leaderboard 只用于诊断失败模式，不能产生 best、不能晋升策略、不能替代模拟账户没有成交的事实。Heuristic Learning coding agent 不得通过外部网页搜索替代本地实验；这项限制不约束交易系统本身。`run_discussion` 和 `research_interactive` 默认可以联网研究。
 
 系统只允许模拟交易，禁止实盘和真实下单接口。
 
