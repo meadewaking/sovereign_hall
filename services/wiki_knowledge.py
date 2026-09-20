@@ -765,11 +765,13 @@ class WikiIngestor:
         cfg = get_config().get("knowledge_wiki", {})
         self.source_excerpt_chars = max(100, int(cfg.get("source_excerpt_chars", 500)))
 
-    def ingest_document(self, doc: Document) -> List[str]:
+    def ingest_document(self, doc: Document, cache: Optional[Dict[str, Any]] = None) -> List[str]:
         content_hash = stable_hash(doc.content or "", 24)
         source_identity = doc.url or doc.id or content_hash
         cache_key = stable_hash(source_identity)
-        cache = self.store.load_cache()
+        own_cache = cache is None
+        if own_cache:
+            cache = self.store.load_cache()
         entry = cache.get("entries", {}).get(cache_key)
         if entry and entry.get("content_hash") == content_hash:
             paths = entry.get("files", [])
@@ -826,7 +828,8 @@ class WikiIngestor:
             "timestamp": utc_timestamp(),
             "files": written,
         }
-        self.store.save_cache(cache)
+        if own_cache:
+            self.store.save_cache(cache)
         self.store.append_log(
             "ingest",
             f"- source: {source_link}\n- topic: {topic_link}\n- entities: {', '.join(entity_links) if entity_links else 'none'}",
@@ -1247,13 +1250,17 @@ class WikiKnowledgeBase:
     async def add_documents_batch(self, docs: List[Document | Dict[str, Any]], llm_client: Any = None) -> int:
         await self._ensure_initialized(llm_client)
         added = 0
+        # Load the ingest cache once for the whole batch. ingest-cache.json can
+        # be tens of MB; loading and saving it per doc turned save_docs into
+        # ~110s of pure JSON I/O.
+        cache = self.store.load_cache()
         for doc in docs or []:
             if isinstance(doc, dict):
                 doc = Document.from_dict(doc)
             if not is_ingestable_source_document(doc):
                 logger.debug("Skipped wiki ingest for generated or low-quality document: %s", doc.title or doc.id)
                 continue
-            self.ingestor.ingest_document(doc)
+            self.ingestor.ingest_document(doc, cache=cache)
             self.documents[doc.id] = doc
             added += 1
             # Ingestion performs synchronous filesystem/cache work. Yield after
@@ -1261,6 +1268,7 @@ class WikiKnowledgeBase:
             # effective even when a caller accidentally submits a large batch.
             await asyncio.sleep(0)
         if added:
+            self.store.save_cache(cache)
             self.store.rebuild_index()
         return added
 

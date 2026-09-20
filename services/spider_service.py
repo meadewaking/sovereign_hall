@@ -43,7 +43,6 @@ class SearchProviderUnavailable(ConnectionError):
 
 _SEARCH_QUERY_PLACEHOLDER_PATTERNS = [
     "查询词", "示例", "占位", "xxx", "test",
-    "投资机会", "股票推荐", "a股市场",
 ]
 _NUMBERED_PLACEHOLDER_QUERY = re.compile(
     r"^(?:query|search[\s_-]*query|keyword|词|搜索词|关键词)[\s_:#-]*\d*$",
