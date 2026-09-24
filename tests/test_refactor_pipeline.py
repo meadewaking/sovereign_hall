@@ -3076,10 +3076,10 @@ async def test_market_data_cools_down_eastmoney_after_repeated_ohlc_failures(mon
     svc._client = failing_client
 
     async def fake_tencent(*_args, **_kwargs):
-        return []
+        return [], False
 
     async def fake_akshare(*_args, **_kwargs):
-        return [{"date": "2026-06-10", "open": 1.0, "close": 1.0, "high": 1.0, "low": 1.0, "volume": 0}]
+        return [{"date": "2026-06-10", "open": 1.0, "close": 1.0, "high": 1.0, "low": 1.0, "volume": 0}], False
 
     monkeypatch.setattr(svc, "_fetch_tencent_ohlc", fake_tencent)
     monkeypatch.setattr(svc, "_fetch_akshare_ohlc", fake_akshare)
@@ -3089,6 +3089,151 @@ async def test_market_data_cools_down_eastmoney_after_repeated_ohlc_failures(mon
         assert bars
 
     assert failing_client.calls == 3
+    await svc.close()
+
+
+@pytest.mark.asyncio
+async def test_market_data_negative_cache_short_circuits_repeat_failures(monkeypatch):
+    """When all OHLC providers fail for a ticker, repeat calls within the TTL
+    must not re-fire any HTTP/akshare request — they should hit the negative
+    cache and return ``[]`` immediately."""
+    svc = MarketDataService()
+    await svc._client.aclose()
+
+    tencent_calls = {"count": 0}
+    akshare_calls = {"count": 0}
+
+    async def failing_tencent(*_args, **_kwargs):
+        tencent_calls["count"] += 1
+        return [], False
+
+    async def failing_akshare(*_args, **_kwargs):
+        akshare_calls["count"] += 1
+        return [], False
+
+    monkeypatch.setattr(svc, "_fetch_tencent_ohlc", failing_tencent)
+    monkeypatch.setattr(svc, "_fetch_akshare_ohlc", failing_akshare)
+    # Force Eastmoney into cooldown so get_ohlc skips the primary path.
+    svc._eastmoney_ohlc_cooldown_until = datetime.now() + timedelta(seconds=300)
+
+    first = await svc.get_ohlc("159995", "2026-06-01", "2026-06-10")
+    assert first == []
+    assert tencent_calls["count"] == 1
+    assert akshare_calls["count"] == 1
+
+    # Repeat calls inside the TTL window must not fire any provider again.
+    second = await svc.get_ohlc("159995", "2026-06-01", "2026-06-10")
+    third = await svc.get_ohlc("159995", "2026-06-01", "2026-06-10")
+    assert second == []
+    assert third == []
+    assert tencent_calls["count"] == 1
+    assert akshare_calls["count"] == 1
+
+    # Negative cache key must be keyed on normalized ticker, not the raw input.
+    fourth = await svc.get_ohlc("sz159995", "2026-06-01", "2026-06-10")
+    assert fourth == []
+    assert tencent_calls["count"] == 1
+    assert akshare_calls["count"] == 1
+    await svc.close()
+
+
+@pytest.mark.asyncio
+async def test_market_data_tencent_qfq_rejection_falls_back_to_raw_bars(monkeypatch):
+    """When Tencent returns HTTP 501 on the ``qfq`` param (currency/cross-border
+    ETFs), the chunk fetcher must retry without qfq and surface the raw bars
+    instead of failing the whole chain."""
+    svc = MarketDataService()
+    await svc._client.aclose()
+
+    fetched_chunks: list[bool] = []  # True = qfq requested
+
+    class StubResponse:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+            self.request = httpx.Request("GET", "https://stub/")
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    f"status {self.status_code}",
+                    request=self.request,
+                    response=httpx.Response(
+                        self.status_code, request=self.request
+                    ),
+                )
+
+        def json(self):
+            return self._payload
+
+    class QfqRejectionClient:
+        is_closed = False
+
+        async def get(self, url, params=None):
+            qfq = params["param"].endswith(",qfq")
+            fetched_chunks.append(qfq)
+            if qfq:
+                # Mirror Tencent's real 501 for currency ETFs.
+                return StubResponse(501, {})
+            return StubResponse(
+                200,
+                {
+                    "data": {
+                        "sz159995": {
+                            "day": [
+                                ["2026-06-10", 1.0, 1.1, 1.2, 0.9, 1000],
+                            ]
+                        }
+                    }
+                },
+            )
+
+        async def aclose(self):
+            pass
+
+    svc._client = QfqRejectionClient()
+    # Skip Eastmoney primary path entirely for this test.
+    svc._eastmoney_ohlc_cooldown_until = datetime.now() + timedelta(seconds=300)
+    # And skip the akshare fallback so we can assert tencent-only success.
+    async def no_akshare(*_args, **_kwargs):
+        return [], False
+    monkeypatch.setattr(svc, "_fetch_akshare_ohlc", no_akshare)
+
+    bars = await svc.get_ohlc("159995", "2026-06-10", "2026-06-10")
+    assert bars
+    assert bars[0]["date"] == "2026-06-10"
+    # First fetch attempted qfq; second fetch (the fallback) did not.
+    assert fetched_chunks == [True, False]
+    # No negative cache entry should be written since tencent succeeded.
+    assert "159995" not in svc._ohlc_negative_cache
+    await svc.close()
+
+
+@pytest.mark.asyncio
+async def test_market_data_negative_cache_uses_long_ttl_for_permanent_failures(monkeypatch):
+    """Permanent failures (Tencent 501 with no raw-bar fallback) should land
+    in the negative cache with the long TTL, not the short one."""
+    svc = MarketDataService()
+    await svc._client.aclose()
+
+    async def permanent_tencent(*_args, **_kwargs):
+        return [], True  # permanent_failure=True
+
+    async def permanent_akshare(*_args, **_kwargs):
+        return [], True
+
+    monkeypatch.setattr(svc, "_fetch_tencent_ohlc", permanent_tencent)
+    monkeypatch.setattr(svc, "_fetch_akshare_ohlc", permanent_akshare)
+    svc._eastmoney_ohlc_cooldown_until = datetime.now() + timedelta(seconds=300)
+
+    await svc.get_ohlc("159995", "2026-06-01", "2026-06-10")
+    expiry, _ = svc._ohlc_negative_cache["159995"]
+    now = datetime.now().timestamp()
+    long_ttl = svc._ohlc_neg_cache_long_ttl
+    short_ttl = svc._ohlc_neg_cache_short_ttl
+    # Long TTL must be the chosen one — well above the short TTL window.
+    assert expiry - now > short_ttl + 60
+    assert expiry - now <= long_ttl + 60
     await svc.close()
 
 

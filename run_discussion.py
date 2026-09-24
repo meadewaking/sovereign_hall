@@ -1535,31 +1535,41 @@ async def stage1_mass_search(
     from sovereign_hall.services.spider_service import SearchQueryGenerator
 
     query_gen = SearchQueryGenerator(llm)
+    from sovereign_hall.services.research_query_policy import (
+        FEEDBACK_QUERY_POLICY, load_topic_research_gaps, select_research_queries,
+    )
+    query_policy = research_config.get('query_selection_policy', 'legacy')
+    research_feedback = []
+    feedback_status = 'disabled'
+    if query_policy == FEEDBACK_QUERY_POLICY and deployment_research and round_coordinator:
+        try:
+            research_feedback = await load_topic_research_gaps(
+                round_coordinator.db_service, raw_topic_head, as_of=research_as_of,
+            )
+            feedback_status = 'loaded' if research_feedback else 'no_eligible_feedback'
+        except Exception as exc:
+            feedback_status = 'read_failed'
+            logger.warning('Research gap read failed: %s', type(exc).__name__)
     queries = await query_gen.generate_queries(
         count=query_count,
         seeds=seeds,
         topic=topic_keyword,
         research_as_of=research_as_of,
+        research_feedback=research_feedback,
     )
 
     print(f"\n生成 {len(queries)} 个搜索词")
     print(f"示例: {queries[:5]}")
 
     # 合并额外查询词并去重（保序）
-    seen = set()
-    all_queries = []
     # Deployment recovery queries carry required company/ETF evidence fields
     # and must not be crowded out when the query generator already returns the
     # full count.  Other research keeps the generated-query-first order.
-    query_candidates = (
-        extra_queries + queries if deployment_research else queries + extra_queries
+    all_queries, selection_audit = select_research_queries(
+        queries, extra_queries, count=query_count, deployment=deployment_research,
+        policy=query_policy,
+        generation_mode=query_gen.last_validation_report.get('generation_mode', 'fallback'),
     )
-    for q in query_candidates:
-        key = str(q).strip().lower()
-        if key and key not in seen:
-            seen.add(key)
-            all_queries.append(q)
-    all_queries = all_queries[:query_count]
 
     raw_docs = await spiders.aggressive_search(
         all_queries,
@@ -1571,6 +1581,9 @@ async def stage1_mass_search(
         "research_as_of": research_as_of.isoformat(),
         "time_contract": "research_query_time_v1",
         "submitted_queries": list(all_queries),
+        "query_selection": {**selection_audit, 'feedback_status': feedback_status,
+                            'feedback_outcome_ids': [r['outcome_id'] for r in research_feedback],
+                            'feedback_round_ids': [r['round_id'] for r in research_feedback]},
         "generator_output_contract": generator_gate.get("output_contract"),
         "generator_mode": generator_gate.get("generation_mode"),
         "generator_attempts": list(generator_gate.get("attempts") or []),

@@ -10,11 +10,12 @@ import logging
 import os
 from datetime import date, datetime, timedelta
 from collections.abc import Awaitable, Callable, Iterable
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 
 from ..domain.portfolio.instruments import is_etf_ticker, normalize_ticker
+from ..utils import sync_retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,15 @@ class MarketDataError(RuntimeError):
     """Raised when market data cannot be fetched."""
 
 
+class _AkSharePermanentError(RuntimeError):
+    """Raised when AkShare fails for a reason that won't resolve on retry.
+
+    Used to distinguish permanent failures (parsing errors, invalid ticker
+    shape) from transient network errors so the OHLC negative cache can pick
+    the right TTL.
+    """
+
+
 class MarketDataService:
     """Small async client for A-share/ETF quotes and daily bars."""
 
@@ -84,6 +94,13 @@ class MarketDataService:
         self._eastmoney_ohlc_cooldown_until: Optional[datetime] = None
         self._eastmoney_ohlc_failure_threshold = 3
         self._eastmoney_ohlc_cooldown_seconds = 300
+        # Ticker-level negative cache: code -> (expiry_ts, reason).
+        # Only populated when ALL providers fail for a ticker, so successful
+        # fallbacks are never cached as failures.
+        self._ohlc_negative_cache: Dict[str, Tuple[float, str]] = {}
+        self._ohlc_negative_lock = asyncio.Lock()
+        self._ohlc_neg_cache_short_ttl = 60      # transient errors
+        self._ohlc_neg_cache_long_ttl = 3600     # permanent errors (e.g. Tencent 501 on qfq)
 
     @staticmethod
     def normalize_ticker(ticker: str) -> str:
@@ -317,6 +334,18 @@ class MarketDataService:
         if not secid:
             return []
 
+        code = self.normalize_ticker(ticker)
+        cached = self._ohlc_negative_cache.get(code)
+        if cached:
+            expiry, reason = cached
+            if datetime.now().timestamp() < expiry:
+                logger.debug(
+                    "OHLC negative cache hit for %s: %s", code, reason
+                )
+                return []
+            # expired entry; drop it so the next attempt actually fires.
+            self._ohlc_negative_cache.pop(code, None)
+
         self._ensure_client()
         start_s = self._format_date(start)
         end_s = self._format_date(end or datetime.now())
@@ -355,12 +384,47 @@ class MarketDataService:
             except Exception as exc:
                 self._record_eastmoney_ohlc_failure(ticker, exc)
 
-        bars = await self._fetch_tencent_ohlc(ticker, start_s, end_s)
-        if bars:
-            return self._decorate_bars(bars, "tencent_ohlc_qfq")
+        tencent_bars, tencent_permanent = await self._fetch_tencent_ohlc(
+            ticker, start_s, end_s
+        )
+        if tencent_bars:
+            return self._decorate_bars(tencent_bars, "tencent_ohlc_qfq")
 
-        bars = await self._fetch_akshare_ohlc(ticker, start_s, end_s)
-        return self._decorate_bars(bars, "akshare_ohlc_qfq") if bars else []
+        akshare_bars, akshare_permanent = await self._fetch_akshare_ohlc(
+            ticker, start_s, end_s
+        )
+        if akshare_bars:
+            return self._decorate_bars(akshare_bars, "akshare_ohlc_qfq")
+
+        # All providers failed for this ticker — record in the negative cache
+        # so repeat calls within the same sweep (and across callers) short-circuit.
+        ttl = (
+            self._ohlc_neg_cache_long_ttl
+            if tencent_permanent or akshare_permanent
+            else self._ohlc_neg_cache_short_ttl
+        )
+        reason = "all_providers_failed"
+        async with self._ohlc_negative_lock:
+            self._ohlc_negative_cache[code] = (
+                datetime.now().timestamp() + ttl,
+                reason,
+            )
+        logger.info(
+            "OHLC negative cache set for %s (%s) ttl=%ss",
+            code,
+            reason,
+            ttl,
+        )
+        return []
+
+    @staticmethod
+    def _is_permanent_http_failure(exc: BaseException) -> bool:
+        """Classify an exception as a permanent (vs transient) HTTP failure."""
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            if 400 <= status < 500 or status == 501:
+                return True
+        return False
 
     @staticmethod
     def _decorate_bars(bars: List[Dict], provider: str) -> List[Dict]:
@@ -482,92 +546,212 @@ class MarketDataService:
         else:
             logger.warning("Eastmoney OHLC fetch failed for %s: %s", ticker, exc)
 
-    async def _fetch_tencent_ohlc(self, ticker: str, start_s: str, end_s: str) -> List[Dict]:
+    async def _fetch_tencent_ohlc(
+        self, ticker: str, start_s: str, end_s: str
+    ) -> Tuple[List[Dict], bool]:
+        """Fetch Tencent daily bars.
+
+        Returns ``(bars, permanent_failure)``.  ``permanent_failure`` is True
+        only when the server explicitly rejected the request shape (e.g.
+        HTTP 501 for ``qfq`` on currency ETFs) AND the raw-bar fallback also
+        failed — transient network errors stay False so the negative cache
+        uses the short TTL.
+        """
         market = self.infer_market(ticker)
         code = self.normalize_ticker(ticker)
         if not market or not code:
-            return []
+            return [], False
 
         url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
         try:
             start_day = datetime.strptime(start_s, "%Y%m%d").date()
             end_day = datetime.strptime(end_s, "%Y%m%d").date()
             if end_day < start_day:
-                return []
+                return [], False
             # Tencent caps one response at roughly 640 daily rows.  Chunking by
             # 700 calendar days keeps every request below that limit while
             # preserving the caller's full 2015-to-cutoff lifecycle.
             by_date: dict[str, Dict[str, Any]] = {}
             chunk_start = start_day
+            qfq_rejected = False
             while chunk_start <= end_day:
                 chunk_end = min(chunk_start + timedelta(days=699), end_day)
-                params = {
-                    "param": (
-                        f"{market}{code},day,{chunk_start.isoformat()},"
-                        f"{chunk_end.isoformat()},640,qfq"
+                bars_for_chunk, rejected = await self._tencent_fetch_chunk(
+                    url, market, code, chunk_start, chunk_end
+                )
+                if rejected:
+                    qfq_rejected = True
+                    # Retry the same chunk without qfq — Tencent 501s on the
+                    # qfq param for currency/cross-border ETFs that have no
+                    # dividend adjustments.  Raw bars are still valid.
+                    bars_for_chunk, _ = await self._tencent_fetch_chunk(
+                        url, market, code, chunk_start, chunk_end, qfq=False
                     )
-                }
-                response = None
-                for attempt in range(3):
-                    try:
-                        response = await self._client.get(url, params=params)
-                        response.raise_for_status()
-                        break
-                    except Exception:
-                        if attempt == 2:
-                            raise
-                        await asyncio.sleep(0.2 * (attempt + 1))
-                payload = response.json() if response is not None else {}
-                rows = (payload.get("data") or {}).get(f"{market}{code}", {})
-                raw_bars = rows.get("qfqday") or rows.get("day") or []
-                for parts in raw_bars:
-                    if len(parts) < 6:
-                        continue
-                    by_date[str(parts[0])[:10]] = {
-                        "date": parts[0],
-                        "open": float(parts[1]),
-                        "close": float(parts[2]),
-                        "high": float(parts[3]),
-                        "low": float(parts[4]),
-                        "volume": float(parts[5]),
-                    }
+                for bar in bars_for_chunk:
+                    by_date[bar["date"]] = bar
                 chunk_start = chunk_end + timedelta(days=1)
-            return [by_date[day] for day in sorted(by_date)]
+            if qfq_rejected and by_date:
+                logger.info(
+                    "Tencent qfq unavailable for %s, served raw bars", code
+                )
+            return [by_date[day] for day in sorted(by_date)], False
+        except httpx.HTTPStatusError as exc:
+            permanent = self._is_permanent_http_failure(exc)
+            if permanent:
+                logger.warning(
+                    "Tencent OHLC permanently rejected for %s: %s",
+                    code,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "Tencent OHLC fetch failed for %s: %s", code, exc
+                )
+            return [], permanent
         except Exception as exc:
             logger.warning("Tencent OHLC fetch failed for %s: %s", code, exc)
-            return []
+            return [], False
 
-    async def _fetch_akshare_ohlc(self, ticker: str, start_s: str, end_s: str) -> List[Dict]:
-        """Fetch daily bars through AkShare when the raw Eastmoney endpoint is unavailable."""
+    async def _tencent_fetch_chunk(
+        self,
+        url: str,
+        market: str,
+        code: str,
+        chunk_start: date,
+        chunk_end: date,
+        *,
+        qfq: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Fetch one Tencent chunk.  Returns ``(bars, qfq_rejected)``.
+
+        On HTTP 501 with ``qfq=True`` the caller retries with ``qfq=False``.
+        """
+        param = (
+            f"{market}{code},day,{chunk_start.isoformat()},"
+            f"{chunk_end.isoformat()},640,qfq"
+            if qfq
+            else f"{market}{code},day,{chunk_start.isoformat()},"
+            f"{chunk_end.isoformat()},640,"
+        )
+        params = {"param": param}
+        response = None
+        for attempt in range(3):
+            try:
+                response = await self._client.get(url, params=params)
+                response.raise_for_status()
+                break
+            except httpx.HTTPStatusError:
+                # 501 etc. — don't retry the same rejected shape.
+                if qfq and response is not None and response.status_code == 501:
+                    return [], True
+                raise
+            except Exception:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.2 * (attempt + 1))
+        payload = response.json() if response is not None else {}
+        rows = (payload.get("data") or {}).get(f"{market}{code}", {})
+        raw_bars = rows.get("qfqday") or rows.get("day") or []
+        bars: List[Dict[str, Any]] = []
+        for parts in raw_bars:
+            if len(parts) < 6:
+                continue
+            bars.append({
+                "date": str(parts[0])[:10],
+                "open": float(parts[1]),
+                "close": float(parts[2]),
+                "high": float(parts[3]),
+                "low": float(parts[4]),
+                "volume": float(parts[5]),
+            })
+        # If qfq was requested but only `day` (not `qfqday`) came back, the
+        # server silently ignored qfq — flag so the caller can log + degrade.
+        qfq_rejected = qfq and not rows.get("qfqday") and bool(rows.get("day"))
+        return bars, qfq_rejected
+
+    async def _fetch_akshare_ohlc(
+        self, ticker: str, start_s: str, end_s: str
+    ) -> Tuple[List[Dict], bool]:
+        """Fetch daily bars through AkShare when the raw Eastmoney endpoint is unavailable.
+
+        Returns ``(bars, permanent_failure)``.  Transient network errors are
+        retried with exponential backoff; only truly permanent failures (e.g.
+        akshare raising a parsing ``ValueError``) report ``True``.
+        """
         code = self.normalize_ticker(ticker)
         if not code or not code.isdigit():
-            return []
+            return [], False
 
         try:
-            return await asyncio.to_thread(self._fetch_akshare_ohlc_sync, code, start_s, end_s)
+            bars = await asyncio.to_thread(
+                self._fetch_akshare_ohlc_sync, code, start_s, end_s
+            )
+            return bars, False
+        except _AkSharePermanentError as exc:
+            logger.warning(
+                "AkShare OHLC permanently failed for %s: %s", code, exc
+            )
+            return [], True
         except Exception as exc:
             logger.warning("AkShare OHLC fetch failed for %s: %s", code, exc)
-            return []
+            return [], False
 
-    def _fetch_akshare_ohlc_sync(self, ticker: str, start_s: str, end_s: str) -> List[Dict]:
+    def _fetch_akshare_ohlc_sync(
+        self, ticker: str, start_s: str, end_s: str
+    ) -> List[Dict]:
         import akshare as ak
 
-        if is_etf_ticker(ticker):
-            df = ak.fund_etf_hist_em(
+        def _fetch_df():
+            if is_etf_ticker(ticker):
+                return ak.fund_etf_hist_em(
+                    symbol=ticker,
+                    period="daily",
+                    start_date=start_s,
+                    end_date=end_s,
+                    adjust="qfq",
+                )
+            return ak.stock_zh_a_hist(
                 symbol=ticker,
                 period="daily",
                 start_date=start_s,
                 end_date=end_s,
                 adjust="qfq",
             )
-        else:
-            df = ak.stock_zh_a_hist(
-                symbol=ticker,
-                period="daily",
-                start_date=start_s,
-                end_date=end_s,
-                adjust="qfq",
+
+        # Only retry on transient network/protocol errors. Parsing errors or
+        # akshare-level validation errors propagate as permanent failures.
+        try:
+            df = sync_retry_with_backoff(
+                _fetch_df,
+                max_retries=3,
+                base_delay=1.0,
+                max_delay=8.0,
+                exceptions=(
+                    ConnectionError,
+                    httpx.RemoteProtocolError,
+                    httpx.ConnectError,
+                    httpx.ReadTimeout,
+                    httpx.WriteTimeout,
+                    httpx.PoolTimeout,
+                    httpx.ConnectTimeout,
+                ),
             )
+        except (
+            ConnectionError,
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+            httpx.ConnectTimeout,
+        ):
+            # Retries exhausted on transient errors — surface as transient so
+            # the negative cache uses the short TTL.
+            raise
+        except Exception as exc:
+            # Anything else (e.g. KeyError from a missing column, ValueError
+            # from akshare's internal parsing) is permanent for this ticker.
+            raise _AkSharePermanentError(str(exc)) from exc
 
         bars = []
         for row in df.to_dict("records"):
