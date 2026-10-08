@@ -7,8 +7,7 @@ simulation all share the same price source and never fall back to fake prices.
 
 import asyncio
 import logging
-import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -16,6 +15,7 @@ import httpx
 
 from ..domain.portfolio.instruments import is_etf_ticker, normalize_ticker
 from ..domain.portfolio.quote_freshness import MARKET_ZONE, is_fresh_quote
+from .exchange_calendar import ExchangeCalendar, load_exchange_calendar
 from ..utils import sync_retry_with_backoff
 
 logger = logging.getLogger(__name__)
@@ -91,6 +91,7 @@ class MarketDataService:
         self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._quote_cache: Dict[str, Dict[str, Any]] = {}
         self._quote_ttl_seconds = 60
+        self._exchange_calendars: Dict[int, ExchangeCalendar] = {}
         self._eastmoney_ohlc_failures = 0
         self._eastmoney_ohlc_cooldown_until: Optional[datetime] = None
         self._eastmoney_ohlc_failure_threshold = 3
@@ -164,14 +165,17 @@ class MarketDataService:
 
         Unknown calendars fail closed; weekdays alone do not establish an open session.
         """
-        target = when.date() if isinstance(when, datetime) else (when or datetime.now().date())
+        if isinstance(when, datetime):
+            target = (when.astimezone(MARKET_ZONE) if when.tzinfo else when).date()
+        else:
+            target = when or datetime.now(MARKET_ZONE).date()
         if not isinstance(target, date):
-            target = datetime.now().date()
+            return False
 
         if target.weekday() >= 5:
             return False
 
-        trade_days = await self._load_trade_days()
+        trade_days = await self._load_trade_days(target.year)
         if trade_days is None:
             logger.warning("Trading calendar unavailable; simulation execution blocked")
             return False
@@ -179,43 +183,28 @@ class MarketDataService:
 
     async def is_market_open(self, when: Optional[datetime] = None) -> bool:
         """Return whether A-share continuous trading is currently open."""
-        current = when or datetime.now()
+        current = when or datetime.now(MARKET_ZONE)
+        current = current.astimezone(MARKET_ZONE) if current.tzinfo else current.replace(tzinfo=MARKET_ZONE)
         if not await self.is_trading_day(current):
             return False
-        minutes = current.hour * 60 + current.minute
-        return (9 * 60 + 30 <= minutes <= 11 * 60 + 30) or (
-            13 * 60 <= minutes <= 15 * 60
-        )
+        clock = current.time()
+        return time(9, 30) <= clock <= time(11, 30) or time(13) <= clock <= time(15)
 
-    async def _load_trade_days(self) -> Optional[Set[date]]:
-        global _trade_days_cache
-        if _trade_days_cache is not None:
-            return _trade_days_cache
-
-        # The optional akshare stack is not required for realtime quotes and can be
-        # binary-incompatible with the active numpy runtime. Avoid importing it in
-        # the normal simulation path; explicit opt-in keeps the failure contained.
-        use_akshare = os.environ.get("SOVEREIGN_HALL_USE_AKSHARE_CALENDAR", "0").strip().lower()
-        if use_akshare not in {"1", "true", "yes", "on"}:
-            return None
-
+    def _get_exchange_calendar(self, year: int) -> Optional[ExchangeCalendar]:
         try:
-            import akshare as ak
-
-            df = await asyncio.to_thread(ak.tool_trade_date_hist_sina)
-            days = set()
-            for value in df.get("trade_date", []):
-                if hasattr(value, "to_pydatetime"):
-                    value = value.to_pydatetime()
-                if isinstance(value, datetime):
-                    days.add(value.date())
-                else:
-                    days.add(datetime.strptime(str(value)[:10], "%Y-%m-%d").date())
-            _trade_days_cache = days
-            return _trade_days_cache
+            if year not in self._exchange_calendars:
+                self._exchange_calendars[year] = load_exchange_calendar(year)
+                calendar = self._exchange_calendars[year]
+                logger.info('Verified exchange calendar loaded: year=%s days=%s source_identity=%s',
+                            year, len(calendar.sessions), calendar.source_identity)
+            return self._exchange_calendars[year]
         except Exception as exc:
-            logger.warning("Trading calendar unavailable, simulation execution blocked: %s", exc)
+            logger.warning("Verified exchange calendar unavailable for %s: %s", year, exc)
             return None
+
+    async def _load_trade_days(self, year: Optional[int] = None) -> Optional[Set[date]]:
+        calendar = self._get_exchange_calendar(year or datetime.now(MARKET_ZONE).year)
+        return {date.fromisoformat(day) for day, opened in calendar.sessions.items() if opened} if calendar else None
 
     async def get_current_price(self, ticker: str) -> Optional[float]:
         """Return the latest realtime quote price, or None when unavailable."""
@@ -250,6 +239,7 @@ class MarketDataService:
         for fetch, source in (
             (self._fetch_tencent_quote, "tencent_realtime_quote"),
             (self._fetch_eastmoney_quote, "eastmoney_realtime_quote"),
+            (self._fetch_sina_quote, "sina_realtime_quote"),
         ):
             price, name, quoted_at = await fetch(code)
             quote = {"ticker": code, "price": price, "name": name,
@@ -315,6 +305,112 @@ class MarketDataService:
             return value / (10 ** decimals)
         except (TypeError, ValueError, OverflowError):
             return None
+
+    async def _fetch_sina_quote(self, ticker: str) -> tuple[Optional[float], str, str]:
+        """Sina realtime quote fallback.
+
+        Sina's ``hq.sinajs.cn`` endpoint returns a GBK-encoded JS snippet
+        like ``var hq_str_sh600519="贵州茅台,昨收,今开,最新,...,日期,时间,00;"``.
+        The server requires a ``Referer: finance.sina.com.cn`` header or it
+        returns 403, so we set it explicitly.
+        """
+        market = self.infer_market(ticker)
+        if not market:
+            return None, "", ""
+        url = f"https://hq.sinajs.cn/list={market}{ticker}"
+        try:
+            resp = await self._client.get(
+                url,
+                headers={"Referer": "https://finance.sina.com.cn"},
+            )
+            resp.raise_for_status()
+            body = resp.content.decode("gbk", errors="strict")
+            # Body: var hq_str_sh600519="name,昨收,今开,最新价,最高,最低,...,日期,时间,00,";
+            payload = body.split('="', 1)[-1].rstrip('";').rstrip(",")
+            parts = payload.split(",")
+            if len(parts) < 32:
+                return None, "", ""
+            price = float(parts[3]) if parts[3] else None
+            if price is None or price <= 0:
+                return None, "", ""
+            name = parts[0].strip()
+            date_str, time_str = parts[30], parts[31]
+            quoted = datetime.strptime(
+                f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=MARKET_ZONE)
+            return price, name, quoted.isoformat()
+        except Exception as exc:
+            logger.debug("Sina quote failed for %s: %s", ticker, exc)
+        return None, "", ""
+
+    async def _fetch_sina_ohlc(
+        self, ticker: str, start_s: str, end_s: str
+    ) -> Tuple[List[Dict], bool]:
+        """Sina daily-K fallback. Returns ``(bars, permanent_failure)``.
+
+        Sina's ``getKLineData`` endpoint only accepts ``datalen`` (number of
+        most-recent bars) — there is no start/end parameter.  When the caller's
+        requested window exceeds ``datalen`` bars we skip Sina entirely so the
+        negative cache uses the right TTL instead of a false-positive miss.
+        """
+        market = self.infer_market(ticker)
+        code = self.normalize_ticker(ticker)
+        if not market or not code:
+            return [], False
+        try:
+            start_day = datetime.strptime(start_s, "%Y%m%d").date()
+            end_day = datetime.strptime(end_s, "%Y%m%d").date()
+        except ValueError:
+            return [], False
+        # ~250 trading days/year; cap at 1000 (Sina's max datalen) and only
+        # attempt when the window is short enough to be fully covered.
+        calendar_days = (end_day - start_day).days
+        if calendar_days > 1000:
+            return [], False
+        datalen = max(int(calendar_days * 1.5) + 10, 30)
+        datalen = min(datalen, 1000)
+        url = (
+            "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+            "CN_MarketData.getKLineData"
+        )
+        try:
+            resp = await self._client.get(
+                url,
+                params={
+                    "symbol": f"{market}{code}",
+                    "scale": "240",  # daily
+                    "ma": "no",
+                    "datalen": str(datalen),
+                },
+                headers={"Referer": "https://finance.sina.com.cn"},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+        except Exception as exc:
+            logger.warning("Sina OHLC fetch failed for %s: %s", code, exc)
+            return [], False
+        bars: List[Dict] = []
+        # start_s/end_s are YYYYMMDD; Sina's day is "YYYY-MM-DD".  Normalize
+        # both sides to YYYYMMDD for lexicographic comparison.
+        start_cmp = start_s.replace("-", "")
+        end_cmp = end_s.replace("-", "")
+        for row in rows or []:
+            try:
+                day = str(row["day"])[:10]
+                day_cmp = day.replace("-", "")
+                if day_cmp < start_cmp or day_cmp > end_cmp:
+                    continue
+                bars.append({
+                    "date": day,
+                    "open": float(row["open"]),
+                    "close": float(row["close"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "volume": float(row.get("volume") or 0),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        return bars, False
 
     async def get_ohlc(
         self,
@@ -389,11 +485,17 @@ class MarketDataService:
         if akshare_bars:
             return self._decorate_bars(akshare_bars, "akshare_ohlc_qfq")
 
+        sina_bars, sina_permanent = await self._fetch_sina_ohlc(
+            ticker, start_s, end_s
+        )
+        if sina_bars:
+            return self._decorate_bars(sina_bars, "sina_ohlc")
+
         # All providers failed for this ticker — record in the negative cache
         # so repeat calls within the same sweep (and across callers) short-circuit.
         ttl = (
             self._ohlc_neg_cache_long_ttl
-            if tencent_permanent or akshare_permanent
+            if tencent_permanent or akshare_permanent or sina_permanent
             else self._ohlc_neg_cache_short_ttl
         )
         reason = "all_providers_failed"
@@ -422,12 +524,16 @@ class MarketDataService:
     @staticmethod
     def _decorate_bars(bars: List[Dict], provider: str) -> List[Dict]:
         fetched_at = datetime.now().isoformat()
+        # Sina's getKLineData returns raw (unadjusted) bars; all other
+        # providers apply qfq.  Downstream code uses this field to decide
+        # whether back-adjustment is needed when stitching windows.
+        adjustment = "raw" if provider == "sina_ohlc" else "qfq"
         return [
             {
                 **bar,
                 "provider": provider,
                 "fetched_at": fetched_at,
-                "adjustment": "qfq",
+                "adjustment": adjustment,
                 "quality_status": "validated",
                 "trade_status": str(bar.get("trade_status") or "normal"),
             }
@@ -441,7 +547,7 @@ class MarketDataService:
         *,
         index_identity: "InstrumentIdentity | None" = None,
     ) -> List[Dict[str, Any]]:
-        """Return an auditable open-session calendar.
+        """Return a verified annual calendar, or historical observed-open evidence.
 
         PR2.1: the calendar is sourced from an explicit index identity, not
         from the bare code ``"000001"``.  Missing bars for the index do NOT
@@ -451,6 +557,13 @@ class MarketDataService:
         method returns the observed-open sessions only and records the source
         and validity range so a downstream auditor can tell the difference.
         """
+        start_day = datetime.strptime(self._format_date(start), '%Y%m%d').date()
+        end_day = datetime.strptime(self._format_date(end or datetime.now(MARKET_ZONE)), '%Y%m%d').date()
+        if start_day.year == end_day.year:
+            calendar = self._get_exchange_calendar(start_day.year)
+            if calendar is not None:
+                return calendar.rows(start_day, end_day)
+
         from ..domain.portfolio.instruments import (
             SHANGHAI_COMPOSITE_INDEX,
             InstrumentIdentity,
@@ -776,7 +889,6 @@ class MarketDataService:
 
 
 _market_data: Optional[MarketDataService] = None
-_trade_days_cache: Optional[Set[date]] = None
 
 
 def get_market_data() -> MarketDataService:

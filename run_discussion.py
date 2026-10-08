@@ -5947,6 +5947,8 @@ async def main():
             repo_root / "domain" / "portfolio" / "instruments.py",
             repo_root / "domain" / "portfolio" / "quote_freshness.py",
             repo_root / "services" / "market_data.py",
+            repo_root / "services" / "exchange_calendar.py",
+            *sorted((repo_root / "services" / "calendar_data").glob("*")),
             repo_root / "application" / "execute_simulation_cycle.py",
             repo_root / "infrastructure" / "sqlite" / "migrations.py",
         ]
@@ -5959,7 +5961,7 @@ async def main():
     policy_snapshot_service = PolicySnapshotService(str(db_path))
     policy_snapshot_manifest = PolicyManifest(
         policy_family="run_discussion",
-        version="run_discussion_quote_event_time_v1",
+        version="run_discussion_exchange_calendar_v1",
         code_artifacts=_snapshot_code_artifacts(),
         effective_config=(
             config.to_dict() if hasattr(config, "to_dict") else {}
@@ -5985,7 +5987,7 @@ async def main():
             "heuristic_policy": "v1",
         },
         source_manifest_path=__file__,
-        change_reason="provider event time required; unknown trading calendar blocks execution",
+        change_reason="verified dual-exchange annual calendar restores covered sessions; source-time price gates retained",
         changes_behavior=True,
     )
     try:
