@@ -55,14 +55,7 @@ def get_realtime_prices(tickers: list) -> dict:
         if hasattr(md, "get_current_quotes"):
             quotes = await md.get_current_quotes(tickers)
         else:
-            quotes = {}
-            for ticker in tickers:
-                price = await md.get_current_price(ticker)
-                quotes[ticker] = {
-                    "price": price,
-                    "source": "realtime_quote",
-                    "fetched_at": datetime.now().isoformat(),
-                } if price else None
+            quotes = {}  # Price-only adapters cannot prove quote freshness.
         for ticker in tickers:
             quote = quotes.get(ticker)
             if is_fresh_realtime_quote(quote):
@@ -74,28 +67,9 @@ def get_realtime_prices(tickers: list) -> dict:
 
 def is_fresh_realtime_quote(quote: Any) -> bool:
     """Apply the same freshness gate as simulated execution."""
-    if not isinstance(quote, dict):
-        return False
-    try:
-        price = float(quote.get("price") or 0.0)
-        fetched = datetime.fromisoformat(
-            str(quote.get("fetched_at") or "").replace("Z", "+00:00")
-        )
-        now = datetime.now(fetched.tzinfo) if fetched.tzinfo else datetime.now()
-        age = (now - fetched).total_seconds()
-        maximum = int(
-            get_config()
-            .get("simulation", {})
-            .get("max_realtime_quote_age_seconds", 120)
-            or 120
-        )
-    except (TypeError, ValueError):
-        return False
-    return (
-        price > 0
-        and bool(str(quote.get("source") or "").strip())
-        and -60 <= age <= maximum
-    )
+    from sovereign_hall.domain.portfolio.quote_freshness import is_fresh_quote
+    maximum = int(get_config().get("simulation", {}).get("max_realtime_quote_age_seconds", 120) or 120)
+    return is_fresh_quote(quote, max_age_seconds=maximum)
 
 
 def filter_supported_candidate_rejections(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

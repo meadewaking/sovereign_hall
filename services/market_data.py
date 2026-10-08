@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 
 from ..domain.portfolio.instruments import is_etf_ticker, normalize_ticker
+from ..domain.portfolio.quote_freshness import MARKET_ZONE, is_fresh_quote
 from ..utils import sync_retry_with_backoff
 
 logger = logging.getLogger(__name__)
@@ -161,7 +162,7 @@ class MarketDataService:
     async def is_trading_day(self, when: Optional[date | datetime] = None) -> bool:
         """Return whether the exchange is open on the given date.
 
-        Falls back to weekday logic when the external trading calendar cannot be loaded.
+        Unknown calendars fail closed; weekdays alone do not establish an open session.
         """
         target = when.date() if isinstance(when, datetime) else (when or datetime.now().date())
         if not isinstance(target, date):
@@ -172,7 +173,8 @@ class MarketDataService:
 
         trade_days = await self._load_trade_days()
         if trade_days is None:
-            return True
+            logger.warning("Trading calendar unavailable; simulation execution blocked")
+            return False
         return target in trade_days
 
     async def is_market_open(self, when: Optional[datetime] = None) -> bool:
@@ -212,7 +214,7 @@ class MarketDataService:
             _trade_days_cache = days
             return _trade_days_cache
         except Exception as exc:
-            logger.warning("Trading calendar unavailable, falling back to weekday check: %s", exc)
+            logger.warning("Trading calendar unavailable, simulation execution blocked: %s", exc)
             return None
 
     async def get_current_price(self, ticker: str) -> Optional[float]:
@@ -234,78 +236,69 @@ class MarketDataService:
         )
 
     async def get_current_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
-        """Return a realtime quote with provider and retrieval timestamp."""
+        """Return only fresh quotes with both provider event and retrieval timestamps."""
         code = self.normalize_ticker(ticker)
         if not self.is_supported_ticker(code):
             logger.warning("Reject unsupported realtime quote ticker: %r", ticker)
             return None
 
         cached = self._quote_cache.get(code)
-        if cached:
-            cached_at = cached.get("fetched_at_datetime")
-            if isinstance(cached_at, datetime) and (
-                datetime.now() - cached_at
-            ).total_seconds() < self._quote_ttl_seconds:
-                return {key: value for key, value in cached.items() if key != "fetched_at_datetime"}
-
+        if cached and is_fresh_quote(cached, max_age_seconds=self._quote_ttl_seconds):
+            return dict(cached)
+        self._quote_cache.pop(code, None)
         self._ensure_client()
-        price, name = await self._fetch_tencent_quote(code)
-        source = "tencent_realtime_quote"
-        if price is None:
-            price, name = await self._fetch_eastmoney_quote(code)
-            source = "eastmoney_realtime_quote"
-
-        if price is not None and price > 0:
-            fetched_at = datetime.now()
-            quote = {
-                "ticker": code,
-                "price": float(price),
-                "name": name or "",
-                "source": source,
-                "fetched_at": fetched_at.isoformat(),
-            }
-            self._quote_cache[code] = {**quote, "fetched_at_datetime": fetched_at}
-            return quote
-
-        logger.warning("No market quote for %s", code)
+        for fetch, source in (
+            (self._fetch_tencent_quote, "tencent_realtime_quote"),
+            (self._fetch_eastmoney_quote, "eastmoney_realtime_quote"),
+        ):
+            price, name, quoted_at = await fetch(code)
+            quote = {"ticker": code, "price": price, "name": name,
+                     "source": source, "quoted_at": quoted_at,
+                     "fetched_at": datetime.now(MARKET_ZONE).isoformat()}
+            if is_fresh_quote(quote):
+                self._quote_cache[code] = quote
+                return dict(quote)
+        logger.warning("No fresh provider-timestamped market quote for %s", code)
         return None
 
-    async def _fetch_tencent_quote(self, ticker: str) -> tuple[Optional[float], str]:
+    async def _fetch_tencent_quote(self, ticker: str) -> tuple[Optional[float], str, str]:
         market = self.infer_market(ticker)
         if not market:
-            return None, ""
-        url = f"http://qt.gtimg.cn/q={market}{ticker}"
+            return None, "", ""
+        url = f"https://qt.gtimg.cn/q={market}{ticker}"
         try:
             resp = await self._client.get(url)
-            if resp.status_code != 200 or "none_match" in resp.text:
-                return None, ""
-            text = resp.content.decode("gbk", errors="ignore")
-            parts = text.split("~")
-            name = parts[1].strip() if len(parts) > 1 else ""
-            if len(parts) > 3 and parts[3]:
-                return float(parts[3]), name
+            resp.raise_for_status()
+            parts = resp.content.decode("gbk", errors="strict").split("~")
+            if len(parts) > 30 and parts[2] == ticker:
+                quoted = datetime.strptime(parts[30], "%Y%m%d%H%M%S").replace(tzinfo=MARKET_ZONE)
+                return float(parts[3]), parts[1].strip(), quoted.isoformat()
         except Exception as exc:
             logger.debug("Tencent quote failed for %s: %s", ticker, exc)
-        return None, ""
+        return None, "", ""
 
-    async def _fetch_eastmoney_quote(self, ticker: str) -> tuple[Optional[float], str]:
+    async def _fetch_eastmoney_quote(self, ticker: str) -> tuple[Optional[float], str, str]:
         secid = self.eastmoney_secid(ticker)
         if not secid:
-            return None, ""
-        url = "http://push2.eastmoney.com/api/qt/stock/get"
-        params = {"secid": secid, "fields": "f43,f57,f58,f59"}
+            return None, "", ""
+        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        params = {"secid": secid, "fields": "f43,f57,f58,f59,f86"}
         try:
             resp = await self._client.get(url, params=params)
             resp.raise_for_status()
-            data = resp.json().get("data") or {}
-            raw = data.get("f43")
-            if raw in (None, "-", ""):
-                return None, ""
+            payload = resp.json()
+            data = payload.get("data") or {}
+            if payload.get("rc") != 0 or data.get("f57") != ticker:
+                return None, "", ""
+            raw, timestamp = data.get("f43"), data.get("f86")
+            if raw in (None, "-", "") or type(timestamp) is not int or timestamp <= 0:
+                return None, "", ""
+            quoted = datetime.fromtimestamp(timestamp, MARKET_ZONE)
             name = str(data.get("f58") or "").strip()
-            return self._parse_eastmoney_price(raw, data.get("f59"), ticker), name
+            return self._parse_eastmoney_price(raw, data.get("f59"), ticker), name, quoted.isoformat()
         except Exception as exc:
             logger.debug("Eastmoney quote failed for %s: %s", ticker, exc)
-        return None, ""
+        return None, "", ""
 
     @staticmethod
     def _parse_eastmoney_price(raw: object, precision: object = None, ticker: str = "") -> Optional[float]:
@@ -720,31 +713,27 @@ class MarketDataService:
 
         # Only retry on transient network/protocol errors. Parsing errors or
         # akshare-level validation errors propagate as permanent failures.
-        try:
-            df = sync_retry_with_backoff(
-                _fetch_df,
-                max_retries=3,
-                base_delay=1.0,
-                max_delay=8.0,
-                exceptions=(
-                    ConnectionError,
-                    httpx.RemoteProtocolError,
-                    httpx.ConnectError,
-                    httpx.ReadTimeout,
-                    httpx.WriteTimeout,
-                    httpx.PoolTimeout,
-                    httpx.ConnectTimeout,
-                ),
-            )
-        except (
-            ConnectionError,
+        # Note: ``requests.exceptions.ConnectionError`` (used by akshare's
+        # underlying HTTP stack) inherits from ``OSError``, NOT from the
+        # builtin ``ConnectionError`` — so ``OSError`` is the right umbrella.
+        transient_exceptions = (
+            OSError,
             httpx.RemoteProtocolError,
             httpx.ConnectError,
             httpx.ReadTimeout,
             httpx.WriteTimeout,
             httpx.PoolTimeout,
             httpx.ConnectTimeout,
-        ):
+        )
+        try:
+            df = sync_retry_with_backoff(
+                _fetch_df,
+                max_retries=3,
+                base_delay=1.0,
+                max_delay=8.0,
+                exceptions=transient_exceptions,
+            )
+        except transient_exceptions:
             # Retries exhausted on transient errors — surface as transient so
             # the negative cache uses the short TTL.
             raise

@@ -31,6 +31,7 @@ from ..utils import (
 )
 from .llm_client import LLMClient
 from .evidence_time import source_time_metadata
+from .search_source_url import resolve_bing_result_url
 
 logger = logging.getLogger(__name__)
 
@@ -883,6 +884,8 @@ class SpiderSwarm:
                             if title_link:
                                 title = title_link.get_text(strip=True)
                                 link_url = title_link.get('href', '')
+                                search_result_url = link_url
+                                link_url = resolve_bing_result_url(link_url)
 
                                 desc_elem = result.find('div', class_='b_caption')
                                 snippet = ""
@@ -898,7 +901,14 @@ class SpiderSwarm:
                                         content=snippet,
                                         url=link_url,
                                         source='bing',
-                                        metadata=source_time_metadata(snippet=snippet, url=link_url),
+                                        metadata={
+                                            **source_time_metadata(snippet=snippet, url=link_url),
+                                            "search_result_url": search_result_url,
+                                            "source_url_resolution": (
+                                                "bing_embedded_destination_v1"
+                                                if link_url != search_result_url else "unchanged"
+                                            ),
+                                        },
                                         sector=self._infer_sector(query),
                                         keywords=[query],
                                     )

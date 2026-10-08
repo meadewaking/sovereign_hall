@@ -23,6 +23,7 @@ from ..application.execute_simulation_cycle import (
     UnquotedExecutionRejectionCommitRequest,
 )
 from ..domain.common.ids import new_id
+from ..domain.portfolio.quote_freshness import is_fresh_quote
 from ..domain.portfolio.costs import CostSchedule
 from ..domain.portfolio.instruments import InstrumentProfile, normalize_ticker
 from ..domain.portfolio.models import ExecutionIntent
@@ -1433,6 +1434,7 @@ class InvestmentSimulation:
                             price=float(execution_quote["price"]),
                             quote_provider=str(execution_quote["provider"]),
                             quote_fetched_at=str(execution_quote["fetched_at"]),
+                            quote_quoted_at=str(execution_quote.get("quoted_at") or ""),
                             code=blocker_code,
                             reason=str(
                                 result.get("reason")
@@ -1716,17 +1718,7 @@ class InvestmentSimulation:
         market_data = self._market_data_service()
         if hasattr(market_data, "get_current_quote"):
             return await market_data.get_current_quote(ticker)
-        if not hasattr(market_data, "get_current_price"):
-            return None
-        price = await market_data.get_current_price(ticker)
-        if not price:
-            return None
-        return {
-            "ticker": self._normalize_ticker(ticker),
-            "price": float(price),
-            "source": "realtime_quote",
-            "fetched_at": datetime.now().isoformat(),
-        }
+        return None  # A bare price cannot establish provider event time.
 
     @staticmethod
     def _normalize_ticker(ticker: str) -> str:
@@ -1784,7 +1776,8 @@ class InvestmentSimulation:
                 return {
                     "price": float(quote["price"]),
                     "source": str(quote.get("source") or "realtime_quote"),
-                    "price_at": str(quote.get("fetched_at") or datetime.now().isoformat()),
+                    "price_at": str(quote["fetched_at"]),
+                    "quoted_at": str(quote["quoted_at"]),
                 }
         return {
             "price": None,
@@ -1793,24 +1786,7 @@ class InvestmentSimulation:
         }
 
     def _quote_is_fresh(self, quote: Any) -> bool:
-        if not isinstance(quote, dict):
-            return False
-        try:
-            if float(quote.get("price") or 0.0) <= 0:
-                return False
-        except (TypeError, ValueError):
-            return False
-        fetched_text = str(quote.get("fetched_at") or "").strip()
-        source = str(quote.get("source") or "").strip()
-        if not fetched_text or not source:
-            return False
-        try:
-            fetched = datetime.fromisoformat(fetched_text.replace("Z", "+00:00"))
-            now = datetime.now(fetched.tzinfo) if fetched.tzinfo else datetime.now()
-            age_seconds = (now - fetched).total_seconds()
-        except (TypeError, ValueError):
-            return False
-        return -60.0 <= age_seconds <= float(self.max_realtime_quote_age_seconds)
+        return is_fresh_quote(quote, max_age_seconds=self.max_realtime_quote_age_seconds)
 
     async def resolve_trade_price(self, ticker: str) -> tuple[Optional[float], str]:
         """Resolve a realtime-only simulated-trade price."""
@@ -1967,22 +1943,16 @@ class InvestmentSimulation:
                 'reason': '无法获取实时现价，拒绝模拟交易；不使用本地估值或历史价格兜底'
             }
         quote_detail = getattr(self, "_last_trade_quote_detail", {}) or {}
-        if quote_detail.get("ticker") != ticker or not quote_detail.get("price"):
-            quote_detail = {
-                "ticker": ticker,
-                "price": price,
-                "source": price_source or "realtime_quote",
-                "price_at": datetime.now().isoformat(),
-            }
-        quote_provider = str(quote_detail.get("source") or "realtime_quote")
-        quote_fetched_at = str(
-            quote_detail.get("price_at") or datetime.now().isoformat()
-        )
-        execution_quote = {
-            "price": float(price),
-            "provider": quote_provider,
-            "fetched_at": quote_fetched_at,
-        }
+        quote_provider = str(quote_detail.get("source") or "")
+        quote_fetched_at = str(quote_detail.get("price_at") or "")
+        quote_quoted_at = str(quote_detail.get("quoted_at") or "")
+        execution_quote = {"price": float(price), "provider": quote_provider,
+                           "fetched_at": quote_fetched_at, "quoted_at": quote_quoted_at}
+        if (quote_detail.get("ticker") != ticker or quote_detail.get("price") != price
+                or not self._quote_is_fresh({**execution_quote, "source": quote_provider})):
+            return {"success": False, "action": "hold", "ticker": ticker,
+                    "blocker_code": "realtime_quote_unavailable",
+                    "reason": "无法验证行情源时间，拒绝模拟交易"}
 
         # 计算当前持仓
         if direction_norm in ("short", "sell"):
@@ -2196,6 +2166,7 @@ class InvestmentSimulation:
                             reason=durable_reason,
                             quote_provider=quote_provider,
                             quote_fetched_at=quote_fetched_at,
+                            quote_quoted_at=quote_quoted_at,
                             new_cash=new_cash,
                             new_positions=new_positions,
                             idempotency_key=stable_key,
@@ -2346,6 +2317,7 @@ class InvestmentSimulation:
                             reason=durable_reason,
                             quote_provider=quote_provider,
                             quote_fetched_at=quote_fetched_at,
+                            quote_quoted_at=quote_quoted_at,
                             new_cash=new_cash,
                             new_positions=new_positions,
                             idempotency_key=stable_key,

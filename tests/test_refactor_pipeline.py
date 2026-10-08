@@ -2208,6 +2208,7 @@ def test_check_db_one_lot_boundary_includes_minimum_commission(
                 "price": 97.72,
                 "source": "test_realtime_quote",
                 "fetched_at": datetime.now().isoformat(),
+                "quoted_at": datetime.now().isoformat(),
             }
         },
     )
@@ -2980,6 +2981,7 @@ async def test_realtime_quote_batch_retries_only_missing_after_full_pass():
             "price": 1.5,
             "source": "controlled_realtime_quote",
             "fetched_at": datetime.now().isoformat(),
+            "quoted_at": datetime.now().isoformat(),
         }
 
     quotes = await collect_realtime_quote_batch(
@@ -3012,6 +3014,7 @@ async def test_calculate_assets_recovers_transient_quote_without_caller_fallback
             "price": 2.0,
             "source": "controlled_realtime_quote",
             "fetched_at": datetime.now().isoformat(),
+            "quoted_at": datetime.now().isoformat(),
         }
 
     monkeypatch.setattr(sim, "get_current_quote", fetch_quote)
@@ -5602,6 +5605,7 @@ async def test_simulation_applies_heuristic_position_cap(monkeypatch):
         "price": 9.0,
         "source": "test_realtime_quote",
         "fetched_at": datetime.now().isoformat(),
+        "quoted_at": datetime.now().isoformat(),
     })
     fake_market = type("FakeMarket", (), {"is_trading_day": AsyncMock(return_value=True)})()
     monkeypatch.setattr("sovereign_hall.services.market_data.get_market_data", lambda: fake_market)
@@ -6027,6 +6031,7 @@ async def test_simulation_passes_portfolio_gross_to_heuristic_cap(monkeypatch):
             "price": quotes[ticker],
             "source": "test_realtime_quote",
             "fetched_at": datetime.now().isoformat(),
+            "quoted_at": datetime.now().isoformat(),
         }
 
     sim.get_current_quote = AsyncMock(side_effect=realtime_quote)
@@ -6119,6 +6124,7 @@ async def test_simulation_assets_use_realtime_quote_not_local_or_prediction(tmp_
         "price": 99.0,
         "source": "test_realtime_quote",
         "fetched_at": datetime.now().isoformat(),
+        "quoted_at": datetime.now().isoformat(),
     })
 
     assets = await sim.calculate_assets()
@@ -6215,7 +6221,10 @@ async def test_simulation_incomplete_portfolio_valuation_blocks_new_buy(monkeypa
     sim = InvestmentSimulation()
     sim.cash = 9_000.0
     sim.positions = {"000001": {"shares": 100, "avg_cost": 10.0}}
-    sim.resolve_trade_price = AsyncMock(return_value=(20.0, "test_realtime_quote"))
+    sim.get_current_quote = AsyncMock(return_value={
+        "price": 20.0, "source": "test_realtime_quote",
+        "fetched_at": datetime.now().isoformat(), "quoted_at": datetime.now().isoformat(),
+    })
     sim._estimate_trade_assets = AsyncMock(
         return_value=({}, 9_000.0, ["000001"])
     )
@@ -6246,7 +6255,7 @@ async def test_simulation_incomplete_portfolio_valuation_blocks_new_buy(monkeypa
     assert "组合实时估值不完整" in result["reason"]
     assert "000001" in result["reason"]
     assert "600519" not in sim.positions
-    sim.resolve_trade_price.assert_awaited_once_with("600519")
+    sim.get_current_quote.assert_awaited_once_with("600519")
 
 
 @pytest.mark.asyncio

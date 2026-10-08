@@ -1613,6 +1613,14 @@ async def stage1_mass_search(
             getattr(spiders, "last_provider_health_report", {}) or {}
         ),
         "result_document_count": len(raw_docs),
+        "source_url_resolutions": [
+            {"document_id": doc.id, "url": doc.url,
+             "search_result_url": doc.metadata["search_result_url"],
+             "method": doc.metadata["source_url_resolution"]}
+            for doc in raw_docs
+            if (getattr(doc, "metadata", {}) or {}).get("source_url_resolution")
+            == "bing_embedded_destination_v1"
+        ],
         "network_enabled": bool(getattr(spiders, "network_enabled", True)),
     }
     search_audit["availability_status"] = (
@@ -1628,6 +1636,8 @@ async def stage1_mass_search(
             search_audit,
         )
     if deployment_research and raw_docs:
+        initial_docs = list(raw_docs)
+        evidence_docs = []
         evidence_queries = build_deployment_evidence_queries(raw_docs)
         if evidence_queries:
             logger.info(
@@ -1639,23 +1649,48 @@ async def stage1_mass_search(
                 max_results_per_query=max_results_per_query,
             )
             raw_docs = merge_documents_prefer_richer(raw_docs, evidence_docs)
-            deep_candidates = [
-                doc
-                for doc in rank_stage2_documents(evidence_docs)
-                if str(getattr(doc, "url", "") or "").startswith(("http://", "https://"))
-            ][:max(0, deployment_deep_fetch_max_docs)]
-            if deep_candidates:
-                deep_docs = await spiders.parallel_fetch(
-                    [getattr(doc, "url", "") for doc in deep_candidates],
-                    extract_full_text=True,
-                    max_concurrent=3,
-                )
-                raw_docs = merge_documents_prefer_richer(raw_docs, deep_docs)
-                logger.info(
-                    "阶段1：证据补强全文抓取 %s/%s 篇；失败保留原始摘要，不伪造正文",
-                    len(deep_docs),
-                    len(deep_candidates),
-                )
+        deep_candidates = [
+            doc for doc in rank_stage2_documents(evidence_docs)
+            if str(getattr(doc, "url", "") or "").startswith(("http://", "https://"))
+        ][:max(0, deployment_deep_fetch_max_docs)]
+        fetch_audit = {
+            "policy": "legacy_followup_only", "as_of": research_as_of.isoformat(),
+            "initial_count": len(initial_docs), "followup_count": len(evidence_docs),
+            "limit": max(0, deployment_deep_fetch_max_docs),
+            "selected": [{**document_time_audit(doc),
+                          "input_chars": len(str(getattr(doc, "content", "") or ""))}
+                         for doc in deep_candidates],
+        }
+        deep_docs = []
+        if deep_candidates:
+            deep_docs = await spiders.parallel_fetch(
+                [getattr(doc, "url", "") for doc in deep_candidates],
+                extract_full_text=True,
+                max_concurrent=3,
+            )
+            raw_docs = merge_documents_prefer_richer(raw_docs, deep_docs)
+            logger.info(
+                "阶段1：证据补强全文抓取 %s/%s 篇；失败保留原始摘要，不伪造正文",
+                len(deep_docs), len(deep_candidates),
+            )
+        fetch_audit.update(
+            followup_queries=evidence_queries,
+            source_url_resolutions=[
+                {"document_id": doc.id, "url": doc.url,
+                 "search_result_url": doc.metadata["search_result_url"],
+                 "method": doc.metadata["source_url_resolution"]}
+                for doc in evidence_docs
+                if (getattr(doc, "metadata", {}) or {}).get("source_url_resolution")
+                == "bing_embedded_destination_v1"
+            ],
+            fetched=[{**document_time_audit(doc),
+                      "content_chars": len(str(getattr(doc, "content", "") or ""))}
+                     for doc in deep_docs],
+            output_document_count=len(raw_docs),
+        )
+        spiders.last_fulltext_fetch_audit = fetch_audit
+        if round_coordinator is not None and round_id:
+            await round_coordinator.record_event(round_id, "ResearchFulltextAcquired", fetch_audit)
 
     print(f"\n抓取 {len(raw_docs)} 篇文档")
     return raw_docs
@@ -2295,6 +2330,14 @@ JSON数组结构：
 
 def parse_committee_vote(text: str) -> Dict:
     """Parse a loose committee vote into a small structured signal."""
+    # Transport/stage failures retain diagnostic JSON for audit. That JSON is
+    # not a completed vote, even if a permissive parser can extract it.
+    if str(text or "").lstrip().startswith("[committee_task_absent]"):
+        return {
+            "direction": "hold", "confidence": None, "position": None,
+            "risk_flags": [], "invalid_if": "", "key_evidence": [],
+            "is_valid": False, "parse_mode": "task_absent",
+        }
     parsed_json = _safe_parse_json(str(text or ""), None)
     if isinstance(parsed_json, dict):
         raw_direction = (
@@ -2400,6 +2443,11 @@ def parse_committee_vote(text: str) -> Dict:
 def parse_strict_committee_vote(text: str) -> Dict[str, Any]:
     """Validate the final-vote wire format without changing legacy parsers."""
     parsed = parse_committee_vote(text)
+    if parsed.get("parse_mode") == "task_absent":
+        return {
+            **parsed, "schema_valid": False,
+            "schema_error": "committee_task_absent", "parse_mode": "schema_invalid",
+        }
     raw_text = str(text or "").strip()
     payload = None
     if raw_text:
@@ -5897,6 +5945,10 @@ async def main():
             repo_root / "services" / "learning_engine.py",
             repo_root / "domain" / "portfolio" / "execution_policy.py",
             repo_root / "domain" / "portfolio" / "instruments.py",
+            repo_root / "domain" / "portfolio" / "quote_freshness.py",
+            repo_root / "services" / "market_data.py",
+            repo_root / "application" / "execute_simulation_cycle.py",
+            repo_root / "infrastructure" / "sqlite" / "migrations.py",
         ]
         artifacts: dict[str, str] = {}
         for path in candidates:
@@ -5907,7 +5959,7 @@ async def main():
     policy_snapshot_service = PolicySnapshotService(str(db_path))
     policy_snapshot_manifest = PolicyManifest(
         policy_family="run_discussion",
-        version="run_discussion_canonical_v1",
+        version="run_discussion_quote_event_time_v1",
         code_artifacts=_snapshot_code_artifacts(),
         effective_config=(
             config.to_dict() if hasattr(config, "to_dict") else {}
@@ -5933,8 +5985,8 @@ async def main():
             "heuristic_policy": "v1",
         },
         source_manifest_path=__file__,
-        change_reason="production startup",
-        changes_behavior=False,
+        change_reason="provider event time required; unknown trading calendar blocks execution",
+        changes_behavior=True,
     )
     try:
         policy_snapshot = await policy_snapshot_service.register(
