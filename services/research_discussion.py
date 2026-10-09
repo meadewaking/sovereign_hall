@@ -656,8 +656,8 @@ class ResearchDiscussionSystem:
         all_views = "\n\n".join(context.discussion_history)
 
         db = await self._get_db()
-        recent_reflections = await db.get_recent_reflections(limit=2)
-        reflection_text = "\n".join([r.get('reflection_text', '')[:500] for r in recent_reflections])
+        from .learning_engine import LearningEngine
+        digest_text = await LearningEngine(db.db_path).generate_research_memory_prompt(context.question)
 
         prompt = f"""
 基于多智能体深度讨论，请作为投资总监陈总监给出结论。
@@ -670,8 +670,8 @@ class ResearchDiscussionSystem:
 【自主研究主循环的最新持久化状态】
 {self.pipeline_memory_context or "暂无可用主循环状态"}
 
-【历史反思参考】
-{reflection_text if reflection_text else "无"}
+【历史轮次摘要】
+{digest_text if digest_text else "无"}
 
 【讨论摘要】
 {all_views[:10000]}...

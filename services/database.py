@@ -446,6 +446,29 @@ class DatabaseService:
             "ON research_stage_diagnostics(stage, created_at DESC)",
         )
 
+        await conn.execute('''CREATE TABLE IF NOT EXISTS round_digest (
+            round_id TEXT PRIMARY KEY,
+            importance_score INTEGER NOT NULL,
+            digest_text TEXT NOT NULL,
+            key_decisions TEXT,
+            key_predictions TEXT,
+            lessons TEXT,
+            source_doc_count INTEGER,
+            source_turn_count INTEGER,
+            source_event_count INTEGER,
+            compacted_at TEXT NOT NULL,
+            content_hash TEXT
+        )''')
+        await self._add_column_if_missing(conn, "round_digest", "key_decisions", "TEXT")
+        await self._add_column_if_missing(conn, "round_digest", "key_predictions", "TEXT")
+        await self._add_column_if_missing(conn, "round_digest", "lessons", "TEXT")
+        await self._add_column_if_missing(conn, "round_digest", "source_doc_count", "INTEGER")
+        await self._add_column_if_missing(conn, "round_digest", "source_turn_count", "INTEGER")
+        await self._add_column_if_missing(conn, "round_digest", "source_event_count", "INTEGER")
+        await self._add_column_if_missing(conn, "round_digest", "content_hash", "TEXT")
+
+        from .storage_archive import ensure_storage_schema
+        await ensure_storage_schema(conn)
         await conn.commit()
         self._initialized = True
         logger.info(f"Database initialized: {self.db_path}")
@@ -917,7 +940,10 @@ class DatabaseService:
         conn = await self._get_connection()
         async with conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)) as cursor:
             row = await cursor.fetchone()
-            return dict(row) if row else None
+        if row is None:
+            return None
+        from .storage_archive import hydrate_payload
+        return await hydrate_payload(conn, "document", dict(row), "content")
 
     async def search_documents(
         self,
@@ -944,7 +970,14 @@ class DatabaseService:
 
         async with conn.execute(sql, params) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+        from .storage_archive import search_cold_documents, hydrate_payload
+        found = {str(row["id"]): dict(row) for row in rows}
+        if query:
+            for row in await search_cold_documents(conn, query, sector=sector, limit=limit):
+                found[str(row["id"])] = row
+        selected = sorted(found.values(), key=lambda row: str(row.get("created_at") or ""),
+                          reverse=True)[:max(0, limit)]
+        return [await hydrate_payload(conn, "document", row, "content") for row in selected]
 
     async def count_documents(self) -> int:
         """统计文档数量"""
@@ -1409,6 +1442,27 @@ class DatabaseService:
         await self._add_column_if_missing(conn, "reflection_summary", "round_id", "TEXT")
         await self._ensure_report_conclusion_id_key(conn)
 
+        await conn.execute('''CREATE TABLE IF NOT EXISTS round_digest (
+            round_id TEXT PRIMARY KEY,
+            importance_score INTEGER NOT NULL,
+            digest_text TEXT NOT NULL,
+            key_decisions TEXT,
+            key_predictions TEXT,
+            lessons TEXT,
+            source_doc_count INTEGER,
+            source_turn_count INTEGER,
+            source_event_count INTEGER,
+            compacted_at TEXT NOT NULL,
+            content_hash TEXT
+        )''')
+        await self._add_column_if_missing(conn, "round_digest", "key_decisions", "TEXT")
+        await self._add_column_if_missing(conn, "round_digest", "key_predictions", "TEXT")
+        await self._add_column_if_missing(conn, "round_digest", "lessons", "TEXT")
+        await self._add_column_if_missing(conn, "round_digest", "source_doc_count", "INTEGER")
+        await self._add_column_if_missing(conn, "round_digest", "source_turn_count", "INTEGER")
+        await self._add_column_if_missing(conn, "round_digest", "source_event_count", "INTEGER")
+        await self._add_column_if_missing(conn, "round_digest", "content_hash", "TEXT")
+
         await conn.commit()
 
     async def save_report_conclusion(self, question: str, conclusion: str, ticker: str = "",
@@ -1459,6 +1513,88 @@ class DatabaseService:
         async with conn.execute(
             '''SELECT * FROM reflection_summary ORDER BY created_at DESC LIMIT ?''',
             (limit,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def save_round_digest(
+        self,
+        round_id: str,
+        importance_score: int,
+        digest_text: str,
+        key_decisions: str = "",
+        key_predictions: str = "",
+        lessons: str = "",
+        source_doc_count: int = 0,
+        source_turn_count: int = 0,
+        source_event_count: int = 0,
+        content_hash: str = "",
+    ):
+        """插入或更新 round_digest（UPSERT on round_id）。"""
+        conn = await self._get_connection()
+        await conn.execute(
+            '''INSERT INTO round_digest
+               (round_id, importance_score, digest_text, key_decisions,
+                key_predictions, lessons, source_doc_count, source_turn_count,
+                source_event_count, compacted_at, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(round_id) DO UPDATE SET
+                 importance_score=excluded.importance_score,
+                 digest_text=excluded.digest_text,
+                 key_decisions=excluded.key_decisions,
+                 key_predictions=excluded.key_predictions,
+                 lessons=excluded.lessons,
+                 source_doc_count=excluded.source_doc_count,
+                 source_turn_count=excluded.source_turn_count,
+                 source_event_count=excluded.source_event_count,
+                 compacted_at=excluded.compacted_at,
+                 content_hash=excluded.content_hash''',
+            (round_id, importance_score, digest_text, key_decisions,
+             key_predictions, lessons, source_doc_count, source_turn_count,
+             source_event_count, datetime.now().isoformat(), content_hash),
+        )
+        await conn.commit()
+
+    async def get_round_digest(self, round_id: str) -> Optional[Dict]:
+        conn = await self._get_connection()
+        async with conn.execute(
+            '''SELECT * FROM round_digest WHERE round_id = ?''',
+            (round_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_recent_digests(
+        self, limit: int = 5, min_importance: int = 0
+    ) -> List[Dict]:
+        """获取最近 N 条 round_digest，按 importance 降序、compacted_at 降序。"""
+        conn = await self._get_connection()
+        async with conn.execute(
+            '''SELECT * FROM round_digest
+               WHERE importance_score >= ?
+               ORDER BY importance_score DESC, compacted_at DESC
+               LIMIT ?''',
+            (min_importance, limit)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def list_rounds_older_than(
+        self, cutoff_iso: str, limit: int = 200
+    ) -> List[Dict]:
+        """列出 completed_at 早于 cutoff 的 round，且尚未有 digest 的。"""
+        conn = await self._get_connection()
+        async with conn.execute(
+            '''SELECT r.id, r.base_topic, r.research_objective, r.status,
+                      r.terminal_code, r.completed_at
+               FROM research_rounds r
+               LEFT JOIN round_digest d ON d.round_id = r.id
+               WHERE r.completed_at IS NOT NULL
+                 AND r.completed_at < ?
+                 AND d.round_id IS NULL
+               ORDER BY r.completed_at ASC
+               LIMIT ?''',
+            (cutoff_iso, limit)
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]

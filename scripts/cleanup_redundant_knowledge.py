@@ -15,6 +15,7 @@ import json
 import re
 import shutil
 import sqlite3
+import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,8 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 DATA_DIR = PROJECT_ROOT / "data"
 DB_PATH = DATA_DIR / "sovereign_hall.db"
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
@@ -161,7 +164,8 @@ def create_backups(backup_dir: Path, dry_run: bool) -> dict:
     if dry_run:
         return backups
     backup_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(DB_PATH, backup_dir / DB_PATH.name)
+    from sovereign_hall.services.storage_archive import consistent_backup
+    consistent_backup(DB_PATH, backup_dir / DB_PATH.name)
     if KNOWLEDGE_DIR.exists():
         shutil.make_archive(
             str(backup_dir / "knowledge"),
@@ -228,12 +232,11 @@ def delete_rowids(conn: sqlite3.Connection, rowids: set[int]) -> None:
 
 
 def cleanup_database(dry_run: bool) -> dict:
-    conn = sqlite3.connect(DB_PATH)
+    if not dry_run:
+        raise RuntimeError("Legacy row deletion is disabled; use compact_rounds.py lossless archival")
+    conn = sqlite3.connect(DB_PATH.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     before = table_count(conn, "documents")
-    conn.execute("ALTER TABLE documents ADD COLUMN content_hash TEXT") if "content_hash" not in {
-        row[1] for row in conn.execute("PRAGMA table_info(documents)")
-    } else None
 
     rows = fetch_document_rows(conn)
     stats = {
@@ -337,6 +340,8 @@ def raw_content_hash(raw_path: Path) -> str:
 
 
 def cleanup_wiki(dry_run: bool) -> dict:
+    if not dry_run:
+        raise RuntimeError("Legacy Wiki deletion is disabled; use compact_storage.py lossless packing")
     wiki_dir = KNOWLEDGE_DIR / "wiki"
     sources_dir = wiki_dir / "sources"
     raw_dir = KNOWLEDGE_DIR / "raw"
@@ -585,7 +590,11 @@ def main() -> int:
         default=DATA_DIR / "cleanup_backups" / created_stamp(),
         help="directory for pre-cleanup backups",
     )
+    parser.add_argument("--apply", action="store_true", help="disabled legacy deletion mode")
     args = parser.parse_args()
+    if args.apply:
+        parser.error("Legacy deletion is disabled; use compact_rounds.py or compact_storage.py")
+    args.dry_run = True
 
     result = {"dry_run": args.dry_run}
     result["backups"] = create_backups(args.backup_dir, args.dry_run)

@@ -620,13 +620,20 @@ class WikiStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text(encoding="utf-8") if path.exists() else None
         merged = merge_markdown_page(existing, content)
-        self.write_text(path, self._bound_aggregate_page(merged))
+        bounded = self._bound_aggregate_page(merged)
+        full_front, full_body = parse_frontmatter(merged)
+        bounded_front, bounded_body = parse_frontmatter(bounded)
+        if full_front != bounded_front or full_body.strip() != bounded_body.strip():
+            locator = self._archive_original("wiki_page", path, merged.encode("utf-8"))
+            bounded_front["full_page_archive"] = locator
+            bounded = dump_markdown(bounded_front, bounded_body)
+        self.write_text(path, bounded)
         # Incremental cache update: re-reading 114k+ md files on every write
         # dominated vector_db.search (~90s per round). Update only the
         # affected page in-place.
         if self._pages_cache is None:
             return
-        frontmatter, body = parse_frontmatter(merged)
+        frontmatter, body = parse_frontmatter(bounded)
         new_page = WikiPage(
             path=path,
             rel_path=normalize_path(path.relative_to(self.root)),
@@ -640,6 +647,25 @@ class WikiStore:
                 self._pages_cache[index] = new_page
                 return
         self._pages_cache.append(new_page)
+
+    def _archive_original(self, kind: str, path: Path, content: bytes) -> dict:
+        from .storage_archive import ArchiveStore
+        archive_path = self.root / ".archives" / "wiki.sqlite3"
+        previous = allocated_size(archive_path.stat()) if archive_path.exists() else 0
+        remaining = self.max_size_bytes - self.used_bytes() - 8192
+        if remaining < 0:
+            raise KnowledgeCapacityError("No capacity for a verified original archive")
+        archive = ArchiveStore(archive_path, max_bytes=previous + remaining)
+        try:
+            locator = archive.put(kind, path.relative_to(self.root).as_posix(), {"content": content})
+        except RuntimeError as exc:
+            raise KnowledgeCapacityError(str(exc)) from exc
+        self._used_bytes = self.used_bytes() + allocated_size(archive_path.stat()) - previous
+        return locator
+
+    def read_raw(self, relative_path: str) -> str:
+        from .wiki_archive import read_raw
+        return read_raw(self.root, relative_path).decode("utf-8")
 
     def rebuild_index(self) -> None:
         topics = self._index_links(self.topics_dir)
@@ -685,6 +711,10 @@ class WikiStore:
 
     def write_text(self, path: Path, content: str, *, bulk: bool = True) -> None:
         encoded = content.encode("utf-8")
+        if path.parent == self.raw_dir and path.exists():
+            previous_content = path.read_bytes()
+            if previous_content != encoded:
+                self._archive_original("wiki_raw", path, previous_content)
         previous_stat = path.stat() if path.exists() else None
         previous = allocated_size(previous_stat) if previous_stat else 0
         projected_file = (
@@ -738,14 +768,22 @@ class WikiStore:
         if len(body) > self.aggregate_page_max_chars:
             title = str(frontmatter.get("title") or "知识摘要")
             tail_budget = max(0, self.aggregate_page_max_chars - len(title) - 40)
-            body = f"# {title}\n\n## 压缩后的近期记录\n\n{body[-tail_budget:]}"
+            blocks, used = [], 0
+            for block in reversed(body.split("\n\n")):
+                if used + len(block) + 2 > tail_budget:
+                    break
+                blocks.append(block)
+                used += len(block) + 2
+            body = f"# {title}\n\n## 近期记录（完整历史见归档）\n\n" + "\n\n".join(reversed(blocks))
         return dump_markdown(frontmatter, body)
 
     def _rotate_log(self) -> None:
         if not self.log_path.exists():
             return
+        self._archive_original("wiki_log", self.log_path, self.log_path.read_bytes())
         oldest = self.root / f"log.{self.log_rotate_keep}.md.gz"
         if oldest.exists():
+            self._archive_original("wiki_log_gzip", oldest, oldest.read_bytes())
             oldest.unlink()
         for index in range(self.log_rotate_keep - 1, 0, -1):
             source = self.root / f"log.{index}.md.gz"

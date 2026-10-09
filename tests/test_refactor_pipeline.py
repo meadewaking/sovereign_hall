@@ -3764,7 +3764,8 @@ async def test_committee_redeployment_awaits_complete_realtime_asset_estimate(mo
 
 
 @pytest.mark.asyncio
-async def test_pending_replay_fills_count_in_cycle_without_reassigning_current_round(monkeypatch):
+@pytest.mark.parametrize("market_open", [True, False])
+async def test_pending_replay_fills_count_in_cycle_without_reassigning_current_round(monkeypatch, market_open):
     """Deferred fills are cycle activity but retain their originating rounds."""
     import sovereign_hall.run_discussion as discussion_module
 
@@ -3823,7 +3824,7 @@ async def test_pending_replay_fills_count_in_cycle_without_reassigning_current_r
         (),
         {
             "is_trading_day": AsyncMock(return_value=True),
-            "is_market_open": AsyncMock(return_value=True),
+            "is_market_open": AsyncMock(return_value=market_open),
         },
     )()
 

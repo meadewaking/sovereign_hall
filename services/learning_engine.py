@@ -187,12 +187,25 @@ class LearningEngine:
         topic: str,
         conclusion_limit: int = 5,
         prediction_limit: int = 12,
+        *,
+        as_of: str | None = None,
     ) -> str:
         """Bring prior conclusions and their prediction outcomes into the next loop.
 
         Historical text is explicitly labelled as a falsifiable prior so fresh
         network evidence remains authoritative.
         """
+        from .research_memory import retrieve_memory
+        try:
+            structured = await retrieve_memory(self.db_path, topic, as_of=as_of,
+                                               limit=conclusion_limit)
+        except Exception as exc:
+            logger.warning("加载结构化研究记忆失败: %s", exc)
+            structured = ""
+        if structured or as_of is not None:
+            # Legacy mutable prediction rows cannot establish point-in-time
+            # validity. Historical replay uses versioned memories exclusively.
+            return structured
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row

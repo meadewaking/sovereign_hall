@@ -5236,12 +5236,21 @@ async def run_committee_approved_simulation(
             else "当前不在A股交易时段；投委会结果与逐仓复核已持久化，可执行裁决仅排队"
         )
         redeployment_blockers.append(closed_reason)
+        # Research can outlast the trading session. Closing the market does
+        # not erase lifecycle fills committed before research, or reassign
+        # deferred replay fills away from their originating rounds.
+        round_fill_count = lifecycle_fill_count
+        cycle_fill_count = round_fill_count + replay_fill_count
+        entry_fill_count = lifecycle_entry_fill_count + replay_entry_fill_count
+        exit_fill_count = lifecycle_exit_fill_count + replay_exit_fill_count
         final_assets = await simulation.calculate_assets()
         if hasattr(simulation, "record_redeployment_attempt"):
             state = await simulation.record_redeployment_attempt(
                 final_assets,
                 candidate_count=len(deployable_new_longs),
-                trade_count=0,
+                trade_count=cycle_fill_count,
+                entry_trade_count=entry_fill_count,
+                exit_trade_count=exit_fill_count,
                 pending_count=pending_count,
                 blockers=redeployment_blockers,
                 rejections=redeployment_rejections,
@@ -5256,26 +5265,32 @@ async def run_committee_approved_simulation(
             print(f"\n📝 每日投资反思:")
             print(reflection[:500] + "...")
         await simulation.save_snapshot(reflection, round_id=round_id)
-        logger.info(
-            "SIMULATION_PIPELINE_END fills=0 pending=%s candidates=%s "
-            "valuation_complete=%s invested_ratio=%s terminal=market_closed",
-            pending_count,
-            len(trade_candidates),
-            final_assets.get("valuation_complete"),
-            final_assets.get("invested_ratio"),
-        )
         closed_terminal = select_simulation_terminal(
-            round_fill_count=0,
+            round_fill_count=round_fill_count,
             pending_count=pending_count,
             trade_candidates=trade_candidates,
             decisions=decisions,
             rejections=redeployment_rejections,
         )
+        logger.info(
+            "SIMULATION_PIPELINE_END fills=%s replay_fills=%s cycle_fills=%s "
+            "pending=%s candidates=%s valuation_complete=%s invested_ratio=%s terminal=%s",
+            round_fill_count,
+            replay_fill_count,
+            cycle_fill_count,
+            pending_count,
+            len(trade_candidates),
+            final_assets.get("valuation_complete"),
+            final_assets.get("invested_ratio"),
+            closed_terminal,
+        )
         return {
             "terminal": closed_terminal,
-            "fills": 0,
-            "replay_fills": 0,
-            "cycle_fills": 0,
+            "fills": round_fill_count,
+            "replay_fills": replay_fill_count,
+            "cycle_fills": cycle_fill_count,
+            "entry_fills": entry_fill_count,
+            "exit_fills": exit_fill_count,
             "pending": pending_count,
             "candidate_count": len(trade_candidates),
             "rejections": redeployment_rejections,
@@ -5939,6 +5954,9 @@ async def main():
 
         repo_root = _Path(__file__).resolve().parent
         candidates = [
+            repo_root / "run_discussion.py",
+            repo_root / "application" / "run_research_round.py",
+            repo_root / "domain" / "research" / "round_state.py",
             repo_root / "services" / "portfolio_policy.py",
             repo_root / "services" / "investment_simulation.py",
             repo_root / "services" / "heuristic_policy.py",
@@ -5961,7 +5979,7 @@ async def main():
     policy_snapshot_service = PolicySnapshotService(str(db_path))
     policy_snapshot_manifest = PolicyManifest(
         policy_family="run_discussion",
-        version="run_discussion_exchange_calendar_v1",
+        version="run_discussion_existing_fill_finalization_v1",
         code_artifacts=_snapshot_code_artifacts(),
         effective_config=(
             config.to_dict() if hasattr(config, "to_dict") else {}
@@ -5987,7 +6005,7 @@ async def main():
             "heuristic_policy": "v1",
         },
         source_manifest_path=__file__,
-        change_reason="verified dual-exchange annual calendar restores covered sessions; source-time price gates retained",
+        change_reason="retain already committed lifecycle fills through committee HOLD and later session closure; complete canonical round feedback",
         changes_behavior=True,
     )
     try:
