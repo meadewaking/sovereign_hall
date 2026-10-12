@@ -424,8 +424,6 @@ class DatabaseService:
         await apply_architecture_migrations(conn)
 
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_sector ON documents(sector)")
-        await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_url ON documents(url)")
-        await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash)")
         await self._create_index_if_possible(
             conn,
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_url "
@@ -436,6 +434,15 @@ class DatabaseService:
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_documents_content_hash "
             "ON documents(content_hash) WHERE content_hash IS NOT NULL AND content_hash <> ''",
         )
+        # Unique indexes already serve nonempty identity lookups. Retain the
+        # fallback only for legacy databases where unique creation failed.
+        for column in ('url', 'content_hash'):
+            async with conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                                    (f'ux_documents_{column}',)) as cursor:
+                unique_exists = await cursor.fetchone()
+            if not unique_exists:
+                await self._create_index_if_possible(conn,
+                    f'CREATE INDEX IF NOT EXISTS idx_documents_{column} ON documents({column})')
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_proposals_ticker ON proposals(ticker)")
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
         await self._create_index_if_possible(conn, "CREATE INDEX IF NOT EXISTS idx_meetings_proposal ON meetings(proposal_id)")
@@ -551,8 +558,8 @@ class DatabaseService:
             SELECT id, LENGTH(COALESCE(content, '')) AS content_len
             FROM documents
             WHERE id = ?
-               OR (? <> '' AND url = ?)
-               OR content_hash = ?
+               OR (? <> '' AND url = ? AND url <> '')
+               OR (content_hash = ? AND content_hash <> '')
             ORDER BY
                 CASE
                     WHEN id = ? THEN 0
@@ -597,7 +604,7 @@ class DatabaseService:
                     """
                     SELECT id
                     FROM documents
-                    WHERE content_hash = ? AND id <> ?
+                    WHERE content_hash = ? AND content_hash <> '' AND id <> ?
                     LIMIT 1
                     """,
                     (content_hash, existing["id"]),
@@ -720,8 +727,8 @@ class DatabaseService:
                     SELECT id, LENGTH(COALESCE(content, '')) AS content_len
                     FROM documents
                     WHERE id = ?
-                       OR (? <> '' AND url = ?)
-                       OR content_hash = ?
+                       OR (? <> '' AND url = ? AND url <> '')
+                       OR (content_hash = ? AND content_hash <> '')
                     ORDER BY
                         CASE
                             WHEN id = ? THEN 0
@@ -762,7 +769,7 @@ class DatabaseService:
                             """
                             SELECT id
                             FROM documents
-                            WHERE content_hash = ? AND id <> ?
+                            WHERE content_hash = ? AND content_hash <> '' AND id <> ?
                             LIMIT 1
                             """,
                             (content_hash, existing["id"]),

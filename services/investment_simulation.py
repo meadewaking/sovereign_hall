@@ -8,9 +8,10 @@ import copy
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
@@ -1786,6 +1787,7 @@ class InvestmentSimulation:
         }
 
     def _quote_is_fresh(self, quote: Any) -> bool:
+        # Re-fetching yesterday's close does not make it a current market tick.
         return is_fresh_quote(quote, max_age_seconds=self.max_realtime_quote_age_seconds)
 
     async def resolve_trade_price(self, ticker: str) -> tuple[Optional[float], str]:

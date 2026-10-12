@@ -494,6 +494,8 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--once", action="store_true", help="只运行一轮后退出")
     parser.add_argument("--max-rounds", type=int, default=0, help="最多运行轮数，0 表示无限")
     parser.add_argument("--skip-preflight", action="store_true", help="跳过 LLM/Embedding/搜索联通性检查")
+    parser.add_argument("--storage-maintenance-only", action="store_true",
+                        help="只执行一次本地存储维护并退出，不启动研究或模型请求")
     parser.add_argument(
         "--local-only",
         action="store_true",
@@ -5802,6 +5804,23 @@ def round_has_operational_result(
 # ============================================================================
 # 主循环
 # ============================================================================
+async def maintain_storage_once():
+    """Run the exact between-round path for local recovery and diagnosis."""
+    from sovereign_hall.services.database import DatabaseService
+    from sovereign_hall.services.storage_governor import StorageGovernor
+    from sovereign_hall.services.wiki_knowledge import WikiStore
+    db = DatabaseService(str(project_root / "data" / "sovereign_hall.db"))
+    try:
+        governor = StorageGovernor(db, WikiStore(project_root / "data" / "knowledge"))
+        await governor.initialize()
+        snapshot = await governor.before_round()
+        result = {"maintenance": governor.last_maintenance, "snapshot": snapshot.to_dict()}
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return result
+    finally:
+        await db.close()
+
+
 async def main():
     from sovereign_hall.core.config import get_config
     from sovereign_hall.services.database import DatabaseService
@@ -5810,11 +5829,16 @@ async def main():
     from sovereign_hall.services.llm_client import LLMClient
     from sovereign_hall.services.market_data import get_market_data
     from sovereign_hall.services.spider_service import SearchQueryGenerator, SpiderSwarm
-    from sovereign_hall.services.storage_governor import StorageGovernor
+    from sovereign_hall.services.storage_governor import (
+        StorageGovernor, storage_pressure_message, storage_requires_offline_recovery,
+    )
     from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
     from sovereign_hall.domain.research import ResearchRoundStatus
 
     args = parse_args()
+    if args.storage_maintenance_only:
+        await maintain_storage_once()
+        return
 
     print("\n" + "="*60)
     print("🔥 Sovereign Hall - 无限 Token 焚化炉")
@@ -5943,44 +5967,14 @@ async def main():
     from sovereign_hall.services.policy_snapshot_service import (
         PolicyManifest,
         PolicySnapshotService,
+        runtime_code_artifacts,
     )
-
-    def _snapshot_code_artifacts() -> dict[str, str]:
-        # Hash the source files that materially drive production decisions.
-        # Missing files are skipped silently; the snapshot remains valid.
-        from pathlib import Path as _Path
-
-        from sovereign_hall.services.policy_snapshot_service import hash_file
-
-        repo_root = _Path(__file__).resolve().parent
-        candidates = [
-            repo_root / "run_discussion.py",
-            repo_root / "application" / "run_research_round.py",
-            repo_root / "domain" / "research" / "round_state.py",
-            repo_root / "services" / "portfolio_policy.py",
-            repo_root / "services" / "investment_simulation.py",
-            repo_root / "services" / "heuristic_policy.py",
-            repo_root / "services" / "learning_engine.py",
-            repo_root / "domain" / "portfolio" / "execution_policy.py",
-            repo_root / "domain" / "portfolio" / "instruments.py",
-            repo_root / "domain" / "portfolio" / "quote_freshness.py",
-            repo_root / "services" / "market_data.py",
-            repo_root / "services" / "exchange_calendar.py",
-            *sorted((repo_root / "services" / "calendar_data").glob("*")),
-            repo_root / "application" / "execute_simulation_cycle.py",
-            repo_root / "infrastructure" / "sqlite" / "migrations.py",
-        ]
-        artifacts: dict[str, str] = {}
-        for path in candidates:
-            if path.exists():
-                artifacts[str(path.relative_to(repo_root))] = hash_file(path)
-        return artifacts
 
     policy_snapshot_service = PolicySnapshotService(str(db_path))
     policy_snapshot_manifest = PolicyManifest(
         policy_family="run_discussion",
-        version="run_discussion_existing_fill_finalization_v1",
-        code_artifacts=_snapshot_code_artifacts(),
+        version="run_discussion_runtime_manifest_v2",
+        code_artifacts=runtime_code_artifacts(Path(__file__).resolve().parent, "run_discussion.py"),
         effective_config=(
             config.to_dict() if hasattr(config, "to_dict") else {}
         ),
@@ -6005,9 +5999,9 @@ async def main():
             "heuristic_policy": "v1",
         },
         source_manifest_path=__file__,
-        change_reason="retain already committed lifecycle fills through committee HOLD and later session closure; complete canonical round feedback",
+        change_reason="identify the current canonical runtime by immutable source/config/model/prompt content",
         changes_behavior=True,
-    )
+    ).with_content_version()
     try:
         policy_snapshot = await policy_snapshot_service.register(
             policy_snapshot_manifest
@@ -6094,6 +6088,7 @@ async def main():
         except Exception as e:
             logger.debug(f"初始验证失败: {e}")
 
+        storage_was_paused = False
         while True:
             if args.max_rounds and (iteration - (prev_stats.get('total_rounds', 0) if prev_stats else 0)) >= args.max_rounds:
                 print(f"\n✅ 已达到 --max-rounds={args.max_rounds}，退出")
@@ -6110,19 +6105,22 @@ async def main():
 
             storage_snapshot = await storage_governor.before_round()
             if not storage_snapshot.research_round_allowed:
-                logger.warning(
-                    "存储达到研究限流水位，暂停新轮次: database=%.1f%% knowledge=%.1f%%",
-                    storage_snapshot.database.ratio * 100,
-                    storage_snapshot.knowledge.ratio * 100,
-                )
-                print(
-                    "\n🧹 存储整理中："
-                    f"数据库 {storage_snapshot.database.ratio:.1%}/2 GiB，"
-                    f"知识库 {storage_snapshot.knowledge.ratio:.1%}/1 GiB；"
-                    "降至90%以下后自动恢复研究"
-                )
+                storage_was_paused = True
+                notice = storage_pressure_message(storage_snapshot, storage_governor.last_maintenance)
+                logger.warning("STORAGE_PRESSURE %s", notice)
+                print("\n" + notice)
+                if storage_requires_offline_recovery(storage_snapshot, storage_governor.last_maintenance):
+                    raise RuntimeError(
+                        '归档和在线回收无法继续释放空间，已停止重复维护并释放连接。'
+                        '请运行 python scripts/compact_storage.py --apply 完成离线归档后重启研究；'
+                        f'详情：{storage_governor.last_maintenance}'
+                    )
                 await asyncio.sleep(storage_pressure_pause)
                 continue
+            if storage_was_paused:
+                logger.info("STORAGE_RECOVERED 存储限制已解除，恢复研究: %s", storage_snapshot.to_dict())
+                print("\n✅ 存储限制已解除，恢复研究")
+                storage_was_paused = False
 
             # 连续无结果时：末尾已经按 empty_rounds 做了指数退避或长休眠。
             # 这里只保留一个低阈值的短延迟，避免在议题切换瞬间重复打 LLM。
@@ -7159,7 +7157,9 @@ if __name__ == "__main__":
         parse_args()
         sys.exit(0)
     try:
-        signalled = kill_existing_run_discussion_instances()
+        # Maintenance must never stop an active producer just to inspect it.
+        # The actual instance lock refuses overlap instead.
+        signalled = [] if parse_args().storage_maintenance_only else kill_existing_run_discussion_instances()
         if signalled:
             print(f"   ✅ 已请求 {len(signalled)} 个旧 run_discussion 进程协作退出，继续检查单实例锁")
         with SingleInstanceLock(project_root / "data" / "run_discussion.lock"):

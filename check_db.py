@@ -47,20 +47,19 @@ def format_size(size_bytes: int) -> str:
 def get_realtime_prices(tickers: list) -> dict:
     """获取实时价格、来源和抓取时间；失败时不使用历史价格兜底。"""
     import asyncio
-    from sovereign_hall.services.market_data import get_market_data
+    from sovereign_hall.services.market_data import MarketDataService
 
     async def fetch():
-        md = get_market_data()
-        prices = {}
-        if hasattr(md, "get_current_quotes"):
-            quotes = await md.get_current_quotes(tickers)
-        else:
-            quotes = {}  # Price-only adapters cannot prove quote freshness.
-        for ticker in tickers:
-            quote = quotes.get(ticker)
-            if is_fresh_realtime_quote(quote):
-                prices[ticker] = quote
-        return prices
+        # Each synchronous refresh owns its event loop and HTTP connections.
+        # A global async client can otherwise retain a closed loop on refresh.
+        md = MarketDataService()
+        try:
+            codes = list(dict.fromkeys(normalize_ticker(t) for t in tickers))
+            quotes = await md.get_current_quotes(codes)
+            return {ticker: quotes[ticker] for ticker in codes
+                    if is_fresh_realtime_quote(quotes.get(ticker))}
+        finally:
+            await md.close()
 
     return asyncio.run(fetch())
 

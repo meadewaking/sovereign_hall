@@ -7,6 +7,7 @@ simulation all share the same price source and never fall back to fake prices.
 
 import asyncio
 import logging
+import re
 from datetime import date, datetime, time, timedelta
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -91,6 +92,9 @@ class MarketDataService:
         self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._quote_cache: Dict[str, Dict[str, Any]] = {}
         self._quote_ttl_seconds = 60
+        self._max_quote_age_seconds = 120
+        self._quote_request_timeout = min(float(timeout), 4.0)
+        self.last_quote_attempts: Dict[str, List[Dict[str, Any]]] = {}
         self._exchange_calendars: Dict[int, ExchangeCalendar] = {}
         self._eastmoney_ohlc_failures = 0
         self._eastmoney_ohlc_cooldown_until: Optional[datetime] = None
@@ -236,19 +240,70 @@ class MarketDataService:
             return dict(cached)
         self._quote_cache.pop(code, None)
         self._ensure_client()
-        for fetch, source in (
+        providers = (
             (self._fetch_tencent_quote, "tencent_realtime_quote"),
             (self._fetch_eastmoney_quote, "eastmoney_realtime_quote"),
             (self._fetch_sina_quote, "sina_realtime_quote"),
-        ):
-            price, name, quoted_at = await fetch(code)
-            quote = {"ticker": code, "price": price, "name": name,
-                     "source": source, "quoted_at": quoted_at,
-                     "fetched_at": datetime.now(MARKET_ZONE).isoformat()}
-            if is_fresh_quote(quote):
-                self._quote_cache[code] = quote
-                return dict(quote)
-        logger.warning("No fresh provider-timestamped market quote for %s", code)
+        )
+        attempts: List[Dict[str, Any]] = []
+        self.last_quote_attempts[code] = attempts
+
+        async def fetch_one(fetch, source, pass_index):
+            record = {"source": source, "pass": pass_index,
+                      "started_at": datetime.now(MARKET_ZONE).isoformat()}
+            attempts.append(record)
+            try:
+                price, name, quoted_at = await asyncio.wait_for(
+                    fetch(code), timeout=self._quote_request_timeout)
+                quote = {"ticker": code, "price": price, "name": name,
+                         "source": source, "quoted_at": quoted_at,
+                         "fetched_at": datetime.now(MARKET_ZONE).isoformat()}
+                if is_fresh_quote(quote, max_age_seconds=self._max_quote_age_seconds):
+                    record["status"] = "fresh"
+                    return quote
+                record["status"] = "invalid_or_stale_quote"
+            except asyncio.CancelledError:
+                record["status"] = "cancelled"
+                raise
+            except (TimeoutError, httpx.TransportError) as exc:
+                record.update(status="transport_failure", error_type=type(exc).__name__, retryable=True)
+            except httpx.HTTPStatusError as exc:
+                record.update(status="http_error", http_status=exc.response.status_code,
+                              retryable=exc.response.status_code in {502, 503, 504})
+            except Exception as exc:
+                record.update(status="invalid_response", error_type=type(exc).__name__)
+            finally:
+                record["finished_at"] = datetime.now(MARKET_ZONE).isoformat()
+            return None
+
+        pending_providers = list(providers)
+        for pass_index in range(2):
+            tasks = [asyncio.create_task(fetch_one(fetch, source, pass_index))
+                     for fetch, source in pending_providers]
+            winner = None
+            try:
+                for completed in asyncio.as_completed(tasks):
+                    candidate = await completed
+                    if candidate is not None:
+                        winner = candidate
+                        break
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # Cancellation cleanup must not rejuvenate a source timestamp.
+            if is_fresh_quote(winner, max_age_seconds=self._max_quote_age_seconds):
+                self._quote_cache[code] = winner
+                return dict(winner)
+            retry_sources = {a["source"] for a in attempts
+                             if a["pass"] == pass_index and a.get("retryable")}
+            pending_providers = [(fetch, source) for fetch, source in providers if source in retry_sources]
+            if pass_index or not pending_providers:
+                break
+            await asyncio.sleep(0.2)
+        logger.warning("No fresh provider-timestamped market quote for %s: %s", code,
+                       [(a["source"], a["status"], a.get("error_type")) for a in attempts])
         return None
 
     async def _fetch_tencent_quote(self, ticker: str) -> tuple[Optional[float], str, str]:
@@ -264,7 +319,8 @@ class MarketDataService:
                 quoted = datetime.strptime(parts[30], "%Y%m%d%H%M%S").replace(tzinfo=MARKET_ZONE)
                 return float(parts[3]), parts[1].strip(), quoted.isoformat()
         except Exception as exc:
-            logger.debug("Tencent quote failed for %s: %s", ticker, exc)
+            logger.debug("Tencent quote failed for %s (%s): %s", ticker, type(exc).__name__, exc)
+            raise
         return None, "", ""
 
     async def _fetch_eastmoney_quote(self, ticker: str) -> tuple[Optional[float], str, str]:
@@ -287,7 +343,8 @@ class MarketDataService:
             name = str(data.get("f58") or "").strip()
             return self._parse_eastmoney_price(raw, data.get("f59"), ticker), name, quoted.isoformat()
         except Exception as exc:
-            logger.debug("Eastmoney quote failed for %s: %s", ticker, exc)
+            logger.debug("Eastmoney quote failed for %s (%s): %s", ticker, type(exc).__name__, exc)
+            raise
         return None, "", ""
 
     @staticmethod
@@ -326,7 +383,10 @@ class MarketDataService:
             resp.raise_for_status()
             body = resp.content.decode("gbk", errors="strict")
             # Body: var hq_str_sh600519="name,昨收,今开,最新价,最高,最低,...,日期,时间,00,";
-            payload = body.split('="', 1)[-1].rstrip('";').rstrip(",")
+            match = re.fullmatch(r'\s*var\s+hq_str_' + market + ticker + r'\s*=\s*"([^"]*)"\s*;\s*', body)
+            if not match:
+                return None, "", ""
+            payload = match.group(1)
             parts = payload.split(",")
             if len(parts) < 32:
                 return None, "", ""
@@ -340,7 +400,8 @@ class MarketDataService:
             ).replace(tzinfo=MARKET_ZONE)
             return price, name, quoted.isoformat()
         except Exception as exc:
-            logger.debug("Sina quote failed for %s: %s", ticker, exc)
+            logger.debug("Sina quote failed for %s (%s): %s", ticker, type(exc).__name__, exc)
+            raise
         return None, "", ""
 
     async def _fetch_sina_ohlc(
