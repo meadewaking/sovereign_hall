@@ -17,6 +17,7 @@ from typing import Any
 
 from ..domain.portfolio.instruments import is_etf_ticker, normalize_ticker
 from .reward_policy import MAX_DAILY_TRADES
+from .runtime_execution_policy import unconfigured_account_gate_claims
 from .simulation_performance import (
     PERFORMANCE_FORMULA,
     PERFORMANCE_STANDARD,
@@ -170,7 +171,8 @@ def sanitize_candidate_rejection_reason(reason: Any) -> tuple[str, list[str]]:
 
     prefix, separator, flags_text = text.partition("；risk_flags=")
     if not separator:
-        if any(marker in text for marker in OBSOLETE_REJECTION_REASON_MARKERS):
+        if (any(marker in text for marker in OBSOLETE_REJECTION_REASON_MARKERS)
+                or unconfigured_account_gate_claims(text)):
             return "", [text]
         return text, []
 
@@ -180,7 +182,8 @@ def sanitize_candidate_rejection_reason(reason: Any) -> tuple[str, list[str]]:
         item = fragment.strip()
         if not item:
             continue
-        if any(marker in item for marker in OBSOLETE_REJECTION_REASON_MARKERS):
+        if (any(marker in item for marker in OBSOLETE_REJECTION_REASON_MARKERS)
+                or unconfigured_account_gate_claims(item)):
             superseded.append(item)
         else:
             active_flags.append(item)

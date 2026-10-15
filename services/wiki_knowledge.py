@@ -526,6 +526,9 @@ class WikiStore:
         self.aggregate_source_limit = max(1, int(cfg.get("aggregate_source_limit", 50)))
         self.log_rotate_bytes = max(1024, int(cfg.get("log_rotate_bytes", 8 * 1024**2)))
         self.log_rotate_keep = max(1, int(cfg.get("log_rotate_keep", 5)))
+        self.embedding_cache_max_bytes = max(0, int(cfg.get('embedding_cache_max_bytes', 48*1024**2)))
+        self.ingest_cache_max_bytes = max(0, int(cfg.get('ingest_cache_max_bytes', 8*1024**2)))
+        self.derived_cache_max_bytes = max(0, int(cfg.get('derived_cache_max_bytes', 64*1024**2)))
         self._used_bytes: Optional[int] = None
 
     def ensure_vault(self) -> None:
@@ -569,21 +572,55 @@ class WikiStore:
             )
 
     def load_cache(self) -> Dict[str, Any]:
-        if not self.cache_path.exists():
+        from .compressed_json import read_json, compressed_path
+        if not self.cache_path.exists() and not compressed_path(self.cache_path).exists():
             return {"entries": {}}
         try:
-            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            data = read_json(self.cache_path)
             return data if isinstance(data, dict) else {"entries": {}}
         except json.JSONDecodeError:
             return {"entries": {}}
 
     def save_cache(self, cache: Dict[str, Any]) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.write_text(
-            self.cache_path,
-            json.dumps(cache, ensure_ascii=False, separators=(",", ":")),
-            bulk=False,
-        )
+        self._write_derived_json(self.cache_path, cache)
+
+    def _write_derived_json(self, path: Path, value):
+        from .compressed_json import write_json, compressed_path
+        import gzip
+        used = self.used_bytes()
+        candidates = (path, compressed_path(path))
+        before = sum(allocated_size(p.stat()) for p in candidates if p.exists())
+        cache_used = sum(allocated_size(p.stat()) for pattern in ('*.json', '*.json.gz')
+                         for p in self.state_dir.glob(pattern) if p.is_file())
+        layer_limit = (self.embedding_cache_max_bytes if path.name == 'page_embeddings.json' else
+                       self.ingest_cache_max_bytes if path.name == 'ingest-cache.json' else
+                       self.derived_cache_max_bytes)
+        # The old file and the temporary replacement coexist during verification.
+        limit = min(layer_limit, max(0, self.derived_cache_max_bytes-cache_used+before),
+                    max(0, self.max_size_bytes-used))//4096*4096
+        known = path.name in ('page_embeddings.json', 'ingest-cache.json')
+        bounded = dict(value)
+        entries = dict(value.get('entries', {})) if path.name == 'ingest-cache.json' else bounded
+        if path.name == 'ingest-cache.json':
+            bounded['entries'] = entries
+        if limit == 0 and known:
+            for candidate in candidates:
+                candidate.unlink(missing_ok=True)
+            self._used_bytes = used-before
+            return {'entries': {}} if path.name == 'ingest-cache.json' else {}
+        while len(gzip.compress(json.dumps(bounded, ensure_ascii=False, separators=(',', ':')).encode(),
+                                compresslevel=6, mtime=0)) > limit:
+            if not known or not entries:
+                raise RuntimeError('Derived cache budget exceeded; original retained')
+            # Dictionary order is LRU for embeddings and insertion order for
+            # disposable ingestion hints. Keep surviving floats byte-exact.
+            for key in list(entries)[:max(1, len(entries)//4)]:
+                del entries[key]
+        write_json(path, bounded, max_output_bytes=limit)
+        after = sum(allocated_size(p.stat()) for p in candidates if p.exists())
+        self._used_bytes = used-before+after
+        return bounded
 
     def append_log(self, action: str, message: str) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -994,12 +1031,13 @@ class WikiSearchIndex:
         self._embeddings_path = store.state_dir / "page_embeddings.json"
 
     def _load_disk_embeddings(self) -> None:
+        from .compressed_json import read_json, compressed_path
         if self._embeddings_loaded:
             return
         self._embeddings_loaded = True
         try:
-            if self._embeddings_path.exists():
-                data = json.loads(self._embeddings_path.read_text(encoding="utf-8"))
+            if self._embeddings_path.exists() or compressed_path(self._embeddings_path).exists():
+                data = read_json(self._embeddings_path)
                 if isinstance(data, dict):
                     for key, vec in data.items():
                         if isinstance(vec, list):
@@ -1016,12 +1054,7 @@ class WikiSearchIndex:
             return
         try:
             self.store.state_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._embeddings_path.with_suffix(".tmp")
-            tmp_path.write_text(
-                json.dumps(self._page_embeddings),
-                encoding="utf-8",
-            )
-            tmp_path.replace(self._embeddings_path)
+            self._page_embeddings = self.store._write_derived_json(self._embeddings_path, self._page_embeddings)
             self._embeddings_dirty = False
         except Exception as exc:
             logger.warning("wiki page embeddings flush failed: %s", exc)
@@ -1147,10 +1180,14 @@ class WikiSearchIndex:
     async def _page_embedding(self, page: WikiPage) -> List[float]:
         key = f"{page.rel_path}:{stable_hash(page.body, 16)}"
         if key in self._page_embeddings:
-            return self._page_embeddings[key]
+            vector = self._page_embeddings.pop(key)
+            self._page_embeddings[key] = vector
+            return vector
         self._load_disk_embeddings()
         if key in self._page_embeddings:
-            return self._page_embeddings[key]
+            vector = self._page_embeddings.pop(key)
+            self._page_embeddings[key] = vector
+            return vector
         text = f"{page.title}\n{page.body[:8000]}"
         vector = await self.llm_client.get_embedding(text)
         self._page_embeddings[key] = vector

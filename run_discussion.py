@@ -63,6 +63,11 @@ from sovereign_hall.services.heuristic_policy import (
 )
 from sovereign_hall.domain.common.ids import new_id
 from sovereign_hall.domain.portfolio.instruments import is_etf_ticker
+from sovereign_hall.services.runtime_execution_policy import (
+    format_runtime_execution_policy,
+    sanitize_account_policy_memory,
+    unconfigured_account_gate_claims,
+)
 
 # 延迟导入Agent避免循环引用
 Agent = None
@@ -1088,6 +1093,17 @@ def prioritize_deployment_research(
     """
     assets = assets or {}
     if not assets.get("valuation_complete"):
+        # The ledger cash is observable even when holdings cannot be marked.
+        # Do not invent NAV/ratio or execute a trade, but retain the research
+        # objective instead of losing it at every close or provider outage.
+        from sovereign_hall.core.config import get_config
+        known_cash = float(assets.get("cash") or 0.0)
+        min_unit = int(get_config().get("simulation", {}).get("min_unit", 100) or 100)
+        if known_cash >= max(1, min_unit):
+            return (
+                f"{topic}｜账本现金{known_cash:.2f}元待研究"
+                "（实时估值不完整，不推算净值或投入率）资金部署候选证据比较"
+            )
         return topic
 
     total_assets = float(assets.get("total_assets") or 0.0)
@@ -1335,7 +1351,10 @@ def build_lessons_with_heuristic_context(
         parts.append(heuristic_prompt)
     if redeployment_context and redeployment_context.strip():
         parts.append(redeployment_context.strip())
-    return "\n\n".join(parts)
+    clean, removed = sanitize_account_policy_memory("\n\n".join(parts))
+    if removed:
+        logger.warning("RUNTIME_POLICY_MEMORY_QUARANTINED count=%s", len(removed))
+    return "\n\n".join(part for part in (clean, format_runtime_execution_policy()) if part)
 
 
 async def record_proposal_lot_screening_event(
@@ -2511,6 +2530,9 @@ def parse_strict_committee_vote(text: str) -> Dict[str, Any]:
         reason = "position_out_of_range"
 
     schema_valid = not reason and bool(parsed.get("is_valid"))
+    if schema_valid and unconfigured_account_gate_claims(payload):
+        reason = "unconfigured_account_execution_gate"
+        schema_valid = False
     return {
         **parsed,
         "is_valid": schema_valid,
@@ -2742,6 +2764,7 @@ def build_structured_vote_prompt(ticker: str, role_view: str, context: str, lear
 - 若投hold，key_evidence必须写清仍缺少的决定性证据或尚未消除的反证，invalid_if必须写下一次可转为long/short的具体条件。
 - confidence 用0到1小数，position 用0到1小数。
 {COMMITTEE_DECISION_BOUNDARIES}
+{format_runtime_execution_policy()}
 """.strip()
 
 
@@ -3206,6 +3229,9 @@ def aggregate_committee_decision(
 ) -> Dict:
     """Aggregate loose text votes into the decision used by downstream systems."""
     parsed = [parse_committee_vote(vote) for vote in vote_results]
+    for index, vote in enumerate(parsed):
+        if vote.get("is_valid") and unconfigured_account_gate_claims(vote_results[index]):
+            parsed[index] = {**vote, "is_valid": False, "parse_mode": "unconfigured_account_execution_gate"}
     weights = vote_weights or [2.0, 1.0, 1.0, 1.0, 1.0, 1.5, 1.0]
     labels = vote_labels or [f"vote_{index + 1}" for index in range(len(parsed))]
     scores = {"long": 0.0, "short": 0.0, "hold": 0.0, "abstain": 0.0}
@@ -3461,6 +3487,7 @@ def build_deployment_deadlock_review_prompt(
 - HOLD必须指出决定性证据缺口；超出能力圈必须abstain。
 - 这是模拟投资裁决，禁止真实下单。
 {COMMITTEE_DECISION_BOUNDARIES}
+{format_runtime_execution_policy()}
 """.strip()
 
 
@@ -4196,6 +4223,8 @@ async def stage3_ic_discussion(
                         lambda agent=agent, prompt=prompt: agent.think(
                             task=(
                                 f"{prompt}\n\n上一次输出缺席或未通过JSON结构校验。"
+                                "若上次引用-10%账户禁开仓或-15%清仓线，它们不是当前模拟执行配置，"
+                                "必须独立重审标的事实和真实风险；不能直接把HOLD改成LONG。"
                                 "本次不得输出解释、Markdown或代码围栏，只输出符合上述字段约束的单个JSON对象。"
                             ),
                             temperature=0.1,
@@ -5821,6 +5850,37 @@ async def maintain_storage_once():
         await db.close()
 
 
+async def await_storage_capacity(governor, pause_seconds=60):
+    """Keep the service alive while online maintenance pauses new writes."""
+    from sovereign_hall.services.storage_governor import storage_capacity_state, storage_pressure_message
+    last_notice = None
+    paused = False
+    while True:
+        snapshot = await governor.before_round()
+        if snapshot.research_round_allowed:
+            if paused:
+                logger.info('STORAGE_RECOVERED 存储限制已解除，自动恢复研究: %s', snapshot.to_dict())
+                print('\n✅ 存储限制已解除，自动恢复研究')
+            return snapshot
+        paused = True
+        maintenance = governor.last_maintenance
+        archive = maintenance.get('archive', {})
+        notice_key = (storage_capacity_state(snapshot, maintenance),
+                      snapshot.database.bulk_writes_allowed, snapshot.knowledge.bulk_writes_allowed,
+                      maintenance.get('error'), archive.get('error'))
+        # Status snapshots and maintenance reports keep updating. Repeat the
+        # user-facing warning only when the waiting reason changes.
+        if notice_key != last_notice:
+            notice = storage_pressure_message(snapshot, maintenance)
+            logger.warning('STORAGE_PRESSURE %s；进程持续运行，达到写入条件后自动恢复', notice)
+            print('\n' + notice + '；进程持续运行，达到写入条件后自动恢复')
+            last_notice = notice_key
+        delay = float(pause_seconds)
+        if snapshot.recovery_targets and (archive.get('can_continue') or archive.get('progressed')):
+            delay = min(delay, 5)
+        await asyncio.sleep(max(.01, delay))
+
+
 async def main():
     from sovereign_hall.core.config import get_config
     from sovereign_hall.services.database import DatabaseService
@@ -5829,9 +5889,7 @@ async def main():
     from sovereign_hall.services.llm_client import LLMClient
     from sovereign_hall.services.market_data import get_market_data
     from sovereign_hall.services.spider_service import SearchQueryGenerator, SpiderSwarm
-    from sovereign_hall.services.storage_governor import (
-        StorageGovernor, storage_pressure_message, storage_requires_offline_recovery,
-    )
+    from sovereign_hall.services.storage_governor import StorageGovernor
     from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
     from sovereign_hall.domain.research import ResearchRoundStatus
 
@@ -6088,7 +6146,6 @@ async def main():
         except Exception as e:
             logger.debug(f"初始验证失败: {e}")
 
-        storage_was_paused = False
         while True:
             if args.max_rounds and (iteration - (prev_stats.get('total_rounds', 0) if prev_stats else 0)) >= args.max_rounds:
                 print(f"\n✅ 已达到 --max-rounds={args.max_rounds}，退出")
@@ -6103,24 +6160,7 @@ async def main():
                 await asyncio.sleep(daily_budget_pause)
                 continue
 
-            storage_snapshot = await storage_governor.before_round()
-            if not storage_snapshot.research_round_allowed:
-                storage_was_paused = True
-                notice = storage_pressure_message(storage_snapshot, storage_governor.last_maintenance)
-                logger.warning("STORAGE_PRESSURE %s", notice)
-                print("\n" + notice)
-                if storage_requires_offline_recovery(storage_snapshot, storage_governor.last_maintenance):
-                    raise RuntimeError(
-                        '归档和在线回收无法继续释放空间，已停止重复维护并释放连接。'
-                        '请运行 python scripts/compact_storage.py --apply 完成离线归档后重启研究；'
-                        f'详情：{storage_governor.last_maintenance}'
-                    )
-                await asyncio.sleep(storage_pressure_pause)
-                continue
-            if storage_was_paused:
-                logger.info("STORAGE_RECOVERED 存储限制已解除，恢复研究: %s", storage_snapshot.to_dict())
-                print("\n✅ 存储限制已解除，恢复研究")
-                storage_was_paused = False
+            await await_storage_capacity(storage_governor, storage_pressure_pause)
 
             # 连续无结果时：末尾已经按 empty_rounds 做了指数退避或长休眠。
             # 这里只保留一个低阈值的短延迟，避免在议题切换瞬间重复打 LLM。

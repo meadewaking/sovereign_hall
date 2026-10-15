@@ -133,6 +133,14 @@ class DatabaseService:
             self._connection.row_factory = aiosqlite.Row
             await self._connection.execute("PRAGMA foreign_keys = ON")
             await self._connection.execute("PRAGMA busy_timeout = 5000")
+            # New databases must enable pointer maps before creating tables;
+            # otherwise incremental reclamation would require a full rebuild.
+            async with self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
+            ) as cursor:
+                has_tables = await cursor.fetchone()
+            if not has_tables:
+                await self._connection.execute('PRAGMA auto_vacuum=INCREMENTAL')
             await self._connection.execute("PRAGMA journal_mode = WAL")
         return self._connection
 

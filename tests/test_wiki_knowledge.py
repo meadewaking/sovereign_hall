@@ -92,7 +92,7 @@ async def test_wiki_ingest_cache_skips_unchanged_document(tmp_path, sample_doc):
     second_log = (tmp_path / "knowledge" / "log.md").read_text(encoding="utf-8")
 
     assert first_log == second_log
-    cache = json.loads((tmp_path / "knowledge" / ".state" / "ingest-cache.json").read_text(encoding="utf-8"))
+    cache = kb.store.load_cache()
     assert len(cache["entries"]) == 1
 
 

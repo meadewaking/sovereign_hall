@@ -101,7 +101,7 @@ vector_db:
 knowledge_wiki:
   root: "./data/knowledge"
   max_size_bytes: 1073741824  # 1 GiB hard ceiling for the whole knowledge vault
-  target_size_ratio: 0.70
+  target_size_ratio: 0.60
   maintenance_ratio: 0.80
   bulk_write_stop_ratio: 0.90
   source_excerpt_chars: 500
@@ -111,6 +111,9 @@ knowledge_wiki:
   log_rotate_keep: 5
   raw_hot_retention_days: 30
   embedding_enabled: true
+  embedding_cache_max_bytes: 50331648  # 48 MiB, disposable vectors
+  ingest_cache_max_bytes: 8388608  # 8 MiB, disposable ingestion index
+  derived_cache_max_bytes: 67108864  # 64 MiB total for derived JSON caches
   lazy_migration_batch_size: 10
   min_wiki_hits: 5
   chunk_target_chars: 1000
@@ -124,7 +127,7 @@ database:
   path: "./sovereign_hall/data/sovereign_hall.db"
   max_bundle_size_bytes: 2147483648  # 2 GiB including DB/WAL/SHM
   max_main_file_bytes: 2080374784  # 1984 MiB, reserving 64 MiB for WAL/SHM
-  target_size_ratio: 0.70
+  target_size_ratio: 0.60
   maintenance_ratio: 0.80
   bulk_write_stop_ratio: 0.90
   max_round_document_links: 300
@@ -135,6 +138,15 @@ database:
   snapshot_daily_retention_days: 180
   non_trade_quote_retention_days: 7
   knowledge_rescan_interval_rounds: 24
+
+# Hot learning memory is a bounded cache; immutable evidence has its own quota.
+agent_memory:
+  episodic_max_bytes: 33554432
+  semantic_max_bytes: 8388608
+  procedural_max_bytes: 2097152
+  max_item_bytes: 8192
+  backfill_batch_limit: 20
+  archive_migration_batch_limit: 20
 
 # 系统运行配置
 system:

@@ -84,7 +84,7 @@ class Config:
             'knowledge_wiki': {
                 'root': str(DATA_DIR / 'knowledge'),
                 'max_size_bytes': 1024 * 1024 * 1024,
-                'target_size_ratio': 0.70,
+                'target_size_ratio': 0.60,
                 'maintenance_ratio': 0.80,
                 'bulk_write_stop_ratio': 0.90,
                 'source_excerpt_chars': 500,
@@ -94,12 +94,24 @@ class Config:
                 'log_rotate_keep': 5,
                 'raw_hot_retention_days': 30,
                 'embedding_enabled': True,
+                'embedding_cache_max_bytes': 48 * 1024**2,
+                'ingest_cache_max_bytes': 8 * 1024**2,
+                'derived_cache_max_bytes': 64 * 1024**2,
                 'lazy_migration_batch_size': 10,
                 'min_wiki_hits': 5,
                 'chunk_target_chars': 1000,
                 'chunk_max_chars': 1500,
                 'chunk_min_chars': 200,
                 'chunk_overlap_chars': 200,
+            },
+
+            'agent_memory': {
+                'episodic_max_bytes': 32 * 1024**2,
+                'semantic_max_bytes': 8 * 1024**2,
+                'procedural_max_bytes': 2 * 1024**2,
+                'max_item_bytes': 8192,
+                'backfill_batch_limit': 20,
+                'archive_migration_batch_limit': 20,
             },
 
             # 缓存配置
@@ -118,7 +130,7 @@ class Config:
                 'sqlite_path': str(DATA_DIR / 'sovereign_hall.db'),
                 'max_bundle_size_bytes': 2 * 1024 * 1024 * 1024,
                 'max_main_file_bytes': 1984 * 1024 * 1024,
-                'target_size_ratio': 0.70,
+                'target_size_ratio': 0.60,
                 'maintenance_ratio': 0.80,
                 'bulk_write_stop_ratio': 0.90,
                 'max_round_document_links': 300,
