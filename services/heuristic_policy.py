@@ -98,6 +98,7 @@ class HeuristicRiskContext:
     simulation_performance: dict[str, Any] = field(default_factory=dict)
     offline_diagnostic_policy: str = ""
     offline_diagnostic_score: float | None = None
+    target_invested_ratio: float = 1.0
 
     @property
     def available(self) -> bool:
@@ -923,11 +924,7 @@ def gross_exposure_position_cap(
     """Prevent leverage while keeping all simulated capital inside the portfolio."""
     if current_position is None or current_gross_exposure is None:
         return None
-    effective_max_gross = max(
-        SIMULATION_TARGET_INVESTED_RATIO,
-        float(context.max_gross or 0.0),
-    )
-    effective_max_gross = min(effective_max_gross, 1.0)
+    effective_max_gross = min(float(context.max_gross or 1.0), 1.0)
     other_gross = max(0.0, float(current_gross_exposure) - max(float(current_position), 0.0))
     return max(0.0, effective_max_gross - other_gross)
 
@@ -1435,14 +1432,14 @@ def load_latest_heuristic_context(runs_root: Path = RUNS_ROOT) -> HeuristicRiskC
             offline_policy = match.group(1) if match else snapshot.stem
             break
 
-    health_status = str(performance.get("health_status") or "valuation_incomplete")
-    failure_reasons = list(performance.get("failure_reasons") or [])
-    warning = "；".join(failure_reasons) or health_status
+    warning = "；".join(f"{name}={performance.get(name, 'unavailable')}" for name in
+                       ("research_status", "execution_status", "capital_status", "evaluation_status"))
     score = performance.get("score")
     score = float(score) if score is not None else None
     return HeuristicRiskContext(
         run_dir=run_dir,
         policy_name="simulation_live_policy_v1",
+        target_invested_ratio=float(simulation_config.get("target_invested_ratio", 1.0)),
         score=score,
         max_position=max_position,
         min_signal_count=1,
@@ -1495,9 +1492,8 @@ def apply_heuristic_risk_cap(
         current_gross_exposure=float(current_gross_exposure or 0.0),
         limits=ExecutionPolicyLimits(
             max_single_position=float(ctx.max_position),
-            # Offline policies may have tested a smaller gross cap, but live
-            # simulation has a fixed 100% deployment invariant.
-            max_gross=SIMULATION_TARGET_INVESTED_RATIO,
+            # The configured gross ceiling is independent of the deployment goal.
+            max_gross=min(float(ctx.max_gross or 1.0), 1.0),
         ),
     )
     minimum_confidence = float(ctx.min_confidence or 0.0)
@@ -1603,7 +1599,7 @@ def apply_heuristic_risk_cap(
         elif ctx.min_signal_count > 1:
             reason += f"；latest policy要求至少{ctx.min_signal_count}条本地同日预测观察支持"
         if gross_cap is not None and gross_cap < target_position:
-            reason += f"；组合禁止杠杆且目标满投资，当前可用仓位{gross_cap:.1%}"
+            reason += f"；当前组合风险预算剩余{gross_cap:.1%}"
         return capped, reason
     if sleeve_reason:
         return capped, sleeve_reason
@@ -1655,7 +1651,7 @@ def apply_heuristic_risk_cap(
             f"latest policy要求至少{ctx.min_signal_count}条本地同日预测观察支持，单条孤证只允许观察/小仓"
         )
     if gross_cap is not None and gross_cap <= max(0.0, target_position) + 1e-12:
-        risk_notes.append("组合目标投资比例100%，仅禁止杠杆，不因风险偏好保留战略现金")
+        risk_notes.append("执行受获批仓位与当前组合风险预算约束，未配置资金可以等待合格机会")
     tape_note = format_tape_update_note(ctx)
     if tape_note:
         if tape_update_cap is not None:
@@ -1780,7 +1776,7 @@ def _format_legacy_offline_prompt_context(
         ),
         f"- 历史评估稳健性告警（不等于当前轮次停机）: {ctx.warning}",
         "- 用法: 只能作为本地风控约束/解释，不得编造成外部市场事实；历史评估不得直接放大仓位。",
-        "- 资金用途: 模拟资金目标投资比例为100%；风险控制必须通过标的替换、分散、减仓后再配置完成，不得把战略现金当作默认避险资产。",
+        f"- 资金用途: 配置投入目标为{ctx.target_invested_ratio:.0%}；不得据此放大本次获批仓位，缺少合格机会时允许现金等待。",
         "- 关键边界: daily_prices只服务历史回测，不用于当前估值或模拟成交；其缺失不得单独构成致命级否决或永久0%仓位。当前轮次产生的新鲜本地证据若通过置信度/观察门槛，可在单标的、分散、实时行情和每日5笔硬门内小步部署。",
         f"- 决策目标: 总资金净收益优先；{REWARD_FORMULA}。",
         f"- 交易频率: 每个交易日最多{MAX_DAILY_TRADES}笔模拟成交；买卖、止损止盈和调仓合并计数，达到上限后形成待执行裁决。",
@@ -1976,7 +1972,7 @@ def format_policy_checklist(context: HeuristicRiskContext) -> str:
         gates.append(f"风险收益比>={context.min_risk_reward:.2f}")
     if context.min_holding_days:
         gates.append(f"最短持有>={context.min_holding_days}天")
-    gates.append("组合目标投资比例=100%（仅允许手续费/整手约束造成的操作性余款，禁止战略现金）")
+    gates.append(f"组合目标投资比例={context.target_invested_ratio:.0%}（研究配置目标；不能提高单标的获批预算，允许等待合格机会）")
     if context.min_signal_count > 1:
         gates.append(f"同日观察>={context.min_signal_count}条")
     coverage_cap = weak_price_coverage_position_cap(context)
@@ -2048,20 +2044,23 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
         f"- 唯一绩效标准: {PERFORMANCE_STANDARD}；{PERFORMANCE_FORMULA}。",
         (
             f"- 实时模拟账户累计净收益={_format_live_return(live_return)}；"
-            f"系统健康={health_status}；投入率={invested_text}；最近成交={latest_trade}。"
+            f"投入率={invested_text}；最近成交={latest_trade}。"
         ),
         "- 离线回测、样本外分数、Sharpe和leaderboard仅用于发现失败模式；不得作为best、score、策略晋升、扩仓或继续空仓的依据。",
         "- 离线诊断内容不得编造成外部市场事实。",
         (
             f"- 当前生效的是静态执行安全边界，不是离线收益best："
-            f"单标的上限={ctx.max_position:.1%}，组合目标投入=100%，"
+            f"单标的上限={ctx.max_position:.1%}，组合目标投入={ctx.target_invested_ratio:.0%}，"
             f"置信度>={float(ctx.min_confidence or 0.0):.0%}，"
             f"每交易日最多{MAX_DAILY_TRADES}笔模拟成交。"
         ),
-        "- 资金规则: 组合目标投入比例为100%，禁止战略现金；未部署资金必须记录证据、行情、整手或执行阻塞。",
+        "- 资金目标与单标的获批预算分开；不得为完成投入目标提高本次仓位。合格机会缺失时允许现金等待。",
         "- 买入、卖出、止损、止盈与调仓均须在交易时段重新获取实时行情；旧价、成本价和回测价格不得兜底。",
         "- 没有证据时必须记录空结果与具体阻塞原因，不能伪造候选或成交。",
     ]
+    lines.append("- 链路状态: " + "；".join(f"{key}={performance.get(key, 'unavailable')}" for key in
+        ("research_status", "execution_status", "capital_status", "evaluation_status")) +
+        "。低投入、HOLD和账户亏损不能单独证明执行故障或要求新增交易。")
     checklist = format_policy_checklist(ctx)
     if checklist:
         lines.append(checklist)
@@ -2139,7 +2138,7 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
         lines.append(f"- 验证分数（离线诊断）: 样本外score={oos}; 3x滑点score={stress}。")
     if health_status == "system_failure_no_live_deployment":
         lines.append(
-            "- 系统故障优先级: 当前长期低投入且无新成交不是正常观望；本轮必须追踪并修复“联网研究→证据提案→投委会→实时行情→模拟成交”断点，未成交时持久化准确故障码和下一步。"
+            "- 链路核查: 用来源、有效裁决、实时行情和执行结果定位阻塞；没有合格机会时保留HOLD，不因低投入或无成交强制交易。"
         )
     if ctx.simulation_failures:
         tickers = ", ".join(row["ticker"] for row in ctx.simulation_failures[:6])
@@ -2195,11 +2194,8 @@ def format_heuristic_status(
     invested_text = (
         f"{float(invested_ratio):.1%}" if invested_ratio is not None else "N/A"
     )
-    live_warning = "；".join(
-        str(item) for item in (performance.get("failure_reasons") or []) if item
-    )
-    if not live_warning:
-        live_warning = str(performance.get("health_status") or ctx.warning)
+    live_warning = "；".join(f"{key}={performance.get(key, 'unavailable')}" for key in
+        ("research_status", "execution_status", "capital_status", "evaluation_status"))
     lines = [
         "\n🧭 Heuristic / 模拟账户绩效状态",
         "=" * 60,
@@ -2210,8 +2206,7 @@ def format_heuristic_status(
             f"score: {score_text}"
         ),
         (
-            "   系统健康: "
-            f"{performance.get('health_status', 'valuation_incomplete')} | "
+            "   账户状态: "
             f"投入率: {invested_text} | "
             f"累计成交: {int(performance.get('trade_count') or 0)} | "
             f"最近成交: {performance.get('latest_trade_at') or '无'}"
@@ -2283,10 +2278,6 @@ def format_heuristic_status(
         lines.append(
             "   离线诊断artifact（非生效）: "
             f"{ctx.offline_diagnostic_policy} | diagnostic_score={offline_score}"
-        )
-    if performance.get("health_status") == "system_failure_no_live_deployment":
-        lines.append(
-            "   ❌ 系统异常: 长期低投入且无新模拟成交；必须优先修复研究到成交链路，不能用回测收益覆盖"
         )
     if ctx.failure_cases:
         lines.append("   最近 failure cases（离线诊断）:")

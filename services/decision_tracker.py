@@ -869,7 +869,10 @@ class DecisionRecorder:
         max_price = None
         min_price = None
 
-        raw_bars = await market.get_ohlc(record['ticker'], window_start, window_end)
+        history = getattr(market, "get_unadjusted_ohlc", market.get_ohlc)
+        raw_bars = await history(record['ticker'], window_start, window_end)
+        if any(bar.get("adjustment", "raw") != "raw" for bar in (raw_bars or [])):
+            return {"error": "prediction_anchor_adjustment_mismatch"}
         if not raw_bars:
             return {"error": "prediction_window_data_unavailable"}
         calendar = await market.get_trading_calendar(window_start, window_end)
@@ -1104,23 +1107,65 @@ class DecisionRecorder:
 
     async def validate_pending(self, max_count: int = 50) -> Dict:
         """批量验证待验证的决策"""
+        await self._ensure_tables()
+        revisions = {}
         # 只验证已到预期窗口的 pending 记录，避免新预测被当天价格污染。
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
+            tables = {row[0] for row in await (await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}
+            if "daily_price_revisions" in tables:
+                revisions = dict(await (await db.execute(
+                    "SELECT ticker,MAX(rowid) FROM daily_price_revisions GROUP BY ticker")).fetchall())
             async with db.execute("""
-                SELECT id, predicted_at, expected_days FROM price_predictions
-                WHERE status = 'pending'
-                AND datetime(MAX(predicted_at, COALESCE(entry_date, predicted_at)), '+' || COALESCE(expected_days, 30) || ' days') <= datetime('now', 'localtime')
-                ORDER BY predicted_at ASC
-                LIMIT ?
-            """, (max_count,)) as cursor:
-                candidates = await cursor.fetchall()
+                SELECT p.id,p.ticker,p.predicted_at,p.expected_days,
+                       a.attempt_count,a.next_attempt_at,a.source_revision
+                FROM price_predictions p LEFT JOIN prediction_validation_attempts a ON a.prediction_id=p.id
+                WHERE p.status = 'pending'
+                AND datetime(MAX(p.predicted_at, COALESCE(p.entry_date, p.predicted_at)), '+' || COALESCE(p.expected_days, 30) || ' days') <= datetime('now', 'localtime')
+                ORDER BY COALESCE(a.last_attempt_at,''),p.predicted_at,p.id
+            """) as cursor:
+                now = datetime.now()
+                candidates = []
+                for row in await cursor.fetchall():
+                    due = row['next_attempt_at']
+                    if (not due or datetime.fromisoformat(due) <= now or
+                            int(revisions.get(row['ticker'], 0)) > int(row['source_revision'] or 0)):
+                        candidates.append(row)
+                        if len(candidates) >= max(0, max_count):
+                            break
+                if max_count <= 0:
+                    candidates = []
 
         results = []
         for row in candidates:
             record_id = row['id']
-            result = await self.validate_single(record_id)
+            try:
+                result = await self.validate_single(record_id)
+            except Exception as exc:
+                logger.exception("Prediction validation failed: %s", record_id)
+                result = {"error": "validation_exception:" + type(exc).__name__}
             results.append(result)
+            attempt = int(row['attempt_count'] or 0) + 1
+            error = result.get('error')
+            permanent = error in {'invalid_prediction_window', 'invalid_prediction_anchor'}
+            disposition = ('unjudgeable' if permanent else 'retry_wait') if error else 'validated'
+            delay = (86400 if 'ambiguous' in str(error) or 'expiry_evidence' in str(error)
+                     else min(21600, 60 * 2 ** min(attempt - 1, 9)))
+            next_at = (datetime.now() + timedelta(seconds=delay)).isoformat() if error else None
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""INSERT INTO prediction_validation_attempts
+                    (prediction_id,attempt_count,last_attempt_at,last_error,next_attempt_at,disposition,source_revision)
+                    VALUES (?,?,?,?,?,?,?) ON CONFLICT(prediction_id) DO UPDATE SET
+                    attempt_count=excluded.attempt_count,last_attempt_at=excluded.last_attempt_at,
+                    last_error=excluded.last_error,next_attempt_at=excluded.next_attempt_at,
+                    disposition=excluded.disposition,source_revision=excluded.source_revision""",
+                    (record_id,attempt,datetime.now().isoformat(),error,next_at,disposition,
+                     int(revisions.get(row['ticker'], 0))))
+                if permanent:
+                    await db.execute("UPDATE price_predictions SET status='unjudgeable',result='unknown' "
+                                     "WHERE id=? AND status='pending'", (record_id,))
+                await db.commit()
 
         terminal_results = {"correct", "partial", "wrong"}
         validated = sum(1 for r in results if r.get("result") in terminal_results)

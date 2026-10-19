@@ -68,6 +68,15 @@ async def ensure_prediction_schema(db: aiosqlite.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_predictions_due "
         "ON price_predictions(status, predicted_at, expected_days)"
     )
+    await db.execute("""CREATE TABLE IF NOT EXISTS prediction_validation_attempts (
+        prediction_id TEXT PRIMARY KEY,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT NOT NULL,
+        last_error TEXT,
+        next_attempt_at TEXT,
+        disposition TEXT NOT NULL,
+        source_revision INTEGER NOT NULL DEFAULT 0
+    )""")
 
     await db.execute(
         """

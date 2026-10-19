@@ -433,10 +433,12 @@ class Config:
         if int(simulation.get("max_daily_trades", 5) or 0) != 5:
             errors.append("simulation.max_daily_trades must equal the shared hard limit 5")
         target = float(simulation.get("target_invested_ratio", 1.0) or 0.0)
-        if target != 1.0:
-            errors.append("simulation.target_invested_ratio must equal 1.0")
-        if float(simulation.get("max_gross", 1.0) or 0.0) > 1.0:
-            errors.append("simulation.max_gross cannot exceed 1.0")
+        if not 0.0 <= target <= 1.0:
+            errors.append("simulation.target_invested_ratio must be between 0 and 1")
+        if not 0.0 < float(simulation.get("max_gross", 1.0)) <= 1.0:
+            errors.append("simulation.max_gross must be in (0, 1]")
+        if not 0.0 < float(simulation.get("max_single_position", 1.0)) <= 1.0:
+            errors.append("simulation.max_single_position must be in (0, 1]")
         if float(simulation.get("trading_fee", 0.0) or 0.0) <= 0:
             errors.append("simulation.trading_fee must be positive")
         if float(simulation.get("minimum_commission", 0.0) or 0.0) <= 0:

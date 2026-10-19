@@ -1060,13 +1060,17 @@ class WikiSearchIndex:
         self._page_embeddings: Dict[str, List[float]] = {}
         self._embeddings_dirty = False
         self._embeddings_loaded = False
-        self._embeddings_path = store.state_dir / "page_embeddings.json"
+        state_dir = getattr(store, "state_dir", None)
+        self._embeddings_path = state_dir / "page_embeddings.json" if state_dir else None
+        self.last_vector_timeout = False
 
     def _load_disk_embeddings(self) -> None:
         from .compressed_json import read_json, compressed_path
         if self._embeddings_loaded:
             return
         self._embeddings_loaded = True
+        if self._embeddings_path is None:
+            return
         try:
             if self._embeddings_path.exists() or compressed_path(self._embeddings_path).exists():
                 data = read_json(self._embeddings_path)
@@ -1082,7 +1086,7 @@ class WikiSearchIndex:
             logger.warning("wiki page embeddings load failed: %s", exc)
 
     def _flush_disk_embeddings(self) -> None:
-        if not self._embeddings_dirty:
+        if not self._embeddings_dirty or self._embeddings_path is None:
             return
         try:
             self.store.state_dir.mkdir(parents=True, exist_ok=True)
@@ -1098,6 +1102,7 @@ class WikiSearchIndex:
         filter_sector: Optional[str] = None,
         min_similarity: float = 0.0,
     ) -> List[SearchHit]:
+        self.last_vector_timeout = False
         pages = self.store.all_wiki_pages()
         if filter_sector:
             pages = [
@@ -1139,6 +1144,7 @@ class WikiSearchIndex:
                     timeout=VECTOR_ENRICHMENT_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
+                self.last_vector_timeout = True
                 logger.warning(
                     "wiki vector enrichment timeout (%.1fs); returning %s lexical hits",
                     VECTOR_ENRICHMENT_TIMEOUT_SECONDS,
@@ -1412,8 +1418,7 @@ class WikiKnowledgeBase:
         # already timed out in the first search the second call would re-embed
         # the same pages and stack another ~20s timeout. Skip the retry when the
         # first pass returned only lexical hits due to enrichment timeout.
-        first_vector_hit_count = sum(1 for h in hits if h.vector_score is not None)
-        if len(hits) < min(self.min_wiki_hits, top_k) and first_vector_hit_count > 0:
+        if len(hits) < min(self.min_wiki_hits, top_k) and not self.search_index.last_vector_timeout:
             migrated = await self._lazy_migrate(query, filter_sector=filter_sector)
             if migrated:
                 hits = await self.search_index.search(query, top_k=top_k, filter_sector=filter_sector, min_similarity=min_similarity)

@@ -4308,7 +4308,7 @@ def test_heuristic_risk_cap_uses_latest_policy_as_constraint(tmp_path):
     assert "样本外风险" in reason
 
 
-def test_heuristic_risk_cap_uses_full_investment_target_instead_of_cash_reserve(tmp_path):
+def test_heuristic_risk_cap_respects_configured_gross_budget(tmp_path):
     context = HeuristicRiskContext(
         run_dir=tmp_path,
         policy_name="single_stock_hold6_cap5_min2obs_anomaly12",
@@ -4330,8 +4330,8 @@ def test_heuristic_risk_cap_uses_full_investment_target_instead_of_cash_reserve(
     )
     checklist = format_policy_checklist(context)
 
-    assert capped == pytest.approx(0.05)
-    assert reason is None
+    assert capped == pytest.approx(0.02)
+    assert reason is not None
     assert "组合目标投资比例=100%" in checklist
 
 
@@ -5485,9 +5485,10 @@ def test_format_heuristic_status_prefers_injected_realtime_account_view(tmp_path
     )
 
     assert "score: -0.027750" in status
-    assert "系统健康: degraded_underdeployed" in status
+    assert "账户状态:" in status
     assert "投入率: 27.2%" in status
-    assert "模拟账户投入率27.2%低于80%健康线" in status
+    assert "模拟账户投入率27.2%低于80%健康线" not in status
+    assert "execution_status=unavailable" in status
     assert "实时估值不完整" not in status
 
 
@@ -5541,7 +5542,8 @@ def test_heuristic_policy_checklist_surfaces_promoted_gates(tmp_path):
     assert "风险收益比>=0.90" in checklist
     assert "最短持有>=6天" in checklist
     assert "组合目标投资比例=100%" in checklist
-    assert "禁止战略现金" in prompt
+    assert "不能提高单标的获批预算" in prompt
+    assert "允许等待合格机会" in prompt
     assert "Heuristic入场校验" in prompt
 
 

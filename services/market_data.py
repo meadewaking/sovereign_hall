@@ -478,14 +478,18 @@ class MarketDataService:
         ticker: str,
         start: date | datetime | str,
         end: date | datetime | str = None,
+        *, adjustment: str = "qfq",
     ) -> List[Dict]:
         """Fetch daily OHLC bars from Eastmoney, with AkShare as a fallback."""
+        if adjustment not in {"qfq", "raw"}:
+            raise ValueError("OHLC adjustment must be qfq or raw")
         secid = self.eastmoney_secid(ticker)
         if not secid:
             return []
 
         code = self.normalize_ticker(ticker)
-        cached = self._ohlc_negative_cache.get(code)
+        cache_key = code if adjustment == "qfq" else code + ":raw"
+        cached = self._ohlc_negative_cache.get(cache_key)
         if cached:
             expiry, reason = cached
             if datetime.now().timestamp() < expiry:
@@ -494,7 +498,7 @@ class MarketDataService:
                 )
                 return []
             # expired entry; drop it so the next attempt actually fires.
-            self._ohlc_negative_cache.pop(code, None)
+            self._ohlc_negative_cache.pop(cache_key, None)
 
         self._ensure_client()
         start_s = self._format_date(start)
@@ -505,7 +509,7 @@ class MarketDataService:
             "fields1": "f1,f2,f3,f4,f5,f6",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
             "klt": "101",
-            "fqt": "1",
+            "fqt": "1" if adjustment == "qfq" else "0",
             "beg": start_s,
             "end": end_s,
         }
@@ -530,19 +534,21 @@ class MarketDataService:
                 if bars:
                     self._eastmoney_ohlc_failures = 0
                     self._eastmoney_ohlc_cooldown_until = None
-                    return self._decorate_bars(bars, "eastmoney_ohlc_qfq")
+                    return self._decorate_bars(bars, "eastmoney_ohlc_" + adjustment)
             except Exception as exc:
                 self._record_eastmoney_ohlc_failure(ticker, exc)
 
-        tencent_bars, tencent_permanent = await self._fetch_tencent_ohlc(
-            ticker, start_s, end_s
-        )
+        if adjustment == "qfq":
+            tencent_bars, tencent_permanent = await self._fetch_tencent_ohlc(ticker, start_s, end_s)
+        else:
+            tencent_bars, tencent_permanent = await self._fetch_tencent_ohlc(
+                ticker, start_s, end_s, adjustment="raw")
         if tencent_bars:
             return self._decorate_bars(tencent_bars, "tencent_ohlc_qfq")
 
-        akshare_bars, akshare_permanent = await self._fetch_akshare_ohlc(
-            ticker, start_s, end_s
-        )
+        akshare_bars, akshare_permanent = (
+            await self._fetch_akshare_ohlc(ticker, start_s, end_s)
+            if adjustment == "qfq" else ([], False))
         if akshare_bars:
             return self._decorate_bars(akshare_bars, "akshare_ohlc_qfq")
 
@@ -561,7 +567,7 @@ class MarketDataService:
         )
         reason = "all_providers_failed"
         async with self._ohlc_negative_lock:
-            self._ohlc_negative_cache[code] = (
+            self._ohlc_negative_cache[cache_key] = (
                 datetime.now().timestamp() + ttl,
                 reason,
             )
@@ -572,6 +578,10 @@ class MarketDataService:
             ttl,
         )
         return []
+
+    async def get_unadjusted_ohlc(self, ticker, start, end=None):
+        """Match historical validation barriers to unadjusted execution anchors."""
+        return await self.get_ohlc(ticker, start, end, adjustment="raw")
 
     @staticmethod
     def _is_permanent_http_failure(exc: BaseException) -> bool:
@@ -588,13 +598,14 @@ class MarketDataService:
         # Sina's getKLineData returns raw (unadjusted) bars; all other
         # providers apply qfq.  Downstream code uses this field to decide
         # whether back-adjustment is needed when stitching windows.
-        adjustment = "raw" if provider == "sina_ohlc" else "qfq"
+        adjustment = "raw" if provider == "sina_ohlc" or provider.endswith("_raw") else "qfq"
         return [
             {
                 **bar,
-                "provider": provider,
+                "provider": ("tencent_ohlc_" + str(bar.get("adjustment") or adjustment)
+                             if provider.startswith("tencent_ohlc") else provider),
                 "fetched_at": fetched_at,
-                "adjustment": adjustment,
+                "adjustment": str(bar.get("adjustment") or adjustment),
                 "quality_status": "validated",
                 "trade_status": str(bar.get("trade_status") or "normal"),
             }
@@ -714,7 +725,7 @@ class MarketDataService:
             logger.warning("Eastmoney OHLC fetch failed for %s: %s", ticker, exc)
 
     async def _fetch_tencent_ohlc(
-        self, ticker: str, start_s: str, end_s: str
+        self, ticker: str, start_s: str, end_s: str, *, adjustment: str = "qfq"
     ) -> Tuple[List[Dict], bool]:
         """Fetch Tencent daily bars.
 
@@ -744,7 +755,7 @@ class MarketDataService:
             while chunk_start <= end_day:
                 chunk_end = min(chunk_start + timedelta(days=699), end_day)
                 bars_for_chunk, rejected = await self._tencent_fetch_chunk(
-                    url, market, code, chunk_start, chunk_end
+                    url, market, code, chunk_start, chunk_end, qfq=adjustment == "qfq"
                 )
                 if rejected:
                     qfq_rejected = True
@@ -755,7 +766,8 @@ class MarketDataService:
                         url, market, code, chunk_start, chunk_end, qfq=False
                     )
                 for bar in bars_for_chunk:
-                    by_date[bar["date"]] = bar
+                    by_date[bar["date"]] = {**bar, "adjustment": (
+                        "raw" if rejected or adjustment == "raw" else str(bar.get("adjustment") or "qfq"))}
                 chunk_start = chunk_end + timedelta(days=1)
             if qfq_rejected and by_date:
                 logger.info(
@@ -834,6 +846,8 @@ class MarketDataService:
         # If qfq was requested but only `day` (not `qfqday`) came back, the
         # server silently ignored qfq — flag so the caller can log + degrade.
         qfq_rejected = qfq and not rows.get("qfqday") and bool(rows.get("day"))
+        for bar in bars:
+            bar["adjustment"] = "qfq" if qfq and rows.get("qfqday") else "raw"
         return bars, qfq_rejected
 
     async def _fetch_akshare_ohlc(

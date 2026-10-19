@@ -2475,18 +2475,10 @@ def parse_strict_committee_vote(text: str) -> Dict[str, Any]:
         try:
             payload = json.loads(raw_text)
         except (TypeError, ValueError, json.JSONDecodeError):
-            stripped = raw_text
-            if stripped.startswith("```"):
-                stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
-                stripped = re.sub(r"\s*```\s*$", "", stripped)
-            # Match the LAST balanced {...} block: LLM responses often wrap
-            # JSON in prose like "投票如下: {...} 以上是判断".
-            match = re.search(r"\{[\s\S]*\}", stripped)
-            if match:
-                try:
-                    payload = json.loads(match.group(0))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    payload = None
+            # The final-vote wire contract is one JSON object. Legacy prose
+            # parsing remains available via parse_committee_vote; malformed
+            # final votes take the existing explicit repair/retry path.
+            payload = None
 
     reason = ""
     required = {
@@ -2633,7 +2625,7 @@ COMMITTEE_DECISION_BOUNDARIES = """
 - 当议题标记“空仓资金部署”时，当前组合没有行业相关性或已有科技仓位；不得虚构存量暴露作为否决理由。
 - 必须区分“事实反证”与“尚未取得数据”。前者可投HOLD/SHORT；后者写入补证队列，但不能伪称事实已经证伪。
 - 非本角色能力圈且没有独立新增证据时投abstain，不得用HOLD代替弃权。abstain参与出席法定人数，但不计入方向票。
-- 风险控制优先使用标的筛选、分散、仓位上限、止损止盈和期限，不得把长期现金当默认风险资产。
+- 风险控制使用标的筛选、分散、仓位上限、止损止盈和期限。缺少合格机会时可以HOLD；投入目标不能代替单标的风险预算。
 """.strip()
 
 
@@ -2759,7 +2751,7 @@ def build_structured_vote_prompt(ticker: str, role_view: str, context: str, lear
 约束：
 - 证据不足或反证更强时 direction 必须是 hold，position 必须是 0。
 - 若该标的超出本角色能力圈且没有独立新增证据，direction 必须是 abstain，position 必须是 0；不得用hold代替弃权。
-- 模拟组合目标投资比例是100%，hold不是默认的“无风险”选项；必须同时衡量继续闲置资金的机会成本。
+- 组合配置目标与本次单标的预算分开。比较持仓风险与现金机会成本；没有合格机会可以hold，不得为了投入率放大仓位。
 - 若已有可追溯事实、可证伪逻辑、明确止损/期限且预期收益风险比不低于0.8，应在风险预算内投long/short，而不是因存在一般性风险自动hold。
 - 若投hold，key_evidence必须写清仍缺少的决定性证据或尚未消除的反证，invalid_if必须写下一次可转为long/short的具体条件。
 - confidence 用0到1小数，position 用0到1小数。
@@ -4763,11 +4755,10 @@ async def run_committee_approved_simulation(
     round_id: str | None = None,
     round_coordinator=None,
     pre_reviewed_positions: Optional[List[Dict[str, Any]]] = None,
+    portfolio_maintenance=None,
 ):
     """Run the daily simulated portfolio step after committee decisions exist."""
-    from sovereign_hall.services.portfolio_policy import (
-        deployment_position_floor as calculate_deployment_position_floor,
-    )
+    from sovereign_hall.domain.portfolio.execution_policy import approved_execution_target
     from sovereign_hall.services.reward_policy import MAX_DAILY_TRADES
     trading_day = await market_data.is_trading_day()
     market_open = bool(trading_day)
@@ -4822,11 +4813,15 @@ async def run_committee_approved_simulation(
         print("   离线回测仅作诊断，不产生best/score，也不能替代模拟成交")
 
     print("   🔎 先执行全部现有持仓的强制生命周期复核...")
-    position_reviews = (
-        list(pre_reviewed_positions)
-        if pre_reviewed_positions is not None
-        else await simulation.review_open_positions()
-    )
+    # Research may have lasted long enough for another lifecycle boundary to
+    # cross. Keep earlier fills for round accounting, never reuse old HOLDs.
+    position_reviews = [
+        item for item in (pre_reviewed_positions or [])
+        if (item.get("execution") or {}).get("action") in {"buy", "sell"}
+        and (item.get("execution") or {}).get("success") is not False
+    ]
+    position_reviews.extend(await (simulation.review_open_positions(round_id=round_id)
+                                  if round_id else simulation.review_open_positions()))
     logger.info(
         "SIMULATION_LIFECYCLE_REVIEW positions=%s outcomes=%s",
         len(position_reviews),
@@ -4937,7 +4932,7 @@ async def run_committee_approved_simulation(
     else:
         print("   资金部署: N/A；组合实时估值不完整，禁止新增或扩大仓位")
     if assets.get('deployment_gap') is not None and assets['deployment_gap'] > 0:
-        print("   规则: 待部署现金不是风险储备；仅因缺少合格标的、新鲜价格、手续费或整手约束暂时未成交")
+        print("   规则: 现金等待须说明具体原因；缺少合格机会时可以HOLD，投入目标不能放大获批仓位")
 
     current_positions = assets.get('positions', {})
     current_tickers = set(current_positions.keys())
@@ -5103,13 +5098,15 @@ async def run_committee_approved_simulation(
         and decision.get("ticker")
         and simulation._normalize_ticker(decision.get("ticker")) not in current_ticker_codes
     ]
-    deployment_position_floor = 0.0
-    if deployable_new_longs and assets.get('total_assets') is not None and assets['total_assets'] > 0:
-        deployment_position_floor = calculate_deployment_position_floor(
-            assets.get('deployment_gap', 0.0),
-            assets['total_assets'],
-            len(deployable_new_longs),
-        )
+    # One sizing policy for open and closed sessions. Retain the original
+    # committee record; an unfilled deployment objective is not a new approval.
+    trade_candidates = [
+        {**decision, "approved_target_position": float(decision.get("target_position") or 0),
+         "target_position": approved_execution_target(
+             float(decision.get("target_position") or 0), decision.get("confidence"))
+         if decision.get("direction") == "long" else 0.0}
+        for decision in trade_candidates
+    ]
 
     if not market_session_open:
         pending_count = 0
@@ -5134,13 +5131,6 @@ async def run_committee_approved_simulation(
                     ticker,
                 )
                 continue
-            if (
-                direction == "long"
-                and ticker not in current_ticker_codes
-                and deployment_position_floor > target_position
-            ):
-                target_position = deployment_position_floor
-
             # A closed-session row is a deferred ruling, not a bypass around
             # the same price-independent heuristic gates used while the market
             # is open. Replay still fetches a fresh quote and re-runs every
@@ -5291,7 +5281,8 @@ async def run_committee_approved_simulation(
                     f"   🧾 再配置队列: {state.get('status')} | "
                     f"gap={state.get('deployment_gap')} | blocker={state.get('blocker_code')}"
                 )
-        reflection = await simulation.daily_reflection(llm)
+        reflection = await (portfolio_maintenance.during(simulation.daily_reflection(llm), context="investment_reflection")
+                            if portfolio_maintenance else simulation.daily_reflection(llm))
         if reflection:
             print(f"\n📝 每日投资反思:")
             print(reflection[:500] + "...")
@@ -5439,12 +5430,6 @@ async def run_committee_approved_simulation(
                 continue
 
             has_position = ticker in current_ticker_codes
-            if direction == "long" and not has_position and deployment_position_floor > target_position:
-                target_position = deployment_position_floor
-                print(
-                    f"   🎯 {ticker}: 为完成100%资金部署，将候选目标仓位提高到"
-                    f"{target_position:.1%}，随后仍接受单标的/证据风控约束"
-                )
             if "卖出" in history_reflection and has_position and direction == "long":
                 trade_position = target_position * 0.3
                 trade_reason = "反思建议谨慎，小幅建仓"
@@ -5460,15 +5445,9 @@ async def run_committee_approved_simulation(
                 )
                 print(f"   ⏭️ {ticker} 已有持仓，跳过买入")
                 continue
-            elif confidence < 0.4:
-                trade_position = target_position * 0.3
-                trade_reason = f"低置信度{confidence:.0%}，轻仓尝试"
-            elif confidence < 0.6:
-                trade_position = target_position * 0.5
-                trade_reason = f"中等置信度{confidence:.0%}，半仓"
             else:
                 trade_position = target_position
-                trade_reason = f"投委会置信度{confidence:.0%}，按裁决执行"
+                trade_reason = f"投委会置信度{confidence:.0%}，按统一获批预算执行"
             if price_source:
                 trade_reason = f"{trade_reason}；价格来源={price_source}"
 
@@ -5642,15 +5621,15 @@ async def run_committee_approved_simulation(
     else:
         if not redeployment_rejections:
             reject(
-                "system_failure_no_live_deployment",
-                "模拟账户空仓且投委会没有返回任何结构化裁决；研究到成交链路未闭合",
+                "no_approved_intent",
+                "本轮没有获批的可执行裁决，现金等待合格候选",
             )
         print(
-            "   ❌ 系统异常：模拟账户空仓且无可执行裁决；"
-            "本轮未产生成交，不能解释为正常观望或用离线收益覆盖"
+            "   💤 当前空仓且无可执行裁决，等待合格候选；"
+            "资料、投票或行情的实际阻塞另行记录"
         )
-        logger.error(
-            "SIMULATION_PIPELINE_FAILURE code=system_failure_no_live_deployment "
+        logger.info(
+            "SIMULATION_PIPELINE_IDLE code=no_approved_intent "
             "decisions=%s candidates=%s rejections=%s",
             len(decisions),
             len(trade_candidates),
@@ -5733,7 +5712,8 @@ async def run_committee_approved_simulation(
         final_performance.get("health_status"),
     )
 
-    reflection = await simulation.daily_reflection(llm)
+    reflection = await (portfolio_maintenance.during(simulation.daily_reflection(llm), context="investment_reflection")
+                        if portfolio_maintenance else simulation.daily_reflection(llm))
     if reflection:
         print(f"\n📝 每日投资反思:")
         print(reflection[:500] + "...")
@@ -6101,15 +6081,39 @@ async def main():
     # 初始化投资模拟
     from sovereign_hall.services.investment_simulation import InvestmentSimulation
     from sovereign_hall.services.committee_meeting_store import CommitteeMeetingStore
-    simulation = InvestmentSimulation(db_service)
+    # Research batches and fills must never share a SQLite transaction. This
+    # separate connection has one portfolio owner; no second account process.
+    account_db_service = DatabaseService(str(db_path))
+    await account_db_service._init_db()
+    simulation = InvestmentSimulation(account_db_service)
     await simulation.initialize()
     await simulation.init_tables()
+    from sovereign_hall.application.execute_simulation_cycle import validate_balance_checkpoint
+    async with account_db_service.transaction(immediate=True) as conn:
+        reconciliation = await validate_balance_checkpoint(conn, simulation.cash,
+            {ticker: int(position["shares"]) for ticker, position in simulation.positions.items()})
+    logger.info("SIMULATION_BALANCE_CHECKPOINT %s", json.dumps(reconciliation, ensure_ascii=False))
     from sovereign_hall.services.portfolio_maintenance import PortfolioMaintenance
     portfolio_maintenance = PortfolioMaintenance(
         simulation,
         status_path=project_root / "data" / "portfolio_maintenance_status.json",
         policy_snapshot_id=policy_snapshot_id,
     )
+    from sovereign_hall.services.continuous_evaluation import ContinuousEvaluation
+    continuous_evaluation = ContinuousEvaluation(account_db_service, market_data,
+        root=project_root / "runs" / "forward_evaluation",
+        policy=dict(config.get("simulation", {})))
+    try:
+        await continuous_evaluation.initialize()
+        portfolio_maintenance.evaluation = continuous_evaluation
+    except Exception as evaluation_error:
+        logger.exception("Forward evaluation initialization failed; account maintenance continues")
+        await continuous_evaluation.close()
+        continuous_evaluation = None
+        async with db_service.transaction() as conn:
+            await conn.execute("INSERT OR REPLACE INTO system_stats(key,value,updated_at) VALUES "
+                "('continuous_evaluation_status',?,?)",
+                (json.dumps({"evaluation_status": "data_blocked", "reason": str(evaluation_error)}), datetime.now().isoformat()))
     committee_store = CommitteeMeetingStore(db_service)
     print(f"   ✅ 投资模拟已初始化 (初始资金: {simulation.initial_capital}元)")
 
@@ -6149,7 +6153,8 @@ async def main():
                     terminal_reconciliation["reconciled"],
                     terminal_reconciliation["prediction_ids"],
                 )
-            validation_result = await recorder.validate_pending(max_count=20)
+            validation_result = await portfolio_maintenance.during(
+                recorder.validate_pending(max_count=20), context="startup_validation")
             if validation_result.get('validated', 0) > 0:
                 logger.info(f"启动时验证了 {validation_result['validated']} 条历史决策")
         except Exception as e:
@@ -6226,6 +6231,8 @@ async def main():
                 policy_snapshot_id=policy_snapshot_id,
             )
             active_round_id = round_record.id
+            portfolio_maintenance.round_id = active_round_id
+            portfolio_maintenance.round_reviews = []
             logger.info(f"🔥 第 {iteration} 轮开始 | 议题: {topic}")
             logger.info("RESEARCH_ROUND_STARTED round_id=%s", active_round_id)
             print(f"\n{'='*60}")
@@ -6264,9 +6271,9 @@ async def main():
                 learning_engine = LearningEngine(str(db_path))
                 logger.info("[diag] validate_pending begin")
                 recorder = DecisionRecorder(str(db_path))
-                validation_result = await asyncio.wait_for(
+                validation_result = await portfolio_maintenance.during(asyncio.wait_for(
                     recorder.validate_pending(max_count=validation_batch_size), timeout=180
-                )
+                ), context="active_research")
                 logger.info(f"[diag] validate_pending done in {(datetime.now()-t0).total_seconds():.1f}s")
                 if validation_result.get('validated', 0) > 0:
                     print(f"🔄 本轮验证了 {validation_result['validated']} 条决策")
@@ -6274,24 +6281,24 @@ async def main():
                 # 更新playbook
                 t0 = datetime.now()
                 logger.info("[diag] update_playbook begin")
-                await asyncio.wait_for(learning_engine.update_playbook(), timeout=180)
+                await portfolio_maintenance.during(asyncio.wait_for(learning_engine.update_playbook(), timeout=180), context="active_research")
                 logger.info(f"[diag] update_playbook done in {(datetime.now()-t0).total_seconds():.1f}s")
 
                 t0 = datetime.now()
                 logger.info("[diag] generate_lessons_prompt begin")
-                lessons_prompt = await asyncio.wait_for(
+                lessons_prompt = await portfolio_maintenance.during(asyncio.wait_for(
                     learning_engine.generate_lessons_prompt(), timeout=120
-                )
-                research_memory_prompt = await asyncio.wait_for(
+                ), context="active_research")
+                research_memory_prompt = await portfolio_maintenance.during(asyncio.wait_for(
                     learning_engine.generate_research_memory_prompt(base_topic), timeout=120
-                )
+                ), context="active_research")
                 logger.info(f"[diag] generate_lessons_prompt done in {(datetime.now()-t0).total_seconds():.1f}s")
 
                 t0 = datetime.now()
                 logger.info("[diag] get_accuracy_stats begin")
-                stats = await asyncio.wait_for(
+                stats = await portfolio_maintenance.during(asyncio.wait_for(
                     learning_engine.get_accuracy_stats(), timeout=60
-                )
+                ), context="active_research")
                 logger.info(f"[diag] get_accuracy_stats done in {(datetime.now()-t0).total_seconds():.1f}s")
                 if stats['total'] > 0:
                     print(f"\n📈 可判定历史预测胜率: {stats['accuracy']:.1%} ({stats['correct']}/{stats['total']})")
@@ -6325,9 +6332,9 @@ async def main():
                 try:
                     t0 = datetime.now()
                     logger.info(f"[diag] vector_db.search begin topic={topic!r}")
-                    existing_docs = await asyncio.wait_for(
+                    existing_docs = await portfolio_maintenance.during(asyncio.wait_for(
                         vector_db.search(topic, top_k=20, llm_client=llm), timeout=120
-                    )
+                    ), context="active_research")
                     logger.info(
                         f"[diag] vector_db.search done in {(datetime.now()-t0).total_seconds():.1f}s, "
                         f"got {len(existing_docs)} docs"
@@ -6358,14 +6365,14 @@ async def main():
                     pass
                 elif should_force_search and not existing_docs:
                     print(f"\n📚 阶段1：本地数据不足，进行搜索补充...")
-                    docs = await stage1_mass_search(
+                    docs = await portfolio_maintenance.during(stage1_mass_search(
                         llm,
                         spiders,
                         topic,
                         query_count=search_query_count,
                         round_coordinator=round_coordinator,
                         round_id=active_round_id,
-                    )
+                    ), context="active_research")
                     round_search_audit = dict(
                         getattr(spiders, "last_round_search_audit", {}) or {}
                     )
@@ -6378,14 +6385,14 @@ async def main():
                     docs = existing_docs
                 else:
                     print(f"\n📚 阶段1：定期更新数据 (每 {force_search_interval or 'N'} 轮强制搜索)")
-                    docs = await stage1_mass_search(
+                    docs = await portfolio_maintenance.during(stage1_mass_search(
                         llm,
                         spiders,
                         topic,
                         query_count=search_query_count,
                         round_coordinator=round_coordinator,
                         round_id=active_round_id,
-                    )
+                    ), context="active_research")
                     round_search_audit = dict(
                         getattr(spiders, "last_round_search_audit", {}) or {}
                     )
@@ -6472,10 +6479,10 @@ async def main():
                     saved_docs = 0
                     # 先保存到数据库（批量单事务，避免每条 WAL fsync）
                     try:
-                        saved_docs = await asyncio.wait_for(
+                        saved_docs = await portfolio_maintenance.during(asyncio.wait_for(
                             db_service.add_documents_batch(external_docs),
                             timeout=120,
-                        )
+                        ), context="active_research")
                     except asyncio.TimeoutError:
                         logger.warning(f"批量保存文档超时 (120s): external={len(external_docs)}")
                     except Exception as e:
@@ -6493,10 +6500,10 @@ async def main():
                         deferred_wiki_docs,
                     )
                     try:
-                        vector_saved = await asyncio.wait_for(
+                        vector_saved = await portfolio_maintenance.during(asyncio.wait_for(
                             vector_db.add_documents_batch(wiki_docs, llm_client=llm),
                             timeout=600,
-                        )
+                        ), context="active_research")
                     except asyncio.TimeoutError:
                         logger.error(f"[diag] add_documents_batch timeout (600s), vector_saved=0")
                         vector_saved = 0
@@ -6633,14 +6640,14 @@ async def main():
                 )
 
                 # 阶段2：深度研报 → 提案
-                proposals = await stage2_deep_research(
+                proposals = await portfolio_maintenance.during(stage2_deep_research(
                     llm,
                     docs,
                     topic,
                     db_service,
                     lessons_prompt=prompt_lessons,
                     round_id=active_round_id,
-                )
+                ), context="active_research")
                 proposals = dedupe_proposals(proposals)
                 rejection_memory = (
                     await simulation.get_candidate_rejection_memory(limit=100)
@@ -6717,7 +6724,7 @@ async def main():
                                 append_round_events=True,
                             )
 
-                        discussions, decisions = await stage3_ic_discussion(
+                        discussions, decisions = await portfolio_maintenance.during(stage3_ic_discussion(
                             llm,
                             spiders,
                             proposals,
@@ -6726,7 +6733,7 @@ async def main():
                             round_id=active_round_id,
                             decision_callback=persist_committee_decision,
                             committee_store=committee_store,
-                        )
+                        ), context="active_research")
                         logger.info(f"阶段3完成，讨论长度: {len(discussions)}, 决策数: {len(decisions)}")
                     except Exception as e:
                         logger.error(f"阶段3失败: {e}", exc_info=True)
@@ -6856,13 +6863,13 @@ async def main():
                         logger.warning("保存投委会会议记忆失败 %s: %s", ticker_key, e)
 
                 # 阶段4：综合结论
-                conclusion_data = await stage4_final_conclusion(
+                conclusion_data = await portfolio_maintenance.during(stage4_final_conclusion(
                     llm,
                     discussions,
                     decisions,
                     topic,
                     memory_prompt=prompt_lessons,
-                )
+                ), context="active_research")
 
                 # 保存结论（包含结构化数据）
                 primary_decision = decisions[0] if decisions else {}
@@ -6918,6 +6925,12 @@ async def main():
                 )
 
                 # 💰 每日投资模拟：只消费投委会裁决后的结构化决策
+                try:
+                    if continuous_evaluation is not None:
+                        await asyncio.wait_for(continuous_evaluation.capture_round(active_round_id, decisions), timeout=30)
+                except Exception as evaluation_error:
+                    logger.exception("Forward comparison blocked; production continues: %s", evaluation_error)
+                maintained_count = len(portfolio_maintenance.round_reviews)
                 simulation_result = await run_committee_approved_simulation(
                     simulation,
                     market_data,
@@ -6926,8 +6939,19 @@ async def main():
                     initial_rejections=repeated_candidate_rejections,
                     round_id=active_round_id,
                     round_coordinator=round_coordinator,
-                    pre_reviewed_positions=pre_round_position_reviews,
+                    pre_reviewed_positions=pre_round_position_reviews + list(portfolio_maintenance.round_reviews),
+                    portfolio_maintenance=portfolio_maintenance,
                 )
+                late_reviews = portfolio_maintenance.round_reviews[maintained_count:]
+                if late_reviews:
+                    simulation_result["terminal"] = "filled"
+                    for key in ("fills", "cycle_fills"):
+                        simulation_result[key] = int(simulation_result.get(key) or 0) + len(late_reviews)
+                    for action, key in (("buy", "entry_fills"), ("sell", "exit_fills")):
+                        simulation_result[key] = int(simulation_result.get(key) or 0) + sum(
+                            (item.get("execution") or {}).get("action") == action for item in late_reviews)
+                    simulation_result["assets"] = await simulation.calculate_assets()
+                    simulation_result["performance"] = await simulation.get_performance_metrics()
                 current_round = await round_coordinator.get(active_round_id)
                 terminal_map = {
                     "market_closed_pending": ResearchRoundStatus.MARKET_CLOSED_PENDING,
@@ -7057,6 +7081,8 @@ async def main():
                 )
 
             # 统计
+            portfolio_maintenance.round_id = None
+            portfolio_maintenance.round_reviews = []
             round_time = (datetime.now() - round_start).total_seconds()
             total_time = (datetime.now() - start_time).total_seconds()
             llm_stats = llm.get_stats()
@@ -7118,7 +7144,8 @@ async def main():
             )
             logger.info(stats_msg)
             try:
-                maintenance_report = await storage_governor.after_round()
+                maintenance_report = await portfolio_maintenance.during(
+                    storage_governor.after_round(), context="after_round_storage")
                 logger.info("Storage maintenance after round: %s", maintenance_report)
             except Exception as maintenance_error:
                 logger.warning("轮后存储整理失败，下轮将重试: %s", maintenance_error)
@@ -7203,6 +7230,9 @@ async def main():
         await market_data.close()
         await llm.close()
         await vector_db.close()
+        if continuous_evaluation is not None:
+            await continuous_evaluation.close()
+        await account_db_service.close()
         await db_service.close()
         print("🔒 资源已释放")
 

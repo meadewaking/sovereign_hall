@@ -1405,8 +1405,17 @@ class DatabaseService:
     async def transaction(self, *, immediate: bool = False):
         """Canonical transaction boundary for atomic application writes."""
         conn = await self._get_connection()
-        async with SQLiteUnitOfWork(conn).transaction(immediate=immediate) as active:
-            yield active
+        if not hasattr(self, "_transaction_lock"):
+            self._transaction_lock = asyncio.Lock()
+        if getattr(self, "_transaction_owner", None) is asyncio.current_task():
+            raise RuntimeError("nested SQLite unit of work is not allowed")
+        async with self._transaction_lock:
+            self._transaction_owner = asyncio.current_task()
+            try:
+                async with SQLiteUnitOfWork(conn).transaction(immediate=immediate) as active:
+                    yield active
+            finally:
+                self._transaction_owner = None
 
     async def close(self):
         """关闭连接"""

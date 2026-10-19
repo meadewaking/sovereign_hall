@@ -7,6 +7,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -28,6 +29,7 @@ from ..domain.portfolio.quote_freshness import is_fresh_quote
 from ..domain.portfolio.costs import CostSchedule
 from ..domain.portfolio.instruments import InstrumentProfile, normalize_ticker
 from ..domain.portfolio.models import ExecutionIntent
+from ..domain.portfolio.execution_policy import ExecutionPolicyLimits, cap_target_position, affordable_lot_quantity
 from ..infrastructure.sqlite.migrations import apply_architecture_migrations
 from ..services.llm_client import LLMClient
 from ..services.heuristic_policy import (
@@ -59,9 +61,10 @@ def _execution_defer_code(reason: Any) -> str:
 class InvestmentSimulation:
     """投资模拟器"""
 
-    def __init__(self, db_service=None, quote_provider=None):
+    def __init__(self, db_service=None, quote_provider=None, *, risk_context=None):
         self.db_service = db_service
         self.quote_provider = quote_provider
+        self.risk_context = risk_context
         self.config = self._load_config()
 
         # 模拟参数
@@ -432,12 +435,10 @@ class InvestmentSimulation:
                         "成交层仍须重新取价；不得放宽静态单标的上限。"
                     ),
                 ])
-        if performance.get("health_status") == "system_failure_no_live_deployment":
-            performance_lines.extend([
-                "- 状态=SYSTEM FAILURE：长期低投入/无成交。空仓不是成功的风险控制，也不是正常观望。",
-                "- 本轮最高优先级是打通研究->有证据提案->投委会方向票->实时报价->模拟成交；"
-                "若仍无成交，必须持久化精确断点，不能用离线回测收益交差。",
-            ])
+        performance_lines.append("- 链路状态: " + "；".join(
+            f"{key}={performance.get(key, 'unavailable')}" for key in
+            ("research_status", "execution_status", "capital_status", "evaluation_status")) +
+            "。现金等待不等于故障；根据具体证据定位阻塞，不为完成投入率放大获批仓位。")
 
         # Temporary execution blockers (closed market, daily capacity, missing
         # quote, cooldown) belong to the replay path and must not become a
@@ -907,7 +908,7 @@ class InvestmentSimulation:
             if gap <= 0.01:
                 status = "completed"
                 blocker_code = ""
-                blocker_reason = "资金部署达到100%目标"
+                blocker_reason = f"资金部署达到配置目标{self.target_invested_ratio:.0%}"
                 next_action = "继续逐仓生命周期复核"
             elif entry_count > 0:
                 status = "partially_redeployed"
@@ -1320,6 +1321,17 @@ class InvestmentSimulation:
                 "reason": f"执行裁决不存在: {intent_id}",
             }
         item = dict(row)
+        if item.get("direction") in {"long", "buy"} and item.get("round_id") and item.get("decision_id"):
+            async with self.db_service._connection.execute(
+                "SELECT target_position,confidence FROM simulation_committee_outcomes "
+                "WHERE round_id=? AND decision_id=? AND ticker=? ORDER BY id DESC LIMIT 1",
+                (item["round_id"], item["decision_id"], item["ticker"]),
+            ) as cursor:
+                approval = await cursor.fetchone()
+            if approval:
+                from ..domain.portfolio.execution_policy import approved_execution_target
+                item["target_position"] = min(float(item["target_position"]),
+                    approved_execution_target(approval[0], approval[1]))
         if item["status"] == "executed":
             return {
                 "success": True,
@@ -1741,14 +1753,8 @@ class InvestmentSimulation:
     ) -> int:
         if cash <= 0 or price <= 0 or self.min_unit <= 0:
             return 0
-        lots = int(cash / price / self.min_unit)
-        while lots > 0:
-            shares = lots * self.min_unit
-            trade_cost = self._trade_cost(ticker, "buy", price=price, shares=shares)
-            if trade_cost.notional + trade_cost.total <= cash + 1e-9:
-                return shares
-            lots -= 1
-        return 0
+        return affordable_lot_quantity(cash, price,
+            InstrumentProfile.from_ticker(ticker, lot_size=self.min_unit), self.cost_schedule)
 
     def _max_affordable_quote(
         self,
@@ -1970,7 +1976,7 @@ class InvestmentSimulation:
             if total_assets > 0
             else None
         )
-        if missing_price_tickers and direction_norm == "long":
+        if missing_price_tickers and direction_norm in {"long", "buy"}:
             return {
                 'success': False,
                 'action': 'hold',
@@ -1990,13 +1996,38 @@ class InvestmentSimulation:
         current_gross_exposure = sum(position_values.values()) / total_assets if total_assets > 0 else 0.0
         current_position_pct = current_position_value / total_assets if total_assets > 0 else 0.0
 
-        if direction_norm == "long" and not risk_cap_already_applied:
-            await self.refresh_simulation_risk_memory()
+        # Strategy scaling happens once upstream; current hard risk limits
+        # cannot be skipped by an old intent or an "already applied" flag.
+        from ..core.config import get_config
+        current_policy = get_config().get("simulation", {})
+        if direction_norm in {"long", "buy"}:
+            if not math.isfinite(float(target_position)):
+                return {"success": False, "action": "hold", "ticker": ticker,
+                        "blocker_code": "invalid_target", "reason": "目标仓位不是有限数值"}
+            target_position, hard_reasons = cap_target_position(
+                target_position, current_position=current_position_pct,
+                current_gross_exposure=current_gross_exposure,
+                limits=ExecutionPolicyLimits(
+                    max_single_position=float(current_policy.get("max_single_position", 1.0)),
+                    max_gross=float(current_policy.get("max_gross", 1.0))))
+            if target_position <= current_position_pct:
+                return {"success": False, "action": "hold", "ticker": ticker,
+                        "blocker_code": "current_risk_limit", "execution_quote": execution_quote,
+                        "reason": "当前仓位或组合风险预算不允许新增持仓"}
+            if hard_reasons:
+                reason += "; 当前风险限额: " + ",".join(hard_reasons)
+
+        if direction_norm in {"long", "buy"}:
+            risk_memory = await self.refresh_simulation_risk_memory()
             observed_signal_count = (
                 signal_count
                 if signal_count is not None
-                else recent_prediction_observation_count(ticker)
+                else (1 if self.risk_context is not None else recent_prediction_observation_count(ticker))
             )
+            if self.risk_context is not None:
+                from dataclasses import replace
+                self.risk_context = replace(self.risk_context,
+                    simulation_failures=risk_memory)
             capped_position, cap_reason = apply_heuristic_risk_cap(
                 ticker,
                 float(target_position),
@@ -2004,6 +2035,8 @@ class InvestmentSimulation:
                 signal_count=observed_signal_count,
                 current_position=current_position_pct,
                 current_gross_exposure=current_gross_exposure,
+                fresh_local_evidence=bool(intent_id),
+                context=self.risk_context,
             )
             if cap_reason:
                 reason = f"{reason}; {cap_reason}" if reason else cap_reason
@@ -2183,6 +2216,11 @@ class InvestmentSimulation:
                             traded_at=now.isoformat(),
                             asset_type=trade_cost.instrument_type.value,
                             cost_model_version=trade_cost.model_version,
+                            expected_cash=self.cash,
+                            expected_shares={t: int(p["shares"]) for t, p in self.positions.items()},
+                            position_marks={t: value / self.positions[t]["shares"]
+                                            for t, value in position_values.items()},
+                            approved_target=target_position,
                         )
                     )
                     trade_id = committed.trade_id
@@ -2334,6 +2372,8 @@ class InvestmentSimulation:
                             traded_at=now.isoformat(),
                             asset_type=trade_cost.instrument_type.value,
                             cost_model_version=trade_cost.model_version,
+                            expected_cash=self.cash,
+                            expected_shares={t: int(p["shares"]) for t, p in self.positions.items()},
                         )
                     )
                     trade_id = committed.trade_id
@@ -2698,7 +2738,10 @@ class InvestmentSimulation:
             """
         ) as cursor:
             snapshot_rows = [dict(row) async for row in cursor]
-        return build_simulation_performance(
+        from .simulation_performance import classify_simulation_runtime
+        runtime = await classify_simulation_runtime(conn, assets, self._market_data_service(),
+            max_daily_trades=self.max_daily_trades, target_ratio=self.target_invested_ratio)
+        metrics = build_simulation_performance(
             initial_capital=self.initial_capital,
             assets=assets,
             trade_count=int(trade_row[0] if trade_row else 0),
@@ -2707,6 +2750,7 @@ class InvestmentSimulation:
             snapshot_rows=snapshot_rows,
             trades_since_window_start=trades_since,
             window_start=window_start,
+            **runtime,
             no_trade_failure_days=int(
                 self.config.get("no_trade_failure_days", 3) or 3
             ),
@@ -2715,6 +2759,17 @@ class InvestmentSimulation:
                 or 0.80
             ),
         )
+        from ..application.execute_simulation_cycle import validate_balance_checkpoint
+        cash_row = await (await conn.execute("SELECT value FROM system_stats WHERE key='simulation_cash'")).fetchone()
+        durable_cash = float(cash_row[0]) if cash_row else self.initial_capital
+        durable_positions = {str(row[0]): int(row[1]) for row in await (await conn.execute(
+            "SELECT ticker,shares FROM simulation_positions WHERE shares>0")).fetchall()}
+        metrics["reconciliation"] = await validate_balance_checkpoint(conn, durable_cash,
+            durable_positions, create=False)
+        metrics["reconciliation"]["cached_account_matches"] = (
+            math.isclose(self.cash, durable_cash, abs_tol=1e-7) and
+            {t: int(p["shares"]) for t, p in self.positions.items()} == durable_positions)
+        return metrics
 
     async def daily_reflection(self, llm: LLMClient = None) -> str:
         """
@@ -2724,7 +2779,7 @@ class InvestmentSimulation:
         if not llm:
             return ""
 
-        # 获取历史交易记录
+        # A stable input watermark avoids repeating the same old reflection.
         trades = await self.get_trade_history(days=7)
 
         # 获取当前资产
@@ -2734,6 +2789,16 @@ class InvestmentSimulation:
                 "实时行情不完整，跳过资产收益反思与调仓推断；缺少实时现价: "
                 + ", ".join(assets.get("missing_price_tickers", []))
             )
+        watermark = json.dumps({"trade_ids": [t["id"] for t in trades],
+            "positions": {t: p["shares"] for t, p in assets["positions"].items()},
+            "nav_bucket": round(assets["total_assets"] / max(self.initial_capital * .01, 1))},
+            sort_keys=True)
+        if self.db_service:
+            async with self.db_service._connection.execute(
+                "SELECT value FROM system_stats WHERE key='simulation_reflection_watermark'") as cursor:
+                previous = await cursor.fetchone()
+            if previous and previous[0] == watermark:
+                return ""
 
         # 获取持仓详情
         positions_text = ""
@@ -2757,8 +2822,12 @@ class InvestmentSimulation:
 【最近交易记录】
 """
 
-        for trade in trades[-10:]:
-            reflection_prompt += f"- {trade['traded_at'][:10]} {trade['direction']} {trade['ticker']} {trade['shares']}股 @ {trade['price']:.2f}\n"
+        for trade in reversed(trades[:10]):
+            reflection_prompt += (
+                f"- #{trade['id']} {trade['traded_at']} {trade['direction']} {trade['ticker']} "
+                f"{trade['shares']}股 @ {trade['price']:.4f}，费用{trade['fee']:.4f}；"
+                f"原获批仓位={trade.get('approved_position')}，执行目标={trade.get('execution_position')}；"
+                f"依据/退出原因={trade.get('reason') or '未留痕'}\n")
 
         reflection_prompt += """
 请进行以下分析：
@@ -2768,9 +2837,9 @@ class InvestmentSimulation:
 4. 下一步建议：买入/卖出/观望、仓位变化、触发条件
 
 唯一绩效标准是本模拟账户按实时行情计算的净值收益。离线回测收益不得用于证明策略有效。
-若账户低投入且连续3天以上无成交，必须明确判定为系统部署故障；不得把“保持空仓/继续观望”
-写成正常或低风险结果。仍不得伪造候选、行情或成交，必须给出修复研究->投委会->实时报价->模拟成交
-链路的下一步动作。没有新交易时不要重复历史反思。
+根据当前来源、获批裁决、行情、时段和实际执行分别判断链路状态。没有合格机会时可以合理观望；
+低投入、无成交或账户亏损本身不能证明执行故障，不能要求为了填满仓位而增加交易。
+不得伪造候选、行情、成交或历史盈亏，没有足够证据时明确未知。
 """
 
         try:
@@ -2780,6 +2849,19 @@ class InvestmentSimulation:
                 temperature=0.5,
                 max_tokens=1000
             )
+            # The account owner may have serviced an exit while the model was
+            # thinking. Do not attach a response about an old book to new fills.
+            latest_trades = await self.get_trade_history(days=7)
+            if ([t["id"] for t in latest_trades] != [t["id"] for t in trades] or
+                    {t: p["shares"] for t, p in self.positions.items()} !=
+                    {t: p["shares"] for t, p in assets["positions"].items()}):
+                logger.info("Discarded reflection whose account inputs changed during research")
+                return ""
+            if response and self.db_service:
+                async with self.db_service.transaction() as conn:
+                    await conn.execute(
+                        "INSERT OR REPLACE INTO system_stats(key,value,updated_at) VALUES "
+                        "('simulation_reflection_watermark',?,?)", (watermark, datetime.now().isoformat()))
             return response
         except Exception as e:
             logger.warning(f"Failed to generate reflection: {e}")
@@ -2796,7 +2878,7 @@ class InvestmentSimulation:
                 SELECT reflection, snapshot_date
                 FROM simulation_snapshots
                 WHERE reflection IS NOT NULL AND reflection != ''
-                ORDER BY snapshot_date DESC
+                ORDER BY snapshot_date DESC, created_at DESC, id DESC
                 LIMIT ?
             """, (limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -2820,11 +2902,16 @@ class InvestmentSimulation:
         try:
             conn = self.db_service._connection
             async with conn.execute("""
-                SELECT id, ticker, direction, shares, price, fee, reason, traded_at
-                FROM simulation_trades
-                ORDER BY traded_at DESC
+                SELECT t.id, t.ticker, t.direction, t.shares, t.price, t.fee, t.reason, t.traded_at,
+                       i.target_position,
+                       (SELECT o.target_position FROM simulation_committee_outcomes o
+                        WHERE o.round_id=i.round_id AND o.decision_id=i.decision_id
+                          AND o.ticker=t.ticker ORDER BY o.id DESC LIMIT 1)
+                FROM simulation_trades t LEFT JOIN execution_intents i ON i.id=t.intent_id
+                WHERE datetime(t.traded_at) >= datetime(?)
+                ORDER BY t.traded_at DESC, t.id DESC
                 LIMIT ?
-            """, (limit,)) as cursor:
+            """, ((datetime.now() - timedelta(days=max(0, days))).isoformat(), limit)) as cursor:
                 rows = await cursor.fetchall()
                 return [
                     {
@@ -2835,7 +2922,9 @@ class InvestmentSimulation:
                         'price': row[4],
                         'fee': row[5],
                         'reason': row[6],
-                        'traded_at': row[7]
+                        'traded_at': row[7],
+                        'execution_position': row[8],
+                        'approved_position': row[9],
                     }
                     for row in rows
                 ]
