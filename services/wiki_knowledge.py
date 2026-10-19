@@ -28,6 +28,9 @@ from ..core.config import get_config
 from .storage_governor import ALLOCATION_BLOCK_BYTES, allocated_size, directory_size
 
 logger = logging.getLogger(__name__)
+# Both implementations allow only safe YAML types; use the native parser when
+# installed so loading a large compressed vault does not stall startup.
+SAFE_FRONTMATTER_LOADER = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
 
 
 DEFAULT_CHUNK_TARGET = 1000
@@ -37,7 +40,7 @@ DEFAULT_CHUNK_OVERLAP = 200
 RRF_K = 60.0
 TITLE_WEIGHT = 5.0
 BODY_WEIGHT = 1.0
-MAX_SEARCH_PAGES = 10000
+MAX_SEARCH_PAGES = 10000  # Bound ranked candidates, never truncate the vault before scoring.
 # 向量检索预筛页面数：先用关键词排序取 top N，再做 embedding
 # 71700 全量 embedding 会超时，预筛后只需 embedding N 个页面
 VECTOR_PREFILTER_TOP_N = 200
@@ -178,7 +181,7 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     if not match:
         return {}, content
     try:
-        frontmatter = yaml.safe_load(match.group(1)) or {}
+        frontmatter = yaml.load(match.group(1), Loader=SAFE_FRONTMATTER_LOADER) or {}
         if not isinstance(frontmatter, dict):
             frontmatter = {}
     except yaml.YAMLError:
@@ -633,12 +636,20 @@ class WikiStore:
     def all_wiki_pages(self) -> List[WikiPage]:
         if self._pages_cache is not None:
             return self._pages_cache
+        from .wiki_source_archive import SourcePageArchive
         pages: List[WikiPage] = []
-        for path in sorted(self.wiki_dir.rglob("*.md")):
-            try:
-                content = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
+        hot_paths = set(self.wiki_dir.rglob("*.md"))
+        def contents():
+            for key, raw in SourcePageArchive(self.root).iter_pages():
+                path = self.root / key
+                if path not in hot_paths:
+                    yield path, raw.decode('utf-8')
+            for path in hot_paths:
+                try:
+                    yield path, path.read_text(encoding='utf-8')
+                except UnicodeDecodeError:
+                    continue
+        for path, content in contents():
             frontmatter, body = parse_frontmatter(content)
             pages.append(
                 WikiPage(
@@ -650,12 +661,16 @@ class WikiStore:
                     frontmatter=frontmatter,
                 )
             )
+        pages.sort(key=lambda page: page.rel_path)
         self._pages_cache = pages
         return pages
 
     def write_page(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        existing = path.read_text(encoding="utf-8") if path.exists() else None
+        try:
+            existing = self.read_page(normalize_path(path.relative_to(self.root)))
+        except FileNotFoundError:
+            existing = None
         merged = merge_markdown_page(existing, content)
         bounded = self._bound_aggregate_page(merged)
         full_front, full_body = parse_frontmatter(merged)
@@ -704,6 +719,20 @@ class WikiStore:
         from .wiki_archive import read_raw
         return read_raw(self.root, relative_path).decode("utf-8")
 
+    def read_page(self, relative_path: str) -> str:
+        from .wiki_source_archive import read_source
+        relative = Path(relative_path)
+        if relative.is_absolute() or '..' in relative.parts or relative.parts[:1] != ('wiki',):
+            raise ValueError('Expected a relative wiki/ path')
+        if relative.parts[:2] == ('wiki', 'sources'):
+            return read_source(self.root, relative_path).decode('utf-8')
+        return (self.root / relative).read_text(encoding='utf-8')
+
+    def page_exists(self, relative_path: str) -> bool:
+        from .wiki_source_archive import SourcePageArchive, source_key
+        key = source_key(relative_path)
+        return (self.root / key).is_file() or SourcePageArchive(self.root).contains(key)
+
     def rebuild_index(self) -> None:
         topics = self._index_links(self.topics_dir)
         entities = self._index_links(self.entities_dir)
@@ -725,6 +754,9 @@ class WikiStore:
 
     def _index_links(self, directory: Path) -> List[str]:
         links = []
+        if directory == self.sources_dir:
+            return [wiki_link(page.title) for page in self.all_wiki_pages()
+                    if page.path.parent == self.sources_dir]
         for path in sorted(directory.glob("*.md")):
             frontmatter, _ = parse_frontmatter(path.read_text(encoding="utf-8"))
             title = str(frontmatter.get("title") or path.stem)
@@ -851,7 +883,7 @@ class WikiIngestor:
         if entry and entry.get("content_hash") == content_hash:
             paths = entry.get("files", [])
             durable_pages = [path for path in paths if str(path).startswith("wiki/sources/")]
-            if durable_pages and all((self.store.root / path).exists() for path in durable_pages):
+            if durable_pages and all(self.store.page_exists(path) for path in durable_pages):
                 return paths
 
         source_title = doc.title or doc.url or doc.id or "Untitled Source"
@@ -1066,7 +1098,7 @@ class WikiSearchIndex:
         filter_sector: Optional[str] = None,
         min_similarity: float = 0.0,
     ) -> List[SearchHit]:
-        pages = self.store.all_wiki_pages()[:MAX_SEARCH_PAGES]
+        pages = self.store.all_wiki_pages()
         if filter_sector:
             pages = [
                 page
@@ -1078,7 +1110,9 @@ class WikiSearchIndex:
         if not pages:
             return []
 
-        keyword_hits = self._keyword_search(query, pages)
+        # Sources sort after entities. Cutting the first 10k paths excluded
+        # every source in a large vault, including all packed evidence pages.
+        keyword_hits = (await asyncio.to_thread(self._keyword_search, query, pages))[:MAX_SEARCH_PAGES]
         # 预筛：取关键词得分最高的 VECTOR_PREFILTER_TOP_N 页面做向量检索
         # 避免 71700+ 页面全量 embedding 导致超时
         prefilter_sorted = sorted(keyword_hits, key=lambda item: item[1], reverse=True)
@@ -1119,12 +1153,16 @@ class WikiSearchIndex:
         tokens = tokenize_query(query)
         phrase = (query or "").lower().strip()
         scored: List[Tuple[str, float]] = []
+        exact_titles, title_matches = set(), set()
         for page in pages:
             hay_title = page.title.lower()
             hay_body = page.body.lower()
             score = 0.0
             if phrase and phrase in hay_title:
                 score += 100.0
+                title_matches.add(page.rel_path)
+                if phrase == hay_title.strip():
+                    exact_titles.add(page.rel_path)
             if phrase and phrase in hay_body:
                 score += min(hay_body.count(phrase), 10) * 10.0
             for token in tokens:
@@ -1132,7 +1170,9 @@ class WikiSearchIndex:
                 score += hay_body.count(token) * BODY_WEIGHT
             if score > 0:
                 scored.append((page.rel_path, score))
-        scored.sort(key=lambda item: item[1], reverse=True)
+        # Repeated common tokens in a long entity page must not bury an exact
+        # source title, especially before the ranked-candidate limit is applied.
+        scored.sort(key=lambda item: (item[0] in exact_titles, item[0] in title_matches, item[1]), reverse=True)
         return scored
 
     async def _vector_search(self, query: str, pages: List[WikiPage]) -> List[Tuple[str, float]]:
@@ -1402,7 +1442,7 @@ class WikiKnowledgeBase:
             "embedding_enabled": self.embedding_enabled,
             "topics": len(list(self.store.topics_dir.glob("*.md"))) if self.store.topics_dir.exists() else 0,
             "entities": len(list(self.store.entities_dir.glob("*.md"))) if self.store.entities_dir.exists() else 0,
-            "sources": len(list(self.store.sources_dir.glob("*.md"))) if self.store.sources_dir.exists() else 0,
+            "sources": sum(page.page_type == 'source' for page in pages),
         }
 
     def set_database_service(self, database_service: Any) -> None:

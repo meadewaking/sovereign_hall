@@ -5850,7 +5850,7 @@ async def maintain_storage_once():
         await db.close()
 
 
-async def await_storage_capacity(governor, pause_seconds=60):
+async def await_storage_capacity(governor, pause_seconds=60, *, portfolio_maintenance=None):
     """Keep the service alive while online maintenance pauses new writes."""
     from sovereign_hall.services.storage_governor import storage_capacity_state, storage_pressure_message
     last_notice = None
@@ -5878,7 +5878,10 @@ async def await_storage_capacity(governor, pause_seconds=60):
         delay = float(pause_seconds)
         if snapshot.recovery_targets and (archive.get('can_continue') or archive.get('progressed')):
             delay = min(delay, 5)
-        await asyncio.sleep(max(.01, delay))
+        if portfolio_maintenance is None:
+            await asyncio.sleep(max(.01, delay))
+        else:
+            await portfolio_maintenance.sleep(max(.01, delay), context="storage_capacity_wait")
 
 
 async def main():
@@ -6101,6 +6104,12 @@ async def main():
     simulation = InvestmentSimulation(db_service)
     await simulation.initialize()
     await simulation.init_tables()
+    from sovereign_hall.services.portfolio_maintenance import PortfolioMaintenance
+    portfolio_maintenance = PortfolioMaintenance(
+        simulation,
+        status_path=project_root / "data" / "portfolio_maintenance_status.json",
+        policy_snapshot_id=policy_snapshot_id,
+    )
     committee_store = CommitteeMeetingStore(db_service)
     print(f"   ✅ 投资模拟已初始化 (初始资金: {simulation.initial_capital}元)")
 
@@ -6151,16 +6160,22 @@ async def main():
                 print(f"\n✅ 已达到 --max-rounds={args.max_rounds}，退出")
                 break
 
+            # The same portfolio owner services existing rulings before any
+            # research admission or long research-only sleep. No second writer.
+            await portfolio_maintenance.run_if_due(context="between_rounds")
             current_tokens = llm.get_stats().get("total_tokens", 0)
             if daily_budget.exceeded(current_tokens):
                 used = daily_budget.used_today(current_tokens)
                 logger.warning(
                     f"今日Token预算已用尽: {format_token(used)}/{format_token(daily_budget.budget)}，暂停{daily_budget_pause}秒"
                 )
-                await asyncio.sleep(daily_budget_pause)
+                await portfolio_maintenance.sleep(daily_budget_pause, context="daily_token_budget_wait")
                 continue
 
-            await await_storage_capacity(storage_governor, storage_pressure_pause)
+            await await_storage_capacity(
+                storage_governor, storage_pressure_pause,
+                portfolio_maintenance=portfolio_maintenance,
+            )
 
             # 连续无结果时：末尾已经按 empty_rounds 做了指数退避或长休眠。
             # 这里只保留一个低阈值的短延迟，避免在议题切换瞬间重复打 LLM。
@@ -6171,7 +6186,7 @@ async def main():
                     empty_rounds,
                     wait_seconds,
                 )
-                await asyncio.sleep(wait_seconds)
+                await portfolio_maintenance.sleep(wait_seconds, context="empty_round_wait")
 
             # 选择议题
             recent_topics = load_recent_topics(db_path, topic_cooldown_hours)
@@ -6179,7 +6194,7 @@ async def main():
             if base_topic is None:
                 wait_seconds = min(3600, max(300, topic_cooldown_hours * 60))
                 print(f"\n💤 所有议题都在 {topic_cooldown_hours} 小时冷却期内，休息 {wait_seconds} 秒")
-                await asyncio.sleep(wait_seconds)
+                await portfolio_maintenance.sleep(wait_seconds, context="topic_cooldown_wait")
                 continue
             try:
                 research_assets = await simulation.calculate_assets()
@@ -7130,7 +7145,7 @@ async def main():
 
             if has_operational_result:
                 print(f"\n💤 休息 1 秒后继续...")
-                await asyncio.sleep(1)
+                await portfolio_maintenance.sleep(1, context="between_round_wait")
             else:
                 # 连续无结果时不要立刻重试——如果是约束导致的（账户余额/整手价格
                 # 上限/黑名单），市场情况没变之前再跑也是同样的结果，徒增 LLM
@@ -7147,13 +7162,13 @@ async def main():
                         empty_rounds,
                         long_pause,
                     )
-                    await asyncio.sleep(long_pause)
+                    await portfolio_maintenance.sleep(long_pause, context="empty_round_backoff")
                 else:
                     wait_time = min(10, 2 ** (empty_rounds - 1))
                     print(
                         f"\n💤 本轮无可执行提案，休息 {wait_time} 秒后继续..."
                     )
-                    await asyncio.sleep(wait_time)
+                    await portfolio_maintenance.sleep(wait_time, context="empty_round_wait")
 
     except asyncio.CancelledError:
         if active_round_id:

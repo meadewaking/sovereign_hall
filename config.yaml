@@ -110,6 +110,9 @@ knowledge_wiki:
   log_rotate_bytes: 8388608
   log_rotate_keep: 5
   raw_hot_retention_days: 30
+  source_page_archive_enabled: true
+  source_hot_retention_days: 30
+  source_archive_batch_limit: 500
   embedding_enabled: true
   embedding_cache_max_bytes: 50331648  # 48 MiB, disposable vectors
   ingest_cache_max_bytes: 8388608  # 8 MiB, disposable ingestion index
