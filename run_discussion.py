@@ -1102,7 +1102,7 @@ def prioritize_deployment_research(
         if known_cash >= max(1, min_unit):
             return (
                 f"{topic}｜账本现金{known_cash:.2f}元待研究"
-                "（实时估值不完整，不推算净值或投入率）资金部署候选证据比较"
+                "（账户估值不完整，不推算净值或投入率）资金部署候选证据比较"
             )
         return topic
 
@@ -4792,7 +4792,7 @@ async def run_committee_approved_simulation(
     )
     heuristic_context = load_latest_heuristic_context()
     if assets.get("valuation_complete"):
-        print(f"   当前资产: {assets['total_assets']:.2f}元 | 现金: {assets['cash']:.2f}元 | 持仓: {assets['positions_value']:.2f}元（实时现价）")
+        print(f"   当前资产: {assets['total_assets']:.2f}元 | 现金: {assets['cash']:.2f}元 | 持仓: {assets['positions_value']:.2f}元（{assets.get('valuation_label','实时现价')}）")
     else:
         print(
             "   当前资产: N/A | 现金: "
@@ -4930,7 +4930,7 @@ async def run_committee_approved_simulation(
             f"待部署{assets['deployment_gap']:.2f}元"
         )
     else:
-        print("   资金部署: N/A；组合实时估值不完整，禁止新增或扩大仓位")
+        print("   资金部署: N/A；组合账户估值不完整，禁止新增或扩大仓位")
     if assets.get('deployment_gap') is not None and assets['deployment_gap'] > 0:
         print("   规则: 现金等待须说明具体原因；缺少合格机会时可以HOLD，投入目标不能放大获批仓位")
 
@@ -5123,11 +5123,11 @@ async def run_committee_approved_simulation(
                     target_position=target_position,
                     confidence=confidence,
                     code="valuation_incomplete",
-                    reason="组合实时估值不完整，禁止形成新增/扩仓待执行裁决",
+                    reason="组合账户估值不完整，禁止形成新增/扩仓待执行裁决",
                 )
                 reject(
                     "valuation_incomplete",
-                    "组合实时估值不完整，禁止形成新增/扩仓待执行裁决",
+                    "组合账户估值不完整，禁止形成新增/扩仓待执行裁决",
                     ticker,
                 )
                 continue
@@ -5470,18 +5470,18 @@ async def run_committee_approved_simulation(
                     confidence=confidence,
                     code="valuation_incomplete",
                     reason=(
-                        "组合实时估值不完整("
+                        "组合账户估值不完整("
                         + ",".join(missing_price_tickers)
                         + ")"
                     ),
                 )
                 reject(
                     "valuation_incomplete",
-                    f"组合实时估值不完整({','.join(missing_price_tickers)})",
+                    f"组合账户估值不完整({','.join(missing_price_tickers)})",
                     ticker,
                 )
                 print(
-                    f"   ⏭️ {ticker}: 组合实时估值不完整，拒绝新增/扩大模拟仓位；"
+                    f"   ⏭️ {ticker}: 组合账户估值不完整，拒绝新增/扩大模拟仓位；"
                     f"缺少实时现价: {', '.join(missing_price_tickers)}"
                 )
                 continue
@@ -5665,7 +5665,7 @@ async def run_committee_approved_simulation(
                 f"gap={state.get('deployment_gap')} | blocker={state.get('blocker_code')}"
             )
     if final_assets.get("valuation_complete"):
-        print(f"   📊 交易后: 现金 {final_assets['cash']:.2f}元 | 持仓 {final_assets['positions_value']:.2f}元（实时现价）")
+        print(f"   📊 交易后: 现金 {final_assets['cash']:.2f}元 | 持仓 {final_assets['positions_value']:.2f}元（{final_assets.get('valuation_label','实时现价')}）")
     else:
         print(
             f"   📊 交易后: 现金 {final_assets['cash']:.2f}元 | 当前资产N/A；"
@@ -6099,8 +6099,8 @@ async def main():
         status_path=project_root / "data" / "portfolio_maintenance_status.json",
         policy_snapshot_id=policy_snapshot_id,
     )
-    from sovereign_hall.services.continuous_evaluation import ContinuousEvaluation
-    continuous_evaluation = ContinuousEvaluation(account_db_service, market_data,
+    from sovereign_hall.services.forward_runtime import FrozenForwardEvaluation
+    continuous_evaluation = FrozenForwardEvaluation(account_db_service, market_data,
         root=project_root / "runs" / "forward_evaluation",
         policy=dict(config.get("simulation", {})))
     try:
@@ -6129,6 +6129,7 @@ async def main():
 
     active_round_id: Optional[str] = None
     try:
+        storage_governor.start_background()
         # 连续无结果计数
         empty_rounds = 0
         docs = []
@@ -7226,6 +7227,7 @@ async def main():
         print(f"   累计成本: {format_cost_breakdown(llm_stats)}")
 
     finally:
+        await storage_governor.close()
         await spiders.close()
         await market_data.close()
         await llm.close()

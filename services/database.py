@@ -1383,7 +1383,8 @@ class DatabaseService:
             (str(stage), max(0, int(limit))),
         ) as cursor:
             rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+        from .storage_archive import hydrate_payload
+        return [await hydrate_payload(conn, 'research_diagnostic', dict(row), 'raw_excerpt') for row in rows]
 
     async def clear_old_checkpoints(self, keep: int = 5):
         """清理旧检查点"""

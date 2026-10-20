@@ -104,6 +104,7 @@ knowledge_wiki:
   target_size_ratio: 0.60
   maintenance_ratio: 0.80
   bulk_write_stop_ratio: 0.90
+  resume_write_ratio: 0.80
   source_excerpt_chars: 500
   aggregate_page_max_chars: 32768
   aggregate_source_limit: 50
@@ -134,6 +135,9 @@ database:
   maintenance_ratio: 0.80
   bulk_write_stop_ratio: 0.90
   max_round_document_links: 300
+  resume_write_ratio: 0.80
+  cold_payload_batch_rows: 400
+  incremental_vacuum_pages: 4096
   wal_autocheckpoint_pages: 1000
   journal_size_limit_bytes: 16777216
   online_maintenance_batch_rows: 1000

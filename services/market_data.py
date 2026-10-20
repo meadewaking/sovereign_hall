@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 
 from ..domain.portfolio.instruments import is_etf_ticker, normalize_ticker
-from ..domain.portfolio.quote_freshness import MARKET_ZONE, is_fresh_quote
+from ..domain.portfolio.quote_freshness import MARKET_ZONE, is_fresh_quote, quote_age_seconds
 from .exchange_calendar import ExchangeCalendar, load_exchange_calendar
 from ..utils import sync_retry_with_backoff
 
@@ -91,6 +91,8 @@ class MarketDataService:
         self.timeout = timeout
         self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
         self._quote_cache: Dict[str, Dict[str, Any]] = {}
+        self._valuation_cache: Dict[str, Dict[str, Any]] = {}
+        self._observed_quotes: Dict[str, Dict[str, Any]] = {}
         self._quote_ttl_seconds = 60
         self._max_quote_age_seconds = 120
         self._quote_request_timeout = min(float(timeout), 4.0)
@@ -230,18 +232,40 @@ class MarketDataService:
 
     async def get_current_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
         """Return only fresh quotes with both provider event and retrieval timestamps."""
+        from .valuation_quotes import is_valid_valuation_quote
+        cached=self._valuation_cache.get(self.normalize_ticker(ticker))
+        if cached and cached.get('valuation_only') and is_valid_valuation_quote(cached):
+            return None
+        return await self._get_quote(ticker,valuation=False)
+
+    async def get_valuation_quote(self,ticker):
+        return await self._get_quote(ticker,valuation=True)
+
+    async def get_valuation_quotes(self,tickers):
+        return await collect_realtime_quote_batch(tickers,self.get_valuation_quote)
+
+    async def _get_quote(self,ticker,*,valuation):
+        from .valuation_quotes import valuation_quote,is_valid_valuation_quote,market_window
         code = self.normalize_ticker(ticker)
         if not self.is_supported_ticker(code):
             logger.warning("Reject unsupported realtime quote ticker: %r", ticker)
             return None
 
+        if valuation:
+            for cached in (self._quote_cache.get(code),self._valuation_cache.get(code),self._observed_quotes.get(code)):
+                if cached:
+                    marked=valuation_quote(cached)
+                    if marked is not None:
+                        self._valuation_cache[code]=marked
+                        return dict(marked)
         cached = self._quote_cache.get(code)
         if cached and is_fresh_quote(cached, max_age_seconds=self._quote_ttl_seconds):
             return dict(cached)
         self._quote_cache.pop(code, None)
         self._ensure_client()
         providers = (
-            (self._fetch_tencent_quote, "tencent_realtime_quote"),
+            ((lambda code:self._fetch_tencent_quote(code,accept_quote=valuation_quote))
+             if valuation else self._fetch_tencent_quote, "tencent_realtime_quote"),
             (self._fetch_eastmoney_quote, "eastmoney_realtime_quote"),
             (self._fetch_sina_quote, "sina_realtime_quote"),
         )
@@ -252,16 +276,35 @@ class MarketDataService:
             record = {"source": source, "pass": pass_index,
                       "started_at": datetime.now(MARKET_ZONE).isoformat()}
             attempts.append(record)
+            request = None
             try:
+                request = asyncio.create_task(fetch(code), name="quote-" + source)
                 price, name, quoted_at = await asyncio.wait_for(
-                    fetch(code), timeout=self._quote_request_timeout)
+                    request, timeout=self._quote_request_timeout)
                 quote = {"ticker": code, "price": price, "name": name,
                          "source": source, "quoted_at": quoted_at,
                          "fetched_at": datetime.now(MARKET_ZONE).isoformat()}
+                age = quote_age_seconds(quote['fetched_at'], quoted_at)
+                record.update(quoted_at=quoted_at,
+                              source_age_seconds=round(age, 1) if age is not None else None,
+                              freshness_limit_seconds=self._max_quote_age_seconds)
+                if is_fresh_quote(quote,max_age_seconds=float('inf')):
+                    previous=self._observed_quotes.get(code)
+                    if previous is None or str(quote['quoted_at'])>=str(previous.get('quoted_at','')):
+                        self._observed_quotes[code]=dict(quote)
+                        reference=valuation_quote(quote)
+                        if reference and reference.get('valuation_only'):
+                            self._valuation_cache[code]=reference
+                if valuation:
+                    marked=valuation_quote(quote)
+                    if marked is not None:
+                        record['status']='valuation_reference' if marked.get('valuation_only') else 'fresh'
+                        return marked
                 if is_fresh_quote(quote, max_age_seconds=self._max_quote_age_seconds):
                     record["status"] = "fresh"
                     return quote
-                record["status"] = "invalid_or_stale_quote"
+                record["status"] = ("stale_quote" if is_fresh_quote(quote, max_age_seconds=float('inf'))
+                                    else "invalid_quote")
             except asyncio.CancelledError:
                 record["status"] = "cancelled"
                 raise
@@ -273,6 +316,12 @@ class MarketDataService:
             except Exception as exc:
                 record.update(status="invalid_response", error_type=type(exc).__name__)
             finally:
+                # A provider can fail while a winner or the caller cancels its
+                # timeout wrapper. Own and drain that inner task explicitly.
+                if request is not None:
+                    if not request.done():
+                        request.cancel()
+                    await asyncio.gather(request, return_exceptions=True)
                 record["finished_at"] = datetime.now(MARKET_ZONE).isoformat()
             return None
 
@@ -293,8 +342,12 @@ class MarketDataService:
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
             # Cancellation cleanup must not rejuvenate a source timestamp.
-            if is_fresh_quote(winner, max_age_seconds=self._max_quote_age_seconds):
-                self._quote_cache[code] = winner
+            if ((valuation and is_valid_valuation_quote(winner)) or
+                    is_fresh_quote(winner, max_age_seconds=self._max_quote_age_seconds)):
+                if winner.get('valuation_only'):
+                    self._valuation_cache[code]=winner
+                else:
+                    self._quote_cache[code] = winner
                 return dict(winner)
             retry_sources = {a["source"] for a in attempts
                              if a["pass"] == pass_index and a.get("retryable")}
@@ -302,25 +355,50 @@ class MarketDataService:
             if pass_index or not pending_providers:
                 break
             await asyncio.sleep(0.2)
-        logger.warning("No fresh provider-timestamped market quote for %s: %s", code,
-                       [(a["source"], a["status"], a.get("error_type")) for a in attempts])
+        window=market_window()
+        log=logger.info if not valuation and window and window['kind']!='realtime' else logger.warning
+        log("No qualified %s quote for %s: %s", 'valuation' if valuation else 'realtime',code,
+                       [{key: a[key] for key in ('source','status','error_type','quoted_at',
+                                                'source_age_seconds','freshness_limit_seconds') if key in a}
+                        for a in attempts])
         return None
 
-    async def _fetch_tencent_quote(self, ticker: str) -> tuple[Optional[float], str, str]:
+    async def _fetch_tencent_quote(self, ticker: str, *,accept_quote=None) -> tuple[Optional[float], str, str]:
         market = self.infer_market(ticker)
         if not market:
             return None, "", ""
-        url = f"https://qt.gtimg.cn/q={market}{ticker}"
-        try:
-            resp = await self._client.get(url)
-            resp.raise_for_status()
-            parts = resp.content.decode("gbk", errors="strict").split("~")
-            if len(parts) > 30 and parts[2] == ticker:
-                quoted = datetime.strptime(parts[30], "%Y%m%d%H%M%S").replace(tzinfo=MARKET_ZONE)
-                return float(parts[3]), parts[1].strip(), quoted.isoformat()
-        except Exception as exc:
-            logger.debug("Tencent quote failed for %s (%s): %s", ticker, type(exc).__name__, exc)
-            raise
+        # Both hosts serve Tencent's original event-time quote format. Give
+        # each a share of the existing provider deadline so an unreachable
+        # host cannot consume the fallback's entire time allowance.
+        hosts = ('web.sqt.gtimg.cn', 'qt.gtimg.cn')
+        best, last_error = None, None
+        for host in hosts:
+            try:
+                async with asyncio.timeout(max(.01, self._quote_request_timeout / len(hosts))):
+                    resp = await self._client.get(f'https://{host}/q={market}{ticker}')
+                    resp.raise_for_status()
+                    parts = resp.content.decode('gbk', errors='strict').split('~')
+                    if len(parts) <= 30 or parts[2] != ticker:
+                        continue
+                    quoted = datetime.strptime(parts[30], '%Y%m%d%H%M%S').replace(tzinfo=MARKET_ZONE)
+                    candidate = float(parts[3]), parts[1].strip(), quoted.isoformat()
+                    quote = {'price': candidate[0], 'source': 'tencent_realtime_quote',
+                             'quoted_at': candidate[2], 'fetched_at': datetime.now(MARKET_ZONE).isoformat()}
+                    if accept_quote is not None and accept_quote(quote) is not None:
+                        return candidate
+                    if is_fresh_quote(quote, max_age_seconds=self._max_quote_age_seconds):
+                        return candidate
+                    if is_fresh_quote(quote, max_age_seconds=float('inf')):
+                        if best is None or candidate[2] > best[2]:
+                            best = candidate
+            except Exception as exc:
+                last_error = exc
+                logger.debug('Tencent quote failed for %s via %s (%s): %s',
+                             ticker, host, type(exc).__name__, exc)
+        if best is not None:
+            return best  # The caller records the real age and rejects stale ticks.
+        if last_error is not None:
+            raise last_error
         return None, "", ""
 
     async def _fetch_eastmoney_quote(self, ticker: str) -> tuple[Optional[float], str, str]:

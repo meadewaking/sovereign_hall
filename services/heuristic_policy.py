@@ -2041,9 +2041,9 @@ def format_heuristic_prompt_context(context: HeuristicRiskContext | None = None)
     )
     lines = [
         "【模拟账户唯一绩效与本地Heuristic风控约束】",
-        f"- 唯一绩效标准: {PERFORMANCE_STANDARD}；{PERFORMANCE_FORMULA}。",
+        f"- 唯一绩效标准: {performance.get('performance_standard',PERFORMANCE_STANDARD)}；{performance.get('reward_formula',PERFORMANCE_FORMULA)}。",
         (
-            f"- 实时模拟账户累计净收益={_format_live_return(live_return)}；"
+            f"- {performance.get('valuation_label','实时现价')}估值的模拟账户累计净收益={_format_live_return(live_return)}；"
             f"投入率={invested_text}；最近成交={latest_trade}。"
         ),
         "- 离线回测、样本外分数、Sharpe和leaderboard仅用于发现失败模式；不得作为best、score、策略晋升、扩仓或继续空仓的依据。",
@@ -2200,9 +2200,9 @@ def format_heuristic_status(
         "\n🧭 Heuristic / 模拟账户绩效状态",
         "=" * 60,
         f"   最新run: {ctx.run_dir}",
-        f"   唯一绩效标准: {PERFORMANCE_STANDARD}",
+        f"   唯一绩效标准: {performance.get('performance_standard',PERFORMANCE_STANDARD)}",
         (
-            f"   实时模拟账户累计净收益: {_format_live_return(live_return)} | "
+            f"   {performance.get('valuation_label','实时现价')}估值的模拟账户累计净收益: {_format_live_return(live_return)} | "
             f"score: {score_text}"
         ),
         (

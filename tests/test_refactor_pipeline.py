@@ -2132,7 +2132,7 @@ def test_check_db_requires_realtime_quote_without_local_fallback(tmp_path, monke
     conn.commit()
     conn.close()
     monkeypatch.delenv("SOVEREIGN_HALL_REALTIME_QUOTES", raising=False)
-    monkeypatch.setattr(check_db, "get_realtime_prices", lambda tickers: {})
+    monkeypatch.setattr(check_db, "get_valuation_prices", lambda tickers: {})
 
     check_db.show_investment_status(db_path)
     output = capsys.readouterr().out
@@ -2159,7 +2159,7 @@ def test_check_db_values_positions_from_realtime_quote(tmp_path, monkeypatch, ca
     conn.close()
     monkeypatch.setattr(
         check_db,
-        "get_realtime_prices",
+        "get_valuation_prices",
         lambda tickers: {
             "600519": {
                 "price": 12.3,
@@ -2172,7 +2172,7 @@ def test_check_db_values_positions_from_realtime_quote(tmp_path, monkeypatch, ca
     performance = check_db.show_investment_status(db_path)
     output = capsys.readouterr().out
 
-    assert "当前资产: 10230.00 元（实时现价）" in output
+    assert "当前资产: 10230.00 元（实时现价；来源时间" in output
     assert "实时现价12.300" in output
     assert "test_realtime_quote" in output
     assert performance["valuation_complete"] is True
@@ -2202,7 +2202,7 @@ def test_check_db_one_lot_boundary_includes_minimum_commission(
     conn.close()
     monkeypatch.setattr(
         check_db,
-        "get_realtime_prices",
+        "get_valuation_prices",
         lambda tickers: {
             "510300": {
                 "price": 97.72,
@@ -2315,12 +2315,13 @@ def test_check_db_lifecycle_review_surfaces_complete_position_evidence(
     conn.close()
     monkeypatch.setattr(
         check_db,
-        "get_realtime_prices",
+        "get_valuation_prices",
         lambda tickers: {
             "600519": {
                 "price": 11.0,
                 "source": "test_realtime_quote",
                 "fetched_at": now,
+                "quoted_at": now,
             }
         },
     )
@@ -3017,7 +3018,7 @@ async def test_calculate_assets_recovers_transient_quote_without_caller_fallback
             "quoted_at": datetime.now().isoformat(),
         }
 
-    monkeypatch.setattr(sim, "get_current_quote", fetch_quote)
+    monkeypatch.setattr(sim, "get_valuation_quote", fetch_quote)
 
     assets = await sim.calculate_assets(prices={"516510": 999.0, "562950": 999.0})
 
@@ -3587,6 +3588,7 @@ async def test_simulation_reviews_every_position_and_only_executes_fresh_exit():
         "512660": {"shares": 300, "avg_cost": 1.483, "opened_at": "2026-05-12T06:02:08"},
         "600050": {"shares": 100, "avg_cost": 4.52, "opened_at": "2026-05-11T02:22:01"},
     }
+    sim.get_valuation_quote = AsyncMock(return_value=None)
     sim.resolve_trade_price_detail = AsyncMock(side_effect=[
         {
             "price": None,
@@ -6084,7 +6086,7 @@ async def test_simulation_assets_are_na_when_realtime_quote_missing(tmp_path):
     sim = InvestmentSimulation(db)
     sim.cash = 9000.0
     sim.positions = {"600519": {"shares": 100, "avg_cost": 10.0}}
-    sim.get_current_quote = AsyncMock(return_value=None)
+    sim.get_valuation_quote = AsyncMock(return_value=None)
 
     assets = await sim.calculate_assets(prices={"600519": 999.0})
     await db.close()
@@ -6123,7 +6125,7 @@ async def test_simulation_assets_use_realtime_quote_not_local_or_prediction(tmp_
     sim = InvestmentSimulation(db)
     sim.cash = 9000.0
     sim.positions = {"600519": {"shares": 100, "avg_cost": 10.0}}
-    sim.get_current_quote = AsyncMock(return_value={
+    sim.get_valuation_quote = AsyncMock(return_value={
         "price": 99.0,
         "source": "test_realtime_quote",
         "fetched_at": datetime.now().isoformat(),
@@ -6136,7 +6138,7 @@ async def test_simulation_assets_use_realtime_quote_not_local_or_prediction(tmp_
     assert assets["valuation_complete"] is True
     assert assets["total_assets"] == pytest.approx(18900.0)
     assert assets["positions_value"] == pytest.approx(9900.0)
-    sim.get_current_quote.assert_awaited_once_with("600519")
+    sim.get_valuation_quote.assert_awaited_once_with("600519")
 
 
 @pytest.mark.asyncio
@@ -6167,7 +6169,7 @@ async def test_simulation_assets_do_not_fallback_to_stale_local_price(tmp_path, 
     sim = InvestmentSimulation(db)
     sim.cash = 9000.0
     sim.positions = {"600519": {"shares": 100, "avg_cost": 10.0}}
-    sim.get_current_quote = AsyncMock(return_value=None)
+    sim.get_valuation_quote = AsyncMock(return_value=None)
 
     assets = await sim.calculate_assets()
     await db.close()

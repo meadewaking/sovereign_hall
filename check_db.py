@@ -71,6 +71,22 @@ def is_fresh_realtime_quote(quote: Any) -> bool:
     return is_fresh_quote(quote, max_age_seconds=maximum)
 
 
+def get_valuation_prices(tickers: list) -> dict:
+    """Fetch source-verified marks; closed-session marks are labelled explicitly."""
+    import asyncio
+    from sovereign_hall.services.market_data import MarketDataService
+    from sovereign_hall.services.valuation_quotes import is_valid_valuation_quote
+    async def fetch():
+        md=MarketDataService()
+        try:
+            codes=list(dict.fromkeys(normalize_ticker(t) for t in tickers))
+            quotes=await md.get_valuation_quotes(codes)
+            return {code:quotes[code] for code in codes if is_valid_valuation_quote(quotes.get(code))}
+        finally:
+            await md.close()
+    return asyncio.run(fetch())
+
+
 def filter_supported_candidate_rejections(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep only executable A-share/ETF symbols in decision feedback."""
     from sovereign_hall.services.market_data import MarketDataService
@@ -1356,9 +1372,11 @@ def show_investment_status(db_path) -> dict[str, Any]:
     tickers = [pos[0] for pos in positions]
     conn.close()
 
-    # 投资状态只接受实时行情；关闭或失败时显示不可估值，绝不回退旧价/成本价。
+    # 按交易时段校验行情；闭市参考价保留来源时间，缺失时不回退成本价。
     use_realtime_quotes = realtime_quotes_enabled()
-    realtime_prices = get_realtime_prices(tickers) if tickers and use_realtime_quotes else {}
+    realtime_prices = get_valuation_prices(tickers) if tickers and use_realtime_quotes else {}
+    from sovereign_hall.services.valuation_quotes import valuation_summary
+    marks=valuation_summary(realtime_prices)
 
     # 计算当前资产
     known_position_value = 0.0
@@ -1379,7 +1397,7 @@ def show_investment_status(db_path) -> dict[str, Any]:
         quote = realtime_prices.get(ticker)
         if quote:
             current_price = float(quote["price"])
-            price_at = str(quote.get("fetched_at") or datetime.now().isoformat())
+            price_at = str(quote.get("quoted_at") or '')
             price_source = str(quote.get("source") or "realtime_quote")
             stock_name = str(quote.get("name") or "").strip()
             position_value = shares * current_price
@@ -1388,7 +1406,7 @@ def show_investment_status(db_path) -> dict[str, Any]:
             sign = '+' if change >= 0 else ''
             display_ticker = f"{ticker}({stock_name})" if stock_name else ticker
             position_details.append(
-                f"  {display_ticker}: {shares}股 @ 实时现价{current_price:.3f} 成本{cost:.3f} "
+                f"  {display_ticker}: {shares}股 @ {marks['valuation_label']}{current_price:.3f} 成本{cost:.3f} "
                 f"({sign}{change:.1f}%) | {price_source} @ {price_at}"
             )
         else:
@@ -1409,13 +1427,16 @@ def show_investment_status(db_path) -> dict[str, Any]:
             opened_at=opened_at,
             price=float(current_price) if current_price is not None else None,
             price_at=price_at,
-            price_source=price_source,
+            price_source='verified_session_valuation' if quote and quote.get('valuation_only') else price_source,
             now=datetime.now(),
             max_price_age_days=max_trade_price_age_days,
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
             max_holding_days=max_holding_days,
         )
+        if quote and quote.get('valuation_only') and lifecycle.action!='exit':
+            from dataclasses import replace
+            lifecycle=replace(lifecycle,action='market_closed',reason='休市期间按核验后的最近交易时报价估值；成交等待开市实时行情')
         peak_price_raw = (
             pos["peak_price"] if "peak_price" in metadata_columns else None
         )
@@ -1492,6 +1513,7 @@ def show_investment_status(db_path) -> dict[str, Any]:
     performance = build_simulation_performance(
         initial_capital=initial_capital,
         assets={
+            **marks,
             "valuation_complete": valuation_complete,
             "total_assets": total_value,
             "cash": cash,
@@ -1532,7 +1554,7 @@ def show_investment_status(db_path) -> dict[str, Any]:
         print(f"   当前资产: N/A（缺少实时现价: {', '.join(missing_realtime_tickers)}）")
         print("   盈亏: N/A（拒绝使用本地估值、历史预测价或成本价推算）")
     else:
-        print(f"   当前资产: {total_value:.2f} 元（实时现价）")
+        print(f"   当前资产: {total_value:.2f} 元（{marks['valuation_label']}；来源时间 {marks['valuation_as_of']}）")
     if profit is not None and profit >= 0:
         print(f"   📈 盈亏: +{profit:.2f} 元 ({profit_pct:+.2f}%)")
     elif profit is not None:
@@ -1604,12 +1626,12 @@ def show_investment_status(db_path) -> dict[str, Any]:
         if performance["net_total_return"] is None
         else f"{float(performance['net_total_return']):+.2%}"
     )
-    print(f"   唯一绩效标准: {PERFORMANCE_STANDARD}")
+    print(f"   唯一绩效标准: {performance.get('performance_standard',PERFORMANCE_STANDARD)}")
     print(
         f"   模拟账户累计净收益: {return_text} | score={score_text} "
         f"| health={performance['health_status']}"
     )
-    print(f"   口径: {PERFORMANCE_FORMULA}")
+    print(f"   口径: {performance.get('reward_formula',PERFORMANCE_FORMULA)}")
     print("   离线回测: 仅诊断，不参与best/score/策略晋升")
     if performance["health_status"] == "system_failure_no_live_deployment":
         print(

@@ -1733,6 +1733,12 @@ class InvestmentSimulation:
             return await market_data.get_current_quote(ticker)
         return None  # A bare price cannot establish provider event time.
 
+    async def get_valuation_quote(self,ticker):
+        market=self._market_data_service()
+        if hasattr(market,'get_valuation_quote'):
+            return await market.get_valuation_quote(ticker)
+        return await self.get_current_quote(ticker)
+
     @staticmethod
     def _normalize_ticker(ticker: str) -> str:
         return normalize_ticker(ticker)
@@ -2530,7 +2536,13 @@ class InvestmentSimulation:
             pos = self.positions.get(ticker)
             if not pos:
                 continue
-            detail = await self.resolve_trade_price_detail(ticker)
+            from .valuation_quotes import is_valid_valuation_quote
+            mark=await self.get_valuation_quote(ticker)
+            reference=bool(mark and mark.get('valuation_only') and is_valid_valuation_quote(mark))
+            detail = ({'price':None,'candidate_price':mark['price'],
+                       'price_at':mark['quoted_at'],'quoted_at':mark['quoted_at'],
+                       'source':'verified_session_valuation'} if reference
+                      else await self.resolve_trade_price_detail(ticker))
             executable_price = detail.get("price")
             diagnostic_price = executable_price or detail.get("candidate_price")
             review = review_position(
@@ -2556,6 +2568,12 @@ class InvestmentSimulation:
                 pos["peak_price"] = max(float(pos.get("peak_price") or diagnostic_price), float(diagnostic_price))
 
             result = review.as_dict()
+            if reference and review.action!='exit':
+                result.update(action='market_closed',
+                    reason='休市期间按核验后的最近交易时报价复核；成交等待开市实时行情',
+                    pnl_pct=(float(mark['price'])/float(pos['avg_cost'])-1) if pos.get('avg_cost') else None,
+                    valuation_only=True,quoted_at=mark['quoted_at'])
+                pos['review_status']=result['action'];pos['review_reason']=result['reason']
             if review.action == "exit":
                 # A lifecycle exit belongs to the open-position episode, not to
                 # whichever research round happened to observe the same breach.
@@ -2627,7 +2645,7 @@ class InvestmentSimulation:
         return reviews
 
     async def calculate_assets(self, prices: Dict[str, float] = None) -> Dict:
-        """按实时现价计算资产；任一行情缺失时明确标记估值不完整。"""
+        """按经过校验的行情估值，并区分实时价和休市参考价。"""
         from .market_data import collect_realtime_quote_batch
 
         known_total_assets = self.cash
@@ -2641,13 +2659,14 @@ class InvestmentSimulation:
         if self.realtime_quotes_enabled():
             realtime_quotes = await collect_realtime_quote_batch(
                 self.positions,
-                self.get_current_quote,
+                self.get_valuation_quote,
             )
         for ticker, pos in self.positions.items():
             code = self._normalize_ticker(ticker)
             price = None
             quote = realtime_quotes.get(code)
-            if self._quote_is_fresh(quote):
+            from .valuation_quotes import is_valid_valuation_quote
+            if is_valid_valuation_quote(quote):
                 price = float(quote["price"])
                 quote_details[code] = dict(quote)
             if not price:
@@ -2664,7 +2683,9 @@ class InvestmentSimulation:
             if valuation_complete
             else None
         )
+        from .valuation_quotes import valuation_summary
         return {
+            **valuation_summary(quote_details),
             'cash': self.cash,
             'positions_value': known_total_assets - self.cash if valuation_complete else None,
             'total_assets': known_total_assets if valuation_complete else None,
@@ -2679,7 +2700,7 @@ class InvestmentSimulation:
             'target_invested_ratio': self.target_invested_ratio,
             'invested_ratio': deployment['invested_ratio'] if deployment else None,
             'deployment_gap': deployment['deployment_gap'] if deployment else None,
-            'valuation_rule': 'realtime quotes only; no local/prediction/cost fallback',
+            'valuation_rule': 'live source-time quotes while open; verified latest session marks while closed; valuation marks cannot execute',
         }
 
     async def get_performance_metrics(
@@ -2687,7 +2708,7 @@ class InvestmentSimulation:
         *,
         window_start: str | None = None,
     ) -> Dict[str, Any]:
-        """Return the only valid reward: realtime simulated-account return."""
+        """Return source-validated account return with its valuation basis."""
         from .simulation_performance import build_simulation_performance
 
         assets = await self.calculate_assets()
