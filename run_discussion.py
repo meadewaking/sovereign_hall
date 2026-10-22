@@ -557,7 +557,7 @@ async def run_with_graceful_shutdown(
 ) -> None:
     """Run the canonical loop and turn SIGTERM into one orderly cancellation."""
     loop = asyncio.get_running_loop()
-    main_task = asyncio.create_task(main_factory())
+    main_task = asyncio.create_task(run_with_database_recovery(main_factory))
     shutdown_request_count = 0
 
     def request_shutdown() -> None:
@@ -588,6 +588,28 @@ async def run_with_graceful_shutdown(
         logger.info("Canonical runner finished cooperative SIGTERM shutdown")
     finally:
         cleanup()
+
+
+async def run_with_database_recovery(main_factory, *, retry_seconds=5):
+    """Reinitialize only after a transient SQLite failure and full cleanup.
+
+    The existing round recovery preserves committed business terminals and
+    closes only abandoned unfinished research. No fills or model calls are
+    replayed here; a new loop reads the durable account and experiment identity.
+    """
+    attempts = 0
+    while True:
+        try:
+            return await main_factory()
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, 'sqlite_errorcode', 0) & 255
+            if code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_FULL}:
+                raise
+            attempts += 1
+            delay = min(60, retry_seconds * attempts)
+            logger.exception("DATABASE_RUNTIME_RECOVERY attempt=%s retry_seconds=%s code=%s",
+                             attempts, delay, getattr(exc, 'sqlite_errorname', code))
+            await asyncio.sleep(delay)
 
 
 async def persist_sigterm_round_terminal(round_coordinator, round_id: str) -> None:
@@ -5864,7 +5886,28 @@ async def await_storage_capacity(governor, pause_seconds=60, *, portfolio_mainte
             await portfolio_maintenance.sleep(max(.01, delay), context="storage_capacity_wait")
 
 
+async def start_research_round_when_ready(coordinator, portfolio_maintenance, *, pause_seconds=5, **fields):
+    """Retry only atomic round admission, keeping account duty alive while waiting."""
+    while True:
+        try:
+            return await coordinator.start(**fields)
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, 'sqlite_errorcode', 0) & 255
+            if code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_FULL}:
+                raise
+            logger.warning("RESEARCH_DATABASE_WAIT code=%s reason=%s; retrying without starting a new round",
+                           getattr(exc, 'sqlite_errorname', code), exc)
+            await portfolio_maintenance.sleep(pause_seconds, context="database_write_wait")
+
+
 async def main():
+    # Register each resource before initialization, so a startup failure cannot
+    # leak a connection/HTTP client into an automatic database recovery attempt.
+    async with contextlib.AsyncExitStack() as resources:
+        await _main(resources)
+
+
+async def _main(resources):
     from sovereign_hall.core.config import get_config
     from sovereign_hall.services.database import DatabaseService
     from sovereign_hall.services.decision_tracker import DecisionRecorder
@@ -5934,6 +5977,7 @@ async def main():
         dimension=vector_dim,
         max_documents=vector_config.get("max_documents"),
     )
+    resources.push_async_callback(vector_db.close)
     await vector_db.initialize()
     print(f"   ✅ Vector DB 已初始化 (当前: {len(vector_db.documents)} 条)")
 
@@ -5973,12 +6017,14 @@ async def main():
         model=llm_config.get('model'),
         provider=llm_config.get('provider'),
     )
+    resources.push_async_callback(llm.close)
     # 从配置中读取 Spider 并发数（已降低防止被封）
     spider_config = config.get_spider_config()
     spiders = SpiderSwarm(
         max_concurrent=spider_config.get('max_concurrent', 10),
         network_enabled=not args.local_only,
     )
+    resources.push_async_callback(spiders.close)
 
     if not args.skip_preflight:
         preflight_ok = await run_startup_preflight(
@@ -5996,6 +6042,7 @@ async def main():
         print("🛡️ local-only 已生效：资料网络搜索被 SpiderSwarm 共享硬门禁止")
 
     db_service = DatabaseService(str(db_path))
+    resources.push_async_callback(db_service.close)
     await db_service._init_db()
     await db_service.init_report_tables()
     round_coordinator = ResearchRoundCoordinator(db_service)
@@ -6074,9 +6121,11 @@ async def main():
         )
     vector_db.set_database_service(db_service)
     storage_governor = StorageGovernor(db_service, vector_db.knowledge.store)
+    resources.push_async_callback(storage_governor.close)
     initial_storage = await storage_governor.initialize()
     logger.info("Storage governor initialized: %s", initial_storage.to_dict())
     market_data = get_market_data()
+    resources.push_async_callback(market_data.close)
 
     # 初始化投资模拟
     from sovereign_hall.services.investment_simulation import InvestmentSimulation
@@ -6084,6 +6133,7 @@ async def main():
     # Research batches and fills must never share a SQLite transaction. This
     # separate connection has one portfolio owner; no second account process.
     account_db_service = DatabaseService(str(db_path))
+    resources.push_async_callback(account_db_service.close)
     await account_db_service._init_db()
     simulation = InvestmentSimulation(account_db_service)
     await simulation.initialize()
@@ -6103,6 +6153,7 @@ async def main():
     continuous_evaluation = FrozenForwardEvaluation(account_db_service, market_data,
         root=project_root / "runs" / "forward_evaluation",
         policy=dict(config.get("simulation", {})))
+    resources.push_async_callback(continuous_evaluation.close)
     try:
         await continuous_evaluation.initialize()
         portfolio_maintenance.evaluation = continuous_evaluation
@@ -6225,7 +6276,8 @@ async def main():
             research_source_failure = False
             round_start = datetime.now()
             round_start_stats = llm.get_stats()
-            round_record = await round_coordinator.start(
+            round_record = await start_research_round_when_ready(
+                round_coordinator, portfolio_maintenance,
                 base_topic=base_topic,
                 research_objective=topic,
                 prompt_version="run_discussion_canonical_v1",
@@ -7227,16 +7279,9 @@ async def main():
         print(f"   累计成本: {format_cost_breakdown(llm_stats)}")
 
     finally:
-        await storage_governor.close()
-        await spiders.close()
-        await market_data.close()
-        await llm.close()
-        await vector_db.close()
-        if continuous_evaluation is not None:
-            await continuous_evaluation.close()
-        await account_db_service.close()
-        await db_service.close()
-        print("🔒 资源已释放")
+        # The exit stack drains evaluation before closing its market/account
+        # dependencies, then stops maintenance before the research connection.
+        logger.info("Canonical loop returning; draining owned resources")
 
 
 if __name__ == "__main__":
@@ -7255,3 +7300,7 @@ if __name__ == "__main__":
         logger.error(str(exc))
         print(f"❌ {exc}")
         sys.exit(2)
+    except Exception:
+        # Persist failures outside an active round as well as console output.
+        logger.exception("Canonical runner stopped unexpectedly")
+        sys.exit(1)

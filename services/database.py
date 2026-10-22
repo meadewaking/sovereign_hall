@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
+from functools import wraps
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..core import DATA_DIR
@@ -21,6 +22,20 @@ from ..infrastructure.sqlite.unit_of_work import SQLiteUnitOfWork
 from .prediction_store import ensure_prediction_schema
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write(method):
+    """Give legacy public writes the same ownership as application writes.
+
+    These methods do only local conversion and SQL. They must not commit the
+    connection themselves or perform network/model work inside this boundary.
+    """
+    @wraps(method)
+    async def write(self, *args, **kwargs):
+        await self._ensure_initialized()
+        async with self.transaction(immediate=True):
+            return await method(self, *args, **kwargs)
+    return write
 
 MIN_STORED_DOCUMENT_CHARS = 20
 MAX_CANONICAL_LINEAGE_PER_PRESENTED_DOCUMENT = 50
@@ -124,24 +139,39 @@ class DatabaseService:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection: Optional[aiosqlite.Connection] = None
         self._initialized = False
+        self._connection_lock = asyncio.Lock()
+        self._initialization_lock = asyncio.Lock()
+        self._transaction_lock = asyncio.Lock()
         logger.info(f"DatabaseService initialized: {self.db_path}")
 
     async def _get_connection(self) -> aiosqlite.Connection:
         """获取数据库连接（延迟初始化）"""
-        if self._connection is None:
-            self._connection = await aiosqlite.connect(str(self.db_path))
-            self._connection.row_factory = aiosqlite.Row
-            await self._connection.execute("PRAGMA foreign_keys = ON")
-            await self._connection.execute("PRAGMA busy_timeout = 5000")
-            # New databases must enable pointer maps before creating tables;
-            # otherwise incremental reclamation would require a full rebuild.
-            async with self._connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
-            ) as cursor:
-                has_tables = await cursor.fetchone()
-            if not has_tables:
-                await self._connection.execute('PRAGMA auto_vacuum=INCREMENTAL')
-            await self._connection.execute("PRAGMA journal_mode = WAL")
+        if self._connection is not None:
+            return self._connection
+        async with self._connection_lock:
+            if self._connection is not None:
+                return self._connection
+            conn = await aiosqlite.connect(str(self.db_path))
+            try:
+                conn.row_factory = aiosqlite.Row
+                async with conn.execute("PRAGMA foreign_keys = ON"):
+                    pass
+                async with conn.execute("PRAGMA busy_timeout = 5000"):
+                    pass
+                # New databases need pointer maps before creating tables.
+                async with conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
+                ) as cursor:
+                    has_tables = await cursor.fetchone()
+                if not has_tables:
+                    async with conn.execute('PRAGMA auto_vacuum=INCREMENTAL'):
+                        pass
+                async with conn.execute("PRAGMA journal_mode = WAL") as cursor:
+                    await cursor.fetchall()
+            except BaseException:
+                await conn.close()
+                raise
+            self._connection = conn
         return self._connection
 
     async def _get_existing_tables(self, conn) -> set:
@@ -169,7 +199,10 @@ class DatabaseService:
     async def _create_index_if_possible(self, conn, sql: str):
         try:
             await conn.execute(sql)
-        except Exception as exc:
+        except aiosqlite.IntegrityError as exc:
+            # Legacy duplicate identities may require a non-unique fallback.
+            # Lock, disk and schema errors must not masquerade as completed
+            # initialization and leave an incompletely configured connection.
             logger.warning("Failed to create index with SQL %r: %s", sql, exc)
 
     async def _next_integer_id(self, conn, table: str, column: str = "id") -> int:
@@ -242,6 +275,16 @@ class DatabaseService:
 
     async def _init_db(self):
         """初始化数据库表"""
+        async with self._initialization_lock:
+            async with self.connection_scope():
+                try:
+                    await self._initialize_schema()
+                except BaseException:
+                    await self._connection.rollback()
+                    self._initialized = False
+                    raise
+
+    async def _initialize_schema(self):
         conn = await self._get_connection()
 
         # 获取现有表结构
@@ -490,7 +533,14 @@ class DatabaseService:
 
     async def _ensure_initialized(self):
         if not self._initialized:
-            await self._init_db()
+            async with self._initialization_lock:
+                if not self._initialized:
+                    async with self.connection_scope():
+                        try:
+                            await self._initialize_schema()
+                        except BaseException:
+                            await self._connection.rollback()
+                            raise
 
     async def _backfill_blacklist_fields(self, conn):
         """Do not acquire a writer lock for already-migrated blacklist rows.
@@ -529,6 +579,7 @@ class DatabaseService:
 
     # ===================== 文档操作 =====================
 
+    @_atomic_write
     async def add_document(self, doc: Any, *, round_id: str | None = None) -> bool:
         """添加文档"""
         if isinstance(doc, dict):
@@ -624,8 +675,6 @@ class DatabaseService:
                         round_id,
                         str(hash_owner["id"]),
                     )
-                    if round_id:
-                        await conn.commit()
                     logger.debug(
                         "Skipped cross-key duplicate document: existing_id=%s hash_owner=%s",
                         existing["id"],
@@ -643,11 +692,8 @@ class DatabaseService:
                     values[1:] + (existing["id"],),
                 )
                 await self._link_round_document(conn, round_id, str(existing["id"]))
-                await conn.commit()
                 return True
             await self._link_round_document(conn, round_id, str(existing["id"]))
-            if round_id:
-                await conn.commit()
             return False
 
         await conn.execute("""
@@ -657,7 +703,6 @@ class DatabaseService:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, values + (round_id,))
         await self._link_round_document(conn, round_id, str(doc_id))
-        await conn.commit()
         return True
 
     async def _link_round_document(
@@ -679,6 +724,7 @@ class DatabaseService:
             (round_id, document_id, usage, datetime.now().isoformat()),
         )
 
+    @_atomic_write
     async def add_documents_batch(
         self,
         docs: List[Any],
@@ -699,128 +745,119 @@ class DatabaseService:
         conn = await self._get_connection()
         await self._ensure_initialized()
         saved = 0
-        # Single shared transaction: commit once at the end.  Per-row commits
-        # dominated the old ~0.85s/doc cost via WAL fsync.
-        async with conn.execute("BEGIN"):
-            pass
-        try:
-            for doc in docs:
+        for doc in docs:
+            if isinstance(doc, dict):
+                doc = Document.from_dict(doc)
+
+            def _attr(name: str, default=None):
                 if isinstance(doc, dict):
-                    doc = Document.from_dict(doc)
+                    return doc.get(name, default)
+                return getattr(doc, name, default)
 
-                def _attr(name: str, default=None):
-                    if isinstance(doc, dict):
-                        return doc.get(name, default)
-                    return getattr(doc, name, default)
+            publish_time_source = (_attr('metadata', {}) or {}).get('publish_time_source')
+            crawled_at = _attr('crawled_at') or datetime.now().astimezone().isoformat()
+            publish_time = _attr('publish_time')
+            if isinstance(publish_time, datetime):
+                publish_time = publish_time.isoformat()
 
-                publish_time_source = (_attr('metadata', {}) or {}).get('publish_time_source')
-                crawled_at = _attr('crawled_at') or datetime.now().astimezone().isoformat()
-                publish_time = _attr('publish_time')
-                if isinstance(publish_time, datetime):
-                    publish_time = publish_time.isoformat()
+            title = normalize_document_text(_attr('title', ''))
+            content = normalize_document_text(_attr('content', ''))
+            url = normalize_document_url(_attr('url', ''))
+            source = str(_attr('source', '') or '').strip()
+            sector = str(_attr('sector', '') or '').strip()
+            content_hash = document_content_hash(content)
+            doc_id = _attr('id') or _attr('doc_id') or f"doc_{content_hash[:16]}"
 
-                title = normalize_document_text(_attr('title', ''))
-                content = normalize_document_text(_attr('content', ''))
-                url = normalize_document_url(_attr('url', ''))
-                source = str(_attr('source', '') or '').strip()
-                sector = str(_attr('sector', '') or '').strip()
-                content_hash = document_content_hash(content)
-                doc_id = _attr('id') or _attr('doc_id') or f"doc_{content_hash[:16]}"
+            if not is_storable_document(title, content, source, doc_id):
+                continue
 
-                if not is_storable_document(title, content, source, doc_id):
-                    continue
+            async with conn.execute(
+                """
+                SELECT id, LENGTH(COALESCE(content, '')) AS content_len
+                FROM documents
+                WHERE id = ?
+                   OR (? <> '' AND url = ? AND url <> '')
+                   OR (content_hash = ? AND content_hash <> '')
+                ORDER BY
+                    CASE
+                        WHEN id = ? THEN 0
+                        WHEN ? <> '' AND url = ? THEN 1
+                        ELSE 2
+                    END
+                LIMIT 1
+                """,
+                (doc_id, url, url, content_hash, doc_id, url, url),
+            ) as cursor:
+                existing = await cursor.fetchone()
 
-                async with conn.execute(
-                    """
-                    SELECT id, LENGTH(COALESCE(content, '')) AS content_len
-                    FROM documents
-                    WHERE id = ?
-                       OR (? <> '' AND url = ? AND url <> '')
-                       OR (content_hash = ? AND content_hash <> '')
-                    ORDER BY
-                        CASE
-                            WHEN id = ? THEN 0
-                            WHEN ? <> '' AND url = ? THEN 1
-                            ELSE 2
-                        END
-                    LIMIT 1
-                    """,
-                    (doc_id, url, url, content_hash, doc_id, url, url),
-                ) as cursor:
-                    existing = await cursor.fetchone()
+            keywords = _attr('keywords', [])
+            if isinstance(keywords, str):
+                try:
+                    keywords = json.loads(keywords)
+                except json.JSONDecodeError:
+                    keywords = [keywords] if keywords.strip() else []
 
-                keywords = _attr('keywords', [])
-                if isinstance(keywords, str):
-                    try:
-                        keywords = json.loads(keywords)
-                    except json.JSONDecodeError:
-                        keywords = [keywords] if keywords.strip() else []
+            values = (
+                doc_id,
+                title,
+                content,
+                url,
+                source,
+                sector,
+                json.dumps(keywords, ensure_ascii=False) if keywords else None,
+                publish_time,
+                json.dumps(_attr('embedding')) if _attr('embedding') else None,
+                content_hash,
+                publish_time_source,
+                crawled_at,
+            )
 
-                values = (
-                    doc_id,
-                    title,
-                    content,
-                    url,
-                    source,
-                    sector,
-                    json.dumps(keywords, ensure_ascii=False) if keywords else None,
-                    publish_time,
-                    json.dumps(_attr('embedding')) if _attr('embedding') else None,
-                    content_hash,
-                    publish_time_source,
-                    crawled_at,
-                )
-
-                if existing:
-                    if len(content) > int(existing["content_len"] or 0):
-                        async with conn.execute(
-                            """
-                            SELECT id
-                            FROM documents
-                            WHERE content_hash = ? AND content_hash <> '' AND id <> ?
-                            LIMIT 1
-                            """,
-                            (content_hash, existing["id"]),
-                        ) as cursor:
-                            hash_owner = await cursor.fetchone()
-                        if hash_owner:
-                            await self._link_round_document(
-                                conn,
-                                round_id,
-                                str(hash_owner["id"]),
-                            )
-                            continue
-                        await conn.execute(
-                            """
-                            UPDATE documents
-                            SET title = ?, content = ?, url = ?, source = ?, sector = ?,
-                                keywords = ?, publish_time = ?, embedding = ?, content_hash = ?,
-                                publish_time_source = ?, crawled_at = ?
-                            WHERE id = ?
-                            """,
-                            values[1:] + (existing["id"],),
+            if existing:
+                if len(content) > int(existing["content_len"] or 0):
+                    async with conn.execute(
+                        """
+                        SELECT id
+                        FROM documents
+                        WHERE content_hash = ? AND content_hash <> '' AND id <> ?
+                        LIMIT 1
+                        """,
+                        (content_hash, existing["id"]),
+                    ) as cursor:
+                        hash_owner = await cursor.fetchone()
+                    if hash_owner:
+                        await self._link_round_document(
+                            conn,
+                            round_id,
+                            str(hash_owner["id"]),
                         )
-                        await self._link_round_document(conn, round_id, str(existing["id"]))
-                        saved += 1
                         continue
+                    await conn.execute(
+                        """
+                        UPDATE documents
+                        SET title = ?, content = ?, url = ?, source = ?, sector = ?,
+                            keywords = ?, publish_time = ?, embedding = ?, content_hash = ?,
+                            publish_time_source = ?, crawled_at = ?
+                        WHERE id = ?
+                        """,
+                        values[1:] + (existing["id"],),
+                    )
                     await self._link_round_document(conn, round_id, str(existing["id"]))
+                    saved += 1
                     continue
+                await self._link_round_document(conn, round_id, str(existing["id"]))
+                continue
 
-                await conn.execute(
-                    """
-                    INSERT INTO documents
-                    (id, title, content, url, source, sector, keywords, publish_time,
-                     embedding, content_hash, publish_time_source, crawled_at, round_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    values + (round_id,),
-                )
-                await self._link_round_document(conn, round_id, str(doc_id))
-                saved += 1
-            await conn.commit()
-        except Exception:
-            await conn.execute("ROLLBACK")
-            raise
+            await conn.execute(
+                """
+                INSERT INTO documents
+                (id, title, content, url, source, sector, keywords, publish_time,
+                 embedding, content_hash, publish_time_source, crawled_at, round_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values + (round_id,),
+            )
+            await self._link_round_document(conn, round_id, str(doc_id))
+            saved += 1
         return saved
 
     async def resolve_document_lineage(
@@ -1004,6 +1041,7 @@ class DatabaseService:
 
     # ===================== 提案操作 =====================
 
+    @_atomic_write
     async def add_proposal(self, proposal: Any, *, round_id: str | None = None):
         """添加提案"""
         if isinstance(proposal, dict):
@@ -1073,7 +1111,6 @@ class DatabaseService:
             pget('reject_if', None),
             round_id,
         ))
-        await conn.commit()
         return proposal_id
 
     async def get_proposals(self, status: str = None, limit: int = 100) -> List[Dict]:
@@ -1101,6 +1138,7 @@ class DatabaseService:
 
     # ===================== 会议操作 =====================
 
+    @_atomic_write
     async def add_meeting(self, meeting: Any):
         """添加会议纪要"""
         conn = await self._get_connection()
@@ -1117,8 +1155,8 @@ class DatabaseService:
             json.dumps(getattr(meeting, 'vote_details', {}), ensure_ascii=False),
             json.dumps(getattr(meeting, 'action_items', []), ensure_ascii=False)
         ))
-        await conn.commit()
 
+    @_atomic_write
     async def add_meeting_record(
         self,
         *,
@@ -1151,7 +1189,6 @@ class DatabaseService:
                 round_id,
             ),
         )
-        await conn.commit()
         return meeting_id
 
     async def get_meetings(self, limit: int = 100) -> List[Dict]:
@@ -1173,6 +1210,7 @@ class DatabaseService:
 
     # ===================== 机构记忆操作 =====================
 
+    @_atomic_write
     async def add_playbook_entry(self, entry: Any):
         """添加经验条目"""
         conn = await self._get_connection()
@@ -1218,7 +1256,6 @@ class DatabaseService:
             ))
         else:
             raise RuntimeError(f"Unsupported playbook schema: {sorted(columns)}")
-        await conn.commit()
 
     async def get_playbook_by_ticker(self, ticker: str) -> List[Dict]:
         """根据股票代码获取经验"""
@@ -1239,6 +1276,7 @@ class DatabaseService:
 
     # ===================== 黑名单操作 =====================
 
+    @_atomic_write
     async def add_to_blacklist(self, ticker: str, reason: str = None):
         """添加到黑名单"""
         conn = await self._get_connection()
@@ -1263,7 +1301,6 @@ class DatabaseService:
                 VALUES (?, ?, 1, ?)
             """, (ticker, reason, datetime.now().isoformat()))
 
-        await conn.commit()
 
     async def is_blacklisted(self, ticker: str) -> bool:
         """检查是否在黑名单"""
@@ -1284,6 +1321,7 @@ class DatabaseService:
 
     # ===================== 统计操作 =====================
 
+    @_atomic_write
     async def save_checkpoint(self, iteration: int, stats: Dict, blacklist: List[str]):
         """保存检查点"""
         conn = await self._get_connection()
@@ -1291,7 +1329,6 @@ class DatabaseService:
             INSERT INTO checkpoints (iteration, stats, blacklist)
             VALUES (?, ?, ?)
         """, (iteration, json.dumps(stats, ensure_ascii=False), json.dumps(blacklist)))
-        await conn.commit()
 
     async def get_latest_checkpoint(self) -> Optional[Dict]:
         """获取最新检查点"""
@@ -1321,6 +1358,7 @@ class DatabaseService:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
+    @_atomic_write
     async def record_research_stage_diagnostic(
         self,
         *,
@@ -1360,7 +1398,6 @@ class DatabaseService:
                 round_id,
             ),
         )
-        await conn.commit()
         return int(cursor.lastrowid)
 
     async def get_recent_research_stage_diagnostics(
@@ -1386,12 +1423,13 @@ class DatabaseService:
         from .storage_archive import hydrate_payload
         return [await hydrate_payload(conn, 'research_diagnostic', dict(row), 'raw_excerpt') for row in rows]
 
+    @_atomic_write
     async def clear_old_checkpoints(self, keep: int = 5):
         """清理旧检查点"""
         conn = await self._get_connection()
         # 获取要删除的ID
         async with conn.execute(
-            "SELECT id FROM checkpoints ORDER BY id DESC OFFSET ?",
+            "SELECT id FROM checkpoints ORDER BY id DESC LIMIT -1 OFFSET ?",
             (keep,)
         ) as cursor:
             rows = await cursor.fetchall()
@@ -1400,37 +1438,47 @@ class DatabaseService:
             id_list = [r[0] for r in rows]
             placeholders = ','.join('?' * len(id_list))
             await conn.execute(f"DELETE FROM checkpoints WHERE id IN ({placeholders})", id_list)
-            await conn.commit()
 
     @asynccontextmanager
-    async def transaction(self, *, immediate: bool = False):
-        """Canonical transaction boundary for atomic application writes."""
-        conn = await self._get_connection()
-        if not hasattr(self, "_transaction_lock"):
-            self._transaction_lock = asyncio.Lock()
+    async def connection_scope(self):
+        """Own the connection for a write or connection-wide maintenance."""
         if getattr(self, "_transaction_owner", None) is asyncio.current_task():
             raise RuntimeError("nested SQLite unit of work is not allowed")
         async with self._transaction_lock:
             self._transaction_owner = asyncio.current_task()
             try:
-                async with SQLiteUnitOfWork(conn).transaction(immediate=immediate) as active:
-                    yield active
+                yield await self._get_connection()
             finally:
                 self._transaction_owner = None
 
+    @asynccontextmanager
+    async def transaction(self, *, immediate: bool = False):
+        """Canonical transaction boundary for atomic application writes."""
+        async with self.connection_scope() as conn:
+            async with SQLiteUnitOfWork(conn).transaction(immediate=immediate) as active:
+                yield active
+
     async def close(self):
         """关闭连接"""
-        if self._connection:
-            await self._connection.close()
-            self._connection = None
-            logger.info("Database connection closed")
+        if getattr(self, "_transaction_owner", None) is asyncio.current_task():
+            raise RuntimeError("cannot close SQLite connection inside its write scope")
+        async with self._initialization_lock:
+            async with self._transaction_lock:
+                async with self._connection_lock:
+                    if self._connection:
+                        await self._connection.close()
+                        self._connection = None
+                        logger.info("Database connection closed")
         resolved = str(self.db_path.resolve())
-        type(self)._instances.pop(resolved, None)
+        self._initialized = False
+        if type(self)._instances.get(resolved) is self:
+            type(self)._instances.pop(resolved, None)
         if type(self)._instance is self:
-            type(self)._instance = None
+            type(self)._instance = next(iter(type(self)._instances.values()), None)
 
     # ===================== 报告结论存储 =====================
 
+    @_atomic_write
     async def init_report_tables(self):
         """初始化报告结论表"""
         conn = await self._get_connection()
@@ -1488,8 +1536,8 @@ class DatabaseService:
         await self._add_column_if_missing(conn, "round_digest", "source_event_count", "INTEGER")
         await self._add_column_if_missing(conn, "round_digest", "content_hash", "TEXT")
 
-        await conn.commit()
 
+    @_atomic_write
     async def save_report_conclusion(self, question: str, conclusion: str, ticker: str = "",
                                       position: float = 0, stop_loss: float = 0,
                                       take_profit: float = 0, holding_period: str = "",
@@ -1505,7 +1553,6 @@ class DatabaseService:
             (conclusion_id, question, conclusion, ticker, position, stop_loss, take_profit,
              holding_period, confidence, key_points, risks, datetime.now().isoformat(),
              round_id))
-        await conn.commit()
         return conclusion_id
 
     async def get_recent_conclusions(self, limit: int = 5) -> List[Dict]:
@@ -1518,6 +1565,7 @@ class DatabaseService:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    @_atomic_write
     async def save_reflection_summary(self, question: str, previous_conclusions: str,
                                        reflection_text: str, verification_results: str = "",
                                        adjusted_conclusion: str = "", lessons_learned: str = "",
@@ -1530,7 +1578,6 @@ class DatabaseService:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
             (question, previous_conclusions, reflection_text, verification_results,
              adjusted_conclusion, lessons_learned, datetime.now().isoformat(), round_id))
-        await conn.commit()
 
     async def get_recent_reflections(self, limit: int = 10) -> List[Dict]:
         """获取最近反思总结"""
@@ -1542,6 +1589,7 @@ class DatabaseService:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    @_atomic_write
     async def save_round_digest(
         self,
         round_id: str,
@@ -1578,7 +1626,6 @@ class DatabaseService:
              key_predictions, lessons, source_doc_count, source_turn_count,
              source_event_count, datetime.now().isoformat(), content_hash),
         )
-        await conn.commit()
 
     async def get_round_digest(self, round_id: str) -> Optional[Dict]:
         conn = await self._get_connection()

@@ -617,31 +617,30 @@ class InvestmentSimulation:
         """Upsert exact per-ticker rejection memory without reconstructing history."""
         if not self.db_service or self.db_service._connection is None:
             return
-        conn = self.db_service._connection
-        now = datetime.now().isoformat()
-        from .market_data import MarketDataService
+        async with self.db_service.transaction(immediate=True) as conn:
+            now = datetime.now().isoformat()
+            from .market_data import MarketDataService
 
-        for item in rejections:
-            ticker = self._normalize_ticker(str(item.get("ticker") or ""))
-            if not MarketDataService.is_supported_ticker(ticker):
-                continue
-            code = str(item.get("code") or "unknown_rejection").strip()
-            reason = str(item.get("reason") or "")[:2000]
-            await conn.execute(
-                """
-                INSERT INTO simulation_candidate_rejections (
-                    ticker, code, rejection_count, last_reason, source,
-                    first_seen_at, last_seen_at
-                ) VALUES (?, ?, 1, ?, ?, ?, ?)
-                ON CONFLICT(ticker, code) DO UPDATE SET
-                    rejection_count = simulation_candidate_rejections.rejection_count + 1,
-                    last_reason = excluded.last_reason,
-                    source = excluded.source,
-                    last_seen_at = excluded.last_seen_at
-                """,
-                (ticker, code, reason, source, now, now),
-            )
-        await conn.commit()
+            for item in rejections:
+                ticker = self._normalize_ticker(str(item.get("ticker") or ""))
+                if not MarketDataService.is_supported_ticker(ticker):
+                    continue
+                code = str(item.get("code") or "unknown_rejection").strip()
+                reason = str(item.get("reason") or "")[:2000]
+                await conn.execute(
+                    """
+                    INSERT INTO simulation_candidate_rejections (
+                        ticker, code, rejection_count, last_reason, source,
+                        first_seen_at, last_seen_at
+                    ) VALUES (?, ?, 1, ?, ?, ?, ?)
+                    ON CONFLICT(ticker, code) DO UPDATE SET
+                        rejection_count = simulation_candidate_rejections.rejection_count + 1,
+                        last_reason = excluded.last_reason,
+                        source = excluded.source,
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    (ticker, code, reason, source, now, now),
+                )
 
     async def record_committee_outcomes(
         self,
@@ -780,77 +779,76 @@ class InvestmentSimulation:
     ) -> None:
         if not self.db_service:
             return
-        conn = self.db_service._connection
-        now = datetime.now().isoformat()
-        completed_at = now if status == "completed" else None
-        normalized_rejections = {
-            str(code): int(count)
-            for code, count in (rejection_counts or {}).items()
-            if str(code).strip() and int(count) > 0
-        }
-        cumulative_rejections: Dict[str, int] = {}
-        try:
-            async with conn.execute(
-                "SELECT rejection_counts_total FROM simulation_redeployment_state WHERE id = 1"
-            ) as cursor:
-                existing_row = await cursor.fetchone()
-            if existing_row and existing_row[0]:
-                cumulative_rejections = {
-                    str(code): int(count)
-                    for code, count in json.loads(existing_row[0]).items()
-                }
-        except (TypeError, ValueError, json.JSONDecodeError, aiosqlite.Error):
-            cumulative_rejections = {}
-        if increment_attempt:
-            for code, count in normalized_rejections.items():
-                cumulative_rejections[code] = cumulative_rejections.get(code, 0) + count
-        last_rejections_json = json.dumps(normalized_rejections, ensure_ascii=False, sort_keys=True)
-        cumulative_rejections_json = json.dumps(cumulative_rejections, ensure_ascii=False, sort_keys=True)
-        await conn.execute(
-            """
-            INSERT INTO simulation_redeployment_state (
-                id, status, deployment_gap, blocker_code, blocker_reason,
-                next_action, source, attempt_count, last_attempt_at,
-                last_candidate_count, last_trade_count,
-                last_entry_trade_count, last_exit_trade_count,
-                last_rejection_counts, rejection_counts_total, created_at,
-                updated_at, completed_at
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                status = excluded.status,
-                deployment_gap = excluded.deployment_gap,
-                blocker_code = excluded.blocker_code,
-                blocker_reason = excluded.blocker_reason,
-                next_action = excluded.next_action,
-                source = excluded.source,
-                attempt_count = simulation_redeployment_state.attempt_count + ?,
-                last_attempt_at = CASE WHEN ? THEN excluded.last_attempt_at ELSE simulation_redeployment_state.last_attempt_at END,
-                last_candidate_count = CASE WHEN ? THEN excluded.last_candidate_count ELSE simulation_redeployment_state.last_candidate_count END,
-                last_trade_count = CASE WHEN ? THEN excluded.last_trade_count ELSE simulation_redeployment_state.last_trade_count END,
-                last_entry_trade_count = CASE WHEN ? THEN excluded.last_entry_trade_count ELSE simulation_redeployment_state.last_entry_trade_count END,
-                last_exit_trade_count = CASE WHEN ? THEN excluded.last_exit_trade_count ELSE simulation_redeployment_state.last_exit_trade_count END,
-                last_rejection_counts = CASE WHEN ? THEN excluded.last_rejection_counts ELSE simulation_redeployment_state.last_rejection_counts END,
-                rejection_counts_total = excluded.rejection_counts_total,
-                updated_at = excluded.updated_at,
-                completed_at = excluded.completed_at
-            """,
-            (
-                status, deployment_gap, blocker_code, blocker_reason, next_action,
-                source, 1 if increment_attempt else 0,
-                now if increment_attempt else None, candidate_count, trade_count,
-                entry_trade_count, exit_trade_count,
-                last_rejections_json, cumulative_rejections_json,
-                now, now, completed_at,
-                1 if increment_attempt else 0,
-                1 if increment_attempt else 0,
-                1 if increment_attempt else 0,
-                1 if increment_attempt else 0,
-                1 if increment_attempt else 0,
-                1 if increment_attempt else 0,
-                1 if increment_attempt else 0,
-            ),
-        )
-        await conn.commit()
+        async with self.db_service.transaction(immediate=True) as conn:
+            now = datetime.now().isoformat()
+            completed_at = now if status == "completed" else None
+            normalized_rejections = {
+                str(code): int(count)
+                for code, count in (rejection_counts or {}).items()
+                if str(code).strip() and int(count) > 0
+            }
+            cumulative_rejections: Dict[str, int] = {}
+            try:
+                async with conn.execute(
+                    "SELECT rejection_counts_total FROM simulation_redeployment_state WHERE id = 1"
+                ) as cursor:
+                    existing_row = await cursor.fetchone()
+                if existing_row and existing_row[0]:
+                    cumulative_rejections = {
+                        str(code): int(count)
+                        for code, count in json.loads(existing_row[0]).items()
+                    }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                cumulative_rejections = {}
+            if increment_attempt:
+                for code, count in normalized_rejections.items():
+                    cumulative_rejections[code] = cumulative_rejections.get(code, 0) + count
+            last_rejections_json = json.dumps(normalized_rejections, ensure_ascii=False, sort_keys=True)
+            cumulative_rejections_json = json.dumps(cumulative_rejections, ensure_ascii=False, sort_keys=True)
+            await conn.execute(
+                """
+                INSERT INTO simulation_redeployment_state (
+                    id, status, deployment_gap, blocker_code, blocker_reason,
+                    next_action, source, attempt_count, last_attempt_at,
+                    last_candidate_count, last_trade_count,
+                    last_entry_trade_count, last_exit_trade_count,
+                    last_rejection_counts, rejection_counts_total, created_at,
+                    updated_at, completed_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    deployment_gap = excluded.deployment_gap,
+                    blocker_code = excluded.blocker_code,
+                    blocker_reason = excluded.blocker_reason,
+                    next_action = excluded.next_action,
+                    source = excluded.source,
+                    attempt_count = simulation_redeployment_state.attempt_count + ?,
+                    last_attempt_at = CASE WHEN ? THEN excluded.last_attempt_at ELSE simulation_redeployment_state.last_attempt_at END,
+                    last_candidate_count = CASE WHEN ? THEN excluded.last_candidate_count ELSE simulation_redeployment_state.last_candidate_count END,
+                    last_trade_count = CASE WHEN ? THEN excluded.last_trade_count ELSE simulation_redeployment_state.last_trade_count END,
+                    last_entry_trade_count = CASE WHEN ? THEN excluded.last_entry_trade_count ELSE simulation_redeployment_state.last_entry_trade_count END,
+                    last_exit_trade_count = CASE WHEN ? THEN excluded.last_exit_trade_count ELSE simulation_redeployment_state.last_exit_trade_count END,
+                    last_rejection_counts = CASE WHEN ? THEN excluded.last_rejection_counts ELSE simulation_redeployment_state.last_rejection_counts END,
+                    rejection_counts_total = excluded.rejection_counts_total,
+                    updated_at = excluded.updated_at,
+                    completed_at = excluded.completed_at
+                """,
+                (
+                    status, deployment_gap, blocker_code, blocker_reason, next_action,
+                    source, 1 if increment_attempt else 0,
+                    now if increment_attempt else None, candidate_count, trade_count,
+                    entry_trade_count, exit_trade_count,
+                    last_rejections_json, cumulative_rejections_json,
+                    now, now, completed_at,
+                    1 if increment_attempt else 0,
+                    1 if increment_attempt else 0,
+                    1 if increment_attempt else 0,
+                    1 if increment_attempt else 0,
+                    1 if increment_attempt else 0,
+                    1 if increment_attempt else 0,
+                    1 if increment_attempt else 0,
+                ),
+            )
 
     async def mark_redeployment_required(self, proceeds: float, source: str) -> None:
         """Put released simulated-sale cash into the durable redeployment queue."""
@@ -1038,40 +1036,67 @@ class InvestmentSimulation:
             ).isoformat()
         )
         try:
-            if existing_id is None:
-                if intent_id:
-                    lookup_sql = (
-                        "SELECT id FROM simulation_pending_decisions "
-                        "WHERE intent_id = ? "
-                        "AND status IN ('pending_next_trading_session', 'replaying') "
-                        "ORDER BY id DESC LIMIT 1"
+            async with self.db_service.transaction(immediate=True) as conn:
+                if existing_id is None:
+                    if intent_id:
+                        lookup_sql = (
+                            "SELECT id FROM simulation_pending_decisions "
+                            "WHERE intent_id = ? "
+                            "AND status IN ('pending_next_trading_session', 'replaying') "
+                            "ORDER BY id DESC LIMIT 1"
+                        )
+                        lookup_params = (intent_id,)
+                    else:
+                        lookup_sql = (
+                            "SELECT id FROM simulation_pending_decisions "
+                            "WHERE ticker = ? AND direction = ? "
+                            "AND status IN ('pending_next_trading_session', 'replaying') "
+                            "AND intent_id IS NULL "
+                            "ORDER BY id DESC LIMIT 1"
+                        )
+                        lookup_params = (normalized_ticker, normalized_direction)
+                    async with conn.execute(lookup_sql, lookup_params) as cursor:
+                        existing = await cursor.fetchone()
+                    existing_id = int(existing[0]) if existing else None
+                if existing_id is not None:
+                    cursor = await conn.execute(
+                        """
+                        UPDATE simulation_pending_decisions
+                        SET ticker = ?, direction = ?, target_position = ?, confidence = ?,
+                            reason = ?, defer_code = ?, source = ?,
+                            status = 'pending_next_trading_session', updated_at = ?,
+                            expires_at = CASE WHEN ? = 1 THEN NULL
+                                              ELSE COALESCE(expires_at, ?) END,
+                            resolution = ?,
+                            round_id = COALESCE(?, round_id),
+                            intent_id = COALESCE(?, intent_id)
+                        WHERE id = ?
+                        """,
+                        (
+                            normalized_ticker,
+                            normalized_direction,
+                            max(0.0, min(float(target_position or 0.0), 1.0)),
+                            confidence,
+                            str(reason or "")[:2000],
+                            str(defer_code or "execution_deferred"),
+                            str(source or "investment_simulation"),
+                            now,
+                            int(durable_exit),
+                            expires_at,
+                            f"replay_deferred:{defer_code}"[:500],
+                            round_id,
+                            intent_id,
+                            int(existing_id),
+                        ),
                     )
-                    lookup_params = (intent_id,)
-                else:
-                    lookup_sql = (
-                        "SELECT id FROM simulation_pending_decisions "
-                        "WHERE ticker = ? AND direction = ? "
-                        "AND status IN ('pending_next_trading_session', 'replaying') "
-                        "AND intent_id IS NULL "
-                        "ORDER BY id DESC LIMIT 1"
-                    )
-                    lookup_params = (normalized_ticker, normalized_direction)
-                async with conn.execute(lookup_sql, lookup_params) as cursor:
-                    existing = await cursor.fetchone()
-                existing_id = int(existing[0]) if existing else None
-            if existing_id is not None:
+                    return int(existing_id) if cursor.rowcount else None
                 cursor = await conn.execute(
                     """
-                    UPDATE simulation_pending_decisions
-                    SET ticker = ?, direction = ?, target_position = ?, confidence = ?,
-                        reason = ?, defer_code = ?, source = ?,
-                        status = 'pending_next_trading_session', updated_at = ?,
-                        expires_at = CASE WHEN ? = 1 THEN NULL
-                                          ELSE COALESCE(expires_at, ?) END,
-                        resolution = ?,
-                        round_id = COALESCE(?, round_id),
-                        intent_id = COALESCE(?, intent_id)
-                    WHERE id = ?
+                    INSERT INTO simulation_pending_decisions (
+                        ticker, direction, target_position, confidence, reason,
+                        defer_code, source, status, created_at, updated_at, expires_at,
+                        round_id, intent_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_next_trading_session', ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_ticker,
@@ -1082,41 +1107,13 @@ class InvestmentSimulation:
                         str(defer_code or "execution_deferred"),
                         str(source or "investment_simulation"),
                         now,
-                        int(durable_exit),
+                        now,
                         expires_at,
-                        f"replay_deferred:{defer_code}"[:500],
                         round_id,
                         intent_id,
-                        int(existing_id),
                     ),
                 )
-                await conn.commit()
-                return int(existing_id) if cursor.rowcount else None
-            cursor = await conn.execute(
-                """
-                INSERT INTO simulation_pending_decisions (
-                    ticker, direction, target_position, confidence, reason,
-                    defer_code, source, status, created_at, updated_at, expires_at,
-                    round_id, intent_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_next_trading_session', ?, ?, ?, ?, ?)
-                """,
-                (
-                    normalized_ticker,
-                    normalized_direction,
-                    max(0.0, min(float(target_position or 0.0), 1.0)),
-                    confidence,
-                    str(reason or "")[:2000],
-                    str(defer_code or "execution_deferred"),
-                    str(source or "investment_simulation"),
-                    now,
-                    now,
-                    expires_at,
-                    round_id,
-                    intent_id,
-                ),
-            )
-            await conn.commit()
-            return int(cursor.lastrowid)
+                return int(cursor.lastrowid)
         except Exception as exc:
             logger.warning("Failed to persist pending simulated decision for %s: %s", ticker, exc)
             return None
@@ -1148,38 +1145,38 @@ class InvestmentSimulation:
             priority=int(priority),
             idempotency_key=idempotency_key,
         )
-        await self.db_service._connection.execute(
-            """
-            INSERT OR IGNORE INTO execution_intents (
-                id, round_id, decision_id, ticker, direction, target_position,
-                confidence, priority, reason, status, defer_code, resolution,
-                idempotency_key, created_at, updated_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
-            """,
-            (
-                intent.id,
-                intent.round_id,
-                intent.decision_id,
-                intent.ticker,
-                intent.direction,
-                intent.target_position,
-                intent.confidence,
-                intent.priority,
-                intent.reason,
-                intent.status.value,
-                intent.stable_idempotency_key,
-                intent.created_at,
-                intent.updated_at,
-                intent.expires_at,
-            ),
-        )
-        await self.db_service._connection.commit()
-        async with self.db_service._connection.execute(
-            "SELECT id FROM execution_intents WHERE idempotency_key = ?",
-            (intent.stable_idempotency_key,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return str(row[0]) if row else None
+        async with self.db_service.transaction(immediate=True) as conn:
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO execution_intents (
+                    id, round_id, decision_id, ticker, direction, target_position,
+                    confidence, priority, reason, status, defer_code, resolution,
+                    idempotency_key, created_at, updated_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    intent.id,
+                    intent.round_id,
+                    intent.decision_id,
+                    intent.ticker,
+                    intent.direction,
+                    intent.target_position,
+                    intent.confidence,
+                    intent.priority,
+                    intent.reason,
+                    intent.status.value,
+                    intent.stable_idempotency_key,
+                    intent.created_at,
+                    intent.updated_at,
+                    intent.expires_at,
+                ),
+            )
+            async with conn.execute(
+                "SELECT id FROM execution_intents WHERE idempotency_key = ?",
+                (intent.stable_idempotency_key,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            return str(row[0]) if row else None
 
     async def _set_execution_intent_status(
         self,
@@ -1264,21 +1261,21 @@ class InvestmentSimulation:
         """Refine a price-free ruling after sizing, before execution."""
         if not self.db_service or self.db_service._connection is None:
             return False
-        cursor = await self.db_service._connection.execute(
-            """
-            UPDATE execution_intents
-            SET target_position = ?, reason = ?, updated_at = ?
-            WHERE id = ? AND status = 'pending'
-            """,
-            (
-                max(0.0, min(float(target_position or 0.0), 1.0)),
-                str(reason or "")[:2000],
-                datetime.now().isoformat(),
-                intent_id,
-            ),
-        )
-        await self.db_service._connection.commit()
-        return bool(cursor.rowcount)
+        async with self.db_service.transaction(immediate=True) as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE execution_intents
+                SET target_position = ?, reason = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    max(0.0, min(float(target_position or 0.0), 1.0)),
+                    str(reason or "")[:2000],
+                    datetime.now().isoformat(),
+                    intent_id,
+                ),
+            )
+            return bool(cursor.rowcount)
 
     async def reject_execution_intent(
         self,
@@ -1550,79 +1547,79 @@ class InvestmentSimulation:
 
         now = datetime.now()
         now_text = now.isoformat()
-        # A prior process may have stopped between claiming and resolving a row.
-        await conn.execute(
-            """
-            UPDATE simulation_pending_decisions
-            SET status = 'pending_next_trading_session', updated_at = ?,
-                resolution = 'recovered_interrupted_replay'
-            WHERE status = 'replaying'
-              AND datetime(updated_at) < datetime(?, '-30 minutes')
-            """,
-            (now_text, now_text),
-        )
-        async with conn.execute(
-            """
-            SELECT id, ticker, direction, target_position, confidence, reason,
-                   defer_code, created_at, expires_at, round_id, intent_id
-            FROM simulation_pending_decisions
-            WHERE status = 'pending_next_trading_session'
-            ORDER BY CASE WHEN direction IN ('sell', 'short') THEN 0 ELSE 1 END,
-                     datetime(created_at), id
-            """
-        ) as cursor:
-            rows = [dict(row) async for row in cursor]
-
-        eligible: List[Dict[str, Any]] = []
-        for row in rows:
-            expiry_text = str(row.get("expires_at") or "")
-            durable_exit = bool(
-                row.get("intent_id")
-                and str(row.get("direction") or "").lower()
-                in {"sell", "short"}
+        async with self.db_service.transaction(immediate=True) as conn:
+            # A prior process may have stopped between claiming and resolving a row.
+            await conn.execute(
+                """
+                UPDATE simulation_pending_decisions
+                SET status = 'pending_next_trading_session', updated_at = ?,
+                    resolution = 'recovered_interrupted_replay'
+                WHERE status = 'replaying'
+                  AND datetime(updated_at) < datetime(?, '-30 minutes')
+                """,
+                (now_text, now_text),
             )
-            if durable_exit:
-                # Defensive compatibility for a database created by an older
-                # runner before the non-expiring-exit migration.  Never discard
-                # a mandatory exit merely because its old queue TTL elapsed.
-                expired = False
-            else:
-                try:
-                    expired = bool(
-                        expiry_text
-                        and datetime.fromisoformat(expiry_text) < now
-                    )
-                except ValueError:
-                    expired = True
-            if expired:
-                await conn.execute(
-                    """
-                    UPDATE simulation_pending_decisions
-                    SET status = 'expired', updated_at = ?, resolved_at = ?,
-                        resolution = 'expired_without_open-session_replay'
-                    WHERE id = ? AND status = 'pending_next_trading_session'
-                    """,
-                    (now_text, now_text, int(row["id"])),
+            async with conn.execute(
+                """
+                SELECT id, ticker, direction, target_position, confidence, reason,
+                       defer_code, created_at, expires_at, round_id, intent_id
+                FROM simulation_pending_decisions
+                WHERE status = 'pending_next_trading_session'
+                ORDER BY CASE WHEN direction IN ('sell', 'short') THEN 0 ELSE 1 END,
+                         datetime(created_at), id
+                """
+            ) as cursor:
+                rows = [dict(row) async for row in cursor]
+
+            eligible: List[Dict[str, Any]] = []
+            for row in rows:
+                expiry_text = str(row.get("expires_at") or "")
+                durable_exit = bool(
+                    row.get("intent_id")
+                    and str(row.get("direction") or "").lower()
+                    in {"sell", "short"}
                 )
-                summary["expired"] += 1
-            else:
-                eligible.append(row)
-        await conn.commit()
+                if durable_exit:
+                    # Defensive compatibility for a database created by an older
+                    # runner before the non-expiring-exit migration.  Never discard
+                    # a mandatory exit merely because its old queue TTL elapsed.
+                    expired = False
+                else:
+                    try:
+                        expired = bool(
+                            expiry_text
+                            and datetime.fromisoformat(expiry_text) < now
+                        )
+                    except ValueError:
+                        expired = True
+                if expired:
+                    await conn.execute(
+                        """
+                        UPDATE simulation_pending_decisions
+                        SET status = 'expired', updated_at = ?, resolved_at = ?,
+                            resolution = 'expired_without_open-session_replay'
+                        WHERE id = ? AND status = 'pending_next_trading_session'
+                        """,
+                        (now_text, now_text, int(row["id"])),
+                    )
+                    summary["expired"] += 1
+                else:
+                    eligible.append(row)
 
         slots = max(0, self.max_daily_trades - await self.count_trades_on_date())
         replay_limit = min(slots, max_count if max_count is not None else self.max_daily_trades)
         for row in eligible[:replay_limit]:
             pending_id = int(row["id"])
-            claimed = await conn.execute(
-                """
-                UPDATE simulation_pending_decisions
-                SET status = 'replaying', updated_at = ?, replayed_at = ?,
-                    replay_count = replay_count + 1
-                WHERE id = ? AND status = 'pending_next_trading_session'
-                """,
-                (datetime.now().isoformat(), datetime.now().isoformat(), pending_id),
-            )
-            await conn.commit()
+            async with self.db_service.transaction(immediate=True) as conn:
+                claimed = await conn.execute(
+                    """
+                    UPDATE simulation_pending_decisions
+                    SET status = 'replaying', updated_at = ?, replayed_at = ?,
+                        replay_count = replay_count + 1
+                    WHERE id = ? AND status = 'pending_next_trading_session'
+                    """,
+                    (datetime.now().isoformat(), datetime.now().isoformat(), pending_id),
+                )
             if not claimed.rowcount:
                 continue
             summary["attempted"] += 1
@@ -1668,35 +1665,35 @@ class InvestmentSimulation:
                 # A persistence failure must leave the price-free ruling
                 # retryable. The failed atomic fill/rejection transaction has
                 # already rolled back every durable consequence.
-                await conn.execute(
-                    """
-                    UPDATE simulation_pending_decisions
-                    SET status = 'pending_next_trading_session',
-                        updated_at = ?, resolution = ?
-                    WHERE id = ? AND status = 'replaying'
-                    """,
-                    (
-                        datetime.now().isoformat(),
-                        f"retryable_after_atomic_failure:{result.get('reason', '')}"[:500],
-                        pending_id,
-                    ),
-                )
-                await conn.commit()
+                async with self.db_service.transaction(immediate=True) as conn:
+                    await conn.execute(
+                        """
+                        UPDATE simulation_pending_decisions
+                        SET status = 'pending_next_trading_session',
+                            updated_at = ?, resolution = ?
+                        WHERE id = ? AND status = 'replaying'
+                        """,
+                        (
+                            datetime.now().isoformat(),
+                            f"retryable_after_atomic_failure:{result.get('reason', '')}"[:500],
+                            pending_id,
+                        ),
+                    )
                 summary["results"].append({"id": pending_id, **result})
                 continue
             else:
                 status = "rejected"
                 summary["rejected"] += 1
             resolution = f"{action or 'unknown'}:{result.get('reason', '')}"[:500]
-            await conn.execute(
-                """
-                UPDATE simulation_pending_decisions
-                SET status = ?, updated_at = ?, resolved_at = ?, resolution = ?
-                WHERE id = ? AND status = 'replaying'
-                """,
-                (status, datetime.now().isoformat(), datetime.now().isoformat(), resolution, pending_id),
-            )
-            await conn.commit()
+            async with self.db_service.transaction(immediate=True) as conn:
+                await conn.execute(
+                    """
+                    UPDATE simulation_pending_decisions
+                    SET status = ?, updated_at = ?, resolved_at = ?, resolution = ?
+                    WHERE id = ? AND status = 'replaying'
+                    """,
+                    (status, datetime.now().isoformat(), datetime.now().isoformat(), resolution, pending_id),
+                )
             summary["results"].append({"id": pending_id, **result})
 
         summary["remaining"] = await self.pending_decision_count()
@@ -2464,62 +2461,62 @@ class InvestmentSimulation:
             if conn is None:
                 return []
 
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS simulation_risk_memory (
-                    ticker TEXT PRIMARY KEY,
-                    source TEXT NOT NULL,
-                    failure_count INTEGER NOT NULL,
-                    last_loss_pct REAL NOT NULL,
-                    worst_loss_pct REAL NOT NULL,
-                    last_trade_id INTEGER,
-                    last_updated TEXT NOT NULL,
-                    expires_at TEXT,
-                    reason TEXT
-                )
-            """)
-
-            async with conn.execute("""
-                SELECT id, ticker, direction, shares, price, fee, reason, traded_at
-                FROM simulation_trades
-                ORDER BY datetime(traded_at), id
-            """) as cursor:
-                rows = [dict(row) async for row in cursor]
-
-            failures = derive_simulation_risk_memory(
-                rows,
-                loss_threshold=self.risk_memory_loss_threshold,
-                memory_days=self.risk_memory_days,
-            )
-            for failure in failures:
+            async with self.db_service.transaction(immediate=True) as conn:
                 await conn.execute("""
-                    INSERT INTO simulation_risk_memory (
-                        ticker, source, failure_count, last_loss_pct, worst_loss_pct,
-                        last_trade_id, last_updated, expires_at, reason
+                    CREATE TABLE IF NOT EXISTS simulation_risk_memory (
+                        ticker TEXT PRIMARY KEY,
+                        source TEXT NOT NULL,
+                        failure_count INTEGER NOT NULL,
+                        last_loss_pct REAL NOT NULL,
+                        worst_loss_pct REAL NOT NULL,
+                        last_trade_id INTEGER,
+                        last_updated TEXT NOT NULL,
+                        expires_at TEXT,
+                        reason TEXT
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(ticker) DO UPDATE SET
-                        source = excluded.source,
-                        failure_count = excluded.failure_count,
-                        last_loss_pct = excluded.last_loss_pct,
-                        worst_loss_pct = excluded.worst_loss_pct,
-                        last_trade_id = excluded.last_trade_id,
-                        last_updated = excluded.last_updated,
-                        expires_at = excluded.expires_at,
-                        reason = excluded.reason
-                """, (
-                    failure["ticker"],
-                    failure["source"],
-                    failure["failure_count"],
-                    failure["last_loss_pct"],
-                    failure["worst_loss_pct"],
-                    failure["last_trade_id"],
-                    failure["last_updated"],
-                    failure["expires_at"],
-                    failure["reason"],
-                ))
+                """)
 
-            await conn.commit()
-            return failures
+                async with conn.execute("""
+                    SELECT id, ticker, direction, shares, price, fee, reason, traded_at
+                    FROM simulation_trades
+                    ORDER BY datetime(traded_at), id
+                """) as cursor:
+                    rows = [dict(row) async for row in cursor]
+
+                failures = derive_simulation_risk_memory(
+                    rows,
+                    loss_threshold=self.risk_memory_loss_threshold,
+                    memory_days=self.risk_memory_days,
+                )
+                for failure in failures:
+                    await conn.execute("""
+                        INSERT INTO simulation_risk_memory (
+                            ticker, source, failure_count, last_loss_pct, worst_loss_pct,
+                            last_trade_id, last_updated, expires_at, reason
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(ticker) DO UPDATE SET
+                            source = excluded.source,
+                            failure_count = excluded.failure_count,
+                            last_loss_pct = excluded.last_loss_pct,
+                            worst_loss_pct = excluded.worst_loss_pct,
+                            last_trade_id = excluded.last_trade_id,
+                            last_updated = excluded.last_updated,
+                            expires_at = excluded.expires_at,
+                            reason = excluded.reason
+                    """, (
+                        failure["ticker"],
+                        failure["source"],
+                        failure["failure_count"],
+                        failure["last_loss_pct"],
+                        failure["worst_loss_pct"],
+                        failure["last_trade_id"],
+                        failure["last_updated"],
+                        failure["expires_at"],
+                        failure["reason"],
+                    ))
+
+                return failures
         except Exception as e:
             logger.warning(f"Failed to refresh simulation risk memory: {e}")
             return []
@@ -2958,266 +2955,266 @@ class InvestmentSimulation:
         if not self.db_service:
             return
 
-        conn = self.db_service._connection
+        async with self.db_service.connection_scope() as conn:
 
-        # 交易记录表
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS simulation_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                shares INTEGER NOT NULL,
-                price REAL NOT NULL,
-                fee REAL NOT NULL,
-                reason TEXT,
-                traded_at TEXT NOT NULL
-            )
-        """)
-
-        # 持仓表
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS simulation_positions (
-                ticker TEXT PRIMARY KEY,
-                shares INTEGER NOT NULL,
-                avg_cost REAL NOT NULL,
-                updated_at TEXT NOT NULL,
-                opened_at TEXT,
-                peak_price REAL,
-                last_mark_price REAL,
-                last_mark_at TEXT,
-                last_mark_source TEXT,
-                last_reviewed_at TEXT,
-                review_status TEXT,
-                review_reason TEXT
-            )
-        """)
-
-        async with conn.execute("PRAGMA table_info(simulation_positions)") as cursor:
-            existing_position_columns = {row[1] for row in await cursor.fetchall()}
-        required_position_columns = {
-            "opened_at": "TEXT",
-            "peak_price": "REAL",
-            "last_mark_price": "REAL",
-            "last_mark_at": "TEXT",
-            "last_mark_source": "TEXT",
-            "last_reviewed_at": "TEXT",
-            "review_status": "TEXT",
-            "review_reason": "TEXT",
-        }
-        for column, column_type in required_position_columns.items():
-            if column not in existing_position_columns:
-                await conn.execute(
-                    f"ALTER TABLE simulation_positions ADD COLUMN {column} {column_type}"
+            # 交易记录表
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    shares INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    fee REAL NOT NULL,
+                    reason TEXT,
+                    traded_at TEXT NOT NULL
                 )
-        await conn.execute("""
-            UPDATE simulation_positions
-            SET opened_at = COALESCE(
-                opened_at,
-                (SELECT MAX(t.traded_at)
-                 FROM simulation_trades t
-                 WHERE t.direction = 'buy'
-                   AND replace(replace(t.ticker, '.SH', ''), '.SZ', '') =
-                       replace(replace(simulation_positions.ticker, '.SH', ''), '.SZ', '')),
-                updated_at
-            ),
-                peak_price = COALESCE(peak_price, avg_cost),
-                review_status = COALESCE(review_status, 'pending_first_review'),
-                review_reason = COALESCE(review_reason, '等待逐仓生命周期复核')
-        """)
+            """)
 
-        # 资产快照表（每日）
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS simulation_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                total_assets REAL NOT NULL,
-                cash REAL NOT NULL,
-                positions_value REAL NOT NULL,
-                reflection TEXT,
-                snapshot_date TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS simulation_risk_memory (
-                ticker TEXT PRIMARY KEY,
-                source TEXT NOT NULL,
-                failure_count INTEGER NOT NULL,
-                last_loss_pct REAL NOT NULL,
-                worst_loss_pct REAL NOT NULL,
-                last_trade_id INTEGER,
-                last_updated TEXT NOT NULL,
-                expires_at TEXT,
-                reason TEXT
-            )
-        """)
-
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS simulation_redeployment_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                status TEXT NOT NULL,
-                deployment_gap REAL,
-                blocker_code TEXT,
-                blocker_reason TEXT,
-                next_action TEXT,
-                source TEXT,
-                attempt_count INTEGER NOT NULL DEFAULT 0,
-                last_attempt_at TEXT,
-                last_candidate_count INTEGER NOT NULL DEFAULT 0,
-                last_trade_count INTEGER NOT NULL DEFAULT 0,
-                last_entry_trade_count INTEGER NOT NULL DEFAULT 0,
-                last_exit_trade_count INTEGER NOT NULL DEFAULT 0,
-                last_rejection_counts TEXT NOT NULL DEFAULT '{}',
-                rejection_counts_total TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                completed_at TEXT
-            )
-        """)
-
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS simulation_pending_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                target_position REAL NOT NULL,
-                confidence REAL,
-                reason TEXT,
-                defer_code TEXT NOT NULL,
-                source TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                resolved_at TEXT,
-                resolution TEXT,
-                expires_at TEXT,
-                replayed_at TEXT,
-                replay_count INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS simulation_candidate_rejections (
-                ticker TEXT NOT NULL,
-                code TEXT NOT NULL,
-                rejection_count INTEGER NOT NULL DEFAULT 0,
-                last_reason TEXT,
-                source TEXT NOT NULL,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL,
-                PRIMARY KEY (ticker, code)
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS simulation_committee_outcomes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                target_position REAL NOT NULL,
-                vote_summary TEXT NOT NULL,
-                vote_margin REAL NOT NULL,
-                vote_count INTEGER NOT NULL,
-                parsed_vote_count INTEGER NOT NULL,
-                invalid_vote_count INTEGER NOT NULL,
-                quorum_required INTEGER NOT NULL,
-                quorum_met INTEGER NOT NULL,
-                review_depth TEXT,
-                prediction_id TEXT,
-                evidence_gaps TEXT NOT NULL DEFAULT '[]',
-                reconsider_if TEXT NOT NULL DEFAULT '[]',
-                individual_votes TEXT NOT NULL DEFAULT '[]',
-                stage_execution_audit TEXT NOT NULL DEFAULT '[]',
-                deadlock_review TEXT NOT NULL DEFAULT '{}',
-                initial_committee_decision TEXT NOT NULL DEFAULT '{}',
-                meeting_id TEXT,
-                outcome_code TEXT,
-                source TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_simulation_candidate_rejections_count "
-            "ON simulation_candidate_rejections(rejection_count DESC, last_seen_at DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_simulation_committee_outcomes_created "
-            "ON simulation_committee_outcomes(created_at DESC, id DESC)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_simulation_pending_status "
-            "ON simulation_pending_decisions(status, created_at)"
-        )
-
-        async with conn.execute("PRAGMA table_info(simulation_committee_outcomes)") as cursor:
-            committee_columns = {row[1] for row in await cursor.fetchall()}
-        committee_migrations = {
-            "prediction_id": "TEXT",
-            "evidence_gaps": "TEXT NOT NULL DEFAULT '[]'",
-            "reconsider_if": "TEXT NOT NULL DEFAULT '[]'",
-            "individual_votes": "TEXT NOT NULL DEFAULT '[]'",
-            "stage_execution_audit": "TEXT NOT NULL DEFAULT '[]'",
-            "deadlock_review": "TEXT NOT NULL DEFAULT '{}'",
-            "initial_committee_decision": "TEXT NOT NULL DEFAULT '{}'",
-            "meeting_id": "TEXT",
-            "outcome_code": "TEXT",
-        }
-        for column, definition in committee_migrations.items():
-            if column not in committee_columns:
-                await conn.execute(
-                    f"ALTER TABLE simulation_committee_outcomes "
-                    f"ADD COLUMN {column} {definition}"
+            # 持仓表
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_positions (
+                    ticker TEXT PRIMARY KEY,
+                    shares INTEGER NOT NULL,
+                    avg_cost REAL NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    opened_at TEXT,
+                    peak_price REAL,
+                    last_mark_price REAL,
+                    last_mark_at TEXT,
+                    last_mark_source TEXT,
+                    last_reviewed_at TEXT,
+                    review_status TEXT,
+                    review_reason TEXT
                 )
+            """)
 
-        async with conn.execute("PRAGMA table_info(simulation_pending_decisions)") as cursor:
-            pending_columns = {row[1] for row in await cursor.fetchall()}
-        pending_migrations = {
-            "expires_at": "TEXT",
-            "replayed_at": "TEXT",
-            "replay_count": "INTEGER NOT NULL DEFAULT 0",
-            # A fresh DatabaseService can apply architecture migrations before
-            # this legacy-owned table exists.  Add lineage locally before any
-            # query uses it; the second architecture pass then installs the
-            # canonical guards and indexes.
-            "round_id": "TEXT",
-            "intent_id": "TEXT",
-        }
-        for column, definition in pending_migrations.items():
-            if column not in pending_columns:
-                await conn.execute(
-                    f"ALTER TABLE simulation_pending_decisions ADD COLUMN {column} {definition}"
+            async with conn.execute("PRAGMA table_info(simulation_positions)") as cursor:
+                existing_position_columns = {row[1] for row in await cursor.fetchall()}
+            required_position_columns = {
+                "opened_at": "TEXT",
+                "peak_price": "REAL",
+                "last_mark_price": "REAL",
+                "last_mark_at": "TEXT",
+                "last_mark_source": "TEXT",
+                "last_reviewed_at": "TEXT",
+                "review_status": "TEXT",
+                "review_reason": "TEXT",
+            }
+            for column, column_type in required_position_columns.items():
+                if column not in existing_position_columns:
+                    await conn.execute(
+                        f"ALTER TABLE simulation_positions ADD COLUMN {column} {column_type}"
+                    )
+            await conn.execute("""
+                UPDATE simulation_positions
+                SET opened_at = COALESCE(
+                    opened_at,
+                    (SELECT MAX(t.traded_at)
+                     FROM simulation_trades t
+                     WHERE t.direction = 'buy'
+                       AND replace(replace(t.ticker, '.SH', ''), '.SZ', '') =
+                           replace(replace(simulation_positions.ticker, '.SH', ''), '.SZ', '')),
+                    updated_at
+                ),
+                    peak_price = COALESCE(peak_price, avg_cost),
+                    review_status = COALESCE(review_status, 'pending_first_review'),
+                    review_reason = COALESCE(review_reason, '等待逐仓生命周期复核')
+            """)
+
+            # 资产快照表（每日）
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    total_assets REAL NOT NULL,
+                    cash REAL NOT NULL,
+                    positions_value REAL NOT NULL,
+                    reflection TEXT,
+                    snapshot_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 )
-        await conn.execute(
-            """
-            UPDATE simulation_pending_decisions
-            SET expires_at = datetime(created_at, ?)
-            WHERE status = 'pending_next_trading_session'
-              AND expires_at IS NULL
-              AND NOT (
-                  direction IN ('sell', 'short')
-                  AND intent_id IS NOT NULL
-              )
-            """,
-            (f"+{self.pending_decision_max_age_days} days",),
-        )
+            """)
 
-        async with conn.execute("PRAGMA table_info(simulation_redeployment_state)") as cursor:
-            redeployment_columns = {row[1] for row in await cursor.fetchall()}
-        redeployment_migrations = {
-            "last_entry_trade_count": "INTEGER NOT NULL DEFAULT 0",
-            "last_exit_trade_count": "INTEGER NOT NULL DEFAULT 0",
-            "last_rejection_counts": "TEXT NOT NULL DEFAULT '{}'",
-            "rejection_counts_total": "TEXT NOT NULL DEFAULT '{}'",
-        }
-        for column, definition in redeployment_migrations.items():
-            if column not in redeployment_columns:
-                await conn.execute(
-                    f"ALTER TABLE simulation_redeployment_state "
-                    f"ADD COLUMN {column} {definition}"
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_risk_memory (
+                    ticker TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    failure_count INTEGER NOT NULL,
+                    last_loss_pct REAL NOT NULL,
+                    worst_loss_pct REAL NOT NULL,
+                    last_trade_id INTEGER,
+                    last_updated TEXT NOT NULL,
+                    expires_at TEXT,
+                    reason TEXT
                 )
+            """)
 
-        await conn.commit()
-        await apply_architecture_migrations(conn)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_redeployment_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    status TEXT NOT NULL,
+                    deployment_gap REAL,
+                    blocker_code TEXT,
+                    blocker_reason TEXT,
+                    next_action TEXT,
+                    source TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at TEXT,
+                    last_candidate_count INTEGER NOT NULL DEFAULT 0,
+                    last_trade_count INTEGER NOT NULL DEFAULT 0,
+                    last_entry_trade_count INTEGER NOT NULL DEFAULT 0,
+                    last_exit_trade_count INTEGER NOT NULL DEFAULT 0,
+                    last_rejection_counts TEXT NOT NULL DEFAULT '{}',
+                    rejection_counts_total TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                )
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_pending_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    target_position REAL NOT NULL,
+                    confidence REAL,
+                    reason TEXT,
+                    defer_code TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolution TEXT,
+                    expires_at TEXT,
+                    replayed_at TEXT,
+                    replay_count INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_candidate_rejections (
+                    ticker TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    rejection_count INTEGER NOT NULL DEFAULT 0,
+                    last_reason TEXT,
+                    source TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    PRIMARY KEY (ticker, code)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_committee_outcomes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    target_position REAL NOT NULL,
+                    vote_summary TEXT NOT NULL,
+                    vote_margin REAL NOT NULL,
+                    vote_count INTEGER NOT NULL,
+                    parsed_vote_count INTEGER NOT NULL,
+                    invalid_vote_count INTEGER NOT NULL,
+                    quorum_required INTEGER NOT NULL,
+                    quorum_met INTEGER NOT NULL,
+                    review_depth TEXT,
+                    prediction_id TEXT,
+                    evidence_gaps TEXT NOT NULL DEFAULT '[]',
+                    reconsider_if TEXT NOT NULL DEFAULT '[]',
+                    individual_votes TEXT NOT NULL DEFAULT '[]',
+                    stage_execution_audit TEXT NOT NULL DEFAULT '[]',
+                    deadlock_review TEXT NOT NULL DEFAULT '{}',
+                    initial_committee_decision TEXT NOT NULL DEFAULT '{}',
+                    meeting_id TEXT,
+                    outcome_code TEXT,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_simulation_candidate_rejections_count "
+                "ON simulation_candidate_rejections(rejection_count DESC, last_seen_at DESC)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_simulation_committee_outcomes_created "
+                "ON simulation_committee_outcomes(created_at DESC, id DESC)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_simulation_pending_status "
+                "ON simulation_pending_decisions(status, created_at)"
+            )
+
+            async with conn.execute("PRAGMA table_info(simulation_committee_outcomes)") as cursor:
+                committee_columns = {row[1] for row in await cursor.fetchall()}
+            committee_migrations = {
+                "prediction_id": "TEXT",
+                "evidence_gaps": "TEXT NOT NULL DEFAULT '[]'",
+                "reconsider_if": "TEXT NOT NULL DEFAULT '[]'",
+                "individual_votes": "TEXT NOT NULL DEFAULT '[]'",
+                "stage_execution_audit": "TEXT NOT NULL DEFAULT '[]'",
+                "deadlock_review": "TEXT NOT NULL DEFAULT '{}'",
+                "initial_committee_decision": "TEXT NOT NULL DEFAULT '{}'",
+                "meeting_id": "TEXT",
+                "outcome_code": "TEXT",
+            }
+            for column, definition in committee_migrations.items():
+                if column not in committee_columns:
+                    await conn.execute(
+                        f"ALTER TABLE simulation_committee_outcomes "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+
+            async with conn.execute("PRAGMA table_info(simulation_pending_decisions)") as cursor:
+                pending_columns = {row[1] for row in await cursor.fetchall()}
+            pending_migrations = {
+                "expires_at": "TEXT",
+                "replayed_at": "TEXT",
+                "replay_count": "INTEGER NOT NULL DEFAULT 0",
+                # A fresh DatabaseService can apply architecture migrations before
+                # this legacy-owned table exists.  Add lineage locally before any
+                # query uses it; the second architecture pass then installs the
+                # canonical guards and indexes.
+                "round_id": "TEXT",
+                "intent_id": "TEXT",
+            }
+            for column, definition in pending_migrations.items():
+                if column not in pending_columns:
+                    await conn.execute(
+                        f"ALTER TABLE simulation_pending_decisions ADD COLUMN {column} {definition}"
+                    )
+            await conn.execute(
+                """
+                UPDATE simulation_pending_decisions
+                SET expires_at = datetime(created_at, ?)
+                WHERE status = 'pending_next_trading_session'
+                  AND expires_at IS NULL
+                  AND NOT (
+                      direction IN ('sell', 'short')
+                      AND intent_id IS NOT NULL
+                  )
+                """,
+                (f"+{self.pending_decision_max_age_days} days",),
+            )
+
+            async with conn.execute("PRAGMA table_info(simulation_redeployment_state)") as cursor:
+                redeployment_columns = {row[1] for row in await cursor.fetchall()}
+            redeployment_migrations = {
+                "last_entry_trade_count": "INTEGER NOT NULL DEFAULT 0",
+                "last_exit_trade_count": "INTEGER NOT NULL DEFAULT 0",
+                "last_rejection_counts": "TEXT NOT NULL DEFAULT '{}'",
+                "rejection_counts_total": "TEXT NOT NULL DEFAULT '{}'",
+            }
+            for column, definition in redeployment_migrations.items():
+                if column not in redeployment_columns:
+                    await conn.execute(
+                        f"ALTER TABLE simulation_redeployment_state "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+
+            await conn.commit()
+            await apply_architecture_migrations(conn)
         await self.refresh_simulation_risk_memory()
 
     async def save_snapshot(
@@ -3238,24 +3235,23 @@ class InvestmentSimulation:
                     ", ".join(assets.get("missing_price_tickers", [])),
                 )
                 return
-            conn = self.db_service._connection
+            async with self.db_service.transaction(immediate=True) as conn:
 
-            await conn.execute("""
-                INSERT INTO simulation_snapshots (
-                    total_assets, cash, positions_value, reflection,
-                    snapshot_date, created_at, round_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                assets['total_assets'],
-                assets['cash'],
-                assets['positions_value'],
-                reflection[:2000] if reflection else "",
-                datetime.now().date().isoformat(),
-                datetime.now().isoformat(),
-                round_id,
-            ))
-            await conn.commit()
-            logger.info(f"Saved snapshot: total={assets['total_assets']}")
+                await conn.execute("""
+                    INSERT INTO simulation_snapshots (
+                        total_assets, cash, positions_value, reflection,
+                        snapshot_date, created_at, round_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    assets['total_assets'],
+                    assets['cash'],
+                    assets['positions_value'],
+                    reflection[:2000] if reflection else "",
+                    datetime.now().date().isoformat(),
+                    datetime.now().isoformat(),
+                    round_id,
+                ))
+                logger.info(f"Saved snapshot: total={assets['total_assets']}")
         except Exception as e:
             logger.warning(f"Failed to save snapshot: {e}")
 
