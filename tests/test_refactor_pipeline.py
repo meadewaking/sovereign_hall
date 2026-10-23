@@ -6200,6 +6200,7 @@ async def test_simulation_trade_refuses_local_prediction_without_realtime_quote(
     monkeypatch.delenv("SOVEREIGN_HALL_REALTIME_QUOTES", raising=False)
 
     sim = InvestmentSimulation(db)
+    await sim.initialize()
     sim.cash = 9000.0
     sim.get_current_quote = AsyncMock(return_value=None)
 

@@ -25,7 +25,7 @@ from ..application.execute_simulation_cycle import (
     UnquotedExecutionRejectionCommitRequest,
 )
 from ..domain.common.ids import new_id
-from ..domain.portfolio.quote_freshness import is_fresh_quote
+from ..domain.portfolio.quote_freshness import is_fresh_quote, retrieved_after
 from ..domain.portfolio.costs import CostSchedule
 from ..domain.portfolio.instruments import InstrumentProfile, normalize_ticker
 from ..domain.portfolio.models import ExecutionIntent
@@ -1298,6 +1298,8 @@ class InvestmentSimulation:
         llm: LLMClient = None,
         *,
         pending_decision_id: int | None = None,
+        signal_count: int | None = None,
+        risk_cap_already_applied: bool = True,
     ) -> Dict[str, Any]:
         """Canonical simulated-execution entry; callers cannot provide a price."""
         if not self.db_service or self.db_service._connection is None:
@@ -1351,7 +1353,8 @@ class InvestmentSimulation:
             llm=llm,
             reason=item.get("reason") or "",
             confidence=item.get("confidence"),
-            risk_cap_already_applied=True,
+            risk_cap_already_applied=risk_cap_already_applied,
+            signal_count=signal_count,
             pending_decision_id=pending_decision_id,
             round_id=item.get("round_id"),
             intent_id=intent_id,
@@ -1781,7 +1784,14 @@ class InvestmentSimulation:
         """Resolve a realtime simulated fill price; never fall back to local marks."""
         code = self._normalize_ticker(ticker)
         if self.realtime_quotes_enabled():
-            quote = await self.get_current_quote(code)
+            market = self._market_data_service()
+            if hasattr(market, 'get_execution_quote'):
+                quote = await market.get_execution_quote(code)
+            else:
+                # Shared batches may already have been fetched after all
+                # intents. Their durable time boundary is checked below and
+                # again under the atomic executor's transaction.
+                quote = await self.get_current_quote(code)
             if self._quote_is_fresh(quote):
                 return {
                     "price": float(quote["price"]),
@@ -1843,7 +1853,25 @@ class InvestmentSimulation:
         """
         market_data = self._market_data_service()
         direction_norm = (direction or "").lower()
+        if direction_norm in {'neutral', '观望'}:
+            direction_norm = 'hold'
         ticker = self._normalize_ticker(ticker)
+
+        if self.db_service and not intent_id:
+            # Preserve the legacy public entry without permitting a durable
+            # trade to skip its price-free ruling and canonical status path.
+            intent_id = await self.create_execution_intent(
+                ticker=ticker, direction=direction_norm,
+                target_position=target_position, reason=reason,
+                confidence=confidence, round_id=round_id,
+                idempotency_key=idempotency_key)
+            if not intent_id:
+                return {'success': False, 'action': 'error',
+                        'reason': '模拟执行裁决持久化失败，未请求成交行情'}
+            return await self.execute_intent(
+                intent_id, llm, pending_decision_id=pending_decision_id,
+                signal_count=signal_count,
+                risk_cap_already_applied=risk_cap_already_applied)
 
         if not await market_data.is_trading_day():
             pending_id = await self.record_pending_decision(
@@ -1959,6 +1987,15 @@ class InvestmentSimulation:
         quote_quoted_at = str(quote_detail.get("quoted_at") or "")
         execution_quote = {"price": float(price), "provider": quote_provider,
                            "fetched_at": quote_fetched_at, "quoted_at": quote_quoted_at}
+        if self.db_service:
+            async with self.db_service._connection.execute(
+                'SELECT created_at FROM execution_intents WHERE id=?', (intent_id,)
+            ) as cursor:
+                intent_row = await cursor.fetchone()
+            if not intent_row or not retrieved_after(execution_quote, intent_row[0]):
+                return {'success': False, 'action': 'hold', 'ticker': ticker,
+                        'blocker_code': 'realtime_quote_unavailable',
+                        'reason': '行情抓取早于持久化裁决或晚于当前时间，等待重新获取实时行情'}
         if (quote_detail.get("ticker") != ticker or quote_detail.get("price") != price
                 or not self._quote_is_fresh({**execution_quote, "source": quote_provider})):
             return {"success": False, "action": "hold", "ticker": ticker,
@@ -2031,6 +2068,17 @@ class InvestmentSimulation:
                 from dataclasses import replace
                 self.risk_context = replace(self.risk_context,
                     simulation_failures=risk_memory)
+            qualified_committee_evidence = False
+            if self.db_service and intent_id:
+                async with self.db_service._connection.execute(
+                    'SELECT c.direction,c.quorum_met FROM execution_intents i '
+                    'JOIN simulation_committee_outcomes c ON c.round_id=i.round_id '
+                    'AND c.decision_id=i.decision_id AND c.ticker=i.ticker '
+                    'WHERE i.id=? ORDER BY c.id DESC LIMIT 1', (intent_id,)
+                ) as cursor:
+                    approval = await cursor.fetchone()
+                qualified_committee_evidence = bool(
+                    approval and approval[0] in {'long', 'buy'} and approval[1])
             capped_position, cap_reason = apply_heuristic_risk_cap(
                 ticker,
                 float(target_position),
@@ -2038,7 +2086,10 @@ class InvestmentSimulation:
                 signal_count=observed_signal_count,
                 current_position=current_position_pct,
                 current_gross_exposure=current_gross_exposure,
-                fresh_local_evidence=bool(intent_id),
+                # Persisting an order does not produce research evidence.
+                # Direct callers and their deferred retries keep the same
+                # conservative policy unless an actual approval is linked.
+                fresh_local_evidence=qualified_committee_evidence,
                 context=self.risk_context,
             )
             if cap_reason:

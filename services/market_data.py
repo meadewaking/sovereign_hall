@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 
 from ..domain.portfolio.instruments import is_etf_ticker, normalize_ticker
-from ..domain.portfolio.quote_freshness import MARKET_ZONE, is_fresh_quote, quote_age_seconds
+from ..domain.portfolio.quote_freshness import MARKET_ZONE, is_fresh_quote, quote_age_seconds, retrieved_after
 from .exchange_calendar import ExchangeCalendar, load_exchange_calendar
 from ..utils import sync_retry_with_backoff
 
@@ -238,13 +238,22 @@ class MarketDataService:
             return None
         return await self._get_quote(ticker,valuation=False)
 
+    async def get_execution_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Acquire a new controlled observation; research caches cannot execute."""
+        requested = datetime.now(MARKET_ZONE)
+        quote = await self._get_quote(ticker, valuation=False, use_cache=False)
+        if (is_fresh_quote(quote, max_age_seconds=self._max_quote_age_seconds)
+                and retrieved_after(quote, requested.isoformat())):
+            return quote
+        return None
+
     async def get_valuation_quote(self,ticker):
         return await self._get_quote(ticker,valuation=True)
 
     async def get_valuation_quotes(self,tickers):
         return await collect_realtime_quote_batch(tickers,self.get_valuation_quote)
 
-    async def _get_quote(self,ticker,*,valuation):
+    async def _get_quote(self,ticker,*,valuation,use_cache=True):
         from .valuation_quotes import valuation_quote,is_valid_valuation_quote,market_window
         code = self.normalize_ticker(ticker)
         if not self.is_supported_ticker(code):
@@ -259,7 +268,7 @@ class MarketDataService:
                         self._valuation_cache[code]=marked
                         return dict(marked)
         cached = self._quote_cache.get(code)
-        if cached and is_fresh_quote(cached, max_age_seconds=self._quote_ttl_seconds):
+        if use_cache and cached and is_fresh_quote(cached, max_age_seconds=self._quote_ttl_seconds):
             return dict(cached)
         self._quote_cache.pop(code, None)
         self._ensure_client()

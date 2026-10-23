@@ -5858,7 +5858,8 @@ async def await_storage_capacity(governor, pause_seconds=60, *, portfolio_mainte
     last_notice = None
     paused = False
     while True:
-        snapshot = await governor.before_round()
+        snapshot = await (portfolio_maintenance.during(governor.before_round(), context='storage_capacity_wait')
+                          if portfolio_maintenance is not None else governor.before_round())
         if snapshot.research_round_allowed:
             if paused:
                 logger.info('STORAGE_RECOVERED 存储限制已解除，自动恢复研究: %s', snapshot.to_dict())
@@ -5878,6 +5879,8 @@ async def await_storage_capacity(governor, pause_seconds=60, *, portfolio_mainte
             print('\n' + notice + '；进程持续运行，达到写入条件后自动恢复')
             last_notice = notice_key
         delay = float(pause_seconds)
+        if archive.get('retry_after_seconds') is not None:
+            delay = min(delay, max(.01, float(archive['retry_after_seconds'])))
         if snapshot.recovery_targets and (archive.get('can_continue') or archive.get('progressed')):
             delay = min(delay, 5)
         if portfolio_maintenance is None:
