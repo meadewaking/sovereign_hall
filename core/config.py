@@ -84,6 +84,22 @@ class Config:
             },
 
             # 爬虫配置
+            'model_collaboration': {
+                'enabled': False,
+                'research_profile': 'glm-5.2-fp8',
+                'review_profile': 'kimi-k3',
+                'research_max_concurrent': 6,
+                'review_max_concurrent': 2,
+                'review_max_tokens': 5000,
+                'review_max_calls_per_round': 4,
+                'max_review_proposals_per_round': 2,
+                'review_max_calls_per_day': 100,
+                'review_timeout_seconds': 180,
+                'empty_audit_interval': 3,
+                'review_source_chars': 24000,
+                'supplement_timeout_seconds': 120,
+            },
+
             'spider': {
                 'max_concurrent': 50,
                 'timeout': 30,

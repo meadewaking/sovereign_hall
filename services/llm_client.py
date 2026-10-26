@@ -8,7 +8,7 @@ import hashlib
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -48,6 +48,8 @@ class LLMClient:
         max_retries: Optional[int] = None,
         retry_delay: Optional[float] = None,
         profile: Optional[str] = None,
+        token_stats: Optional[TokenStats] = None,
+        usage_observer: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         """
         初始化LLM客户端
@@ -97,7 +99,8 @@ class LLMClient:
         self._embedding_semaphore = asyncio.Semaphore(16)
 
         # 统计
-        self.token_stats = TokenStats()
+        self.token_stats = token_stats if token_stats is not None else TokenStats()
+        self.usage_observer = usage_observer
         self._stats_lock = threading.Lock()
 
         # 缓存
@@ -250,7 +253,7 @@ class LLMClient:
             # response, including one generated with a different token budget.
             use_cache = use_cache and not json_output
             if use_cache:
-                cache_key = self._get_cache_key(messages, temperature)
+                cache_key = self._get_cache_key(messages, temperature, max_tokens)
                 cached = self._get_cached(cache_key)
                 if cached:
                     logger.debug(f"[CACHE HIT] {cache_key[:16]}")
@@ -275,6 +278,7 @@ class LLMClient:
 
             # 带重试的执行调用
             last_exception = None
+            started = time.monotonic()
             for attempt in range(self.max_retries + 1):
                 try:
                     response, usage = await _call_llm()
@@ -298,13 +302,14 @@ class LLMClient:
                     )
                     cost = input_cost + output_cost
                     with self._stats_lock:
-                        self.token_stats.add_request(
+                        self._record_usage(
                             prompt_len=prompt_tokens * 4,  # 还原为字符数
                             completion_len=completion_tokens * 4,
                             success=True,
                             cost_usd=cost,
                             input_cost_usd=input_cost,
                             output_cost_usd=output_cost,
+                            elapsed_seconds=time.monotonic() - started,
                         )
 
                     # 写入缓存
@@ -337,11 +342,12 @@ class LLMClient:
                         # 使用估算值作为后备，避免变量未定义错误
                         fallback_prompt_tokens = estimated_prompt_tokens if 'estimated_prompt_tokens' in dir() else 0
                         with self._stats_lock:
-                            self.token_stats.add_request(
+                            self._record_usage(
                                 prompt_len=fallback_prompt_tokens * 4,
                                 completion_len=0,
                                 success=False,
-                                cost_usd=0
+                                cost_usd=0,
+                                elapsed_seconds=time.monotonic() - started,
                             )
                         raise
 
@@ -766,13 +772,15 @@ class LLMClient:
             input_per_1k = float(embedding_config.get('embedding_input_per_1k', 0.0) or 0.0)
             input_cost = (prompt_tokens / 1000) * input_per_1k
             with self._stats_lock:
-                self.token_stats.add_request(
+                self._record_usage(
                     prompt_len=prompt_tokens * 4,
                     completion_len=0,
                     success=True,
                     cost_usd=input_cost,
                     input_cost_usd=input_cost,
                     output_cost_usd=0.0,
+                    billing_model=model_name,
+                    billing_base_url=embedding_config.get('embedding_base_url', ''),
                 )
         except Exception as exc:
             logger.debug("Failed to track embedding usage: %s", self._format_exception(exc))
@@ -781,11 +789,36 @@ class LLMClient:
     # 缓存管理
     # =========================================================================
 
-    def _get_cache_key(self, messages: List[Dict], temperature: float) -> str:
+    def _get_cache_key(self, messages: List[Dict], temperature: float, max_tokens: Optional[int] = None) -> str:
         """生成缓存键"""
         # 使用 json.dumps 代替 str，效率更高且结果更稳定
-        content = json.dumps(messages, sort_keys=True, ensure_ascii=False) + json.dumps(temperature)
+        content = json.dumps({
+            "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
+            "model": self.model, "provider": self.provider, "base_url": self.base_url,
+            "profile": getattr(self, "profile", None),
+        }, sort_keys=True, ensure_ascii=False)
         return hashlib.md5(content.encode()).hexdigest()
+
+    def _record_usage(self, *, elapsed_seconds: float = 0.0, billing_model=None,
+                      billing_base_url=None, **usage):
+        """Keep one shared lifetime counter and attribute each request once."""
+        self.token_stats.add_request(**usage)
+        observer = getattr(self, "usage_observer", None)
+        if observer is not None:
+            try:
+                observer({
+                    "model": billing_model or self.model, "provider": self.provider,
+                    "profile": "embedding" if billing_model else self.profile,
+                    "base_url": billing_base_url if billing_model else self.base_url,
+                    "prompt_tokens": usage["prompt_len"] // 4,
+                    "completion_tokens": usage["completion_len"] // 4,
+                    "input_cost": usage.get("input_cost_usd", 0.0),
+                    "output_cost": usage.get("output_cost_usd", 0.0),
+                    "requests": 1, "successful_requests": int(usage.get("success", True)),
+                    "elapsed_seconds": elapsed_seconds,
+                })
+            except Exception:
+                logger.exception("Failed to persist per-model usage")
 
     def _get_cached(self, cache_key: str) -> Optional[str]:
         """获取缓存"""

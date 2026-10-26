@@ -46,6 +46,22 @@ llm_profiles:
     # 旧端点在reasoning_effort=none配合json_object时可能返回500，保留本地校验。
     structured_output_use_response_format: false
 
+# GLM承担日常研究，K3只用于终审、实质补证后的复审和空候选抽查。
+model_collaboration:
+  enabled: true
+  research_profile: "glm-5.2-fp8"
+  review_profile: "kimi-k3"
+  research_max_concurrent: 6
+  review_max_concurrent: 2
+  review_max_tokens: 5000
+  review_max_calls_per_round: 4
+  max_review_proposals_per_round: 2
+  review_max_calls_per_day: 100
+  review_timeout_seconds: 180
+  empty_audit_interval: 3
+  review_source_chars: 24000
+  supplement_timeout_seconds: 120
+
 # Token预算占位（沿用原估算值，非kimi-k3实际费率；按网关账单调整）
 pricing:
   openai:

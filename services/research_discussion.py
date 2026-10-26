@@ -30,6 +30,7 @@ sys.path.insert(0, str(project_root))
 from sovereign_hall.core import AgentRole, Document, InvestmentProposal
 from sovereign_hall.agents import AgentPersona, get_persona
 from sovereign_hall.services.llm_client import LLMClient
+from sovereign_hall.services.model_collaboration import create_llm_client
 from sovereign_hall.services.spider_service import SpiderSwarm
 from sovereign_hall.services.vector_db import VectorDatabase
 from sovereign_hall.services.database import DatabaseService
@@ -65,7 +66,7 @@ class ResearchDiscussionSystem:
 
     def __init__(self, enable_search: bool = True, enable_web: bool = False):
         self.db_service = None  # 延迟初始化
-        self.llm = LLMClient(max_concurrent=16)
+        self.llm = create_llm_client(max_concurrent=16)
         self.spider = SpiderSwarm(max_concurrent=30)
         self.vector_db = VectorDatabase()
 
@@ -88,6 +89,7 @@ class ResearchDiscussionSystem:
         self.heuristic_prompt_context = format_heuristic_prompt_context()
         self.learned_prediction_context = ""
         self.pipeline_memory_context = ""
+        self._raw_sources = {}
 
     async def _get_db(self) -> DatabaseService:
         """获取数据库服务（延迟初始化）"""
@@ -105,6 +107,7 @@ class ResearchDiscussionSystem:
         print(f"{'='*70}\n")
 
         context = ResearchContext(question=question)
+        self._raw_sources = {}
 
         # Use validated autonomous-loop outcomes, not only raw documents and
         # recent prose conclusions, when answering a user.
@@ -457,6 +460,10 @@ class ResearchDiscussionSystem:
             parts.append("")
 
         docs = await db.search_documents(query=keyword_query, limit=15)
+        if not hasattr(self, "_raw_sources"):
+            self._raw_sources = {}
+        for doc in docs:
+            self._raw_sources[str(doc.get("id") or doc.get("url") or len(self._raw_sources))] = doc
         if docs:
             parts.append("【历史分析文档】")
             for i, doc in enumerate(docs[:5]):
@@ -484,6 +491,10 @@ class ResearchDiscussionSystem:
 
         try:
             results = await self.spider.aggressive_search([query], max_results_per_query=5)
+            if not hasattr(self, "_raw_sources"):
+                self._raw_sources = {}
+            for doc in results:
+                self._raw_sources[str(doc.id)] = doc.to_dict()
             if not results:
                 return ""
 
@@ -654,6 +665,7 @@ class ResearchDiscussionSystem:
     async def _generate_conclusion(self, context: ResearchContext) -> str:
         """生成最终结论"""
         all_views = "\n\n".join(context.discussion_history)
+        context.relevant_docs = list(getattr(self, "_raw_sources", {}).values())
 
         db = await self._get_db()
         from .learning_engine import LearningEngine
@@ -703,7 +715,18 @@ daily_prices缺失只表示历史回测可信度不足，不是当前市场事�
 若问题指定持有期，操作建议必须贴合该持有期，并给出到期复核条件。
 如展开能提高判断质量，可以补充关键证据、反证和跟踪条件。
 """
-        response = await self.cio.think(prompt, max_tokens=8000)
+        reviewer = getattr(self.llm, "reviewer", None)
+        if getattr(self.llm, "collaboration_enabled", False) is True:
+            from uuid import uuid4
+            response = await reviewer.for_round("interactive_" + uuid4().hex).chat(
+                system="你是高级研究终审员。核对给定原始资料，审阅GLM各角色意见，保留异议并给出条件化结论。",
+                user=prompt + "\n【原始研究资料】\n" + json.dumps(
+                    context.relevant_docs + [doc.to_dict() for doc in context.search_results],
+                    ensure_ascii=False, default=str)[:24000],
+                temperature=0.2, max_tokens=5000,
+            )
+        else:
+            response = await self.cio.think(prompt, max_tokens=8000)
         return extract_actual_response(response, max_length=20000)
 
     async def close(self) -> None:

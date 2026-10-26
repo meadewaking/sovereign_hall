@@ -1504,7 +1504,9 @@ class InvestmentSimulation:
                     }
         return {"intent_id": intent_id, **result}
 
-    async def replay_pending_decisions(self, max_count: int | None = None) -> Dict[str, Any]:
+    async def replay_pending_decisions(
+        self, max_count: int | None = None, *, eligible_tickers: set[str] | None = None,
+    ) -> Dict[str, Any]:
         """Consume deferred rulings once, only in an open trading session.
 
         The queue stores decisions, never orders or prices.  Every replay calls
@@ -1606,7 +1608,7 @@ class InvestmentSimulation:
                         (now_text, now_text, int(row["id"])),
                     )
                     summary["expired"] += 1
-                else:
+                elif eligible_tickers is None or row["ticker"] in eligible_tickers:
                     eligible.append(row)
 
         slots = max(0, self.max_daily_trades - await self.count_trades_on_date())
@@ -2576,8 +2578,15 @@ class InvestmentSimulation:
         self,
         *,
         round_id: str | None = None,
+        prepare_only: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Review every open position before considering new simulated trades."""
+        """Review holdings, optionally persisting exits for a shared later batch.
+
+        Planning never requests an execution quote or changes cash/shares. The
+        default retains the production lifecycle's immediate execution path.
+        """
+        if prepare_only and (not self.db_service or self.db_service._connection is None):
+            raise RuntimeError("planning exits requires a durable account")
         reviews: List[Dict[str, Any]] = []
         now = datetime.now()
         for ticker in list(self.positions):
@@ -2652,7 +2661,9 @@ class InvestmentSimulation:
                         ),
                     )
                     execution = (
-                        await self.execute_intent(intent_id)
+                        ({"success": False, "action": "prepared", "intent_id": intent_id,
+                          "reason": "退出裁决已持久化，等待共同执行行情"}
+                         if prepare_only else await self.execute_intent(intent_id))
                         if intent_id
                         else {
                             "success": False,

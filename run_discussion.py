@@ -792,6 +792,13 @@ async def run_startup_preflight(llm, spiders, *, check_search: bool = True) -> b
         if not isinstance(vector, list) or not vector:
             raise RuntimeError("Embedding 返回空向量")
 
+    async def _check_reviewer():
+        response = await asyncio.wait_for(llm.reviewer.chat(
+            system="只输出最终答案。", user="联通性检查：只回复 OK",
+            temperature=0.0, max_tokens=80), timeout=45)
+        if "OK" not in str(response).upper():
+            raise RuntimeError("K3 final reviewer returned no completed health response")
+
     async def _check_search():
         docs = await asyncio.wait_for(
             spiders.aggressive_search(["A股 最新消息"], max_results_per_query=1),
@@ -804,6 +811,8 @@ async def run_startup_preflight(llm, spiders, *, check_search: bool = True) -> b
         ("LLM", _check_llm, True),
         ("Embedding", _check_embedding, True),
     ]
+    if getattr(llm, "collaboration_enabled", False) is True:
+        configured_checks.append(("K3终审", _check_reviewer, False))
     if check_search:
         configured_checks.append(("搜索", _check_search, False))
     else:
@@ -829,7 +838,7 @@ async def run_startup_preflight(llm, spiders, *, check_search: bool = True) -> b
 
     optional_failed = [item for item in checks if not item[1] and not item[3]]
     if optional_failed:
-        print("\n⚠️ 搜索联通性暂时不可用，将依赖本地知识库并在后续轮次继续重试。")
+        print("\n⚠️ 部分可选服务暂不可用；保留持仓维护，后续轮次重试。K3缺席的提案不能进入执行。")
 
     print("✅ 联通性检查通过\n")
     return True
@@ -1887,6 +1896,8 @@ async def stage2_deep_research(
     # 构建文档摘要。联网返回顺序受查询完成顺序影响；先按“明确代码 +
     # 可核查经营数据”排序，避免有限上下文被泛行业摘要或垃圾页占满。
     valid_docs = rank_stage2_documents(valid_docs)
+    if getattr(llm, "collaboration_enabled", False) is True:
+        llm.remember_sources(valid_docs, round_id)
     content_text, context_audit = build_evidence_context(
         valid_docs, max_docs=stage2_max_docs, doc_chars=stage2_doc_chars,
         context_chars=stage2_context_chars,
@@ -2268,6 +2279,18 @@ JSON数组结构：
                     )
             except Exception:
                 pass
+
+        if not proposals and getattr(llm, "collaboration_enabled", False) is True:
+            audited_response = await llm.audit_empty_proposals(prompt, round_id)
+            if audited_response:
+                audited_proposals, audited_mode = extract_stage2_proposal_array(audited_response)
+                diagnostic_repair_modes.append("k3_empty_candidate_audit:" + audited_mode)
+                await record_stage2_diagnostic(
+                    "empty_candidate_audited", parse_mode=audited_mode,
+                    raw_excerpt=audited_response[:8000], reason="K3 independent source-based omission audit",
+                )
+                if audited_proposals:
+                    proposals, parse_mode = audited_proposals, audited_mode
 
         # 清洗数据（同时过滤黑名单）
         cleaned = []
@@ -2966,7 +2989,14 @@ async def execute_durable_committee_stage(
         input_material = spec.get("input_material")
         if input_material is None:
             input_material = label
-        input_hash = str(spec.get("input_hash") or committee_content_hash(input_material))
+        input_hash = committee_content_hash({
+            "input": spec.get("input_hash") or input_material,
+            "model": str(spec.get("model") or ""),
+            "provider": str(spec.get("provider") or ""),
+            "profile": str(spec.get("profile") or ""),
+            "base_url": str(spec.get("base_url") or ""),
+            "prompt_version": prompt_version,
+        })
         attempt = int(spec.get("attempt") or 0)
         cached = None
         if meeting_store is not None and meeting_id:
@@ -3694,6 +3724,72 @@ def preflight_committee_decisions(
 # ============================================================================
 # 阶段3：投委会审议（多轮辩论）
 # ============================================================================
+async def load_collaboration_sources(llm, db_service, round_id, proposals):
+    """Hydrate dated canonical documents, excluding derived wiki summaries."""
+    if db_service is None or not round_id:
+        return
+    conn = await db_service._get_connection()
+    identities = []
+    for proposal in proposals:
+        ticker = str(proposal.get("ticker") or "")
+        async with conn.execute(
+            "SELECT DISTINCT d.id FROM documents d JOIN round_documents rd ON rd.document_id=d.id "
+            "WHERE rd.round_id=? AND COALESCE(d.publish_time,'')<>'' "
+            "AND d.publish_time_source IN ('page_publication_metadata','search_snippet_date',"
+            "'url_path_date','structured_disclosure_notice') "
+            "AND COALESCE(d.source,'')<>'obsidian_wiki' "
+            "ORDER BY CASE WHEN d.title LIKE ? OR d.content LIKE ? THEN 0 ELSE 1 END, d.id LIMIT 30",
+            (round_id, f"%{ticker}%", f"%{ticker}%"),
+        ) as cursor:
+            identities.extend(row[0] for row in await cursor.fetchall())
+    sources = [await db_service.get_document(identity) for identity in dict.fromkeys(identities)]
+    llm._sources[round_id] = {}
+    llm._base_sources[round_id] = {}
+    llm.remember_sources([row for row in sources if row], round_id)
+
+
+async def supplement_model_evidence(llm, spiders, proposal, questions, *, round_id, db_service):
+    """Acquire bounded, dated raw sources and persist lineage before re-review."""
+    if spiders is None or db_service is None or not round_id:
+        return {"status": "source_channel_unavailable", "sources": []}
+    from sovereign_hall.services.evidence_time import document_time_audit
+    from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
+    from sovereign_hall.core.config import get_config
+
+    raw_queries = await llm.chat(
+        system="针对指定标的和证据问题生成最多3个精确搜索词。只输出JSON字符串数组。",
+        user=json.dumps({"ticker": proposal["ticker"], "questions": questions}, ensure_ascii=False),
+        max_tokens=1000, temperature=0.2, json_array_output=True, use_cache=False,
+    )
+    queries = json.loads(raw_queries)
+    if not isinstance(queries, list) or not queries or any(not isinstance(q, str) or not q.strip() for q in queries):
+        raise ValueError("Invalid targeted evidence queries")
+    queries = [f"{proposal['ticker']} {q[:150]}" for q in queries[:3]]
+    docs = await spiders.aggressive_search(queries, max_results_per_query=3)
+    urls = [str(getattr(doc, "url", "")) for doc in docs[:3]
+            if str(getattr(doc, "url", "")).startswith(("http://", "https://"))]
+    if urls:
+        full_docs = await spiders.parallel_fetch(urls, extract_full_text=True, max_concurrent=2)
+        docs = merge_documents_prefer_richer(docs, full_docs)
+    docs = [doc for doc in docs if document_time_audit(doc).get("publication_time_known")][:6]
+    conn = await db_service._get_connection()
+    async with conn.execute("SELECT COUNT(DISTINCT document_id) FROM round_documents WHERE round_id=?",
+                            (round_id,)) as cursor:
+        linked_count = (await cursor.fetchone())[0]
+    max_links = int(get_config().get("database", {}).get("max_round_document_links", 300))
+    docs = docs[:max(0, max_links - linked_count)]
+    await db_service.add_documents_batch(docs, round_id=round_id)
+    lineage = await db_service.resolve_document_lineage(docs)
+    source_ids = sorted({identity for identities in lineage for identity in identities})
+    sources = [await db_service.get_document(identity) for identity in source_ids]
+    sources = [source for source in sources if source and source.get("content")]
+    await ResearchRoundCoordinator(db_service).record_event(round_id, "CollaborationEvidenceSupplemented", {
+        "ticker": proposal["ticker"], "questions": questions, "queries": queries,
+        "source_ids": source_ids, "review_model": llm.reviewer.model,
+    })
+    return {"status": "sources_persisted" if sources else "no_dated_evidence", "sources": sources}
+
+
 async def stage3_ic_discussion(
     llm,
     spiders,
@@ -3715,6 +3811,9 @@ async def stage3_ic_discussion(
 
     research_config = get_config().get("research", {})
     committee_proposal_limit = int(research_config.get("committee_proposal_limit", 5) or 5)
+    if getattr(llm, "collaboration_enabled", False) is True:
+        committee_proposal_limit = min(committee_proposal_limit,
+                                      int(llm.settings.get("max_review_proposals_per_round", 2)))
     committee_full_discussion = bool(research_config.get("committee_full_discussion", True))
     committee_min_review_depth = str(research_config.get("committee_min_review_depth", "full") or "full")
     round1_max_tokens = int(research_config.get("committee_round1_max_tokens", 12000) or 12000)
@@ -3791,6 +3890,9 @@ async def stage3_ic_discussion(
 
     # 每轮优先讨论最高价值提案，但默认扩大审议面并保持深度辩论。
     committee_proposals = select_committee_proposals(proposals, limit=committee_proposal_limit)
+    if getattr(llm, "collaboration_enabled", False) is True:
+        await load_collaboration_sources(llm, getattr(committee_store, "db_service", None),
+                                         round_id, committee_proposals)
     for i, proposal in enumerate(committee_proposals):
         ticker = proposal.get('ticker', '')
         thesis = proposal.get('thesis', '')
@@ -3932,6 +4034,8 @@ async def stage3_ic_discussion(
                         ),
                         "model": getattr(getattr(agent, "llm", None), "model", ""),
                         "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "profile": getattr(getattr(agent, "llm", None), "profile", ""),
+                        "base_url": getattr(getattr(agent, "llm", None), "base_url", ""),
                         "input_material": {
                             "task": task,
                             "proposal": proposal,
@@ -4014,6 +4118,8 @@ async def stage3_ic_discussion(
                             ),
                             "model": getattr(getattr(agent, "llm", None), "model", ""),
                             "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "profile": getattr(getattr(agent, "llm", None), "profile", ""),
+                        "base_url": getattr(getattr(agent, "llm", None), "base_url", ""),
                             "input_material": {
                                 "task": task,
                                 "proposal": proposal,
@@ -4110,6 +4216,8 @@ async def stage3_ic_discussion(
                         ),
                         "model": getattr(getattr(agent, "llm", None), "model", ""),
                         "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "profile": getattr(getattr(agent, "llm", None), "profile", ""),
+                        "base_url": getattr(getattr(agent, "llm", None), "base_url", ""),
                         "input_material": (
                             f"{task}\n\n提案：{ticker}\n核心观点：{thesis}\n\n"
                             f"讨论材料：\n{revision_context[:vote_context_chars]}"
@@ -4190,6 +4298,8 @@ async def stage3_ic_discussion(
                         "seat_role": role.value,
                         "model": getattr(getattr(agent, "llm", None), "model", ""),
                         "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "profile": getattr(getattr(agent, "llm", None), "profile", ""),
+                        "base_url": getattr(getattr(agent, "llm", None), "base_url", ""),
                         "input_material": {"prompt": prompt, "output_contract": "final_json_v3_no_reasoning"},
                         "factory": (
                             lambda agent=agent, prompt=prompt: agent.think(
@@ -4227,6 +4337,8 @@ async def stage3_ic_discussion(
                     "seat_role": role.value,
                     "model": getattr(getattr(agent, "llm", None), "model", ""),
                     "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "profile": getattr(getattr(agent, "llm", None), "profile", ""),
+                        "base_url": getattr(getattr(agent, "llm", None), "base_url", ""),
                     "input_material": {
                         "prompt": prompt,
                         "retry": "strict_json_repair",
@@ -4349,6 +4461,8 @@ async def stage3_ic_discussion(
                             ),
                             "model": getattr(getattr(agent, "llm", None), "model", ""),
                             "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "profile": getattr(getattr(agent, "llm", None), "profile", ""),
+                        "base_url": getattr(getattr(agent, "llm", None), "base_url", ""),
                             "input_material": {"prompt": prompt, "output_contract": "final_json_v3_no_reasoning"},
                             "factory": (
                                 lambda agent=agent, prompt=prompt: agent.think(
@@ -4393,6 +4507,8 @@ async def stage3_ic_discussion(
                         ),
                         "model": getattr(getattr(agent, "llm", None), "model", ""),
                         "provider": getattr(getattr(agent, "llm", None), "provider", ""),
+                        "profile": getattr(getattr(agent, "llm", None), "profile", ""),
+                        "base_url": getattr(getattr(agent, "llm", None), "base_url", ""),
                         "input_material": {
                             "prompt": prompt,
                             "retry": "strict_json_repair",
@@ -4480,6 +4596,48 @@ async def stage3_ic_discussion(
                     )
                 else:
                     print("      ➖ 死锁复核未通过，保留HOLD并记录具体缺口")
+            if getattr(llm, "collaboration_enabled", False) is True:
+                from sovereign_hall.services.model_collaboration import review_committee_decision
+
+                async def supplement(questions):
+                    results, audit = await execute_durable_committee_stage([{
+                        "label": "GLM-targeted-evidence", "seat_role": "evidence_researcher",
+                        "model": llm.model, "provider": llm.provider,
+                        "profile": llm.profile, "base_url": llm.base_url,
+                        "input_material": {"proposal": proposal, "questions": questions},
+                        "factory": lambda: supplement_and_render(questions),
+                    }], timeout_seconds=float(llm.settings.get("supplement_timeout_seconds", 120)),
+                        stage="glm_targeted_evidence", max_concurrency=1,
+                        meeting_store=committee_store, meeting_id=meeting_id,
+                        prompt_version="glm_research_k3_review_v1")
+                    return {**json.loads(results[0]), "stage_audit": audit}
+
+                async def supplement_and_render(questions):
+                    response = await supplement_model_evidence(
+                        llm, spiders, proposal, questions, round_id=round_id,
+                        db_service=getattr(committee_store, "db_service", None),
+                    )
+                    return json.dumps(response, ensure_ascii=False, default=str)
+
+                committee_decision, review_audits, review_turns = await review_committee_decision(
+                    llm, proposal, committee_decision, full_context, round_id=round_id,
+                    execute_stage=execute_durable_committee_stage,
+                    meeting_store=committee_store, meeting_id=meeting_id,
+                    supplement=supplement, learned_context=learned_context,
+                )
+                stage_execution_audit.extend(review_audits)
+                full_context = (
+                    f"【K3终审 model={committee_decision['final_review_model']}】\n"
+                    + json.dumps(committee_decision["final_review"], ensure_ascii=False)
+                    + "\n【GLM研究与原始异议】\n" + full_context
+                )
+                all_discussions.append("\n【K3终审与GLM定向补证】\n" +
+                                       json.dumps(review_turns, ensure_ascii=False, default=str))
+                logger.info("K3 final review ticker=%s action=%s valid=%s direction=%s",
+                            ticker, committee_decision["final_review"].get("action"),
+                            committee_decision["final_review"].get("schema_valid"),
+                            committee_decision["direction"])
+
             expected_days = normalize_proposal_holding_period(proposal, topic)
             committee_outcome_code = (
                 "committee_incomplete"
@@ -4527,6 +4685,9 @@ async def stage3_ic_discussion(
                             f"vote_summary={committee_decision.get('vote_summary')}; "
                             f"individual_votes={committee_decision.get('individual_votes', [])}; "
                             f"risk_flags={committee_decision.get('risk_flags', [])}; "
+                            f"decision_authority={committee_decision.get('decision_authority', 'committee_vote')}; "
+                            f"final_review_model={committee_decision.get('final_review_model', '')}; "
+                            f"final_review={committee_decision.get('final_review', {})}; "
                             f"evidence_gaps={committee_decision.get('evidence_gaps', [])}; "
                             f"reconsider_if={committee_decision.get('reconsider_if', [])}"
                         ),
@@ -5915,7 +6076,7 @@ async def _main(resources):
     from sovereign_hall.services.database import DatabaseService
     from sovereign_hall.services.decision_tracker import DecisionRecorder
     from sovereign_hall.services.learning_engine import LearningEngine
-    from sovereign_hall.services.llm_client import LLMClient
+    from sovereign_hall.services.model_collaboration import create_llm_client
     from sovereign_hall.services.market_data import get_market_data
     from sovereign_hall.services.spider_service import SearchQueryGenerator, SpiderSwarm
     from sovereign_hall.services.storage_governor import StorageGovernor
@@ -6015,10 +6176,8 @@ async def _main(resources):
     if args.local_only:
         force_search_interval = 0
 
-    llm = LLMClient(
+    llm = create_llm_client(
         max_concurrent=int(llm_config.get('max_concurrent', 12)),
-        model=llm_config.get('model'),
-        provider=llm_config.get('provider'),
     )
     resources.push_async_callback(llm.close)
     # 从配置中读取 Spider 并发数（已降低防止被封）
@@ -6079,9 +6238,13 @@ async def _main(resources):
         },
         model_versions={
             "committee": {
-                "model": str(llm_config.get("model") or "unknown"),
-                "provider": str(llm_config.get("provider") or "unknown"),
+                "model": str(llm.model or "unknown"),
+                "provider": str(llm.provider or "unknown"),
                 "temperature": float(llm_config.get("temperature", 0.0) or 0.0),
+            },
+            "final_review": {
+                "model": str(getattr(getattr(llm, "reviewer", None), "model", "")),
+                "profile": str(getattr(getattr(llm, "reviewer", None), "profile", "")),
             },
         },
         policy_module_versions={
@@ -7156,6 +7319,12 @@ async def _main(resources):
             round_time = (datetime.now() - round_start).total_seconds()
             total_time = (datetime.now() - start_time).total_seconds()
             llm_stats = llm.get_stats()
+            if "models" in llm_stats:
+                logger.info("MODEL_COLLABORATION_USAGE %s", json.dumps({
+                    "models": llm_stats["models"],
+                    "review_calls_today": llm_stats["review_calls_today"],
+                    "review_daily_limit": llm_stats["review_daily_limit"],
+                }, ensure_ascii=False))
             round_llm_stats = _llm_stats_delta(llm_stats, round_start_stats)
 
             final_round = await round_coordinator.get(active_round_id)

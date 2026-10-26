@@ -49,6 +49,8 @@ async def main(argv: list[str] | None = None) -> None:
         config.set("llm.model", args.model)
     if args.api_url:
         config.set("llm.base_url", args.api_url)
+    if args.model or args.api_url:
+        config.set("model_collaboration.enabled", False)
 
     translated: list[str] = []
     if args.single:
