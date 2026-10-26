@@ -47,6 +47,7 @@ class LLMClient:
         timeout: Optional[int] = None,
         max_retries: Optional[int] = None,
         retry_delay: Optional[float] = None,
+        profile: Optional[str] = None,
     ):
         """
         初始化LLM客户端
@@ -60,19 +61,26 @@ class LLMClient:
             timeout: 超时时间（秒）
             max_retries: 最大重试次数
             retry_delay: 重试基础延迟（秒）
+            profile: 可选的命名模型档案，用于为不同任务选择部署
         """
         config = get_config()
 
-        llm_config = config.get_llm_config()
+        llm_config = config.get_llm_config(profile)
+        self.profile = profile
 
-        self.model = model or llm_config.get('model', 'claude-sonnet-4-5')
-        self.provider = provider or llm_config.get('provider', 'anthropic')
+        self.model = model or llm_config.get('model', 'kimi-k3')
+        self.provider = provider or llm_config.get('provider', 'openai')
         self.timeout = int(timeout if timeout is not None else llm_config.get('timeout', 120))
         self.max_retries = int(max_retries if max_retries is not None else llm_config.get('max_retries', 3))
         self.retry_delay = float(retry_delay if retry_delay is not None else llm_config.get('retry_delay', 2.0))
 
         # API配置
-        self.api_key = api_key or llm_config.get('api_key', 'empty')
+        key_env = llm_config.get('api_key_env', 'OPENAI_API_KEY')
+        self.api_key = (
+            api_key
+            or (config.get_api_key(key_env) if key_env else None)
+            or llm_config.get('api_key', 'empty')
+        )
         self.base_url = base_url or llm_config.get('base_url')
         self.model_uuid = llm_config.get('model_uuid')  # 用于本地API的Host header
         self.structured_output_reasoning_effort = str(

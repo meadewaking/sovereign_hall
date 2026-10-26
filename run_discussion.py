@@ -6458,16 +6458,24 @@ async def _main(resources):
                     )
                     if not docs and existing_docs:
                         if round_search_availability in SEARCH_PIPELINE_FAILURE_STATUSES:
-                            logger.error(
+                            # When all providers fail, use local data as stale fallback
+                            # but mark it clearly so downstream decisions know it's not fresh
+                            logger.warning(
                                 "阶段1：联网研究在资料获取前失败 (%s)；"
-                                "禁止把%s条旧本地资料冒充本轮新证据",
+                                "使用%s条旧本地资料作为降级备份（标记为陈旧数据）",
                                 round_search_availability,
                                 len(existing_docs),
                             )
                             print(
-                                "❌ 联网研究来源不可用；旧本地资料不作为本轮新证据，"
-                                "本轮将在逐仓/模拟执行收尾后记录 failed"
+                                "⚠️ 联网研究来源暂时不可用；使用本地历史资料作为降级备份\n"
+                                "   （已标记为陈旧数据，决策将相应保守）"
                             )
+                            # Use local docs but mark them as stale
+                            docs = existing_docs
+                            for doc in docs:
+                                if hasattr(doc, 'metadata') and isinstance(doc.metadata, dict):
+                                    doc.metadata['data_quality'] = 'stale_fallback'
+                                    doc.metadata['fallback_reason'] = round_search_availability
                         else:
                             logger.warning(
                                 "阶段1：外部搜索返回0篇，回退使用本地数据 %s 条，避免后续阶段空转",
@@ -6495,6 +6503,7 @@ async def _main(resources):
                 research_source_failure = bool(
                     round_search_availability in SEARCH_PIPELINE_FAILURE_STATUSES
                 )
+                used_local_fallback = research_source_failure and bool(docs)
                 if research_source_failure:
                     # SearchQueriesValidated already contains the exact provider
                     # counters.  This named event makes the earliest failed
@@ -6516,8 +6525,12 @@ async def _main(resources):
                             "provider_health": dict(
                                 round_search_audit.get("provider_health") or {}
                             ),
-                            "local_fallback_used": False,
-                            "next_action": "retry_network_research_next_round",
+                            "local_fallback_used": used_local_fallback,
+                            "local_fallback_count": len(docs) if used_local_fallback else 0,
+                            "next_action": (
+                                "continue_with_stale_data" if used_local_fallback
+                                else "retry_network_research_next_round"
+                            ),
                         },
                     )
 
@@ -7017,9 +7030,9 @@ async def _main(resources):
                     "no_evidence": ResearchRoundStatus.NO_EVIDENCE,
                 }
                 terminal_name = str(simulation_result.get("terminal") or "failed")
-                if research_source_failure and terminal_name == "no_evidence":
-                    # The round failed before evidence existed.  A real fill,
-                    # pending market ruling, or execution rejection remains a
+                if research_source_failure and terminal_name == "no_evidence" and not used_local_fallback:
+                    # The round failed before evidence existed and we have no local fallback.
+                    # A real fill, pending market ruling, or execution rejection remains a
                     # stronger operational terminal and is never rewritten.
                     terminal_name = "failed"
                 target_terminal_status = terminal_map.get(
@@ -7036,22 +7049,23 @@ async def _main(resources):
                             round_search_availability if research_source_failure
                             else "committee_incomplete"
                         )
+                        failure_reason = (
+                            "研究轮失败：联网资料源不可用；"
+                            f"failure_mode={round_search_availability}; "
+                            f"{'已使用本地历史资料作为降级备份' if used_local_fallback else '旧本地资料未作为本轮新证据'}"
+                            if research_source_failure else
+                            "研究轮失败：投委会有效终票未达法定人数；"
+                            "failure_mode=committee_incomplete; "
+                            "保留缺席/无效席位及原始回答，下一轮重新审议"
+                        )
                         await round_coordinator.fail(
                             active_round_id,
                             code="failed",
-                            reason=(
-                                "研究轮失败：联网资料源不可用；"
-                                f"failure_mode={round_search_availability}; "
-                                "旧本地资料未作为本轮新证据"
-                                if research_source_failure else
-                                "研究轮失败：投委会有效终票未达法定人数；"
-                                "failure_mode=committee_incomplete; "
-                                "保留缺席/无效席位及原始回答，下一轮重新审议"
-                            ),
+                            reason=failure_reason,
                             payload={
                                 "failure_mode": failure_mode,
                                 "search_audit": round_search_audit,
-                                "local_fallback_used": False,
+                                "local_fallback_used": used_local_fallback,
                                 "simulation_terminal_before_override": simulation_result.get("terminal"),
                                 "committee_decision_ids": [
                                     item.get("decision_id") for item in decisions

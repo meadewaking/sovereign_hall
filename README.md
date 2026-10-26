@@ -251,8 +251,9 @@ sovereign_hall/
 ```yaml
 llm:
   provider: "openai"
-  base_url: "http://172.18.5.19:8000/v1"
-  model: "GLM-5.2-FP8"
+  base_url: "https://api.nextoken.real-ai.cn/v1"
+  model: "kimi-k3"
+  api_key_env: "OPENAI_API_KEY"
   model_uuid: ""
   max_concurrent: 16
   max_tokens: 15000
@@ -288,9 +289,15 @@ investment_committee:
   approval_threshold: 0.6
 ```
 
+将 `.env.example` 复制为 `.env`，在其中填写 `OPENAI_API_KEY`，也可直接设置同名环境变量。环境变量优先于 `.env`；`.env` 已排除在版本控制之外。所有研究智能体、讨论流程和新建研究实验默认共用此模型配置。
+
+`llm_profiles` 保留了 `kimi-k3` 和原有内网 `glm-5.2-fp8` 两份部署配置，包含各自的接口、凭据来源和结构化输出参数。可通过 `LLMClient(profile="kimi-k3")` 或 `LLMClient(profile="glm-5.2-fp8")` 为任务分别创建客户端，公共的并发、超时和 embedding 参数继承自 `llm`。默认客户端继续读取 `llm`，可以用来逐步增加多模型分工。
+
+`pricing.openai.kimi-k3` 暂沿用原部署的预算估算值，实际费用以网关账单为准，取得费率后更新此处。
+
 根据本机环境需要调整：
 
-- `llm.base_url` / `llm.api_key`
+- `llm.base_url` / `llm.api_key_env`
 - `llm.embedding_base_url` / `llm.embedding_uuid`
 - `spider.proxy`
 - `database.path`

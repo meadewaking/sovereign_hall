@@ -1,23 +1,20 @@
 # 🏛️ Sovereign Hall - 系统配置文件
 # 2026-03-02 更新
 
-# LLM配置 (使用本地API)
+# LLM配置 (Nextoken OpenAI兼容API)
 llm:
   provider: "openai"  # openai/anthropic/local
-  base_url: "http://172.18.5.19:8000/v1"
-  model: "GLM-5.2-FP8"
-  api_key: "not_need"
-  model_uuid: ""  # 用于Host header；8000 为独立入口，不需要 Host 路由
+  base_url: "https://api.nextoken.real-ai.cn/v1"
+  model: "kimi-k3"
+  api_key_env: "OPENAI_API_KEY"  # 从环境变量或本地 .env 读取
+  model_uuid: ""  # 公网网关使用标准Host，不覆盖路由
   max_concurrent: 12
   temperature: 0.7
   max_tokens: 22500
   timeout: 600
-  # 正式结构化裁决只需要终态 JSON。GLM 的默认深度推理会在
-  # committee deadline / completion budget 内耗尽全部 token，留下
-  # reasoning_content 而没有可计票的 final content。
+  # 正式结构化裁决只需要终态 JSON，避免额外推理耗尽裁决预算。
   structured_output_reasoning_effort: "none"
-  # 当前GLM端点在 reasoning_effort=none 与泛化 json_object grammar 同用、
-  # 且终票提示较复杂时返回HTTP 500。本地仍逐字段严格校验，失败席位不计票。
+  # 由本地逐字段严格校验终态 JSON，失败席位不计票。
   structured_output_use_response_format: false
 
   # Embedding 配
@@ -27,9 +24,34 @@ llm:
   embedding_base_url: "http://172.18.1.128:30977"
   embedding_input_per_1k: 0.0
 
-# Token计费配置（当前为内网估算价，拿到真实费率后只改这里）
+# 保留可供不同任务/智能体选择的部署；全系统默认使用上面的llm配置。
+llm_profiles:
+  kimi-k3:
+    provider: "openai"
+    model: "kimi-k3"
+    base_url: "https://api.nextoken.real-ai.cn/v1"
+    api_key_env: "OPENAI_API_KEY"
+    api_key: ""
+    model_uuid: ""
+    structured_output_reasoning_effort: "none"
+    structured_output_use_response_format: false
+  glm-5.2-fp8:
+    provider: "openai"
+    model: "GLM-5.2-FP8"
+    base_url: "http://172.18.5.19:8000/v1"
+    api_key_env: ""  # 内网部署使用原有凭据
+    api_key: "not_need"
+    model_uuid: ""
+    structured_output_reasoning_effort: "none"
+    # 旧端点在reasoning_effort=none配合json_object时可能返回500，保留本地校验。
+    structured_output_use_response_format: false
+
+# Token预算占位（沿用原估算值，非kimi-k3实际费率；按网关账单调整）
 pricing:
   openai:
+    kimi-k3:
+      input_per_1k: 0.0003
+      output_per_1k: 0.0012
     GLM-5.2-FP8:
       input_per_1k: 0.0003
       output_per_1k: 0.0012

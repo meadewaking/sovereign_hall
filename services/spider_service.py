@@ -1139,127 +1139,140 @@ class SpiderSwarm:
             max_results: 最大结果数
             deep_fetch: 是否深度抓取URL内容（默认开启）
         """
-        try:
-            import logging
+        max_retries = 2
+        base_delay = 1.0
 
-            # 抑制 ddgs 内部日志（ddgs 是元搜索引擎，部分引擎失败是正常的）
-            # 只有当所有引擎都失败、返回空结果时才记录警告
-            ddgs_logger = logging.getLogger('ddgs.ddgs')
-            primp_logger = logging.getLogger('primp')
-            original_ddgs_level = ddgs_logger.level
-            original_primp_level = primp_logger.level
-            ddgs_logger.setLevel(logging.WARNING)
-            primp_logger.setLevel(logging.WARNING)
-
+        for attempt in range(max_retries):
             try:
-                from ddgs import DDGS
+                import logging
 
-                def _run_ddgs_text():
-                    # 使用代理；ddgs 是同步库，放到线程里避免阻塞整个 async 搜索调度。
-                    proxy = get_config().get_spider_config().get("proxy")
-                    ddgs = DDGS(proxy=proxy, timeout=min(8, self.source_timeout))
-                    return ddgs.text(query, max_results=max_results)
+                # 抑制 ddgs 内部日志（ddgs 是元搜索引擎，部分引擎失败是正常的）
+                # 只有当所有引擎都失败、返回空结果时才记录警告
+                ddgs_logger = logging.getLogger('ddgs.ddgs')
+                primp_logger = logging.getLogger('primp')
+                original_ddgs_level = ddgs_logger.level
+                original_primp_level = primp_logger.level
+                ddgs_logger.setLevel(logging.WARNING)
+                primp_logger.setLevel(logging.WARNING)
 
-                results = await asyncio.to_thread(_run_ddgs_text)
-            finally:
-                # 恢复日志级别
-                ddgs_logger.setLevel(original_ddgs_level)
-                primp_logger.setLevel(original_primp_level)
+                try:
+                    from ddgs import DDGS
 
-            # 只有当没有返回结果时才记录警告
-            if not results:
-                logger.warning(f"DuckDuckGO search returned no results for '{query}'")
-                return []
+                    def _run_ddgs_text():
+                        # 使用代理；ddgs 是同步库，放到线程里避免阻塞整个 async 搜索调度。
+                        proxy = get_config().get_spider_config().get("proxy")
+                        # Increase timeout to be more resilient
+                        ddgs = DDGS(proxy=proxy, timeout=min(15, self.source_timeout))
+                        return ddgs.text(query, max_results=max_results)
 
-            if not deep_fetch:
-                # 快速模式：只使用搜索结果摘要
-                docs = []
-                for r in results:
+                    results = await asyncio.to_thread(_run_ddgs_text)
+                finally:
+                    # 恢复日志级别
+                    ddgs_logger.setLevel(original_ddgs_level)
+                    primp_logger.setLevel(original_primp_level)
+
+                # 只有当没有返回结果时才记录警告
+                if not results:
+                    logger.warning(f"DuckDuckGO search returned no results for '{query}'")
+                    return []
+
+                if not deep_fetch:
+                    # 快速模式：只使用搜索结果摘要
+                    docs = []
+                    for r in results:
+                        try:
+                            title = r.get('title', '')
+                            url = r.get('href', '')
+                            body = r.get('body', '')
+
+                            if title and url and url.startswith('http'):
+                                doc = Doc(
+                                    id=generate_id('doc'),
+                                    title=title,
+                                    content=body or f"关于{query}的搜索结果",
+                                    url=url,
+                                    source='duckduckgo',
+                                    metadata=source_time_metadata(snippet=body, url=url),
+                                    sector=self._infer_sector(query),
+                                    keywords=[query],
+                                )
+                                docs.append(doc)
+                        except Exception as e:
+                            logger.debug(f"Failed to parse DDG result: {e}")
+                            continue
+                    return docs[:max_results]
+
+                # 深度模式：抓取URL完整内容
+                search_results = [(r.get('title', ''), r.get('href', ''), r.get('body', ''))
+                                 for r in results if r.get('title') and r.get('href', '').startswith('http')]
+
+                if not search_results:
+                    return []
+
+                # 并发抓取URL内容（带超时，避免长时间等待）
+                DEEP_FETCH_TIMEOUT = max(3, min(8, self.source_timeout // 2))
+                DEEP_FETCH_LIMIT = max(1, min(max_results, 5))
+
+                async def fetch_and_parse(title: str, url: str, fallback_body: str):
                     try:
-                        title = r.get('title', '')
-                        url = r.get('href', '')
-                        body = r.get('body', '')
-
-                        if title and url and url.startswith('http'):
-                            doc = Doc(
+                        full_doc = await asyncio.wait_for(
+                            self.deep_fetch(url, extract_full_text=True),
+                            timeout=DEEP_FETCH_TIMEOUT
+                        )
+                        if full_doc and full_doc.content and len(full_doc.content) > 100:
+                            return Doc(
                                 id=generate_id('doc'),
-                                title=title,
-                                content=body or f"关于{query}的搜索结果",
+                                title=title or full_doc.title,
+                                content=full_doc.content[:MAX_STORED_CONTENT_CHARS],
                                 url=url,
                                 source='duckduckgo',
-                                metadata=source_time_metadata(snippet=body, url=url),
+                                metadata=dict(full_doc.metadata),
                                 sector=self._infer_sector(query),
                                 keywords=[query],
                             )
-                            docs.append(doc)
+                    except asyncio.TimeoutError:
+                        logger.debug(f"Deep fetch timeout for {url}, using fallback")
                     except Exception as e:
-                        logger.debug(f"Failed to parse DDG result: {e}")
-                        continue
-                return docs[:max_results]
+                        logger.debug(f"Deep fetch failed for {url}: {e}")
 
-            # 深度模式：抓取URL完整内容
-            search_results = [(r.get('title', ''), r.get('href', ''), r.get('body', ''))
-                             for r in results if r.get('title') and r.get('href', '').startswith('http')]
-
-            if not search_results:
-                return []
-
-            # 并发抓取URL内容（带超时，避免长时间等待）
-            DEEP_FETCH_TIMEOUT = max(3, min(6, self.source_timeout // 2))
-            DEEP_FETCH_LIMIT = max(1, min(max_results, 5))
-
-            async def fetch_and_parse(title: str, url: str, fallback_body: str):
-                try:
-                    full_doc = await asyncio.wait_for(
-                        self.deep_fetch(url, extract_full_text=True),
-                        timeout=DEEP_FETCH_TIMEOUT
+                    # 如果抓取失败，使用摘要
+                    return Doc(
+                        id=generate_id('doc'),
+                        title=title,
+                        content=fallback_body or f"关于{query}的搜索结果",
+                        url=url,
+                        source='duckduckgo',
+                        metadata=source_time_metadata(snippet=fallback_body, url=url),
+                        sector=self._infer_sector(query),
+                        keywords=[query],
                     )
-                    if full_doc and full_doc.content and len(full_doc.content) > 100:
-                        return Doc(
-                            id=generate_id('doc'),
-                            title=title or full_doc.title,
-                            content=full_doc.content[:MAX_STORED_CONTENT_CHARS],
-                            url=url,
-                            source='duckduckgo',
-                            metadata=dict(full_doc.metadata),
-                            sector=self._infer_sector(query),
-                            keywords=[query],
-                        )
-                except asyncio.TimeoutError:
-                    logger.debug(f"Deep fetch timeout for {url}, using fallback")
-                except Exception as e:
-                    logger.debug(f"Deep fetch failed for {url}: {e}")
 
-                # 如果抓取失败，使用摘要
-                return Doc(
-                    id=generate_id('doc'),
-                    title=title,
-                    content=fallback_body or f"关于{query}的搜索结果",
-                    url=url,
-                    source='duckduckgo',
-                    metadata=source_time_metadata(snippet=fallback_body, url=url),
-                    sector=self._infer_sector(query),
-                    keywords=[query],
-                )
+                # 并发执行（限制并发数）
+                semaphore = asyncio.Semaphore(3)
+                async def limited_fetch(title, url, body):
+                    async with semaphore:
+                        return await fetch_and_parse(title, url, body)
 
-            # 并发执行（限制并发数）
-            semaphore = asyncio.Semaphore(3)
-            async def limited_fetch(title, url, body):
-                async with semaphore:
-                    return await fetch_and_parse(title, url, body)
+                tasks = [limited_fetch(t, u, b) for t, u, b in search_results[:DEEP_FETCH_LIMIT]]
+                docs = await asyncio.gather(*tasks, return_exceptions=True)
 
-            tasks = [limited_fetch(t, u, b) for t, u, b in search_results[:DEEP_FETCH_LIMIT]]
-            docs = await asyncio.gather(*tasks, return_exceptions=True)
+                # 过滤异常结果
+                valid_docs = [d for d in docs if isinstance(d, Doc)]
+                logger.info(f"DDG search for '{query}': {len(valid_docs)}/{len(tasks)} docs with full content")
 
-            # 过滤异常结果
-            valid_docs = [d for d in docs if isinstance(d, Doc)]
-            logger.info(f"DDG search for '{query}': {len(valid_docs)}/{len(tasks)} docs with full content")
+                return valid_docs[:max_results]
 
-            return valid_docs[:max_results]
-
-        except Exception as e:
-            logger.warning(f"DuckDuckGO search failed: {e}")
-            raise
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.debug(
+                        f"DuckDuckGO search attempt {attempt + 1}/{max_retries} failed for '{query}', "
+                        f"retrying in {delay}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(f"DuckDuckGO search failed after {max_retries} attempts: {e}")
+                raise
 
     def _generate_fallback_docs(self, query: str, max_results: int) -> List[Doc]:
         """当所有搜索引擎失败时，生成基于主题的备用文档"""

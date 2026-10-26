@@ -87,9 +87,13 @@ class _AkSharePermanentError(RuntimeError):
 class MarketDataService:
     """Small async client for A-share/ETF quotes and daily bars."""
 
-    def __init__(self, timeout: int = 10):
+    def __init__(self, timeout: int = 15):
         self.timeout = timeout
-        self._client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=5.0, read=timeout),
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
         self._quote_cache: Dict[str, Dict[str, Any]] = {}
         self._valuation_cache: Dict[str, Dict[str, Any]] = {}
         self._observed_quotes: Dict[str, Dict[str, Any]] = {}
@@ -164,7 +168,11 @@ class MarketDataService:
 
     def _ensure_client(self):
         if self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True)
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout, connect=5.0, read=self.timeout),
+                follow_redirects=True,
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+            )
 
     async def is_trading_day(self, when: Optional[date | datetime] = None) -> bool:
         """Return whether the exchange is open on the given date.
@@ -601,29 +609,45 @@ class MarketDataService:
             "end": end_s,
         }
         if not self._eastmoney_ohlc_in_cooldown():
-            try:
-                resp = await self._client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json().get("data") or {}
-                bars = []
-                for raw in data.get("klines") or []:
-                    parts = raw.split(",")
-                    if len(parts) < 6:
+            # Retry with exponential backoff for transient connection issues
+            max_retries = 3
+            base_delay = 0.5
+            for attempt in range(max_retries):
+                try:
+                    resp = await self._client.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json().get("data") or {}
+                    bars = []
+                    for raw in data.get("klines") or []:
+                        parts = raw.split(",")
+                        if len(parts) < 6:
+                            continue
+                        bars.append({
+                            "date": parts[0],
+                            "open": float(parts[1]),
+                            "close": float(parts[2]),
+                            "high": float(parts[3]),
+                            "low": float(parts[4]),
+                            "volume": float(parts[5]),
+                        })
+                    if bars:
+                        self._eastmoney_ohlc_failures = 0
+                        self._eastmoney_ohlc_cooldown_until = None
+                        return self._decorate_bars(bars, "eastmoney_ohlc_" + adjustment)
+                    break
+                except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.debug(
+                            "Eastmoney OHLC transient error for %s (attempt %d/%d), retrying in %.1fs: %s",
+                            ticker, attempt + 1, max_retries, delay, exc
+                        )
+                        await asyncio.sleep(delay)
                         continue
-                    bars.append({
-                        "date": parts[0],
-                        "open": float(parts[1]),
-                        "close": float(parts[2]),
-                        "high": float(parts[3]),
-                        "low": float(parts[4]),
-                        "volume": float(parts[5]),
-                    })
-                if bars:
-                    self._eastmoney_ohlc_failures = 0
-                    self._eastmoney_ohlc_cooldown_until = None
-                    return self._decorate_bars(bars, "eastmoney_ohlc_" + adjustment)
-            except Exception as exc:
-                self._record_eastmoney_ohlc_failure(ticker, exc)
+                    self._record_eastmoney_ohlc_failure(ticker, exc)
+                except Exception as exc:
+                    self._record_eastmoney_ohlc_failure(ticker, exc)
+                    break
 
         if adjustment == "qfq":
             tencent_bars, tencent_permanent = await self._fetch_tencent_ohlc(ticker, start_s, end_s)

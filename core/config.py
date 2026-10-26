@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Union
 from dataclasses import dataclass, field
 import logging
 import yaml
+from dotenv import dotenv_values, find_dotenv
 
 from . import PROJECT_ROOT, DATA_DIR
 
@@ -43,9 +44,9 @@ class Config:
             # LLM配置
             'llm': {
                 'provider': 'openai',
-                'model': 'GLM-5.2-FP8',
+                'model': 'kimi-k3',
                 'api_key_env': 'OPENAI_API_KEY',
-                'base_url': 'http://172.18.5.19:8000/v1',
+                'base_url': 'https://api.nextoken.real-ai.cn/v1',
                 'model_uuid': '',
                 'max_concurrent': 16,
                 'temperature': 0.7,
@@ -56,6 +57,30 @@ class Config:
                 'embedding_model': 'text-embedding-3-small',
                 'embedding_dim': 1536,
                 'embedding_input_per_1k': 0.0,
+            },
+
+            # Named deployments available to individual tasks/agents.
+            'llm_profiles': {
+                'kimi-k3': {
+                    'provider': 'openai',
+                    'model': 'kimi-k3',
+                    'base_url': 'https://api.nextoken.real-ai.cn/v1',
+                    'api_key_env': 'OPENAI_API_KEY',
+                    'api_key': '',
+                    'model_uuid': '',
+                    'structured_output_reasoning_effort': 'none',
+                    'structured_output_use_response_format': False,
+                },
+                'glm-5.2-fp8': {
+                    'provider': 'openai',
+                    'model': 'GLM-5.2-FP8',
+                    'base_url': 'http://172.18.5.19:8000/v1',
+                    'api_key_env': '',
+                    'api_key': 'not_need',
+                    'model_uuid': '',
+                    'structured_output_reasoning_effort': 'none',
+                    'structured_output_use_response_format': False,
+                },
             },
 
             # 爬虫配置
@@ -356,6 +381,9 @@ class Config:
                     'output_per_1k': 0.0042,  # ¥8.40/百万 → ¥0.0042/千 (半价)
                 },
                 'openai': {
+                    # Budget placeholder inherited from the previous deployment;
+                    # replace with the gateway's actual billing rates when known.
+                    'kimi-k3': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
                     'MiniMax/MiniMax-M2.5': {'input_per_1k': 0.0006, 'output_per_1k': 0.0042},
                     'MiniMax-M2.7-INT8': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
                     'GLM-5.2-FP8': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
@@ -485,9 +513,17 @@ class Config:
             config = config[k]
         config[keys[-1]] = value
 
-    def get_llm_config(self) -> Dict:
-        """获取LLM配置"""
-        return self._config.get('llm', {})
+    def get_llm_config(self, profile: Optional[str] = None) -> Dict:
+        """获取默认部署，或在公共参数上叠加指定模型档案。"""
+        llm_config = self._config.get('llm', {})
+        if profile is None:
+            return llm_config
+        profiles = self._config.get('llm_profiles', {})
+        if profile not in profiles:
+            raise ValueError(f"Unknown LLM profile: {profile}")
+        resolved = copy.deepcopy(llm_config)
+        self._merge_config(resolved, profiles[profile])
+        return resolved
 
     def get_spider_config(self) -> Dict:
         """获取爬虫配置"""
@@ -514,9 +550,9 @@ class Config:
         return 'tmt_analyst'  # 默认
 
     def get_api_key(self, key_env: str) -> Optional[str]:
-        """获取API密钥"""
+        """读取环境变量或项目 .env 中的密钥，环境变量优先。"""
         if self._config.get('security', {}).get('use_env_vars', True):
-            return os.environ.get(key_env)
+            return os.environ.get(key_env) or dotenv_values(find_dotenv()).get(key_env)
         return None
 
     def get_pricing(self, provider: str = None, model: str = None) -> Dict:
