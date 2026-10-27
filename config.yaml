@@ -76,11 +76,13 @@ pricing:
 spider:
   max_concurrent: 2  # 进一步降低并发，防止被封
   timeout: 30
+  source_timeout: 20  # 单个搜索源超时时间（秒），提高网络不稳定时的容错性
   user_agent: "SovereignHall/1.0 (Research Bot)"
   proxy: "http://127.0.0.1:7890"
   retry_times: 3
   retry_delay: 2
   respect_robots_txt: true
+  provider_failure_threshold: 5  # 搜索源连续失败5次后才熔断（更宽容）
   rate_limit:
     requests_per_minute: 6  # 进一步降低请求频率
     burst: 2
