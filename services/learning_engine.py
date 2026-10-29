@@ -9,6 +9,8 @@ from collections import defaultdict
 
 import aiosqlite
 
+from .prediction_feedback import format_prediction_feedback
+
 logger = logging.getLogger(__name__)
 
 
@@ -129,7 +131,7 @@ class LearningEngine:
                 if item.get("result") not in ("wrong", "partial"):
                     continue
                 context = (item.get("discussion_context") or "").replace("\n", " ")[:120]
-                examples.append(f"{item.get('ticker')}:{item.get('result')}({context})")
+                examples.append(format_prediction_feedback(item) + f"（历史生成观点，未核验：{context}）")
                 if len(examples) >= 3:
                     break
 
@@ -160,20 +162,22 @@ class LearningEngine:
             return ""
 
         prompt = "\n【历史投资教训】\n"
-        prompt += "以下教训只用于否决或修正当前判断，不要复述；若与当前标的无关请忽略：\n"
+        prompt += "以下是动作条件下的历史价格路径反馈；若与当前标的无关请忽略。\n"
+        prompt += "HOLD/wrong/missed_upside表示观望错失上涨，不是看多论点被证伪；HOLD/correct也不是基本面利空被证明。\n"
+        prompt += "价格路径命中不等于扣费投资收益，不能据此判定因果、自动否决新提案或取消风险保护。\n"
 
         for i, lesson in enumerate(lessons[:5], 1):
             prompt += f"{i}. {lesson['description'][:160]}\n"
 
         if profiles:
             prompt += "\n【错误画像】\n"
-            prompt += "优先检查当前提案是否落入这些低胜率模式；若落入，必须降低仓位或给出新证据：\n"
+            prompt += "分别复核错误行动与错失机会；分组频率仅供诊断，当前行动仍须本轮证据支持：\n"
             for i, profile in enumerate(profiles[:5], 1):
                 tickers = ",".join(profile.get("tickers") or [])
-                examples = "；".join(profile.get("examples") or [])
+                examples = "；".join((profile.get("examples") or [])[:1])
                 prompt += (
                     f"{i}. {profile['description']}；样本: {tickers or '无'}"
-                    f"{'；例: ' + examples[:180] if examples else ''}\n"
+                    f"{'；例: ' + examples if examples else ''}\n"
                 )
 
         stats = await self.get_accuracy_stats()
@@ -232,9 +236,10 @@ class LearningEngine:
                     placeholders = ",".join("?" for _ in tickers)
                     async with db.execute(
                         f"""
-                        SELECT ticker, direction, confidence, expected_days, status,
+                        SELECT id, round_id, ticker, direction, confidence, expected_days, status,
                                result, accuracy_score, predicted_at, validated_at,
-                               target_price, stop_loss
+                               target_price, stop_loss, current_price, actual_hit_type,
+                               actual_hit_price, actual_hit_date, actual_return
                         FROM price_predictions
                         WHERE ticker IN ({placeholders})
                         ORDER BY datetime(predicted_at) DESC, rowid DESC
@@ -254,6 +259,13 @@ class LearningEngine:
             "【同议题历史研究记忆】",
             "以下内容是旧结论与旧预测结果，不是当前事实。必须用本轮联网资料重新验证，并明确维持、修正或推翻。",
         ]
+        if predictions:
+            lines.append("【关联预测验证：价格路径结果先于历史生成观点；不判定投资论点真伪】")
+            for row in predictions:
+                lines.append(
+                    f"- {format_prediction_feedback(row)} | "
+                    f"{int(row.get('expected_days') or 30)}天 | {row.get('status')}/{row.get('result')}"
+                )
         for index, row in enumerate(conclusions, 1):
             conclusion = " ".join(str(row.get("conclusion") or "").split())
             lines.append(
@@ -261,18 +273,6 @@ class LearningEngine:
                 f"{row.get('ticker') or '无标的'} | 置信度={float(row.get('confidence') or 0):.0%} | "
                 f"期限={row.get('holding_period') or '未记录'} | {conclusion[:360]}"
             )
-
-        if predictions:
-            lines.append("【关联预测验证】")
-            for row in predictions:
-                score = row.get("accuracy_score")
-                score_text = f"{float(score):.2f}" if score is not None else "N/A"
-                lines.append(
-                    f"- {row.get('ticker')} {row.get('direction')} | "
-                    f"{int(row.get('expected_days') or 30)}天 | "
-                    f"{row.get('status')}/{row.get('result')} | accuracy={score_text} | "
-                    f"预测于={row.get('predicted_at') or 'N/A'}"
-                )
 
         return "\n".join(lines)
 

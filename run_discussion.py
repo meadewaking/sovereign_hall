@@ -1946,10 +1946,11 @@ async def stage2_deep_research(
 2. 必须把“已验证事实”和“推断”分开写入thesis
 3. ETF是空仓部署的一等候选，不是低置信度替代品；若资料能验证其跟踪指数、
    规模、流动性、折溢价和行业暴露，可按与个股相同的证据门给出confidence
-4. 不得用模型记忆、常识或猜测的价格判断整手可执行性，也不得因资料未给当前价格而
-   丢弃有证据的候选；提案抽取后、投委会前会由统一行情服务重新取得新鲜实时报价并
-   执行整手硬门。资料中已有可执行ETF或低价候选时仍应优先比较
-5. 黑名单标的一律排除
+4. 不得用模型记忆、常识或猜测的价格判断整手可执行性。资料未给当前价格时，
+   不要把它当成买入理由，也不要凭空补价；可保留候选交由后续实时行情筛选。提案
+   抽取后、投委会前会由统一行情服务重新取得新鲜实时报价并执行整手硬门。
+   资料中已有可执行ETF或低价候选时仍应优先比较
+5. 黑名单标的一律排除；代码、名称、市场或资产类型无法相互核对时不得提交
 
 【confidence 取值规则——重要】
 本系统投委会门槛为 confidence >= 0.55。请按证据强度动态打分，不要一律给 0.7：
@@ -1962,16 +1963,20 @@ async def stage2_deep_research(
 【什么时候输出 []】
 只有以下情况才输出空数组：
 - 资料完全不含任何 A 股/ETF 六位代码
-- 资料只有泛行业宏观分析，没有任何具体公司经营数据
+ - 资料只有泛行业宏观分析，没有任何具体公司经营数据
+ - 代码与资料中的公司/基金名称、市场或资产类型无法一致核验
+ - 关键事实缺失导致无法形成可证伪的标的级预期差、催化或失效条件
 - 所有候选都已被黑名单排除
 
-不要因为“资料不够完整”就输出 []：只要能识别出具体标的 + 至少一条经营数据，
-就按 confidence 0.55-0.64 输出提案，让投委会做最终判断。
+不要为了让委员会产生候选而输出证据不足的标的。具体代码加一条经营数据仍不够时，
+应输出 []；只有资料同时支持标的身份、至少一个标的级事实、可验证的投资机制和
+明确失效条件时才提交提案。行业事实不能自动替代公司/基金事实。
 
 JSON数组结构：
 [
     {{
         "ticker": "推荐标的代码",
+        "security_name": "资料明确给出的证券简称，不得猜测",
         "direction": "long或short",
         "target_position": 0.1,
         "stop_loss": 5.0,
@@ -1999,7 +2004,7 @@ JSON数组结构：
         logger.info(f"[diag] stage2 LLM call begin")
         response = await asyncio.wait_for(
             llm.chat(
-                system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；只要能识别具体标的+至少一条经营数据就按 confidence 0.55-0.64 输出提案交投委会审计，不要因资料不完整直接吞掉。回答第一个字符必须是 [。",
+ system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；代码、名称、市场和资产类型无法核验，或只有行业叙事而没有标的级可证伪事实、催化和失效条件时输出 []，不要为了交给投委会而制造候选。回答第一个字符必须是 [。",
                 user=prompt,
                 temperature=0.3,
                 max_tokens=16000
@@ -2329,6 +2334,7 @@ JSON数组结构：
                 try:
                     cleaned_proposal = {
                         'ticker': ticker,
+                        'security_name': str(p.get('security_name') or '').strip(),
                         'direction': direction,
                         'target_position': float(p.get('target_position', 0.1)),
                         'stop_loss': float(p.get('stop_loss', 5.0)),
@@ -4661,6 +4667,7 @@ async def stage3_ic_discussion(
                 'stop_loss': proposal.get('stop_loss', 5.0),
                 'take_profit': proposal.get('take_profit', 15.0),
                 'expected_days': expected_days,
+                'failure_conditions': proposal.get('reject_if', ''),
                 'holding_period_reason': proposal.get('holding_period_reason', ''),
                 'sector': sector,
                 'discussion_excerpt': full_context[:24000],
@@ -4927,6 +4934,20 @@ async def stage4_final_conclusion(
             'key_reasons': [],
             'action': '观望',
         }
+
+
+def investment_contract_terms(decision):
+    """Convert proposal percentage points to execution fractions."""
+    if decision.get("direction") not in {"long", "buy"}:
+        return {}
+    return dict(
+        holding_period_days=decision.get("expected_days"),
+        strategy_stop_loss_pct=(-abs(float(decision["stop_loss"])) / 100
+                               if decision.get("stop_loss") is not None else None),
+        strategy_take_profit_pct=(float(decision["take_profit"]) / 100
+                                 if decision.get("take_profit") is not None else None),
+        failure_conditions=str(decision.get("failure_conditions") or ""),
+    )
 
 
 async def run_committee_approved_simulation(
@@ -5384,6 +5405,7 @@ async def run_committee_approved_simulation(
                     reason=pending_reason,
                     round_id=round_id,
                     decision_id=decision.get("decision_id"),
+                    **investment_contract_terms(decision),
                     priority=50 if direction in {"sell", "short"} else 100,
                     idempotency_key=(
                         f"{round_id or 'standalone'}:"
@@ -5536,6 +5558,7 @@ async def run_committee_approved_simulation(
                                 f"{deferred.get('decision_id') or deferred_ticker}:"
                                 f"{str(deferred.get('direction') or 'hold').lower()}"
                             ),
+                            **investment_contract_terms(deferred),
                         )
                         if deferred_intent_id:
                             await note_execution_intent(deferred_intent_id)
@@ -5595,6 +5618,7 @@ async def run_committee_approved_simulation(
                         f"{decision.get('decision_id') or ticker}:"
                         f"{str(direction).lower()}"
                     ),
+                    **investment_contract_terms(decision),
                 )
                 await note_execution_intent(intent_id)
             current_price, price_source = await simulation.resolve_trade_price(ticker)
@@ -6939,6 +6963,12 @@ async def _main(resources):
                 # 阶段3：投委会讨论
                 logger.info(f"开始阶段3投委会审议，提案数: {len(proposals)}")
                 if proposals:
+                    from sovereign_hall.services.issuer_acquisition import supplement_proposals
+                    if not args.local_only:
+                        supplement = await portfolio_maintenance.during(
+                            supplement_proposals(proposals, db_service, active_round_id),
+                            context="active_research")
+                        prompt_lessons += "\n" + supplement
                     await round_coordinator.advance(
                         active_round_id,
                         ResearchRoundStatus.PROPOSALS_EXTRACTED,

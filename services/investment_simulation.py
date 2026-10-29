@@ -151,7 +151,9 @@ class InvestmentSimulation:
                 """
                 SELECT ticker, shares, avg_cost, opened_at, peak_price,
                        last_mark_price, last_mark_at, last_mark_source,
-                       last_reviewed_at, review_status, review_reason
+                       last_reviewed_at, review_status, review_reason,
+                       holding_period_days, strategy_stop_loss_pct,
+                       strategy_take_profit_pct, failure_conditions, contract_source
                 FROM simulation_positions
                 """
             ) as cursor:
@@ -167,6 +169,11 @@ class InvestmentSimulation:
                         'last_reviewed_at': row[8],
                         'review_status': row[9],
                         'review_reason': row[10],
+                        'holding_period_days': row[11],
+                        'strategy_stop_loss_pct': row[12],
+                        'strategy_take_profit_pct': row[13],
+                        'failure_conditions': row[14],
+                        'contract_source': row[15],
                     }
 
             # 加载上次交易日期
@@ -281,13 +288,18 @@ class InvestmentSimulation:
                     INSERT OR REPLACE INTO simulation_positions (
                         ticker, shares, avg_cost, updated_at, opened_at, peak_price,
                         last_mark_price, last_mark_at, last_mark_source,
-                        last_reviewed_at, review_status, review_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        last_reviewed_at, review_status, review_reason,
+                        holding_period_days, strategy_stop_loss_pct,
+                        strategy_take_profit_pct, failure_conditions, contract_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     ticker, pos['shares'], pos['avg_cost'], datetime.now().isoformat(),
                     pos.get('opened_at'), pos.get('peak_price'), pos.get('last_mark_price'),
                     pos.get('last_mark_at'), pos.get('last_mark_source'),
                     pos.get('last_reviewed_at'), pos.get('review_status'), pos.get('review_reason'),
+                    pos.get('holding_period_days'), pos.get('strategy_stop_loss_pct'),
+                    pos.get('strategy_take_profit_pct'), pos.get('failure_conditions'),
+                    pos.get('contract_source'),
                 ))
 
             # 删除不在当前持仓中的股票
@@ -586,6 +598,15 @@ class InvestmentSimulation:
                     "candidate remains eligible for committee and execution must refetch",
                     ticker,
                 )
+            claimed_name = str(proposal.get("security_name") or "").strip()
+            provider_name = str((quote or {}).get("name") or "").strip()
+            if quote_is_fresh and claimed_name and provider_name and claimed_name != provider_name:
+                rejections.append({
+                    "ticker": ticker, "code": "proposal_identity_mismatch",
+                    "reason": f"提案名称{claimed_name}与行情证券名称{provider_name}不一致；需核验简称/更名及资料主体，禁止自动改代码。",
+                    "quote_source": str(quote.get("source") or ""),
+                })
+                continue
             if reference_price <= 0 or reference_price <= executable_quote_ceiling:
                 feasible.append(proposal)
                 continue
@@ -1130,6 +1151,10 @@ class InvestmentSimulation:
         decision_id: str | None = None,
         priority: int = 100,
         idempotency_key: str | None = None,
+        holding_period_days: int | None = None,
+        strategy_stop_loss_pct: float | None = None,
+        strategy_take_profit_pct: float | None = None,
+        failure_conditions: str | None = None,
     ) -> str | None:
         """Persist a typed price-free ruling before attempting a fill."""
         if not self.db_service or self.db_service._connection is None:
@@ -1145,14 +1170,44 @@ class InvestmentSimulation:
             priority=int(priority),
             idempotency_key=idempotency_key,
         )
+        # Explicit fractions only; the producer converts percentage points.
+        # Never guess whether 1 means 1% or 100% at the persistence boundary.
+        normalized_stop = None
+        if strategy_stop_loss_pct is not None:
+            value = float(strategy_stop_loss_pct)
+            normalized_stop = value
+        normalized_take = None
+        if strategy_take_profit_pct is not None:
+            value = float(strategy_take_profit_pct)
+            normalized_take = value
+        normalized_days = (
+            int(holding_period_days)
+            if holding_period_days is not None else None
+        )
+        if holding_period_days is not None and (
+            isinstance(holding_period_days, bool)
+            or normalized_days != float(holding_period_days)
+            or not 1 <= normalized_days <= 180
+        ):
+            raise ValueError("holding period must be an integer from 1 to 180")
+        if normalized_stop is not None and (
+            not math.isfinite(normalized_stop) or not -1 < normalized_stop < 0
+        ):
+            raise ValueError("strategy stop must be a finite loss fraction between -1 and 0")
+        if normalized_take is not None and (
+            not math.isfinite(normalized_take) or normalized_take <= 0
+        ):
+            raise ValueError("strategy take profit must be a positive finite fraction")
         async with self.db_service.transaction(immediate=True) as conn:
             await conn.execute(
                 """
                 INSERT OR IGNORE INTO execution_intents (
                     id, round_id, decision_id, ticker, direction, target_position,
                     confidence, priority, reason, status, defer_code, resolution,
-                    idempotency_key, created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                    idempotency_key, created_at, updated_at, expires_at,
+                    holding_period_days, strategy_stop_loss_pct,
+                    strategy_take_profit_pct, failure_conditions
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     intent.id,
@@ -1169,6 +1224,10 @@ class InvestmentSimulation:
                     intent.created_at,
                     intent.updated_at,
                     intent.expires_at,
+                    normalized_days,
+                    normalized_stop,
+                    normalized_take,
+                    failure_conditions,
                 ),
             )
             async with conn.execute(
@@ -1359,6 +1418,10 @@ class InvestmentSimulation:
             round_id=item.get("round_id"),
             intent_id=intent_id,
             idempotency_key=item["idempotency_key"],
+            holding_period_days=item.get("holding_period_days"),
+            strategy_stop_loss_pct=item.get("strategy_stop_loss_pct"),
+            strategy_take_profit_pct=item.get("strategy_take_profit_pct"),
+            failure_conditions=item.get("failure_conditions"),
         )
         if (
             str(item.get("direction") or "").lower() in {"sell", "short"}
@@ -1838,6 +1901,10 @@ class InvestmentSimulation:
         round_id: str | None = None,
         intent_id: str | None = None,
         idempotency_key: str | None = None,
+        holding_period_days: int | None = None,
+        strategy_stop_loss_pct: float | None = None,
+        strategy_take_profit_pct: float | None = None,
+        failure_conditions: str | None = None,
     ) -> Dict:
         """
         执行交易（支持买入、卖出、持有）
@@ -1865,8 +1932,12 @@ class InvestmentSimulation:
             intent_id = await self.create_execution_intent(
                 ticker=ticker, direction=direction_norm,
                 target_position=target_position, reason=reason,
-                confidence=confidence, round_id=round_id,
-                idempotency_key=idempotency_key)
+                 confidence=confidence, round_id=round_id,
+                 idempotency_key=idempotency_key,
+                 holding_period_days=holding_period_days,
+                 strategy_stop_loss_pct=strategy_stop_loss_pct,
+                 strategy_take_profit_pct=strategy_take_profit_pct,
+                 failure_conditions=failure_conditions)
             if not intent_id:
                 return {'success': False, 'action': 'error',
                         'reason': '模拟执行裁决持久化失败，未请求成交行情'}
@@ -2225,9 +2296,18 @@ class InvestmentSimulation:
                     'last_mark_at': quote_fetched_at,
                     'last_mark_source': quote_provider,
                     'last_reviewed_at': now.isoformat(),
-                    'review_status': 'opened',
-                    'review_reason': reason or '新建模拟持仓',
-                }
+                        'review_status': 'opened',
+                        'review_reason': reason or '新建模拟持仓',
+                        'holding_period_days': holding_period_days,
+                        'strategy_stop_loss_pct': strategy_stop_loss_pct,
+                        'strategy_take_profit_pct': strategy_take_profit_pct,
+                        'failure_conditions': failure_conditions,
+                        'contract_source': 'execution_intent' if (
+                            holding_period_days is not None
+                            or strategy_stop_loss_pct is not None
+                            or strategy_take_profit_pct is not None
+                        ) else None,
+                    }
 
             durable_reason = (reason or f"加仓至{target_position*100:.0f}%") + (
                 f"; price_source={quote_provider} {quote_fetched_at}"
@@ -2611,9 +2691,15 @@ class InvestmentSimulation:
                 price_source=str(detail.get("source", "")),
                 now=now,
                 max_price_age_days=self.max_trade_price_age_days,
-                stop_loss_pct=self.stop_loss_pct,
-                take_profit_pct=self.take_profit_pct,
-                max_holding_days=self.max_holding_days,
+                stop_loss_pct=(max(self.stop_loss_pct, float(pos.get('strategy_stop_loss_pct')))
+                               if pos.get('strategy_stop_loss_pct') is not None
+                               else self.stop_loss_pct),
+                take_profit_pct=(min(self.take_profit_pct, float(pos.get('strategy_take_profit_pct')))
+                                 if pos.get('strategy_take_profit_pct') is not None
+                                 else self.take_profit_pct),
+                max_holding_days=(min(self.max_holding_days, int(pos.get('holding_period_days')))
+                                  if pos.get('holding_period_days') is not None
+                                  else self.max_holding_days),
             )
             pos["last_reviewed_at"] = now.isoformat()
             pos["review_status"] = review.action
@@ -2860,7 +2946,11 @@ class InvestmentSimulation:
             return ""
 
         # A stable input watermark avoids repeating the same old reflection.
-        trades = await self.get_trade_history(days=7)
+        # A seven-day window routinely becomes empty while the account still
+        # carries the consequences of older exits.  Reflection must inspect
+        # complete recent investment episodes rather than infer realized loss
+        # from the cash balance.
+        trades = await self.get_trade_history(days=365, limit=200)
 
         # 获取当前资产
         assets = await self.calculate_assets()
@@ -2909,6 +2999,11 @@ class InvestmentSimulation:
                 f"原获批仓位={trade.get('approved_position')}，执行目标={trade.get('execution_position')}；"
                 f"依据/退出原因={trade.get('reason') or '未留痕'}\n")
 
+        attribution = await self.get_event_level_attribution()
+        reflection_prompt += "\n【确定性全历史交易归因（不替代账户净值）】\n" + json.dumps(
+            attribution, ensure_ascii=False, default=str
+        ) + "\n存在未匹配卖出时，总已实现收益未知；不得将现金差额推断成策略损失。\n"
+
         reflection_prompt += """
 请进行以下分析：
 1. 当前资产变化是否由真实交易结果驱动
@@ -2931,7 +3026,7 @@ class InvestmentSimulation:
             )
             # The account owner may have serviced an exit while the model was
             # thinking. Do not attach a response about an old book to new fills.
-            latest_trades = await self.get_trade_history(days=7)
+            latest_trades = await self.get_trade_history(days=365, limit=200)
             if ([t["id"] for t in latest_trades] != [t["id"] for t in trades] or
                     {t: p["shares"] for t, p in self.positions.items()} !=
                     {t: p["shares"] for t, p in assets["positions"].items()}):
@@ -2946,6 +3041,61 @@ class InvestmentSimulation:
         except Exception as e:
             logger.warning(f"Failed to generate reflection: {e}")
             return f"反思生成失败: {e}"
+
+    async def get_event_level_attribution(self, *, limit: int = 200) -> Dict[str, Any]:
+        """Return deterministic FIFO realized P&L by ticker and exit reason.
+
+        This is diagnostic only: it never rewrites the historical ledger and
+        deliberately reports unmatched legacy sales separately.
+        """
+        if not self.db_service or self.db_service._connection is None:
+            return {"trade_count": 0, "realized_pnl": None, "unmatched_sales": []}
+        async with self.db_service._connection.execute(
+            """SELECT id,ticker,direction,shares,price,fee,reason,traded_at
+               FROM simulation_trades ORDER BY datetime(traded_at),id""",
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+        from collections import defaultdict, deque
+        lots = defaultdict(deque)
+        by_ticker = defaultdict(float)
+        by_reason = defaultdict(float)
+        unmatched = []
+        for row in rows:
+            ticker = str(row["ticker"])
+            shares = int(row["shares"] or 0)
+            price = float(row["price"] or 0.0)
+            fee = float(row["fee"] or 0.0)
+            if row["direction"] == "buy":
+                lots[ticker].append([shares, price, fee])
+                continue
+            remaining, basis = shares, 0.0
+            while remaining > 0 and lots[ticker]:
+                lot_shares, lot_price, lot_fee = lots[ticker][0]
+                take = min(remaining, lot_shares)
+                basis += take * lot_price + lot_fee * take / lot_shares
+                remaining -= take
+                lot_shares -= take
+                if lot_shares:
+                    lots[ticker][0] = [lot_shares, lot_price, lot_fee * lot_shares / (lot_shares + take)]
+                else:
+                    lots[ticker].popleft()
+            if remaining:
+                unmatched.append({"trade_id": row["id"], "ticker": ticker, "shares": remaining})
+            matched = shares - remaining
+            realized = matched * price - fee * matched / shares - basis
+            by_ticker[ticker] += realized
+            reason = str(row["reason"] or "unknown")
+            by_reason["stop_loss" if "止损" in reason else
+                      "take_profit" if "止盈" in reason else
+                      "max_holding" if "最大持有期" in reason else "other"] += realized
+        return {
+            "trade_count": len(rows),
+            "realized_pnl": None if unmatched else round(sum(by_ticker.values()), 8),
+            "matched_realized_pnl": round(sum(by_ticker.values()), 8),
+            "by_ticker": {k: round(v, 8) for k, v in sorted(by_ticker.items(), key=lambda x: x[1])},
+            "by_exit_reason": {k: round(v, 8) for k, v in sorted(by_reason.items())},
+            "unmatched_sales": unmatched,
+        }
 
     async def get_recent_reflection(self, limit: int = 3) -> str:
         """获取最近N条反思摘要"""
@@ -3062,11 +3212,28 @@ class InvestmentSimulation:
                 "last_reviewed_at": "TEXT",
                 "review_status": "TEXT",
                 "review_reason": "TEXT",
+                "holding_period_days": "INTEGER",
+                "strategy_stop_loss_pct": "REAL",
+                "strategy_take_profit_pct": "REAL",
+                "failure_conditions": "TEXT",
+                "contract_source": "TEXT",
             }
             for column, column_type in required_position_columns.items():
                 if column not in existing_position_columns:
                     await conn.execute(
                         f"ALTER TABLE simulation_positions ADD COLUMN {column} {column_type}"
+                    )
+            async with conn.execute("PRAGMA table_info(execution_intents)") as cursor:
+                existing_intent_columns = {row[1] for row in await cursor.fetchall()}
+            for column, column_type in {
+                "holding_period_days": "INTEGER",
+                "strategy_stop_loss_pct": "REAL",
+                "strategy_take_profit_pct": "REAL",
+                "failure_conditions": "TEXT",
+            }.items():
+                if column not in existing_intent_columns:
+                    await conn.execute(
+                        f"ALTER TABLE execution_intents ADD COLUMN {column} {column_type}"
                     )
             await conn.execute("""
                 UPDATE simulation_positions

@@ -43,6 +43,7 @@ class PredictionEnhancer:
         - 不同标的的预测难度
         """
         async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
             # 分析置信度与准确率的关系
             cursor = await db.execute("""
                 SELECT 
@@ -160,7 +161,7 @@ class PredictionEnhancer:
             """, (ticker,))
             
             row = await cursor.fetchone()
-            if row and row[0]:
+            if row and row[0] is not None:
                 avg_score, total, win_rate = row
                 
                 if total >= 5:  # 有足够样本
@@ -176,25 +177,24 @@ class PredictionEnhancer:
                             f"{ticker}历史预测表现优秀({avg_score:.2f})，置信度上调"
                         )
                     
-                    # 如果胜率低，收紧止损
+                    # Absolute target/stop prices do not supply an entry
+                    # anchor. A mixed historical hit rate cannot justify a
+                    # new protective price; retain the supplied contract.
                     if win_rate < 0.4:
-                        # 将止损收紧10%
-                        stop_range = base_stop_loss - base_target_price if base_stop_loss < base_target_price else base_stop_loss - base_target_price
-                        params['adjusted_stop_loss'] = base_stop_loss + stop_range * 0.1
                         params['adjustment_reasons'].append(
-                            f"历史胜率较低({win_rate*100:.1f}%)，止损位收紧10%"
+                            "历史命中率偏低仅供诊断；缺少入场锚点和受控对照，保持原止损"
                         )
         
-        # 查询整体市场状态
-        cursor = await db.execute("""
-            SELECT AVG(accuracy_score) as market_avg_score
-            FROM price_predictions
-            WHERE status IN ('validated', 'expired')
-            AND predicted_at >= date('now', '-30 days')
-        """)
-        
-        row = await cursor.fetchone()
-        if row and row[0] and row[0] < 0.4:
+            # 查询整体市场状态；必须在连接上下文内执行。
+            cursor = await db.execute("""
+                SELECT AVG(accuracy_score) as market_avg_score
+                FROM price_predictions
+                WHERE status IN ('validated', 'expired')
+                AND predicted_at >= date('now', '-30 days')
+                AND result IN ('correct', 'partial', 'wrong')
+            """)
+            row = await cursor.fetchone()
+        if row and row[0] is not None and row[0] < 0.4:
             # 市场整体表现差，进一步降低置信度
             params['adjusted_confidence'] = params['adjusted_confidence'] * 0.9
             params['adjustment_reasons'].append(

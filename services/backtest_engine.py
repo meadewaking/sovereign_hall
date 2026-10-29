@@ -46,8 +46,8 @@ class BacktestResult:
     losing_trades: int
     win_rate: float
     avg_return: float
-    max_drawdown: float
-    sharpe_ratio: float
+    max_drawdown: Optional[float]
+    sharpe_ratio: Optional[float]
     profit_factor: float
     trades: List[BacktestTrade]
 
@@ -268,22 +268,17 @@ class BacktestEngine:
         returns = [t.pnl_pct for t in trades]
         avg_return = np.mean(returns)
         
-        # 计算最大回撤
-        cumulative = np.cumsum(returns)
-        running_max = np.maximum.accumulate(cumulative)
-        drawdown = running_max - cumulative
-        max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
-        
-        # 计算夏普比率（简化版，假设无风险利率为0）
-        if len(returns) > 1 and np.std(returns) > 0:
-            sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252)  # 年化
-        else:
-            sharpe_ratio = 0
+        # Overlapping independent predictions are not a funded daily equity
+        # curve. Neither portfolio drawdown nor annualized Sharpe is defined.
+        max_drawdown = None
+        sharpe_ratio = None
         
         # 计算盈亏比
         avg_win = np.mean([t.pnl_pct for t in trades if t.pnl > 0]) if winning_trades > 0 else 0
         avg_loss = abs(np.mean([t.pnl_pct for t in trades if t.pnl < 0])) if losing_trades > 0 else 1
-        profit_factor = avg_win / avg_loss if avg_loss > 0 else 0
+        gains = sum(t.pnl for t in trades if t.pnl > 0)
+        losses = -sum(t.pnl for t in trades if t.pnl < 0)
+        profit_factor = gains / losses if losses > 0 else float('inf') if gains else 0.0
         
         return BacktestResult(
             total_trades=total_trades,
@@ -358,8 +353,8 @@ class BacktestEngine:
   
 📈 收益指标
   平均收益率: {result.avg_return:.2f}%
-  最大回撤: {result.max_drawdown:.2f}%
-  夏普比率: {result.sharpe_ratio:.2f}
+  最大回撤: N/A（独立预测诊断无组合净值曲线）
+  夏普比率: N/A（不可将逐笔收益当作日收益年化）
   盈亏比: {result.profit_factor:.2f}
 
 📝 最近交易明细
