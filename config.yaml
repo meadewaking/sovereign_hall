@@ -37,13 +37,12 @@ llm_profiles:
     structured_output_use_response_format: false
   glm-5.2-fp8:
     provider: "openai"
-    model: "GLM-5.2-FP8"
-    base_url: "http://172.18.5.19:8000/v1"
-    api_key_env: ""  # 内网部署使用原有凭据
-    api_key: "not_need"
+    model: "deepseek-v4.1-flash"
+    base_url: "https://api.nextoken.real-ai.cn/v1"
+    api_key_env: "OPENAI_API_KEY"
+    api_key: ""
     model_uuid: ""
     structured_output_reasoning_effort: "none"
-    # 旧端点在reasoning_effort=none配合json_object时可能返回500，保留本地校验。
     structured_output_use_response_format: false
 
 # GLM承担日常研究，K3只用于终审、实质补证后的复审和空候选抽查。
