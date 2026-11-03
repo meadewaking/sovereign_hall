@@ -23,6 +23,17 @@ from sovereign_hall.ports.broker import assert_safe_execution_mode  # noqa: E402
 from sovereign_hall.services.shadow_runner import ShadowEvaluationService  # noqa: E402
 
 
+def _prune_old_runs(runs_root: Path, keep: int = 30) -> None:
+    """删除最旧的 run 目录，只保留最近 keep 个。按目录名排序（格式为时间戳）。"""
+    import shutil
+    dirs = sorted(
+        [p for p in runs_root.iterdir() if p.is_dir()],
+        key=lambda p: p.name,
+    )
+    for old_dir in dirs[:-keep]:
+        shutil.rmtree(old_dir, ignore_errors=True)
+
+
 async def run(args: argparse.Namespace) -> int:
     config_path = (PROJECT_ROOT / args.config).resolve()
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
@@ -37,6 +48,7 @@ async def run(args: argparse.Namespace) -> int:
     run_id = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = output_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
+    _prune_old_runs(output_root, keep=30)
 
     sleeve_values = (
         [SleeveId.SYSTEMATIC_ETF_MOMENTUM_V1, SleeveId.LLM_RESEARCH]

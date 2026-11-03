@@ -2208,6 +2208,17 @@ def build_persisted_lifecycle_review(db_path: Path) -> dict[str, Any]:
     }
 
 
+def _prune_old_runs(runs_root: Path, keep: int = 30) -> None:
+    """删除最旧的 run 目录，只保留最近 keep 个。按目录名排序（格式为时间戳）。"""
+    import shutil
+    dirs = sorted(
+        [p for p in runs_root.iterdir() if p.is_dir()],
+        key=lambda p: p.name,
+    )
+    for old_dir in dirs[:-keep]:
+        shutil.rmtree(old_dir, ignore_errors=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a local heuristic learning cycle without pandas/numpy.")
     parser.add_argument("--db", default="data/sovereign_hall.db", help="SQLite database path")
@@ -2257,6 +2268,7 @@ def main() -> int:
     iteration_window_start = args.window_start or inferred_window_start
     run_dir = runs_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
+    _prune_old_runs(runs_root, keep=30)
     live_metrics = attach_live_iteration_attribution(
         asyncio.run(
             collect_simulation_performance(
