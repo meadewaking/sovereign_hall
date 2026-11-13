@@ -92,7 +92,7 @@ class MarketDataService:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout, connect=5.0, read=timeout),
             follow_redirects=True,
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
         )
         self._quote_cache: Dict[str, Dict[str, Any]] = {}
         self._valuation_cache: Dict[str, Dict[str, Any]] = {}
@@ -171,7 +171,7 @@ class MarketDataService:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout, connect=5.0, read=self.timeout),
                 follow_redirects=True,
-                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+                limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
             )
 
     async def is_trading_day(self, when: Optional[date | datetime] = None) -> bool:
@@ -422,7 +422,7 @@ class MarketDataService:
         secid = self.eastmoney_secid(ticker)
         if not secid:
             return None, "", ""
-        url = "https://push2.eastmoney.com/api/qt/stock/get"
+        url = "http://push2.eastmoney.com/api/qt/stock/get"
         params = {"secid": secid, "fields": "f43,f57,f58,f59,f86"}
         try:
             resp = await self._client.get(url, params=params)
@@ -609,9 +609,11 @@ class MarketDataService:
             "end": end_s,
         }
         if not self._eastmoney_ohlc_in_cooldown():
-            # Retry with exponential backoff for transient connection issues
-            max_retries = 3
-            base_delay = 0.5
+            # Single attempt: RemoteProtocolError from eastmoney is currently
+            # persistent (server disconnects immediately), so 3x retry with
+            # backoff wastes up to 3.5s per call for no benefit. Tencent/Sina
+            # fallbacks are healthy and serve the data in ~0.2s.
+            max_retries = 1
             for attempt in range(max_retries):
                 try:
                     resp = await self._client.get(url, params=params)
@@ -636,14 +638,6 @@ class MarketDataService:
                         return self._decorate_bars(bars, "eastmoney_ohlc_" + adjustment)
                     break
                 except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
-                    if attempt < max_retries - 1:
-                        delay = base_delay * (2 ** attempt)
-                        logger.debug(
-                            "Eastmoney OHLC transient error for %s (attempt %d/%d), retrying in %.1fs: %s",
-                            ticker, attempt + 1, max_retries, delay, exc
-                        )
-                        await asyncio.sleep(delay)
-                        continue
                     self._record_eastmoney_ohlc_failure(ticker, exc)
                 except Exception as exc:
                     self._record_eastmoney_ohlc_failure(ticker, exc)

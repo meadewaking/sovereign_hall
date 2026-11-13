@@ -35,20 +35,29 @@ llm_profiles:
     model_uuid: ""
     structured_output_reasoning_effort: "none"
     structured_output_use_response_format: false
-  glm-5.2-fp8:
+  deepseek-v4.1-flash-1017:
     provider: "openai"
-    model: "deepseek-v4.1-flash"
+    model: "deepseek-v4.1-flash-1017"
     base_url: "https://api.nextoken.real-ai.cn/v1"
     api_key_env: "OPENAI_API_KEY"
     api_key: ""
     model_uuid: ""
     structured_output_reasoning_effort: "none"
     structured_output_use_response_format: false
+  self-hosted/deepseek-v4.1-flash-1017:
+    provider: "openai"
+    model: "self-hosted/deepseek-v4.1-flash-1017"
+    base_url: "https://api.nextoken.real-ai.cn/v1"
+    api_key_env: "OPENAI_API_KEY"
+    api_key: ""
+    model_uuid: ""
+    structured_output_reasoning_effort: "high"
+    structured_output_use_response_format: false
 
-# GLM承担日常研究，K3只用于终审、实质补证后的复审和空候选抽查。
+# self-hosted/deepseek-v4.1-flash-1017承担日常研究，K3只用于终审、实质补证后的复审和空候选抽查。
 model_collaboration:
   enabled: true
-  research_profile: "glm-5.2-fp8"
+  research_profile: "self-hosted/deepseek-v4.1-flash-1017"
   review_profile: "kimi-k3"
   research_max_concurrent: 6
   review_max_concurrent: 2
@@ -67,7 +76,10 @@ pricing:
     kimi-k3:
       input_per_1k: 0.0003
       output_per_1k: 0.0012
-    GLM-5.2-FP8:
+    deepseek-v4.1-flash-1017:
+      input_per_1k: 0.0003
+      output_per_1k: 0.0012
+    self-hosted/deepseek-v4.1-flash-1017:
       input_per_1k: 0.0003
       output_per_1k: 0.0012
 
@@ -234,7 +246,7 @@ research:
   force_search_interval: 1
   stage2_max_docs: 30
   wiki_ingest_max_docs_per_round: 30
-  deployment_deep_fetch_max_docs: 6
+  deployment_deep_fetch_max_docs: 12
   stage2_doc_chars: 1200
   stage2_context_chars: 24000
   agent_search_max_docs: 10

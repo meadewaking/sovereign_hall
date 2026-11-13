@@ -3928,6 +3928,30 @@ def test_incomplete_round_cannot_reuse_previous_cycle_fill_activity():
     )
 
 
+def test_rejected_or_held_round_without_fill_keeps_empty_backoff():
+    for terminal_code in ("execution_rejected", "committee_hold"):
+        round_ = ResearchRound(
+            base_topic="screened out",
+            research_objective="no executable proposal",
+            status=ResearchRoundStatus.COMPLETED,
+            current_stage=ResearchRoundStatus.COMPLETED.value,
+            terminal_code=terminal_code,
+        )
+        assert not round_has_operational_result(
+            round_,
+            {"fills": 0, "replay_fills": 0, "cycle_fills": 0},
+        )
+    for terminal_code in ("filled", "market_closed_pending"):
+        round_ = ResearchRound(
+            base_topic="progress",
+            research_objective="durable execution progress",
+            status=ResearchRoundStatus.COMPLETED,
+            current_stage=ResearchRoundStatus.COMPLETED.value,
+            terminal_code=terminal_code,
+        )
+        assert round_has_operational_result(round_, {"cycle_fills": 0})
+
+
 def test_weaker_research_terminal_cannot_overwrite_atomic_fill_terminal():
     filled_during_lifecycle = ResearchRound(
         base_topic="lifecycle exit",

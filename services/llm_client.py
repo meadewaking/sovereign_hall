@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from datetime import datetime
@@ -486,6 +487,23 @@ class LLMClient:
                     json=payload,
                     headers=headers,
                 )
+                parameter_recovery = None
+                required = self._kimi_required_temperature(resp, payload['temperature'])
+                if required is not None:
+                    # The gateway routes Kimi to groups with different accepted
+                    # temperatures. Negotiate only an explicit pre-generation
+                    # 400 rejection, once. Never resample a completed answer or
+                    # change the prompt, reasoning mode, model or token budget.
+                    parameter_recovery = {
+                        'parameter': 'temperature', 'requested': payload['temperature'],
+                        'required': required, 'rejected_status': 400,
+                        'error_message': resp.json()['error']['message'][:500],
+                        'rejected_request_usage': None, 'additional_http_requests': 1,
+                    }
+                    payload['temperature'] = required
+                    logger.warning('Kimi structured temperature rejected; retrying once: %s -> %s',
+                                   parameter_recovery['requested'], required)
+                    resp = await self._http_client.post(url, json=payload, headers=headers)
                 if resp.status_code >= 400:
                     raise httpx.HTTPStatusError(
                         f"HTTP {resp.status_code}: {resp.content[:500]!r}",
@@ -524,6 +542,8 @@ class LLMClient:
                     "completion_tokens": raw_usage.get("completion_tokens", 0),
                     "total_tokens": raw_usage.get("total_tokens", 0),
                 }
+                if parameter_recovery is not None:
+                    usage['parameter_recovery'] = parameter_recovery
                 if not content or finish_reason != "stop":
                     return (
                         "[committee_task_absent] reason=structured_output_incomplete "
@@ -633,6 +653,24 @@ class LLMClient:
         except Exception as e:
             logger.error("OpenAI chat failed: %s", self._format_exception(e))
             raise
+
+    def _kimi_required_temperature(self, response, requested):
+        """Accept only the two observed, explicit Kimi gateway constraints."""
+        if self.model.lower() != 'kimi-k3' or response.status_code != 400:
+            return None
+        try:
+            error = response.json()['error']
+            if error.get('type') != 'invalid_request_error':
+                return None
+            message = error['message']
+            match = re.search(
+                r'invalid temperature: only (0\.6|1(?:\.0)?) is allowed for this model '
+                r'when thinking\.type=(?:disabled|enabled)(?:\s|\(|$)', message)
+            required = float(match.group(1)) if match else (
+                1.0 if 'temperature must be the number 1 for this group' in message else None)
+            return required if required is not None and required != requested else None
+        except (KeyError, TypeError, ValueError):
+            return None
 
     async def _anthropic_chat(
         self,

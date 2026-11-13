@@ -506,11 +506,12 @@ class InvestmentSimulation:
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Remove structurally unbuyable long proposals before committee work.
 
-        The quote is used only as a current screening reference and must pass
-        the same freshness gate as valuation/execution quotes.  Execution still
-        creates a durable intent and fetches a new, fresh quote in an open
-        market session.  Missing or stale screening quotes are not rejected
-        here because the execution path owns the authoritative quote gate.
+        The quote is used only as a current screening reference: a fresh
+        realtime quote, or in a closed session the validated session-boundary
+        valuation reference.  Execution still creates a durable intent and
+        fetches a new, fresh quote in an open market session.  Stale screening
+        quotes are not rejected here because the execution path owns the
+        authoritative quote gate.
         """
         assets = await self.calculate_assets()
         if (
@@ -561,10 +562,16 @@ class InvestmentSimulation:
                 continue
             try:
                 quote = await self.get_current_quote(ticker)
-                quote_is_fresh = self._quote_is_fresh(quote)
+                quote_usable = self._quote_is_fresh(quote)
+                if quote is None:
+                    # Lunch break / after close: the session-boundary reference proves the ticker exists.
+                    reference = await self.get_valuation_quote(ticker)
+                    if reference and reference.get("valuation_only"):
+                        quote = reference
+                        quote_usable = True
                 reference_price = (
                     float((quote or {}).get("price") or 0.0)
-                    if quote_is_fresh
+                    if quote_usable
                     else 0.0
                 )
             except Exception as exc:
@@ -575,7 +582,7 @@ class InvestmentSimulation:
                 )
                 reference_price = 0.0
                 quote = None
-                quote_is_fresh = False
+                quote_usable = False
             if quote is None and reference_price <= 0:
                 rejections.append({
                     "ticker": ticker,
@@ -592,7 +599,7 @@ class InvestmentSimulation:
                     "max_executable_quote": executable_quote_ceiling,
                 })
                 continue
-            if quote and not quote_is_fresh:
+            if quote and not quote_usable:
                 logger.warning(
                     "Proposal lot-feasibility quote unavailable/stale for %s; "
                     "candidate remains eligible for committee and execution must refetch",
@@ -600,7 +607,7 @@ class InvestmentSimulation:
                 )
             claimed_name = str(proposal.get("security_name") or "").strip()
             provider_name = str((quote or {}).get("name") or "").strip()
-            if quote_is_fresh and claimed_name and provider_name and claimed_name != provider_name:
+            if quote_usable and claimed_name and provider_name and claimed_name != provider_name:
                 rejections.append({
                     "ticker": ticker, "code": "proposal_identity_mismatch",
                     "reason": f"提案名称{claimed_name}与行情证券名称{provider_name}不一致；需核验简称/更名及资料主体，禁止自动改代码。",

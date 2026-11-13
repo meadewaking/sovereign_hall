@@ -3004,6 +3004,61 @@ async def test_proposal_screen_cannot_reject_from_stale_quote(
     await db.close()
 
 
+class SessionPauseMarket(ClosedMarket):
+    async def get_current_quote(self, ticker):
+        return None
+
+    async def get_valuation_quote(self, ticker):
+        if self.price is None:
+            return None
+        return {
+            "ticker": ticker,
+            "price": self.price,
+            "name": "中国人寿",
+            "source": "architecture_test_session_pause",
+            "fetched_at": datetime.now().isoformat(),
+            "quoted_at": datetime.now().replace(hour=11, minute=30).isoformat(),
+            "valuation_only": True,
+            "valuation_kind": "session_pause",
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("price", "expected_code"),
+    [(4.25, None), (32.15, "proposal_lot_infeasible"), (None, "proposal_ticker_unverifiable")],
+)
+async def test_proposal_screen_uses_session_reference_when_market_paused(
+    tmp_path,
+    monkeypatch,
+    price,
+    expected_code,
+):
+    db, simulation = await build_simulation(
+        tmp_path,
+        monkeypatch,
+        SessionPauseMarket(price=price),
+    )
+    monkeypatch.setattr(simulation, "config", {**simulation.config, "max_single_position": 0.10})
+    proposal = {
+        "ticker": "601628",
+        "security_name": "中国人寿",
+        "direction": "long",
+        "confidence": 0.8,
+        "target_position": 0.1,
+    }
+
+    feasible, rejected = await simulation.screen_proposal_lot_feasibility([proposal])
+
+    if expected_code is None:
+        assert feasible == [proposal]
+        assert rejected == []
+    else:
+        assert feasible == []
+        assert rejected[0]["code"] == expected_code
+    await db.close()
+
+
 @pytest.mark.asyncio
 async def test_proposal_lot_rejection_quote_is_round_traceable(
     tmp_path,

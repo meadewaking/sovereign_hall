@@ -1500,8 +1500,9 @@ async def stage1_mass_search(
     research_config = get_config().get("research", {})
     max_results_per_query = int(research_config.get("search_results_per_query", 10) or 10)
     deployment_deep_fetch_max_docs = int(
-        research_config.get("deployment_deep_fetch_max_docs", 6) or 6
+        research_config.get("deployment_deep_fetch_max_docs", 12) or 12
     )
+    stage2_doc_chars = int(research_config.get("stage2_doc_chars", 1200) or 1200)
 
     logger.info(f"========== 阶段1：海量信息搜索 - 议题: {topic} ==========")
     print("\n" + "="*60)
@@ -1701,12 +1702,22 @@ async def stage1_mass_search(
                 max_results_per_query=max_results_per_query,
             )
             raw_docs = merge_documents_prefer_richer(raw_docs, evidence_docs)
+        # Search hits are mostly short snippets; upgrade the strongest to full text, follow-ups first.
+        evidence_keys = {
+            getattr(doc, "url", "") or getattr(doc, "id", "") for doc in evidence_docs
+        }
+        initial_pool = [
+            doc for doc in raw_docs
+            if (getattr(doc, "url", "") or getattr(doc, "id", "")) not in evidence_keys
+        ]
         deep_candidates = [
-            doc for doc in rank_stage2_documents(evidence_docs)
+            doc
+            for doc in rank_stage2_documents(evidence_docs) + rank_stage2_documents(initial_pool)
             if str(getattr(doc, "url", "") or "").startswith(("http://", "https://"))
+            and len(str(getattr(doc, "content", "") or "")) < stage2_doc_chars
         ][:max(0, deployment_deep_fetch_max_docs)]
         fetch_audit = {
-            "policy": "legacy_followup_only", "as_of": research_as_of.isoformat(),
+            "policy": "followup_then_ranked_snippets", "as_of": research_as_of.isoformat(),
             "initial_count": len(initial_docs), "followup_count": len(evidence_docs),
             "limit": max(0, deployment_deep_fetch_max_docs),
             "selected": [{**document_time_audit(doc),
@@ -1718,7 +1729,7 @@ async def stage1_mass_search(
             deep_docs = await spiders.parallel_fetch(
                 [getattr(doc, "url", "") for doc in deep_candidates],
                 extract_full_text=True,
-                max_concurrent=3,
+                max_concurrent=4,
             )
             raw_docs = merge_documents_prefer_richer(raw_docs, deep_docs)
             logger.info(
@@ -1854,48 +1865,30 @@ async def stage2_deep_research(
         )
         return []
 
-    # PR-pre-search-cleanup: stage2 entry requires documents to carry a
-    # source-reported publication time. decision_funnel.json 2026-09-14
-    # showed known_publication_dates=13/99 (87% of sources had no time
-    # anchor), and these untraceable sources dominated the context window
-    # without supporting a verifiable candidate. The gate is configurable
-    # so a fully offline/local-only round can still proceed.
+    # Dated sources win the context budget; undated ones (header N/A) fill the rest rather than being dropped.
     require_publication_time = bool(
         research_config.get("stage2_require_publication_time", True)
         if require_publication_time is None
         else require_publication_time
     )
-    if require_publication_time:
-        before_count = len(valid_docs)
-        filtered_docs = []
-        for doc in valid_docs:
-            audit = document_time_audit(doc)
-            if audit.get("publication_time_known"):
-                filtered_docs.append(doc)
-        filtered_out = before_count - len(filtered_docs)
-        if filtered_docs:
-            valid_docs = filtered_docs
-            logger.info(
-                "[diag] stage2 publication_time gate: kept=%s/%s (filtered_out=%s)",
-                len(valid_docs), before_count, filtered_out,
-            )
-        else:
-            await record_stage2_diagnostic(
-                "empty_no_publication_time_documents",
-                reason=(
-                    f"阶段1返回{before_count}篇有效文档，"
-                    f"但{filtered_out}篇均无可核查的发布时间"
-                    "（stage2_require_publication_time=true）；"
-                    "候选必须基于有时效锚点的证据，未通过则丢弃"
-                ),
-            )
-            return []
 
     AgentCls = _get_agent()
 
     # 构建文档摘要。联网返回顺序受查询完成顺序影响；先按“明确代码 +
     # 可核查经营数据”排序，避免有限上下文被泛行业摘要或垃圾页占满。
     valid_docs = rank_stage2_documents(valid_docs)
+    if require_publication_time:
+        dated_docs, undated_docs = [], []
+        for doc in valid_docs:
+            if document_time_audit(doc).get("publication_time_known"):
+                dated_docs.append(doc)
+            else:
+                undated_docs.append(doc)
+        valid_docs = dated_docs + undated_docs
+        logger.info(
+            "[diag] stage2 publication_time priority: dated=%s undated=%s",
+            len(dated_docs), len(undated_docs),
+        )
     if getattr(llm, "collaboration_enabled", False) is True:
         llm.remember_sources(valid_docs, round_id)
     content_text, context_audit = build_evidence_context(
@@ -1963,14 +1956,13 @@ async def stage2_deep_research(
 【什么时候输出 []】
 只有以下情况才输出空数组：
 - 资料完全不含任何 A 股/ETF 六位代码
- - 资料只有泛行业宏观分析，没有任何具体公司经营数据
- - 代码与资料中的公司/基金名称、市场或资产类型无法一致核验
- - 关键事实缺失导致无法形成可证伪的标的级预期差、催化或失效条件
+- 资料只有泛行业宏观分析，没有任何具体公司/基金的经营或产品事实
+- 代码与资料中的公司/基金名称、市场或资产类型无法一致核验
 - 所有候选都已被黑名单排除
 
-不要为了让委员会产生候选而输出证据不足的标的。具体代码加一条经营数据仍不够时，
-应输出 []；只有资料同时支持标的身份、至少一个标的级事实、可验证的投资机制和
-明确失效条件时才提交提案。行业事实不能自动替代公司/基金事实。
+提交门槛：代码与名称可核验 + 资料中至少一条带日期或来源的标的级事实。满足即输出，
+用confidence反映证据强弱，并在thesis里写明证据缺口；催化、估值、失效条件不完整
+不是输出[]的理由，由投委会审计与否决。行业事实不能自动替代公司/基金事实。
 
 JSON数组结构：
 [
@@ -2004,7 +1996,7 @@ JSON数组结构：
         logger.info(f"[diag] stage2 LLM call begin")
         response = await asyncio.wait_for(
             llm.chat(
- system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；代码、名称、市场和资产类型无法核验，或只有行业叙事而没有标的级可证伪事实、催化和失效条件时输出 []，不要为了交给投委会而制造候选。回答第一个字符必须是 [。",
+ system="你是严谨的投资提案抽取器。只输出合法JSON；不编造资料中没有的事实；代码与名称可核验且有至少一条标的级事实时就输出提案并用confidence反映证据强弱，交由投委会审计；代码、名称、市场和资产类型无法核验，或只有行业叙事没有标的级事实时输出 []。回答第一个字符必须是 [。",
                 user=prompt,
                 temperature=0.3,
                 max_tokens=16000
@@ -6010,10 +6002,11 @@ def round_has_operational_result(
     if str(status_value or "") != "completed":
         return False
     cycle_fills = int((simulation_result or {}).get("cycle_fills") or 0)
+    # execution_rejected / committee_hold end with no executable proposal and must not reset backoff.
     return bool(
         cycle_fills > 0
         or getattr(final_round, "terminal_code", None)
-        not in {"no_evidence", "committee_incomplete", "failed"}
+        in {"filled", "market_closed_pending"}
     )
 
 

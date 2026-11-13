@@ -19,6 +19,29 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+async def audit_research_boundary(conn):
+    """Inspect the research schema without creating an execution subsystem.
+
+    DatabaseService initializes intents and predictions, but simulation_trades
+    is owned by the simulation service, which this nonexecuting driver never
+    starts. An absent optional trade table is recorded explicitly. Missing
+    required tables and actual rows still fail the audit.
+    """
+    counts, schema, missing = {}, {}, []
+    for table in ('execution_intents', 'simulation_trades', 'price_predictions', 'paper_fills'):
+        async with conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)) as cursor:
+            schema[table] = await cursor.fetchone() is not None
+        if schema[table]:
+            async with conn.execute('SELECT COUNT(*) FROM ' + table) as cursor:
+                counts[table] = (await cursor.fetchone())[0]
+        else:
+            counts[table] = 0
+            if table in ('execution_intents', 'price_predictions'):
+                missing.append(table)
+    return dict(persisted_counts=counts, boundary_schema=schema,
+                missing_required_tables=missing, boundary_valid=not missing and not any(counts.values()))
+
+
 async def main(run, side):
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(run / 'runtime'))
@@ -151,14 +174,14 @@ async def main(run, side):
             raise
     finally:
         if db:
-            conn = await db._get_connection()
-            result['persisted_counts'] = {}
-            for table in ('execution_intents', 'simulation_trades', 'price_predictions'):
-                async with conn.execute('SELECT COUNT(*) FROM ' + table) as cursor:
-                    result['persisted_counts'][table] = (await cursor.fetchone())[0]
-            if any(result['persisted_counts'].values()):
-                result.update(status='boundary_failure')
-            await db.close()
+            try:
+                result.update(await audit_research_boundary(await db._get_connection()))
+                if not result['boundary_valid']:
+                    result.update(status='boundary_failure')
+            except Exception as exc:
+                result.update(status='boundary_audit_failed', boundary_error=type(exc).__name__+': '+str(exc))
+            finally:
+                await db.close()
         await client.close()
         attempts = [a for ledger in ledgers.values() for call in ledger.calls for a in call['attempts']]
         complete = all(a.get('status') == 'returned' and isinstance(a.get('usage'), dict) for a in attempts)

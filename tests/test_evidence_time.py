@@ -275,9 +275,9 @@ async def test_default_fulltext_audit_records_failure_without_changing_stage1(mo
     coordinator=SimpleNamespace(record_event=AsyncMock())
     out=await stage1_mass_search(llm,swarm,'银行｜资金部署候选证据比较',query_count=8,round_coordinator=coordinator,round_id='offline')
     assert out==[source,extra]
-    assert swarm.parallel_fetch.call_args.args[0]==[extra.url]
+    assert swarm.parallel_fetch.call_args.args[0]==[extra.url,source.url]
     event=coordinator.record_event.call_args_list[-1].args
     assert event[1]=='ResearchFulltextAcquired'
-    assert event[2]['selected'][0]['url']==extra.url
+    assert [row['url'] for row in event[2]['selected']]==[extra.url,source.url]
     assert event[2]['fetched']==[]
     assert event[2]['output_document_count']==2
