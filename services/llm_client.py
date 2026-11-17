@@ -656,7 +656,7 @@ class LLMClient:
 
     def _kimi_required_temperature(self, response, requested):
         """Accept only the two observed, explicit Kimi gateway constraints."""
-        if self.model.lower() != 'kimi-k3' or response.status_code != 400:
+        if not self.model.lower().startswith('kimi-k3') or response.status_code != 400:
             return None
         try:
             error = response.json()['error']

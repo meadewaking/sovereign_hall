@@ -503,6 +503,8 @@ class InvestmentSimulation:
     async def screen_proposal_lot_feasibility(
         self,
         proposals: List[Dict[str, Any]],
+        *,
+        round_id: str | None = None,
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Remove structurally unbuyable long proposals before committee work.
 
@@ -536,6 +538,8 @@ class InvestmentSimulation:
 
         feasible: List[Dict[str, Any]] = []
         rejections: List[Dict[str, Any]] = []
+        self.last_proposal_identity_audits = []
+        identity_requests = 0
         from .market_data import MarketDataService
         for proposal in proposals or []:
             direction = str(proposal.get("direction") or "long").lower()
@@ -608,12 +612,39 @@ class InvestmentSimulation:
             claimed_name = str(proposal.get("security_name") or "").strip()
             provider_name = str((quote or {}).get("name") or "").strip()
             if quote_usable and claimed_name and provider_name and claimed_name != provider_name:
-                rejections.append({
-                    "ticker": ticker, "code": "proposal_identity_mismatch",
-                    "reason": f"提案名称{claimed_name}与行情证券名称{provider_name}不一致；需核验简称/更名及资料主体，禁止自动改代码。",
-                    "quote_source": str(quote.get("source") or ""),
-                })
-                continue
+                from .security_identity import check_security_identity, fetch_fund_identity
+                from ..domain.portfolio.instruments import is_etf_ticker
+                identity = check_security_identity(ticker, claimed_name, quote)
+                if (not identity["matches"] and is_etf_ticker(ticker)
+                        and identity_requests < 2):
+                    identity_requests += 1
+                    try:
+                        profile = await fetch_fund_identity(ticker)
+                        identity = check_security_identity(ticker, claimed_name, quote, profile)
+                        # Preserve even a successful fetch that did not match.
+                        identity["profile"] = profile
+                    except Exception as exc:
+                        identity["lookup_error"] = type(exc).__name__
+                identity.update(quote_source=quote.get("source"),
+                                quote_fetched_at=quote.get("fetched_at"),
+                                identity_requests_so_far=identity_requests,
+                                identity_request_limit=2)
+                # The captured response bytes and code/name fields are durable
+                # before any changed eligibility reaches the committee. They
+                # are descriptive identity evidence, never a fresh catalyst.
+                if round_id:
+                    from ..application.run_research_round import ResearchRoundCoordinator
+                    await ResearchRoundCoordinator(self.db_service).record_event(
+                        round_id, "ProposalIdentityChecked", identity)
+                self.last_proposal_identity_audits.append(identity)
+                if not identity["matches"]:
+                    rejections.append({
+                        "ticker": ticker, "code": "proposal_identity_mismatch",
+                        "reason": f"提案名称{claimed_name}与行情证券名称{provider_name}不一致且未取得同代码名称依据；需核验简称/更名及资料主体，禁止自动改代码。",
+                        "quote_source": str(quote.get("source") or ""),
+                        "identity_check_mode": identity["mode"],
+                    })
+                    continue
             if reference_price <= 0 or reference_price <= executable_quote_ceiling:
                 feasible.append(proposal)
                 continue

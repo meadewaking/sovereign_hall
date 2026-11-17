@@ -6910,7 +6910,8 @@ async def _main(resources):
                 lot_rejections: List[Dict[str, Any]] = []
                 if proposals and hasattr(simulation, "screen_proposal_lot_feasibility"):
                     proposals, lot_rejections = (
-                        await simulation.screen_proposal_lot_feasibility(proposals)
+                        await simulation.screen_proposal_lot_feasibility(
+                            proposals, round_id=active_round_id)
                     )
                     await record_proposal_lot_screening_event(
                         round_coordinator,

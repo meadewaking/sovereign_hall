@@ -51,7 +51,9 @@ def client(tmp_path, responses, *, daily_limit=10, round_limit=4):
         base_url="http://offline.invalid/v1", chat=AsyncMock(), close=AsyncMock())
     reviewer = SimpleNamespace(model="kimi-k3", profile="kimi-k3", provider="openai",
         base_url="https://offline.invalid/v1", chat=AsyncMock(side_effect=responses), close=AsyncMock())
-    result = CollaborativeLLM(research, reviewer, settings={"review_timeout_seconds": 1}, state=state)
+    # Preserve coverage of the legacy wire contract during the protocol change.
+    result = CollaborativeLLM(research, reviewer, settings={"review_timeout_seconds": 1,
+                              "review_citation_wire": False}, state=state)
     result.remember_sources([SOURCE], "round-one")
     return result
 
@@ -322,8 +324,14 @@ async def test_two_transports_share_lifetime_totals_and_attribute_each_request_o
     monkeypatch.setenv("OPENAI_API_KEY", "offline-fixture")
     state = CollaborationState(tmp_path / "usage.json", daily_limit=5, round_limit=2)
     totals = EphemeralStats(prompt_tokens=100, completion_tokens=50, total_tokens=150)
+    # Transport accounting should not depend on a retired deployed model name.
+    for name in ("usage-test-research", "usage-test-review"):
+        monkeypatch.setitem(Config()._config["llm_profiles"], name, {
+            "provider": "openai", "model": name, "base_url": "https://offline.invalid/v1",
+            "api_key": "not_need",
+        })
     clients = [LLMClient(profile=name, token_stats=totals, usage_observer=state.observe)
-               for name in ("glm-5.2-fp8", "kimi-k3")]
+               for name in ("usage-test-research", "usage-test-review")]
     seen = []
 
     def handler(request):
@@ -342,7 +350,7 @@ async def test_two_transports_share_lifetime_totals_and_attribute_each_request_o
             assert len(saved["usage"]) == 2
             assert sum(row["prompt_tokens"] for row in saved["usage"].values()) == 20
             assert sum(row["completion_tokens"] for row in saved["usage"].values()) == 40
-        assert seen[0][1] == "Bearer not_need"
+        assert seen[0][1] == "Bearer offline-fixture"
     finally:
         await asyncio.gather(*(llm.close() for llm in clients))
 

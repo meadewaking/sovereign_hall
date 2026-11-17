@@ -26,6 +26,15 @@ llm:
 
 # 保留可供不同任务/智能体选择的部署；全系统默认使用上面的llm配置。
 llm_profiles:
+  kimi-k3.1-pro:
+    provider: "openai"
+    model: "kimi-k3.1-pro"
+    base_url: "https://api.nextoken.real-ai.cn/v1"
+    api_key_env: "OPENAI_API_KEY"
+    api_key: ""
+    model_uuid: ""
+    structured_output_reasoning_effort: "none"
+    structured_output_use_response_format: false
   kimi-k3:
     provider: "openai"
     model: "kimi-k3"
@@ -54,11 +63,11 @@ llm_profiles:
     structured_output_reasoning_effort: "high"
     structured_output_use_response_format: false
 
-# self-hosted/deepseek-v4.1-flash-1017承担日常研究，K3只用于终审、实质补证后的复审和空候选抽查。
+# self-hosted/deepseek-v4.1-flash-1017承担日常研究，kimi-k3.1-pro只用于终审、实质补证后的复审和空候选抽查。
 model_collaboration:
   enabled: true
   research_profile: "self-hosted/deepseek-v4.1-flash-1017"
-  review_profile: "kimi-k3"
+  review_profile: "kimi-k3.1-pro"
   research_max_concurrent: 6
   review_max_concurrent: 2
   review_max_tokens: 5000
@@ -73,6 +82,9 @@ model_collaboration:
 # Token预算占位（沿用原估算值，非kimi-k3实际费率；按网关账单调整）
 pricing:
   openai:
+    kimi-k3.1-pro:
+      input_per_1k: 0.0003
+      output_per_1k: 0.0012
     kimi-k3:
       input_per_1k: 0.0003
       output_per_1k: 0.0012
