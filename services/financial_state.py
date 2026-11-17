@@ -273,7 +273,7 @@ REFER必须valuation、catalyst、整数shares/holding_days、至少2条不重�
 
 
 async def run_financial_research(llm, packet, *, record):
-    """The redesigned real path: GLM hypothesis, compiler, independent K3 review."""
+    """The redesigned real path: DS hypothesis, compiler, independent K3.1 review."""
     from .model_collaboration import REVIEW_SYSTEM, parse_review
     response = await llm.chat(system=WRITER_SYSTEM, user=json.dumps(packet, ensure_ascii=False),
                               temperature=0.2, max_tokens=5000, json_output=True, use_cache=False)

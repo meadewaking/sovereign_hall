@@ -47,9 +47,9 @@ def verdict(**updates):
 def client(tmp_path, responses, *, daily_limit=10, round_limit=4):
     state = CollaborationState(tmp_path / "collaboration.json", daily_limit=daily_limit,
                                round_limit=round_limit)
-    research = SimpleNamespace(model="GLM-5.2-FP8", profile="glm-5.2-fp8", provider="openai",
+    research = SimpleNamespace(model="self-hosted/deepseek-v4.1-flash-1017", profile="self-hosted/deepseek-v4.1-flash-1017", provider="openai",
         base_url="http://offline.invalid/v1", chat=AsyncMock(), close=AsyncMock())
-    reviewer = SimpleNamespace(model="kimi-k3", profile="kimi-k3", provider="openai",
+    reviewer = SimpleNamespace(model="kimi-k3.1-pro", profile="kimi-k3.1-pro", provider="openai",
         base_url="https://offline.invalid/v1", chat=AsyncMock(side_effect=responses), close=AsyncMock())
     # Preserve coverage of the legacy wire contract during the protocol change.
     result = CollaborativeLLM(research, reviewer, settings={"review_timeout_seconds": 1,
@@ -160,7 +160,7 @@ async def test_failed_review_consumes_allowance_without_research_fallback(tmp_pa
 async def test_final_reviewer_can_resolve_research_disagreement_without_forging_votes(tmp_path):
     llm = client(tmp_path, [json.dumps(verdict())])
     result, audits, _ = await run_review(llm)
-    assert result["direction"] == "long" and result["final_review_model"] == "kimi-k3"
+    assert result["direction"] == "long" and result["final_review_model"] == "kimi-k3.1-pro"
     assert result["individual_votes"] == RESEARCH["individual_votes"]
     assert result["research_committee_decision"] == RESEARCH
     request = llm.reviewer.client_impl.chat.call_args.kwargs
@@ -189,7 +189,7 @@ async def test_fenced_reject_retains_evidence_and_reconsider_conditions_without_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("response", ["reasoning only", json.dumps(verdict(citations=[])), RuntimeError("down")])
-async def test_absent_or_invalid_final_review_never_executes_a_glm_approval(tmp_path, response):
+async def test_absent_or_invalid_final_review_never_executes_a_research_approval(tmp_path, response):
     llm = client(tmp_path, [response])
     original = {**RESEARCH, "direction": "long", "target_position": 0.1}
     result, _, _ = await review_committee_decision(llm, PROPOSAL, original, "views",
@@ -356,7 +356,9 @@ async def test_two_transports_share_lifetime_totals_and_attribute_each_request_o
 
 
 @pytest.mark.asyncio
-async def test_targeted_sources_are_durable_and_linked_before_reviewer_sees_them(tmp_path):
+@pytest.mark.parametrize("raw_queries", ['["600519 现金流 公告"]',
+                                         '["600519 现金流 公告"]\n以上为搜索词。'])
+async def test_targeted_sources_are_durable_and_linked_before_reviewer_sees_them(tmp_path, raw_queries):
     db = DatabaseService(str(tmp_path / "sources.db"))
     await db._init_db()
     try:
@@ -364,8 +366,8 @@ async def test_targeted_sources_are_durable_and_linked_before_reviewer_sees_them
         doc = Document(id="source-new", title="600519公司经营公告", content=SOURCE["content"] * 3,
                        url="https://example.org/2026-10-25/filing", source="issuer_filing",
                        publish_time=datetime(2026, 10, 25), metadata={"publish_time_source": "page_publication_metadata"})
-        llm = SimpleNamespace(chat=AsyncMock(return_value='["600519 现金流 公告"]'),
-                              reviewer=SimpleNamespace(model="kimi-k3"))
+        llm = SimpleNamespace(chat=AsyncMock(return_value=raw_queries),
+                              reviewer=SimpleNamespace(model="kimi-k3.1-pro"))
         spiders = SimpleNamespace(aggressive_search=AsyncMock(return_value=[doc]),
                                   parallel_fetch=AsyncMock(return_value=[]))
         result = await supplement_model_evidence(llm, spiders, PROPOSAL, ["核对现金流"],
@@ -390,7 +392,7 @@ async def test_empty_candidate_audit_is_sampled_and_bounded(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_full_committee_uses_glm_roles_then_k3_and_persists_both_models(tmp_path, monkeypatch):
+async def test_full_committee_uses_ds_roles_then_k3_1_and_persists_both_models(tmp_path, monkeypatch):
     rd = import_module("sovereign_hall.run_discussion")
     config_module = import_module("sovereign_hall.core.config")
     config = object.__new__(Config)
@@ -423,15 +425,15 @@ async def test_full_committee_uses_glm_roles_then_k3_and_persists_both_models(tm
             round_id=scope.id, committee_store=CommitteeMeetingStore(db))
         assert len(decisions) == 1
         final = decisions[0]
-        assert final["direction"] == "long" and final["final_review_model"] == "kimi-k3"
+        assert final["direction"] == "long" and final["final_review_model"] == "kimi-k3.1-pro"
         assert final["research_committee_decision"]["direction"] == "hold"
-        assert "K3终审 model=kimi-k3" in final["discussion_excerpt"]
-        assert "final_review_model=kimi-k3" in recorder.record_decision.call_args.kwargs["discussion_context"]
+        assert "K3.1终审 model=kimi-k3.1-pro" in final["discussion_excerpt"]
+        assert "final_review_model=kimi-k3.1-pro" in recorder.record_decision.call_args.kwargs["discussion_context"]
         assert llm.research.chat.await_count >= 7
         assert llm.reviewer.client_impl.chat.await_count == 1
         conn = await db._get_connection()
         async with conn.execute("SELECT DISTINCT model FROM committee_tasks") as cursor:
-            assert {row[0] for row in await cursor.fetchall()} == {"GLM-5.2-FP8", "kimi-k3"}
+            assert {row[0] for row in await cursor.fetchall()} == {"self-hosted/deepseek-v4.1-flash-1017", "kimi-k3.1-pro"}
         packet = json.loads(llm.reviewer.client_impl.chat.call_args.kwargs["user"])
         assert packet["sources"][0]["content"] == SOURCE["content"] * 3
     finally:

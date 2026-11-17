@@ -5,7 +5,7 @@
 llm:
   provider: "openai"  # openai/anthropic/local
   base_url: "https://api.nextoken.real-ai.cn/v1"
-  model: "kimi-k3"
+  model: "kimi-k3.1-pro"
   api_key_env: "OPENAI_API_KEY"  # 从环境变量或本地 .env 读取
   model_uuid: ""  # 公网网关使用标准Host，不覆盖路由
   max_concurrent: 12
@@ -29,15 +29,6 @@ llm_profiles:
   kimi-k3.1-pro:
     provider: "openai"
     model: "kimi-k3.1-pro"
-    base_url: "https://api.nextoken.real-ai.cn/v1"
-    api_key_env: "OPENAI_API_KEY"
-    api_key: ""
-    model_uuid: ""
-    structured_output_reasoning_effort: "none"
-    structured_output_use_response_format: false
-  kimi-k3:
-    provider: "openai"
-    model: "kimi-k3"
     base_url: "https://api.nextoken.real-ai.cn/v1"
     api_key_env: "OPENAI_API_KEY"
     api_key: ""
@@ -79,13 +70,10 @@ model_collaboration:
   review_source_chars: 24000
   supplement_timeout_seconds: 120
 
-# Token预算占位（沿用原估算值，非kimi-k3实际费率；按网关账单调整）
+# Token预算占位（按网关账单调整）
 pricing:
   openai:
     kimi-k3.1-pro:
-      input_per_1k: 0.0003
-      output_per_1k: 0.0012
-    kimi-k3:
       input_per_1k: 0.0003
       output_per_1k: 0.0012
     deepseek-v4.1-flash-1017:

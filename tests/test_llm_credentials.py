@@ -86,11 +86,11 @@ async def test_named_models_keep_independent_endpoints_and_credentials(monkeypat
     monkeypatch.setattr(module, "get_config", lambda: config)
     monkeypatch.setattr(LLMClient, "_init_client", lambda self: None)
     before = config.to_dict()
-    clients = [LLMClient(), LLMClient(profile="kimi-k3"),
+    clients = [LLMClient(), LLMClient(profile="kimi-k3.1-pro"),
                LLMClient(profile="self-hosted/deepseek-v4.1-flash-1017")]
     expected = [
-        ("kimi-k3", "https://api.nextoken.real-ai.cn/v1", "gateway-fixture"),
-        ("kimi-k3", "https://api.nextoken.real-ai.cn/v1", "gateway-fixture"),
+        ("kimi-k3.1-pro", "https://api.nextoken.real-ai.cn/v1", "gateway-fixture"),
+        ("kimi-k3.1-pro", "https://api.nextoken.real-ai.cn/v1", "gateway-fixture"),
         ("self-hosted/deepseek-v4.1-flash-1017", "https://api.nextoken.real-ai.cn/v1", "gateway-fixture"),
     ]
     observed = []

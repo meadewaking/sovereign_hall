@@ -1658,7 +1658,7 @@ class SearchQueryGenerator:
                 system="你是投资研究搜索词生成器。只输出JSON数组；避免泛词、重复词、占位符和无法检索的概念词。",
                 user=prompt,
                 temperature=0.8,
-                max_tokens=2000,
+                max_tokens=8000,
                 json_array_output=True,
                 use_cache=False,
             )
@@ -1712,7 +1712,7 @@ class SearchQueryGenerator:
 {response[:12000]}
 """,
                     temperature=0.0,
-                    max_tokens=2000,
+                    max_tokens=8000,
                     use_cache=False,
                     json_array_output=True,
                 )

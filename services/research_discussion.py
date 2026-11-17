@@ -719,7 +719,7 @@ daily_prices缺失只表示历史回测可信度不足，不是当前市场事�
         if getattr(self.llm, "collaboration_enabled", False) is True:
             from uuid import uuid4
             response = await reviewer.for_round("interactive_" + uuid4().hex).chat(
-                system="你是高级研究终审员。核对给定原始资料，审阅GLM各角色意见，保留异议并给出条件化结论。",
+                system="你是高级研究终审员。核对给定原始资料，审阅DS研究各角色意见，保留异议并给出条件化结论。",
                 user=prompt + "\n【原始研究资料】\n" + json.dumps(
                     context.relevant_docs + [doc.to_dict() for doc in context.search_results],
                     ensure_ascii=False, default=str)[:24000],

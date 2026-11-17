@@ -44,7 +44,7 @@ class Config:
             # LLM配置
             'llm': {
                 'provider': 'openai',
-                'model': 'kimi-k3',
+                'model': 'kimi-k3.1-pro',
                 'api_key_env': 'OPENAI_API_KEY',
                 'base_url': 'https://api.nextoken.real-ai.cn/v1',
                 'model_uuid': '',
@@ -61,9 +61,9 @@ class Config:
 
             # Named deployments available to individual tasks/agents.
             'llm_profiles': {
-                'kimi-k3': {
+                'kimi-k3.1-pro': {
                     'provider': 'openai',
-                    'model': 'kimi-k3',
+                    'model': 'kimi-k3.1-pro',
                     'base_url': 'https://api.nextoken.real-ai.cn/v1',
                     'api_key_env': 'OPENAI_API_KEY',
                     'api_key': '',
@@ -97,7 +97,7 @@ class Config:
             'model_collaboration': {
                 'enabled': False,
                 'research_profile': 'self-hosted/deepseek-v4.1-flash-1017',
-                'review_profile': 'kimi-k3',
+                'review_profile': 'kimi-k3.1-pro',
                 'research_max_concurrent': 6,
                 'review_max_concurrent': 2,
                 'review_max_tokens': 5000,
@@ -409,14 +409,9 @@ class Config:
                 'openai': {
                     # Budget placeholder inherited from the previous deployment;
                     # replace with the gateway's actual billing rates when known.
-                    'kimi-k3': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
-                    'MiniMax/MiniMax-M2.5': {'input_per_1k': 0.0006, 'output_per_1k': 0.0042},
-                    'MiniMax-M2.7-INT8': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
+                    'kimi-k3.1-pro': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
                     'deepseek-v4.1-flash-1017': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
                     'self-hosted/deepseek-v4.1-flash-1017': {'input_per_1k': 0.0003, 'output_per_1k': 0.0012},
-                    'gpt-4': {'input_per_1k': 0.03, 'output_per_1k': 0.06},
-                    'gpt-4-turbo': {'input_per_1k': 0.01, 'output_per_1k': 0.03},
-                    'gpt-3.5-turbo': {'input_per_1k': 0.0005, 'output_per_1k': 0.0015},
                 },
                 'local': {
                     'input_per_1k': 0.0,

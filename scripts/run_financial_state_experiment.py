@@ -1,7 +1,7 @@
 """Run one frozen nonexecuting financial-state arm in a fresh subprocess.
 
-The control is the native GLM/committee/K3 route. The candidate's actual
-route is GLM -> deterministic financial/scenario compiler -> independent K3.
+The control is the native DS/committee/K3.1 route. The candidate's actual
+route is DS -> deterministic financial/scenario compiler -> independent K3.1.
 Both persist identical original sources privately. No historical forecasts,
 execution intents, main-account writes or model-output resampling.
 """

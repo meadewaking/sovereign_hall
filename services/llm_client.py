@@ -71,7 +71,7 @@ class LLMClient:
         llm_config = config.get_llm_config(profile)
         self.profile = profile
 
-        self.model = model or llm_config.get('model', 'kimi-k3')
+        self.model = model or llm_config.get('model', 'kimi-k3.1-pro')
         self.provider = provider or llm_config.get('provider', 'openai')
         self.timeout = int(timeout if timeout is not None else llm_config.get('timeout', 120))
         self.max_retries = int(max_retries if max_retries is not None else llm_config.get('max_retries', 3))

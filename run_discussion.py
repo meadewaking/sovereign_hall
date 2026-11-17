@@ -797,7 +797,7 @@ async def run_startup_preflight(llm, spiders, *, check_search: bool = True) -> b
             system="只输出最终答案。", user="联通性检查：只回复 OK",
             temperature=0.0, max_tokens=80), timeout=45)
         if "OK" not in str(response).upper():
-            raise RuntimeError("K3 final reviewer returned no completed health response")
+            raise RuntimeError("K3.1 final reviewer returned no completed health response")
 
     async def _check_search():
         docs = await asyncio.wait_for(
@@ -812,7 +812,7 @@ async def run_startup_preflight(llm, spiders, *, check_search: bool = True) -> b
         ("Embedding", _check_embedding, True),
     ]
     if getattr(llm, "collaboration_enabled", False) is True:
-        configured_checks.append(("K3终审", _check_reviewer, False))
+        configured_checks.append(("K3.1终审", _check_reviewer, False))
     if check_search:
         configured_checks.append(("搜索", _check_search, False))
     else:
@@ -838,7 +838,7 @@ async def run_startup_preflight(llm, spiders, *, check_search: bool = True) -> b
 
     optional_failed = [item for item in checks if not item[1] and not item[3]]
     if optional_failed:
-        print("\n⚠️ 部分可选服务暂不可用；保留持仓维护，后续轮次重试。K3缺席的提案不能进入执行。")
+        print("\n⚠️ 部分可选服务暂不可用；保留持仓维护，后续轮次重试。K3.1缺席的提案不能进入执行。")
 
     print("✅ 联通性检查通过\n")
     return True
@@ -2284,7 +2284,7 @@ JSON数组结构：
                 diagnostic_repair_modes.append("k3_empty_candidate_audit:" + audited_mode)
                 await record_stage2_diagnostic(
                     "empty_candidate_audited", parse_mode=audited_mode,
-                    raw_excerpt=audited_response[:8000], reason="K3 independent source-based omission audit",
+                    raw_excerpt=audited_response[:8000], reason="K3.1 independent source-based omission audit",
                 )
                 if audited_proposals:
                     proposals, parse_mode = audited_proposals, audited_mode
@@ -3757,11 +3757,13 @@ async def supplement_model_evidence(llm, spiders, proposal, questions, *, round_
     raw_queries = await llm.chat(
         system="针对指定标的和证据问题生成最多3个精确搜索词。只输出JSON字符串数组。",
         user=json.dumps({"ticker": proposal["ticker"], "questions": questions}, ensure_ascii=False),
-        max_tokens=1000, temperature=0.2, json_array_output=True, use_cache=False,
+        max_tokens=8000, temperature=0.2, json_array_output=True, use_cache=False,
     )
-    queries = json.loads(raw_queries)
-    if not isinstance(queries, list) or not queries or any(not isinstance(q, str) or not q.strip() for q in queries):
-        raise ValueError("Invalid targeted evidence queries")
+    queries = _safe_parse_json(raw_queries, None)
+    if not isinstance(queries, list):
+        raise ValueError(f"Invalid targeted evidence queries: {raw_queries[:200]!r}")
+    if not queries or any(not isinstance(q, str) or not q.strip() for q in queries):
+        raise ValueError(f"Invalid targeted evidence queries: {raw_queries[:200]!r}")
     queries = [f"{proposal['ticker']} {q[:150]}" for q in queries[:3]]
     docs = await spiders.aggressive_search(queries, max_results_per_query=3)
     urls = [str(getattr(doc, "url", "")) for doc in docs[:3]
@@ -4599,15 +4601,15 @@ async def stage3_ic_discussion(
 
                 async def supplement(questions):
                     results, audit = await execute_durable_committee_stage([{
-                        "label": "GLM-targeted-evidence", "seat_role": "evidence_researcher",
+                        "label": "DS-targeted-evidence", "seat_role": "evidence_researcher",
                         "model": llm.model, "provider": llm.provider,
                         "profile": llm.profile, "base_url": llm.base_url,
                         "input_material": {"proposal": proposal, "questions": questions},
                         "factory": lambda: supplement_and_render(questions),
                     }], timeout_seconds=float(llm.settings.get("supplement_timeout_seconds", 120)),
-                        stage="glm_targeted_evidence", max_concurrency=1,
+                        stage="ds_targeted_evidence", max_concurrency=1,
                         meeting_store=committee_store, meeting_id=meeting_id,
-                        prompt_version="glm_research_k3_review_v1")
+                        prompt_version="ds_research_k3_review_v1")
                     return {**json.loads(results[0]), "stage_audit": audit}
 
                 async def supplement_and_render(questions):
@@ -4625,13 +4627,13 @@ async def stage3_ic_discussion(
                 )
                 stage_execution_audit.extend(review_audits)
                 full_context = (
-                    f"【K3终审 model={committee_decision['final_review_model']}】\n"
+                    f"【K3.1终审 model={committee_decision['final_review_model']}】\n"
                     + json.dumps(committee_decision["final_review"], ensure_ascii=False)
-                    + "\n【GLM研究与原始异议】\n" + full_context
+                    + "\n【DS研究与原始异议】\n" + full_context
                 )
-                all_discussions.append("\n【K3终审与GLM定向补证】\n" +
+                all_discussions.append("\n【K3.1终审与DS定向补证】\n" +
                                        json.dumps(review_turns, ensure_ascii=False, default=str))
-                logger.info("K3 final review ticker=%s action=%s valid=%s direction=%s",
+                logger.info("K3.1 final review ticker=%s action=%s valid=%s direction=%s",
                             ticker, committee_decision["final_review"].get("action"),
                             committee_decision["final_review"].get("schema_valid"),
                             committee_decision["direction"])
