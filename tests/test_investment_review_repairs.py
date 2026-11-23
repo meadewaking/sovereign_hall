@@ -212,6 +212,30 @@ async def test_screen_rejects_explicit_security_name_mismatch(tmp_path):
         assert [p["ticker"] for p in accepted] == ["002186"]
         assert rejected[0]["code"] == "proposal_identity_mismatch"
         assert await scalar(db, "SELECT count(*) FROM simulation_trades") == 0
+        screening = accepted[0]["screening_quote"]
+        assert screening["price"] > 0
+        assert screening["name"] == "证券甲"
+        assert screening["max_executable_quote"] >= screening["price"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_lot_infeasible_memory_lists_only_tickers_above_current_ceiling(tmp_path):
+    db, sim = await make_account(tmp_path)
+    try:
+        await sim._record_candidate_rejections([
+            {"ticker": "600519", "code": "proposal_lot_infeasible",
+             "reason": "当前筛选参考价1485.7500元高于整手可执行上限87.1303元"},
+            {"ticker": "300274", "code": "proposal_lot_infeasible",
+             "reason": "当前筛选参考价75.8100元高于整手可执行上限70.6900元"},
+            {"ticker": "002186", "code": "committee_hold", "reason": "参考价200.0000元"},
+        ], source="test")
+        text = await sim.format_lot_infeasible_memory(80.0)
+        assert "600519(实测1485.75元" in text
+        assert "300274" not in text
+        assert "002186" not in text
+        assert await sim.format_lot_infeasible_memory(2000.0) == ""
     finally:
         await db.close()
 

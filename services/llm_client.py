@@ -488,21 +488,31 @@ class LLMClient:
                     headers=headers,
                 )
                 parameter_recovery = None
-                required = self._kimi_required_temperature(resp, payload['temperature'])
-                if required is not None:
+                recovered = set()
+                while True:
                     # The gateway routes Kimi to groups with different accepted
-                    # temperatures. Negotiate only an explicit pre-generation
-                    # 400 rejection, once. Never resample a completed answer or
-                    # change the prompt, reasoning mode, model or token budget.
+                    # parameters. Negotiate only an explicit pre-generation 400
+                    # rejection, once per parameter. Never resample a completed
+                    # answer or change the prompt, model or token budget.
+                    parameter, required = 'temperature', self._kimi_required_temperature(
+                        resp, payload['temperature'])
+                    if required is None and 'reasoning_effort' in payload:
+                        parameter, required = 'reasoning_effort', self._kimi_supported_reasoning_effort(
+                            resp, payload['reasoning_effort'])
+                    if required is None or parameter in recovered:
+                        break
+                    recovered.add(parameter)
                     parameter_recovery = {
-                        'parameter': 'temperature', 'requested': payload['temperature'],
+                        'parameter': parameter, 'requested': payload[parameter],
                         'required': required, 'rejected_status': 400,
                         'error_message': resp.json()['error']['message'][:500],
-                        'rejected_request_usage': None, 'additional_http_requests': 1,
+                        'rejected_request_usage': None,
+                        'additional_http_requests': len(recovered),
+                        'recovered_parameters': sorted(recovered),
                     }
-                    payload['temperature'] = required
-                    logger.warning('Kimi structured temperature rejected; retrying once: %s -> %s',
-                                   parameter_recovery['requested'], required)
+                    payload[parameter] = required
+                    logger.warning('Kimi structured %s rejected; retrying once: %s -> %s',
+                                   parameter, parameter_recovery['requested'], required)
                     resp = await self._http_client.post(url, json=payload, headers=headers)
                 if resp.status_code >= 400:
                     raise httpx.HTTPStatusError(
@@ -655,20 +665,39 @@ class LLMClient:
             raise
 
     def _kimi_required_temperature(self, response, requested):
-        """Accept only the two observed, explicit Kimi gateway constraints."""
+        """Accept explicit temperature constraints returned by the Kimi gateway."""
         if not self.model.lower().startswith('kimi-k3') or response.status_code != 400:
             return None
         try:
             error = response.json()['error']
-            if error.get('type') != 'invalid_request_error':
+            if not isinstance(error, dict) or error.get('type') != 'invalid_request_error':
                 return None
             message = error['message']
             match = re.search(
-                r'invalid temperature: only (0\.6|1(?:\.0)?) is allowed for this model '
-                r'when thinking\.type=(?:disabled|enabled)(?:\s|\(|$)', message)
+                r'invalid temperature: only (0\.6|1(?:\.0)?) is allowed for this model'
+                r'(?: when thinking\.type=(?:disabled|enabled)(?=\s|\(|$)'
+                r'|(?=\s*(?:\(request id:|$)))', message)
             required = float(match.group(1)) if match else (
                 1.0 if 'temperature must be the number 1 for this group' in message else None)
             return required if required is not None and required != requested else None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _kimi_supported_reasoning_effort(self, response, requested):
+        """Pick the lowest effort the Kimi gateway explicitly lists as supported."""
+        if not self.model.lower().startswith('kimi-k3') or response.status_code != 400:
+            return None
+        try:
+            message = response.json()['error']['message']
+            match = re.search(r"Invalid value for reasoning_effort: '([^']*)'\. "
+                              r"Supported values are: ([^.]+)\.", message)
+            if not match or match.group(1) != requested:
+                return None
+            supported = re.findall(r"'([a-z]+)'", match.group(2))
+            for choice in ('low', 'medium', 'high'):
+                if choice in supported:
+                    return choice
+            return None
         except (KeyError, TypeError, ValueError):
             return None
 

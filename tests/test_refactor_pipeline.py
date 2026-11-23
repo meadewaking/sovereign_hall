@@ -80,12 +80,14 @@ from sovereign_hall.run_discussion import (
     committee_role_weight,
     committee_think_from_persisted_evidence,
     collect_committee_results,
+    dedupe_proposals,
     retry_absent_committee_results,
     build_deployment_evidence_queries,
     filter_repeated_rejection_proposals,
     extract_stage2_candidate_windows,
     extract_stage2_proposal_array,
     format_stage2_diagnostic_context,
+    format_committee_market_reference,
     kill_existing_run_discussion_instances,
     merge_committee_deadlock_review,
     parse_committee_vote,
@@ -928,6 +930,53 @@ async def test_stage2_scalar_evidence_cannot_reach_committee_or_storage():
 
 
 @pytest.mark.asyncio
+async def test_stage2_canonicalizes_local_venue_before_blacklist_and_deduplication():
+    proposal = {
+        "direction": "long",
+        "thesis": "事实: 资料有列明该证券的业绩；推断: 等待其他资料核验",
+        "evidence": ["公告：公司季度营业收入同比改善，记录需复核"],
+    }
+    raw = json.dumps([
+        proposal | {"ticker": " 300092.sz ", "confidence": 0.7},
+        proposal | {"ticker": "300092", "confidence": 0.6},
+        proposal | {"ticker": "512200.SH", "security_name": "房地产ETF南方"},
+        proposal | {"ticker": "000001.SH"},
+        proposal | {"ticker": "300092.HK"},
+        proposal | {"ticker": "600000.SH.extra"},
+        proposal | {"ticker": "600519.SH"},
+    ], ensure_ascii=False)
+    db = AsyncMock()
+    db.get_blacklist.return_value = ["600519"]
+    llm = AsyncMock()
+    llm.chat.return_value = raw
+    doc = Document(title="证券披露", content="公司提供财报数据，仍需核验增长与估值。" * 5)
+
+    result = dedupe_proposals(await stage2_deep_research(llm, [doc], "证券研究", db))
+
+    assert [(p["ticker"], p["confidence"]) for p in result] == [
+        ("300092", 0.7),
+        ("512200", 0.6),
+    ]
+    assert result[1]["security_name"] == "房地产ETF南方"
+    assert result[0]["evidence"] == proposal["evidence"]
+    assert dedupe_proposals([proposal | {"ticker": "000001.SH"}]) == []
+    memory = [{"ticker": "300092", "code": "committee_hold", "rejection_count": 3,
+               "last_seen_at": "2026-11-18T10:00:00"}]
+    eligible, suppressed = filter_repeated_rejection_proposals(
+        result, memory, now=datetime(2026, 11, 18, 12)
+    )
+    assert [p["ticker"] for p in eligible] == ["512200"]
+    assert [(p["ticker"], p["code"]) for p in suppressed] == [
+        ("300092", "repeated_candidate_cooldown"),
+    ]
+    diagnostic = db.record_research_stage_diagnostic.await_args.kwargs
+    assert diagnostic["raw_excerpt"] == raw
+    assert '"300092.SZ": "300092"' in diagnostic["reason"]
+    assert '"unsupported_ticker": 3' in diagnostic["reason"]
+    assert '"blacklist": 1' in diagnostic["reason"]
+
+
+@pytest.mark.asyncio
 async def test_stage2_prompt_uses_valid_empty_array_and_defers_price_to_quote_gate():
     class EmptyProposalLLM:
         def __init__(self):
@@ -1630,6 +1679,35 @@ def test_vote_context_balances_all_deliberation_stages():
     assert "cross-examination-tail" in context
     assert "counterfactual-tail" in context
     assert "OPPORTUNITY_EVIDENCE" in context
+    assert "投委会前行情参考" in context
+
+
+def test_committee_market_reference_renders_quote_and_reward_risk():
+    text = format_committee_market_reference({
+        "take_profit": 15.0,
+        "stop_loss": 8.0,
+        "screening_quote": {
+            "price": 10.0,
+            "source": "tencent_realtime_quote",
+            "quoted_at": "2026-11-21T14:59:00+08:00",
+            "valuation_kind": "session_close",
+            "max_executable_quote": 40.0,
+        },
+    })
+
+    assert "参考价: 10.0000元（闭市参考价" in text
+    assert "约11.5000元" in text
+    assert "约9.2000元" in text
+    assert "赔率(止盈/止损)=1.88" in text
+    assert "不能单独构成HOLD理由" in text
+
+
+def test_committee_market_reference_without_quote_uses_percent_terms():
+    text = format_committee_market_reference({"take_profit": 0.12, "stop_loss": -0.06})
+
+    assert "未取得筛选参考价" in text
+    assert "止盈+12.0% / 止损-6.0%" in text
+    assert "赔率(止盈/止损)=2.00" in text
 
 
 def test_stage2_prompt_has_no_preset_ticker_fallback():

@@ -384,6 +384,49 @@ class InvestmentSimulation:
         except Exception:
             return []
 
+    async def format_lot_infeasible_memory(
+        self,
+        ceiling: float,
+        *,
+        days: int = 7,
+        limit: int = 20,
+    ) -> str:
+        """List recently screened tickers whose verified quote still exceeds one-lot capacity."""
+        if ceiling <= 0 or not self.db_service or self.db_service._connection is None:
+            return ""
+        import re
+        since = (datetime.now() - timedelta(days=days)).isoformat()
+        async with self.db_service._connection.execute(
+            """
+            SELECT ticker, rejection_count, last_reason, last_seen_at
+            FROM simulation_candidate_rejections
+            WHERE code = 'proposal_lot_infeasible' AND last_seen_at >= ?
+            ORDER BY rejection_count DESC, last_seen_at DESC
+            """,
+            (since,),
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+        entries = []
+        for row in rows:
+            match = re.search(r"参考价([0-9.]+)元", str(row.get("last_reason") or ""))
+            price = float(match.group(1)) if match else 0.0
+            if price <= ceiling:
+                continue
+            entries.append(
+                f"{row['ticker']}(实测{price:.2f}元，被拒{int(row.get('rejection_count') or 0)}次)"
+            )
+            if len(entries) >= limit:
+                break
+        if not entries:
+            return ""
+        return (
+            "【近期整手不可行标的（统一行情服务实测价，非模型记忆）】\n"
+            f"- 当前一手可执行上限约{ceiling:.2f}元；以下代码近{days}天实测价高于该上限，"
+            "提出后会在投委会前被整手硬门直接剔除，整轮无产出：\n- "
+            + "、".join(entries)
+            + "\n- 不得再提出上述代码；同一逻辑请改选资料中有标的级事实、价格不超过上限的个股或ETF。"
+        )
+
     async def format_redeployment_learning_context(self, limit: int = 5) -> str:
         """Build a local-only feedback block for research and committee agents."""
         performance = await self.get_performance_metrics()
@@ -447,6 +490,11 @@ class InvestmentSimulation:
                         "成交层仍须重新取价；不得放宽静态单标的上限。"
                     ),
                 ])
+                lot_memory = await self.format_lot_infeasible_memory(
+                    max_executable_one_lot_quote
+                )
+                if lot_memory:
+                    performance_lines.append(lot_memory)
         performance_lines.append("- 链路状态: " + "；".join(
             f"{key}={performance.get(key, 'unavailable')}" for key in
             ("research_status", "execution_status", "capital_status", "evaluation_status")) +
@@ -646,6 +694,16 @@ class InvestmentSimulation:
                     })
                     continue
             if reference_price <= 0 or reference_price <= executable_quote_ceiling:
+                if reference_price > 0:
+                    proposal["screening_quote"] = {
+                        "price": reference_price,
+                        "name": provider_name,
+                        "source": str(quote.get("source") or ""),
+                        "quoted_at": str(quote.get("quoted_at") or ""),
+                        "fetched_at": str(quote.get("fetched_at") or ""),
+                        "valuation_kind": str(quote.get("valuation_kind") or "realtime"),
+                        "max_executable_quote": executable_quote_ceiling,
+                    }
                 feasible.append(proposal)
                 continue
 

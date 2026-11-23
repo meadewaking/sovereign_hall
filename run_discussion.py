@@ -1279,16 +1279,29 @@ def bound_round_source_lineage(
     )
 
 
-def dedupe_proposals(proposals: List[Dict]) -> List[Dict]:
-    """同一轮内按标的和方向去重，保留置信度最高的提案。"""
+def canonical_proposal_ticker(value: Any) -> str | None:
+    """Accept a local code or its matching SH/SZ suffix at proposal intake."""
     from sovereign_hall.services.market_data import MarketDataService
 
+    match = re.fullmatch(r"([0-9]{6})(?:\.(SH|SZ))?", str(value or "").strip().upper())
+    if not match:
+        return None
+    ticker, venue = match.groups()
+    if not MarketDataService.is_supported_ticker(ticker):
+        return None
+    if venue and venue.lower() != MarketDataService.infer_market(ticker):
+        return None
+    return ticker
+
+
+def dedupe_proposals(proposals: List[Dict]) -> List[Dict]:
+    """同一轮内按标的和方向去重，保留置信度最高的提案。"""
     by_key = {}
     for proposal in proposals:
-        ticker = str(proposal.get("ticker", "")).strip().upper()
-        direction = str(proposal.get("direction", "long")).strip().lower()
-        if not MarketDataService.is_supported_ticker(ticker):
+        ticker = canonical_proposal_ticker(proposal.get("ticker"))
+        if ticker is None:
             continue
+        direction = str(proposal.get("direction", "long")).strip().lower()
         key = (ticker, direction)
         previous = by_key.get(key)
         if previous is None or float(proposal.get("confidence", 0)) > float(previous.get("confidence", 0)):
@@ -1942,6 +1955,7 @@ async def stage2_deep_research(
 4. 不得用模型记忆、常识或猜测的价格判断整手可执行性。资料未给当前价格时，
    不要把它当成买入理由，也不要凭空补价；可保留候选交由后续实时行情筛选。提案
    抽取后、投委会前会由统一行情服务重新取得新鲜实时报价并执行整手硬门。
+   【近期整手不可行标的】列出的代码是行情服务实测价高于一手上限，不得再提交。
    资料中已有可执行ETF或低价候选时仍应优先比较
 5. 黑名单标的一律排除；代码、名称、市场或资产类型无法相互核对时不得提交
 
@@ -2291,9 +2305,9 @@ JSON数组结构：
 
         # 清洗数据（同时过滤黑名单）
         cleaned = []
-        from sovereign_hall.services.market_data import MarketDataService
-
+        blacklisted_tickers = {canonical_proposal_ticker(ticker) for ticker in blacklist}
         cleaning_rejections: Dict[str, int] = {}
+        ticker_rewrites: Dict[str, str] = {}
 
         def reject_cleaning(code: str) -> None:
             cleaning_rejections[code] = cleaning_rejections.get(code, 0) + 1
@@ -2302,7 +2316,8 @@ JSON数组结构：
             if not isinstance(p, dict):
                 reject_cleaning("not_object")
                 continue
-            ticker = str(p.get('ticker', '')).strip().upper()
+            raw_ticker = str(p.get('ticker', '')).strip().upper()
+            ticker = canonical_proposal_ticker(raw_ticker)
             direction = str(p.get("direction") or "").strip().lower()
             evidence, evidence_rejection = normalize_stage2_evidence(
                 p.get("evidence")
@@ -2317,36 +2332,39 @@ JSON数组结构：
             if not evidence or not str(thesis).strip():
                 reject_cleaning("insufficient_structured_evidence")
                 continue
-            if MarketDataService.is_supported_ticker(ticker):
-                # 过滤黑名单中的标的
-                if blacklist and ticker in blacklist:
-                    logger.warning(f"Filtered blacklisted ticker: {ticker}")
-                    reject_cleaning("blacklist")
-                    continue
-                try:
-                    cleaned_proposal = {
-                        'ticker': ticker,
-                        'security_name': str(p.get('security_name') or '').strip(),
-                        'direction': direction,
-                        'target_position': float(p.get('target_position', 0.1)),
-                        'stop_loss': float(p.get('stop_loss', 5.0)),
-                        'take_profit': float(p.get('take_profit', 15.0)),
-                        'confidence': float(p.get('confidence', 0.6)),
-                        'thesis': thesis,
-                        'sector': p.get('sector', '未知'),
-                        'holding_period_reason': str(p.get('holding_period_reason') or '')[:200],
-                        'evidence': evidence,
-                        'resolved_rejection': str(p.get('resolved_rejection') or '')[:300],
-                        'evidence_delta': str(p.get('evidence_delta') or '')[:500],
-                        'reject_if': str(p.get('reject_if') or '')[:500],
-                    }
-                except (TypeError, ValueError):
-                    reject_cleaning("invalid_numeric_field")
-                    continue
-                cleaned_proposal['holding_period'] = normalize_proposal_holding_period(cleaned_proposal | {'holding_period': p.get('holding_period')}, topic)
-                cleaned.append(cleaned_proposal)
-            else:
+            if ticker is None:
                 reject_cleaning("unsupported_ticker")
+                continue
+            if ticker in blacklisted_tickers:
+                logger.warning(f"Filtered blacklisted ticker: {ticker}")
+                reject_cleaning("blacklist")
+                continue
+            try:
+                cleaned_proposal = {
+                    'ticker': ticker,
+                    'security_name': str(p.get('security_name') or '').strip(),
+                    'direction': direction,
+                    'target_position': float(p.get('target_position', 0.1)),
+                    'stop_loss': float(p.get('stop_loss', 5.0)),
+                    'take_profit': float(p.get('take_profit', 15.0)),
+                    'confidence': float(p.get('confidence', 0.6)),
+                    'thesis': thesis,
+                    'sector': p.get('sector', '未知'),
+                    'holding_period_reason': str(p.get('holding_period_reason') or '')[:200],
+                    'evidence': evidence,
+                    'resolved_rejection': str(p.get('resolved_rejection') or '')[:300],
+                    'evidence_delta': str(p.get('evidence_delta') or '')[:500],
+                    'reject_if': str(p.get('reject_if') or '')[:500],
+                }
+            except (TypeError, ValueError):
+                reject_cleaning("invalid_numeric_field")
+                continue
+            cleaned_proposal['holding_period'] = normalize_proposal_holding_period(
+                cleaned_proposal | {'holding_period': p.get('holding_period')}, topic
+            )
+            if raw_ticker != ticker:
+                ticker_rewrites[raw_ticker] = ticker
+            cleaned.append(cleaned_proposal)
 
         logger.info(
             f"[diag] stage2 cleaned={len(cleaned)}; rejections={cleaning_rejections}"
@@ -2370,6 +2388,7 @@ JSON数组结构：
             reason=(
                 f"cleaned={len(cleaned)}; "
                 f"cleaning_rejections={json.dumps(cleaning_rejections, ensure_ascii=False)}; "
+                f"ticker_rewrites={json.dumps(ticker_rewrites, sort_keys=True)}; "
                 "candidate_source_coverage="
                 f"{json.dumps(candidate_source_coverage, ensure_ascii=False, sort_keys=True)}"
             ),
@@ -2672,6 +2691,56 @@ COMMITTEE_DECISION_BOUNDARIES = """
 """.strip()
 
 
+def format_committee_market_reference(proposal: Dict[str, Any]) -> str:
+    """Render the pre-committee quote and the proposal's implied risk/reward."""
+    def pct(value: Any, default: float) -> float:
+        try:
+            number = abs(float(value))
+        except (TypeError, ValueError):
+            return default
+        if number <= 0:
+            return default
+        return number * 100 if number < 1 else number
+
+    take_profit = pct(proposal.get("take_profit"), 15.0)
+    stop_loss = pct(proposal.get("stop_loss"), 5.0)
+    reward_risk = take_profit / stop_loss
+    quote = proposal.get("screening_quote") or {}
+    price = float(quote.get("price") or 0.0)
+    lines = ["【投委会前行情参考（统一行情服务取得，非模型记忆）】"]
+    if price > 0:
+        label = {
+            "realtime": "实时现价",
+            "session_close": "闭市参考价",
+            "session_pause": "午间休市参考价",
+        }.get(str(quote.get("valuation_kind") or "realtime"), "参考价")
+        lines.append(
+            f"- 参考价: {price:.4f}元（{label}；source={quote.get('source') or 'N/A'}；"
+            f"quoted_at={quote.get('quoted_at') or 'N/A'}）"
+        )
+        lines.append(
+            f"- 提案止盈+{take_profit:.1f}% → 约{price * (1 + take_profit / 100):.4f}元；"
+            f"止损-{stop_loss:.1f}% → 约{price * (1 - stop_loss / 100):.4f}元；"
+            f"赔率(止盈/止损)={reward_risk:.2f}"
+        )
+        max_quote = float(quote.get("max_executable_quote") or 0.0)
+        if max_quote > 0:
+            lines.append(f"- 已通过整手可行性筛选（整手可执行上限{max_quote:.4f}元）。")
+    else:
+        lines.append("- 本轮未取得筛选参考价（行情源暂不可用或非多头提案）。")
+        lines.append(
+            f"- 提案止盈+{take_profit:.1f}% / 止损-{stop_loss:.1f}%，"
+            f"赔率(止盈/止损)={reward_risk:.2f}，按百分比口径评估风险收益比。"
+        )
+    lines.append(
+        "- 成交前执行器会重新获取实时行情并重过整手、价格新鲜度和风控硬门；"
+        "买不起一手或行情不可用会在执行阶段被拒绝。因此“缺实时报价/无法计算风险收益比/"
+        "整手不可验证”属于执行环节校验项，不是事实反证，不能单独构成HOLD理由。"
+        "PE/PB、成交额等未提供字段是待补证缺口，只有构成决定性反证时才可作为HOLD依据。"
+    )
+    return "\n".join(lines)
+
+
 def parse_ratio_value(value: Any) -> Optional[float]:
     """Parse percentages or decimal ratios into [0, 1]."""
     if value in (None, ""):
@@ -2747,13 +2816,14 @@ def build_balanced_vote_context(
         f"{thesis}"
     )
     proposal_budget = min(max(400, total_budget // 8), 1000)
-    remaining = max(600, total_budget - proposal_budget - 12)
+    market_text = format_committee_market_reference(proposal)
+    remaining = max(600, total_budget - proposal_budget - len(market_text) - 14)
     stage_specs = (
         ("第一轮独立分析", round1_items, 0.40),
         ("第二轮交叉质疑", debate_items, 0.30),
         ("第三轮反事实修正", revision_items, 0.30),
     )
-    sections = [proposal_text[:proposal_budget]]
+    sections = [proposal_text[:proposal_budget], market_text]
     for label, items, share in stage_specs:
         if not items:
             continue
@@ -3912,6 +3982,7 @@ async def stage3_ic_discussion(
             "不限制必要展开，但每条都必须承担不同验证角度；"
             "必须给出正反两面推理、至少两个可证伪条件、仓位纪律、观察指标；"
             "结论必须含买入/卖出/观望、置信度和否决条件。"
+            f"\n\n{format_committee_market_reference(proposal)}"
             f"\n\n{COMMITTEE_DECISION_BOUNDARIES}"
         )
 
