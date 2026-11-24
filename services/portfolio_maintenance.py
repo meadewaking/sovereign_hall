@@ -122,11 +122,17 @@ class PortfolioMaintenance:
             temporary.replace(self.status_path)
         except (OSError, ValueError, TypeError):
             logger.exception("Cannot publish portfolio maintenance status")
-        logger.info(
+        summary = (report["status"], len(report["reviews"] or []),
+                   (report["pending_replay"] or {}).get("executed"),
+                   (report["performance"] or {}).get("score"))
+        previous = self.last_result or {}
+        unchanged = summary[1] == 0 and not summary[2] and summary == (
+            previous.get("status"), len(previous.get("reviews") or []),
+            (previous.get("pending_replay") or {}).get("executed"),
+            (previous.get("performance") or {}).get("score"))
+        (logger.debug if unchanged else logger.info)(
             "PORTFOLIO_MAINTENANCE context=%s status=%s reviews=%s replay_fills=%s score=%s snapshot=%s",
-            context, report["status"], len(report["reviews"] or []),
-            (report["pending_replay"] or {}).get("executed"),
-            (report["performance"] or {}).get("score"), self.policy_snapshot_id,
+            context, *summary, self.policy_snapshot_id,
         )
         # Publish one completed result. Readers must not observe "ready" while
         # evaluation, runtime persistence or the status file is still pending.

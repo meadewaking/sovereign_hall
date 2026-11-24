@@ -7,6 +7,7 @@ simulation all share the same price source and never fall back to fake prices.
 
 import asyncio
 import logging
+import math
 import re
 from datetime import date, datetime, time, timedelta
 from collections.abc import Awaitable, Callable, Iterable
@@ -373,7 +374,8 @@ class MarketDataService:
                 break
             await asyncio.sleep(0.2)
         window=market_window()
-        log=logger.info if not valuation and window and window['kind']!='realtime' else logger.warning
+        # Outside trading sessions realtime misses are expected on every maintenance tick.
+        log=logger.debug if not valuation and window and window['kind']!='realtime' else logger.warning
         log("No qualified %s quote for %s: %s", 'valuation' if valuation else 'realtime',code,
                        [{key: a[key] for key in ('source','status','error_type','quoted_at',
                                                 'source_age_seconds','freshness_limit_seconds') if key in a}
@@ -417,6 +419,63 @@ class MarketDataService:
         if last_error is not None:
             raise last_error
         return None, "", ""
+
+    @staticmethod
+    def parse_tencent_snapshot(text: str, ticker: str) -> Optional[Dict[str, Any]]:
+        parts = text.split('~')
+        if len(parts) <= 81 or parts[2] != ticker:
+            return None
+
+        def number(index):
+            try:
+                value = float(parts[index])
+            except (TypeError, ValueError):
+                return None
+            return value if math.isfinite(value) else None
+
+        quoted = datetime.strptime(parts[30], '%Y%m%d%H%M%S').replace(tzinfo=MARKET_ZONE)
+        is_etf = parts[61].strip() == 'ETF'
+        turnover = number(37)
+        market_value = number(45)
+        snapshot = {
+            'ticker': ticker, 'name': parts[1].strip(), 'price': number(3),
+            'previous_close': number(4), 'change_pct': number(32),
+            'turnover_yuan': turnover * 1e4 if turnover is not None else None,
+            'turnover_rate_pct': number(38),
+            'market_value_yuan': market_value * 1e8 if market_value else None,
+            'security_type': 'etf' if is_etf else parts[61].strip().lower(),
+            'source': 'tencent_realtime_snapshot', 'quoted_at': quoted.isoformat(),
+            'fetched_at': datetime.now(MARKET_ZONE).isoformat(),
+        }
+        if is_etf:
+            iopv = number(78)
+            snapshot.update(fund_shares=number(72), iopv=iopv if iopv else None,
+                            premium_pct=number(77) if iopv else None,
+                            previous_nav=number(81) or None)
+        else:
+            pb = number(46)
+            snapshot.update(pe=number(39), pb=pb if pb else None)
+        return snapshot
+
+    async def get_security_snapshot(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Liquidity/size/IOPV fields from the same Tencent quote record; descriptive only."""
+        code = self.normalize_ticker(ticker)
+        market = self.infer_market(code)
+        if not market:
+            return None
+        for host in ('web.sqt.gtimg.cn', 'qt.gtimg.cn'):
+            try:
+                async with asyncio.timeout(max(.01, self._quote_request_timeout / 2)):
+                    resp = await self._client.get(f'https://{host}/q={market}{code}')
+                    resp.raise_for_status()
+                    snapshot = self.parse_tencent_snapshot(
+                        resp.content.decode('gbk', errors='strict'), code)
+                if snapshot is not None:
+                    return snapshot
+            except Exception as exc:
+                logger.debug('Tencent snapshot failed for %s via %s (%s): %s',
+                             code, host, type(exc).__name__, exc)
+        return None
 
     async def _fetch_eastmoney_quote(self, ticker: str) -> tuple[Optional[float], str, str]:
         secid = self.eastmoney_secid(ticker)

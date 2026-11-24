@@ -201,11 +201,23 @@ async def test_absent_or_invalid_final_review_never_executes_a_research_approval
 
 @pytest.mark.asyncio
 async def test_k3_does_not_supply_missing_research_participation(tmp_path):
-    llm = client(tmp_path, [json.dumps(verdict())])
-    result, _, _ = await review_committee_decision(llm, PROPOSAL,
+    llm = client(tmp_path, [json.dumps(verdict())], daily_limit=1)
+    supplement = AsyncMock()
+    result, audits, turns = await review_committee_decision(llm, PROPOSAL,
         {**RESEARCH, "vote_quorum_met": False}, "views", round_id="round-one",
-        execute_stage=execute_durable_committee_stage)
+        execute_stage=execute_durable_committee_stage, supplement=supplement)
     assert not result["vote_quorum_met"] and result["target_position"] == 0
+    assert result["direction"] == "hold"
+    assert result["evidence_gaps"] == ["research_participation_incomplete"]
+    assert result["final_review"]["parse_mode"] == "not_attempted"
+    assert audits[0]["stage"] == "k3_final_review" and audits[0]["task_count"] == 0
+    assert not turns
+    llm.reviewer.client_impl.chat.assert_not_awaited()
+    supplement.assert_not_awaited()
+
+    recovered, _, _ = await run_review(llm)
+    assert recovered["direction"] == "long" and recovered["vote_quorum_met"]
+    assert llm.reviewer.client_impl.chat.await_count == 1
 
 
 @pytest.mark.asyncio

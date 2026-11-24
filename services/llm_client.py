@@ -282,7 +282,7 @@ class LLMClient:
             started = time.monotonic()
             for attempt in range(self.max_retries + 1):
                 try:
-                    response, usage = await _call_llm()
+                    response, usage = await self._retry_gateway_access_rejection(_call_llm)
 
                     # 检查响应是否为 None
                     if response is None:
@@ -354,6 +354,30 @@ class LLMClient:
 
             # 理论上不会到这里，但以防万一
             raise last_exception
+
+    GATEWAY_ACCESS_RETRY_DELAYS = (1.0, 2.0, 4.0)
+
+    @staticmethod
+    def _is_gateway_access_rejection(error: Exception) -> bool:
+        # The relay gateway intermittently rejects the token's source IP before
+        # any generation, so a retry costs no tokens and cannot resample an answer.
+        response = getattr(error, "response", None)
+        if not isinstance(error, httpx.HTTPStatusError) or getattr(response, "status_code", None) != 403:
+            return False
+        try:
+            return response.json()["error"].get("code") == "access_denied"
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
+
+    async def _retry_gateway_access_rejection(self, call):
+        for delay in (*self.GATEWAY_ACCESS_RETRY_DELAYS, None):
+            try:
+                return await call()
+            except httpx.HTTPStatusError as exc:
+                if delay is None or not self._is_gateway_access_rejection(exc):
+                    raise
+                logger.warning("LLM gateway access_denied (403); retrying in %.1fs", delay)
+                await asyncio.sleep(delay)
 
     def _is_retryable_error(self, error: Exception) -> bool:
         """判断错误是否可重试"""
@@ -460,6 +484,9 @@ class LLMClient:
                 # promoting reasoning text into a vote.
                 "stream": not json_output,
             }
+            if self._uses_server_default_temperature():
+                # Kimi gateway groups each accept a different fixed temperature.
+                del payload["temperature"]
             if json_output:
                 if not json_array_output and bool(getattr(
                     self,
@@ -494,10 +521,9 @@ class LLMClient:
                     # parameters. Negotiate only an explicit pre-generation 400
                     # rejection, once per parameter. Never resample a completed
                     # answer or change the prompt, model or token budget.
-                    parameter, required = 'temperature', self._kimi_required_temperature(
-                        resp, payload['temperature'])
-                    if required is None and 'reasoning_effort' in payload:
-                        parameter, required = 'reasoning_effort', self._kimi_supported_reasoning_effort(
+                    parameter, required = 'reasoning_effort', None
+                    if 'reasoning_effort' in payload:
+                        required = self._kimi_supported_reasoning_effort(
                             resp, payload['reasoning_effort'])
                     if required is None or parameter in recovered:
                         break
@@ -516,7 +542,7 @@ class LLMClient:
                     resp = await self._http_client.post(url, json=payload, headers=headers)
                 if resp.status_code >= 400:
                     raise httpx.HTTPStatusError(
-                        f"HTTP {resp.status_code}: {resp.content[:500]!r}",
+                        f"HTTP {resp.status_code}: {resp.content[:500].decode('utf-8', 'replace')}",
                         request=resp.request,
                         response=resp,
                     )
@@ -583,7 +609,7 @@ class LLMClient:
                 if resp.status_code >= 400:
                     body = await resp.aread()
                     raise httpx.HTTPStatusError(
-                        f"HTTP {resp.status_code}: {body[:500]!r}",
+                        f"HTTP {resp.status_code}: {body[:500].decode('utf-8', 'replace')}",
                         request=resp.request,
                         response=resp,
                     )
@@ -664,24 +690,8 @@ class LLMClient:
             logger.error("OpenAI chat failed: %s", self._format_exception(e))
             raise
 
-    def _kimi_required_temperature(self, response, requested):
-        """Accept explicit temperature constraints returned by the Kimi gateway."""
-        if not self.model.lower().startswith('kimi-k3') or response.status_code != 400:
-            return None
-        try:
-            error = response.json()['error']
-            if not isinstance(error, dict) or error.get('type') != 'invalid_request_error':
-                return None
-            message = error['message']
-            match = re.search(
-                r'invalid temperature: only (0\.6|1(?:\.0)?) is allowed for this model'
-                r'(?: when thinking\.type=(?:disabled|enabled)(?=\s|\(|$)'
-                r'|(?=\s*(?:\(request id:|$)))', message)
-            required = float(match.group(1)) if match else (
-                1.0 if 'temperature must be the number 1 for this group' in message else None)
-            return required if required is not None and required != requested else None
-        except (KeyError, TypeError, ValueError):
-            return None
+    def _uses_server_default_temperature(self):
+        return str(self.model or '').lower().startswith('kimi-k3')
 
     def _kimi_supported_reasoning_effort(self, response, requested):
         """Pick the lowest effort the Kimi gateway explicitly lists as supported."""

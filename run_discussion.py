@@ -2691,6 +2691,49 @@ COMMITTEE_DECISION_BOUNDARIES = """
 """.strip()
 
 
+def format_security_snapshot(snapshot: Dict[str, Any]) -> List[str]:
+    """Render quote-service size/liquidity/IOPV fields; absent fields are omitted."""
+    if not snapshot:
+        return []
+
+    def yi(value):
+        return f"{value / 1e8:.2f}亿元" if isinstance(value, (int, float)) else None
+
+    facts = []
+    if snapshot.get("security_type") == "etf":
+        if yi(snapshot.get("market_value_yuan")):
+            shares = snapshot.get("fund_shares")
+            share_text = f"，场内份额{shares / 1e8:.2f}亿份" if isinstance(shares, (int, float)) else ""
+            facts.append(f"场内规模约{yi(snapshot['market_value_yuan'])}（份额×现价{share_text}）")
+        if snapshot.get("iopv") is not None:
+            premium = snapshot.get("premium_pct")
+            premium_text = f"，折溢价{premium:+.2f}%" if isinstance(premium, (int, float)) else ""
+            facts.append(f"IOPV {snapshot['iopv']:.4f}{premium_text}")
+        if snapshot.get("previous_nav") is not None:
+            facts.append(f"上日单位净值{snapshot['previous_nav']:.4f}")
+    else:
+        if yi(snapshot.get("market_value_yuan")):
+            facts.append(f"总市值约{yi(snapshot['market_value_yuan'])}")
+        if snapshot.get("pe") is not None:
+            facts.append(f"市盈率{snapshot['pe']:.2f}")
+        if snapshot.get("pb") is not None:
+            facts.append(f"市净率{snapshot['pb']:.2f}")
+    if yi(snapshot.get("turnover_yuan")):
+        rate = snapshot.get("turnover_rate_pct")
+        rate_text = f"，换手率{rate:.2f}%" if isinstance(rate, (int, float)) else ""
+        facts.append(f"当日截至报价时累计成交额{yi(snapshot['turnover_yuan'])}{rate_text}")
+    if isinstance(snapshot.get("change_pct"), (int, float)):
+        facts.append(f"当日涨跌幅{snapshot['change_pct']:+.2f}%")
+    if not facts:
+        return []
+    return [
+        f"- 行情快照（{snapshot.get('source') or 'N/A'}；quoted_at={snapshot.get('quoted_at') or 'N/A'}）："
+        + "；".join(facts) + "。",
+        "- 以上规模/流动性/IOPV/估值字段来自行情服务实测，可直接用于流动性、折溢价与退出成本核验，"
+        "不需再要求网页补证；它们只说明交易条件，不构成方向性证据。",
+    ]
+
+
 def format_committee_market_reference(proposal: Dict[str, Any]) -> str:
     """Render the pre-committee quote and the proposal's implied risk/reward."""
     def pct(value: Any, default: float) -> float:
@@ -2726,6 +2769,9 @@ def format_committee_market_reference(proposal: Dict[str, Any]) -> str:
         max_quote = float(quote.get("max_executable_quote") or 0.0)
         if max_quote > 0:
             lines.append(f"- 已通过整手可行性筛选（整手可执行上限{max_quote:.4f}元）。")
+        snapshot_lines = format_security_snapshot(quote.get("snapshot") or {})
+        if snapshot_lines:
+            lines.extend(snapshot_lines)
     else:
         lines.append("- 本轮未取得筛选参考价（行情源暂不可用或非多头提案）。")
         lines.append(

@@ -664,7 +664,7 @@ class InvestmentSimulation:
                 from ..domain.portfolio.instruments import is_etf_ticker
                 identity = check_security_identity(ticker, claimed_name, quote)
                 if (not identity["matches"] and is_etf_ticker(ticker)
-                        and identity_requests < 2):
+                        and identity_requests < 4):
                     identity_requests += 1
                     try:
                         profile = await fetch_fund_identity(ticker)
@@ -676,7 +676,7 @@ class InvestmentSimulation:
                 identity.update(quote_source=quote.get("source"),
                                 quote_fetched_at=quote.get("fetched_at"),
                                 identity_requests_so_far=identity_requests,
-                                identity_request_limit=2)
+                                identity_request_limit=4)
                 # The captured response bytes and code/name fields are durable
                 # before any changed eligibility reaches the committee. They
                 # are descriptive identity evidence, never a fresh catalyst.
@@ -704,6 +704,9 @@ class InvestmentSimulation:
                         "valuation_kind": str(quote.get("valuation_kind") or "realtime"),
                         "max_executable_quote": executable_quote_ceiling,
                     }
+                    snapshot = await self.get_security_snapshot(ticker)
+                    if snapshot:
+                        proposal["screening_quote"]["snapshot"] = snapshot
                 feasible.append(proposal)
                 continue
 
@@ -1893,6 +1896,17 @@ class InvestmentSimulation:
         if hasattr(market_data, "get_current_quote"):
             return await market_data.get_current_quote(ticker)
         return None  # A bare price cannot establish provider event time.
+
+    async def get_security_snapshot(self, ticker: str) -> Optional[Dict[str, Any]]:
+        market_data = self._market_data_service()
+        if not hasattr(market_data, "get_security_snapshot"):
+            return None
+        try:
+            snapshot = await asyncio.wait_for(market_data.get_security_snapshot(ticker), timeout=6)
+        except Exception as exc:
+            logger.info("Security snapshot unavailable for %s: %s", ticker, type(exc).__name__)
+            return None
+        return snapshot if (snapshot or {}).get("ticker") == self._normalize_ticker(ticker) else None
 
     async def get_valuation_quote(self,ticker):
         market=self._market_data_service()

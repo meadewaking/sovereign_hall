@@ -233,7 +233,7 @@ async def test_stalled_tencent_web_route_leaves_time_for_legacy_fallback():
 
 @pytest.mark.asyncio
 async def test_stale_source_is_logged_with_real_timestamp_and_age(caplog):
-    caplog.set_level('INFO',logger='sovereign_hall.services.market_data')
+    caplog.set_level('DEBUG',logger='sovereign_hall.services.market_data')
     stamp=datetime.now(MARKET_ZONE)-timedelta(minutes=30)
     async def handle(request):
         if request.url.host in {'web.sqt.gtimg.cn','qt.gtimg.cn'}:
