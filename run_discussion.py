@@ -5071,6 +5071,7 @@ async def run_committee_approved_simulation(
     round_coordinator=None,
     pre_reviewed_positions: Optional[List[Dict[str, Any]]] = None,
     portfolio_maintenance=None,
+    proposal_reference_quotes: dict[str, dict[str, Any]] | None = None,
 ):
     """Run the daily simulated portfolio step after committee decisions exist."""
     from sovereign_hall.domain.portfolio.execution_policy import approved_execution_target
@@ -5422,6 +5423,25 @@ async def run_committee_approved_simulation(
          if decision.get("direction") == "long" else 0.0}
         for decision in trade_candidates
     ]
+
+    if round_coordinator and round_id and proposal_reference_quotes is not None and deployable_new_longs:
+        from sovereign_hall.services.entry_budget_audit import approved_entry_budget_at_reference
+
+        try:
+            entries = [
+                approved_entry_budget_at_reference(
+                    decision, proposal_reference_quotes.get(decision["ticker"]),
+                    assets, simulation.config, simulation.cost_schedule,
+                )
+                for decision in trade_candidates
+                if decision["direction"] == "long"
+            ]
+            await round_coordinator.record_event(round_id, "ApprovedEntryBudgetObserved", {
+                "basis": "research_reference_only",
+                "entries": entries,
+            })
+        except Exception as error:
+            logger.warning("Approved entry budget audit unavailable for %s: %s", round_id, error)
 
     if not market_session_open:
         pending_count = 0
@@ -7316,6 +7336,10 @@ async def _main(resources):
                     round_coordinator=round_coordinator,
                     pre_reviewed_positions=pre_round_position_reviews + list(portfolio_maintenance.round_reviews),
                     portfolio_maintenance=portfolio_maintenance,
+                    proposal_reference_quotes={
+                        simulation._normalize_ticker(proposal["ticker"]): proposal["screening_quote"]
+                        for proposal in proposals if proposal.get("screening_quote")
+                    },
                 )
                 late_reviews = portfolio_maintenance.round_reviews[maintained_count:]
                 if late_reviews:

@@ -64,7 +64,7 @@ model_collaboration:
   review_max_tokens: 5000
   review_max_calls_per_round: 4
   max_review_proposals_per_round: 2
-  review_max_calls_per_day: 100
+  review_max_calls_per_day: 300
   review_timeout_seconds: 180
   empty_audit_interval: 3
   review_source_chars: 24000

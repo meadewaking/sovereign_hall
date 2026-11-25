@@ -82,6 +82,44 @@ async def test_open_and_deferred_ruling_keep_same_approved_budget(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_approved_entry_budget_audit_preserves_the_deferred_ruling(tmp_path, monkeypatch):
+    import sovereign_hall.run_discussion as runner
+
+    ctx = HeuristicRiskContext(None, "fixture", None, 1, False, "", [], min_confidence=.55)
+    monkeypatch.setattr(runner, "load_latest_heuristic_context", lambda: ctx)
+    monkeypatch.setattr(runner, "recent_prediction_observation_count", lambda ticker: 1)
+    market = Market(opened=False)
+    db, sim = await make_account(tmp_path, market=market)
+    try:
+        coordinator = ResearchRoundCoordinator(db)
+        record = await coordinator.start(base_topic="entry audit", research_objective="reference budget")
+        ticker = "002382"
+        decision = dict(ticker=ticker, direction="long", confidence=.58, target_position=.08,
+                        decision_id="entry-audit-fixture", expected_days=60, vote_quorum_met=True)
+        stamp = datetime.now().isoformat()
+        result = await run_committee_approved_simulation(
+            sim, market, None, [decision], round_id=record.id, round_coordinator=coordinator,
+            proposal_reference_quotes={ticker: dict(price=4.97, source="reference_fixture",
+                                                    quoted_at=stamp, valuation_kind="session_close")},
+        )
+        payload = json.loads(await scalar(db, "SELECT payload_json FROM round_events "
+                                        "WHERE event_type='ApprovedEntryBudgetObserved'"))
+        entry, = payload["entries"]
+        assert entry["decision_id"] == decision["decision_id"]
+        assert entry["status"] == "zero_lots_at_reference"
+        assert entry["target_after_confidence"] == .04
+        assert entry["max_quote_before_tighter_caps"] == 4.0
+        assert entry["reference_price"] == 4.97
+        assert entry["time_exit_at_most_days"] == 30
+        assert result["terminal"] == "market_closed_pending"
+        assert await scalar(db, "SELECT target_position FROM execution_intents") == .04
+        assert await scalar(db, "SELECT count(*) FROM quote_snapshots") == 0
+        assert await scalar(db, "SELECT count(*) FROM simulation_trades") == 0
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bypass_flag", [False, True])
 async def test_current_risk_limit_cannot_be_skipped(tmp_path, monkeypatch, bypass_flag):
     db, sim = await make_account(tmp_path)
