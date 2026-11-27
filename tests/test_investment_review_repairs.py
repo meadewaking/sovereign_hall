@@ -259,6 +259,61 @@ async def test_screen_rejects_explicit_security_name_mismatch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stage3_market_reference_uses_durable_fund_identity(tmp_path, monkeypatch):
+    import hashlib
+
+    from sovereign_hall.run_discussion import format_committee_market_reference
+    from sovereign_hall.services import security_identity
+
+    ticker = "159581"
+    fund_name = "万家中证红利交易型开放式指数证券投资基金"
+    index_name = "中证红利指数"
+    body = (
+        '<meta charset="utf-8"><table class="info">'
+        f"<tr><th>基金代码</th><td>{ticker}</td><th>基金全称</th><td>{fund_name}</td></tr>"
+        f"<tr><th>基金简称</th><td>红利ETF万家</td><th>跟踪标的</th><td>{index_name}</td></tr>"
+        "</table>"
+    ).encode()
+
+    async def fetch(code):
+        now = datetime.now().astimezone()
+        receipt = dict(url=f"https://fundf10.eastmoney.com/jbgk_{code}.html", status=200,
+                       requested_at=now.isoformat(), captured_at=now.isoformat(),
+                       sha256=hashlib.sha256(body).hexdigest())
+        return security_identity.parse_fund_identity(body, receipt, ticker=code, now=now)
+
+    market = Market()
+    original = market.get_current_quote
+
+    async def quote(code):
+        return {**await original(code), "name": "红利ETF万家"}
+
+    market.get_current_quote = quote
+    monkeypatch.setattr(security_identity, "fetch_fund_identity", fetch)
+    db, sim = await make_account(tmp_path, market=market)
+    try:
+        round_ = await ResearchRoundCoordinator(db).start(base_topic="test", research_objective="test")
+        proposals = [dict(ticker=ticker, security_name=fund_name, direction="long"),
+                     dict(ticker=ticker, security_name="红利低波ETF", direction="long")]
+        accepted, rejected = await sim.screen_proposal_lot_feasibility(proposals, round_id=round_.id)
+        assert len(accepted) == 1
+        assert rejected[0]["code"] == "proposal_identity_mismatch"
+        card = accepted[0]["screening_quote"]["fund_identity"]
+        assert card["tracked_index"] == index_name
+        assert card["publication_time"] is None
+        assert card["purpose"] == "security_identity_only"
+        assert "raw_body_base64" not in card
+        assert index_name in format_committee_market_reference(accepted[0])
+        cursor = await db._connection.execute(
+            "SELECT payload_json FROM round_events WHERE event_type='ProposalIdentityChecked' ORDER BY id")
+        event = json.loads((await cursor.fetchone())[0])
+        assert card["source_sha256"] == event["profile"]["receipt"]["sha256"]
+        assert await scalar(db, "SELECT count(*) FROM execution_intents") == 0
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_lot_infeasible_memory_lists_only_tickers_above_current_ceiling(tmp_path):
     db, sim = await make_account(tmp_path)
     try:

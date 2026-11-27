@@ -376,6 +376,13 @@ async def review_committee_decision(llm, proposal, decision, discussion, *, roun
                        "error_count": 0, "absent_labels": [], "tasks": []})
     span_wire = llm.settings.get("review_citation_wire", True)
     system = SPAN_REVIEW_SYSTEM if span_wire else REVIEW_SYSTEM
+    identity = (proposal.get("screening_quote") or {}).get("fund_identity") or {}
+    if identity and identity.get("ticker") == proposal.get("ticker"):
+        system += (
+            "\nproposal.screening_quote.fund_identity来自本轮已留存的同代码基金资料。"
+            "用它核对基金名称及跟踪标的。抓取时间不是发布时间，仅限身份核对，"
+            "不能用来证明当前催化、指数权重、估值或资金流，也不计入approve所需原文证据。"
+        )
     prompt_version = REVIEW_PROMPT_VERSION if span_wire else VERSION
     parse = parse_span_review if span_wire else parse_review
     for attempt in range(2 if research_quorum_met else 0):

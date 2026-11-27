@@ -101,6 +101,65 @@ async def test_outcome_cards_survive_narrative_budget_and_archived_availability(
         await db.close()
 
 
+async def test_research_memory_reconciles_only_execution_events_visible_at_the_cutoff(tmp_path):
+    from sovereign_hall.application.run_research_round import ResearchRoundCoordinator
+
+    db = DatabaseService(str(tmp_path / "memory.db"))
+    await db._init_db()
+    try:
+        topic = "执行结果回读"
+        coordinator = ResearchRoundCoordinator(db)
+        round_ = await coordinator.start(base_topic=topic, research_objective=topic)
+        before = "2026-11-27T09:30:47.218048+08:00"
+        after = "2026-11-27T09:30:47.218049+08:00"
+        prediction = dict(id="entry", ticker="002415", direction="long", status="awaiting_entry_quote",
+                          result="unknown", predicted_at="2026-11-26T19:50:00")
+        unquoted = dict(prediction, id="no-quote", ticker="600183")
+        memory = dict(schema_version=1, round_id=round_.id, topic=topic,
+                      completed_at="2026-11-26T19:51:35", status="completed",
+                      terminal_code="market_closed_pending",
+                      failure_reason="模拟投资管线已持久化明确终态；fills=0",
+                      conclusions=[], reflections=[], predictions=[prediction, unquoted],
+                      decisions=[], evidence=[], event_ids=[])
+        conn = await db._get_connection()
+        await conn.execute("INSERT INTO research_memories VALUES (?,?,?,?,?,?,?)",
+                           (round_.id, content_hash(memory), topic, "2026-11-26T11:52:00+00:00",
+                            memory["completed_at"], "completed", json.dumps(memory, ensure_ascii=False)))
+        events = [
+            ("PredictionQuoteAnchored", {"ticker": "002415", "prediction_id": "entry"}),
+            ("SimulatedFillCreated", {"ticker": "002415", "trade_id": 89, "direction": "buy",
+                                     "shares": 100, "total_fee": 6.657}),
+            ("ExecutionRejectedWithoutQuote", {"ticker": "600183", "prediction_id": "no-quote",
+                                               "intent_id": "rejected-intent", "blocker_code": "quote_unavailable"}),
+            ("ExecutionRejectedWithQuote", {"ticker": "600000", "intent_id": "later-intent",
+                                            "blocker_code": "lot_size_cap_infeasible"}),
+        ]
+        for sequence, (kind, payload) in enumerate(events, 2):
+            recorded_at = ("2026-11-27T01:30:47.218050Z" if sequence == 5 else
+                           "2026-11-27T09:30:47.218049")
+            await conn.execute("""INSERT INTO round_events(round_id,sequence,event_type,payload_json,created_at)
+                                  VALUES (?,?,?,?,?)""",
+                               (round_.id, sequence, kind, json.dumps(payload), recorded_at))
+        await conn.commit()
+
+        reader = LearningEngine(db.db_path)
+        prior = await reader.generate_research_memory_prompt(topic, as_of=before)
+        observed = await reader.generate_research_memory_prompt(topic, as_of=after)
+        assert "存档终态=market_closed_pending" in prior
+        assert "002415 long | 状态=awaiting_entry_quote" in prior
+        assert "模拟成交[89]" not in prior and "rejected-intent" not in prior
+        assert "模拟成交[89] | buy 100股 | 费用=6.657元" in observed
+        assert "002415 long | 状态=pending 结果=unknown" in observed
+        assert "600183 long | 状态=execution_rejected 结果=unknown" in observed
+        assert "执行拒绝[rejected-intent] | 阻断=quote_unavailable" in observed
+        assert "later-intent" not in observed and "fills=0" not in observed
+        assert await reader.generate_research_memory_prompt(topic, as_of=after) == observed
+        async with conn.execute("SELECT memory_json FROM research_memories WHERE round_id=?", (round_.id,)) as cursor:
+            assert json.loads((await cursor.fetchone())[0]) == memory
+    finally:
+        await db.close()
+
+
 async def test_global_lessons_distinguish_missed_opportunities_and_do_not_command_smaller_hold(tmp_path):
     from sovereign_hall.services.decision_tracker import ensure_prediction_tables
     path = str(tmp_path / "predictions.db")

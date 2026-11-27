@@ -2772,6 +2772,13 @@ def format_committee_market_reference(proposal: Dict[str, Any]) -> str:
         snapshot_lines = format_security_snapshot(quote.get("snapshot") or {})
         if snapshot_lines:
             lines.extend(snapshot_lines)
+        fund_identity = quote.get("fund_identity") or {}
+        if fund_identity and fund_identity.get("ticker") == proposal.get("ticker"):
+            lines.append(
+                f"- 已核对基金身份: {fund_identity['fund_name']}，跟踪标的为"
+                f"{fund_identity['tracked_index']}（{fund_identity['source_url']}，"
+                f"抓取于{fund_identity['captured_at']}，发布时间未知，仅用于身份和指数归属核对）。"
+            )
     else:
         lines.append("- 本轮未取得筛选参考价（行情源暂不可用或非多头提案）。")
         lines.append(

@@ -659,6 +659,7 @@ class InvestmentSimulation:
                 )
             claimed_name = str(proposal.get("security_name") or "").strip()
             provider_name = str((quote or {}).get("name") or "").strip()
+            fund_identity = None
             if quote_usable and claimed_name and provider_name and claimed_name != provider_name:
                 from .security_identity import check_security_identity, fetch_fund_identity
                 from ..domain.portfolio.instruments import is_etf_ticker
@@ -693,6 +694,20 @@ class InvestmentSimulation:
                         "identity_check_mode": identity["mode"],
                     })
                     continue
+                if round_id and (profile := identity.get("profile")):
+                    tracked_index = profile["fields"].get("跟踪标的", "").strip()
+                    if tracked_index and tracked_index.strip("-—") and tracked_index != "无":
+                        receipt = profile["receipt"]
+                        fund_identity = {
+                            "ticker": ticker,
+                            "fund_name": profile["fields"]["基金全称"],
+                            "tracked_index": tracked_index,
+                            "source_url": receipt["url"],
+                            "source_sha256": receipt["sha256"],
+                            "captured_at": receipt["captured_at"],
+                            "publication_time": None,
+                            "purpose": "security_identity_only",
+                        }
             if reference_price <= 0 or reference_price <= executable_quote_ceiling:
                 if reference_price > 0:
                     proposal["screening_quote"] = {
@@ -707,6 +722,8 @@ class InvestmentSimulation:
                     snapshot = await self.get_security_snapshot(ticker)
                     if snapshot:
                         proposal["screening_quote"]["snapshot"] = snapshot
+                    if fund_identity:
+                        proposal["screening_quote"]["fund_identity"] = fund_identity
                 feasible.append(proposal)
                 continue
 

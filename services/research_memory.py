@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -363,6 +364,64 @@ class ResearchCompactor:
             raise
 
 
+async def _execution_feedback(source_uri, memories, cutoff):
+    """Read atomic execution events published after the selected archive versions."""
+    archived = {m["round_id"]: set(m.get("event_ids") or ()) for m in memories}
+    cards, prediction_status = defaultdict(list), {}
+    if not archived:
+        return cards, prediction_status
+
+    import aiosqlite
+    async with aiosqlite.connect(source_uri, uri=True) as conn:
+        async with conn.execute("SELECT 1 FROM sqlite_master WHERE name='round_events'") as cur:
+            if not await cur.fetchone():
+                return cards, prediction_status
+        placeholders = ",".join("?" for _ in archived)
+        async with conn.execute(f"""
+            SELECT id, round_id, event_type, payload_json, created_at FROM round_events
+            WHERE round_id IN ({placeholders}) AND event_type IN (
+                'SimulatedFillCreated', 'ExecutionRejectedWithQuote',
+                'ExecutionRejectedWithoutQuote', 'PredictionQuoteAnchored'
+            ) ORDER BY round_id, sequence
+        """, tuple(archived)) as cur:
+            async for event_id, round_id, event_type, raw, created_at in cur:
+                if event_id in archived[round_id]:
+                    continue
+                try:
+                    if utc_time(created_at) > cutoff:
+                        continue
+                    event = json.loads(raw)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+
+                prediction_id = event.get("prediction_id")
+                if isinstance(prediction_id, str) and prediction_id:
+                    if event_type == "PredictionQuoteAnchored":
+                        prediction_status[round_id, prediction_id] = "pending"
+                    elif event_type == "ExecutionRejectedWithoutQuote":
+                        prediction_status[round_id, prediction_id] = "execution_rejected"
+                ticker = event.get("ticker")
+                if not isinstance(ticker, str) or not ticker:
+                    continue
+                if event_type == "SimulatedFillCreated":
+                    if not all(field in event for field in ("trade_id", "direction", "shares", "total_fee")):
+                        continue
+                    detail = (f"模拟成交[{event['trade_id']}] | {event['direction']} "
+                              f"{event['shares']}股 | 费用={event['total_fee']}元")
+                elif event_type.startswith("ExecutionRejected"):
+                    if not event.get("intent_id") or not event.get("blocker_code"):
+                        continue
+                    detail = f"执行拒绝[{event['intent_id']}] | 阻断={event['blocker_code']}"
+                else:
+                    continue
+                cards[round_id].append(
+                    f"{detail} | 标的={ticker} | 记录时间={created_at} | 来源轮次={round_id}"
+                )
+    return cards, prediction_status
+
+
 async def retrieve_memory(db_path, query: str, *, as_of: str | None = None,
                           limit: int = 4, max_chars: int = 6000) -> str:
     """Bounded lexical retrieval; never globally inject top-success rounds."""
@@ -374,7 +433,8 @@ async def retrieve_memory(db_path, query: str, *, as_of: str | None = None,
         terms.update(text[i:i+3] for i in range(max(1, len(text)-2)) if len(text[i:i+3]) >= 2)
     terms = sorted(terms)[:32]
     cutoff = utc_time(as_of) if as_of else now_utc()
-    async with aiosqlite.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True) as conn:
+    source_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    async with aiosqlite.connect(source_uri, uri=True) as conn:
         async with conn.execute("SELECT 1 FROM sqlite_master WHERE name='research_memories'") as cur:
             if not await cur.fetchone():
                 return ""
@@ -404,10 +464,15 @@ async def retrieve_memory(db_path, query: str, *, as_of: str | None = None,
         if memory.get('schema_version') == 2:
             memory = (await asyncio.to_thread(ArchiveStore.read, memory['locator']))['memory']
         selected.append(memory)
+    execution_cards, prediction_status = await _execution_feedback(source_uri, selected, cutoff)
     predictions = {}
     for memory in selected:
         for index, prediction in enumerate(memory['predictions']):
             record = {**prediction, 'round_id': prediction.get('round_id') or memory['round_id']}
+            if record.get("status") == "awaiting_entry_quote":
+                status = prediction_status.get((record["round_id"], record.get("id")))
+                if status:
+                    record["status"] = status
             predictions.setdefault((memory['round_id'], record.get('id') or index), record)
     # Whole outcome cards precede generated narrative, so the character budget
     # cannot retain a quoted wrong-thesis inference while dropping its result.
@@ -420,6 +485,13 @@ async def retrieve_memory(db_path, query: str, *, as_of: str | None = None,
         if len('\n'.join(lines))+len(text)+1 <= max_chars:
             lines.append(text)
             rendered.add((record.get('round_id'), record.get('id')))
+    heading = "【存档后的模拟执行记录。持仓收益依据账户估值与结算。】\n"
+    for memory in selected:
+        for card in execution_cards.get(memory["round_id"], ()):
+            text = heading + card
+            if len("\n".join(lines)) + len(text) + 1 <= max_chars:
+                lines.append(text)
+                heading = ""
     from .bounded_memory import retrieve_units
     for unit in await retrieve_units(db_path, query, cutoff, limit=max(0, limit)):
         value = unit['value']
@@ -428,9 +500,12 @@ async def retrieve_memory(db_path, query: str, *, as_of: str | None = None,
         if len('\n'.join(lines))+len(text)+1 <= max_chars:
             lines.append(text)
     for m in selected:
-        items = [f"轮次={m['round_id']} | {m['completed_at']} | 议题={m['topic']} | 状态={m['status']}"]
-        if m.get("failure_reason"):
-            items.append("失败/终止原因: " + m["failure_reason"])
+        terminal = m.get("terminal_code")
+        items = [f"轮次={m['round_id']} | {m['completed_at']} | 议题={m['topic']} | 状态={m['status']}"
+                 + (f" | 存档终态={terminal}" if terminal else "")]
+        reason = m.get("failure_reason")
+        if reason and not (terminal and reason.startswith("模拟投资管线已持久化明确终态；")):
+            items.append("存档结案说明 " + reason)
         for c in m["conclusions"]:
             items.append(f"历史判断[{c.get('id')}]: {c.get('conclusion') or ''}")
             for key, label in (("risks", "反对/风险"), ("key_points", "依据")):
@@ -439,11 +514,12 @@ async def retrieve_memory(db_path, query: str, *, as_of: str | None = None,
         for r in m["reflections"]:
             if r.get("lessons_learned"):
                 items.append(f"历史经验（未自动认定有效）[{r.get('id')}]: {r['lessons_learned']}")
-        for p in m["predictions"]:
+        for index, p in enumerate(m["predictions"]):
             if (p.get('round_id') or m['round_id'], p.get('id')) not in rendered:
-                items.append(format_prediction_feedback(p, as_of=cutoff))
+                record = predictions[(m["round_id"], p.get("id") or index)]
+                items.append(format_prediction_feedback(record, as_of=cutoff))
         for d in m["decisions"]:
-            items.append(f"决策[{d.get('id')}]: {d.get('ticker')} | 状态={d.get('status')} | "
+            items.append(f"存档决策[{d.get('id')}]: {d.get('ticker')} | 存档状态={d.get('status')} | "
                          f"理由={d.get('reason') or d.get('reason_json') or '参见原始记录'}")
         items.append("原始证据ID: " + ", ".join(str(e["id"]) for e in m["evidence"]))
         if len("\n".join(lines)) + len(items[0]) + 1 > max_chars:
